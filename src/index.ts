@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.2 MICROSTRUCTURE ENGINE";
+const VERSION = "V1.3 NEWS/X ENGINE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -49,6 +49,12 @@ const INTERVAL_MS: Record<string, number> = {
 };
 
 type AnyObj = Record<string, any>;
+
+type Env = {
+  // Optional. Add with:
+  // npx wrangler secret put X_API_BEARER_TOKEN
+  X_API_BEARER_TOKEN?: string;
+};
 
 type Candle = {
   coin?: string;
@@ -1101,6 +1107,824 @@ async function buildSignal(coin: string) {
   };
 }
 
+
+// ============================================================
+// V1.3 NEWS + X ENGINE
+//
+// Official feeds:
+// - SEC Press Releases RSS
+// - Federal Reserve All Press Releases RSS
+// - Federal Reserve Monetary Policy RSS
+//
+// Optional X:
+// - X API v2 recent search
+// - Requires X_API_BEARER_TOKEN Cloudflare secret
+//
+// This first News Engine is deterministic/rule-based.
+// It does NOT pretend to be an LLM. We first validate ingestion,
+// timestamps, source weighting, relevance, direction and decay.
+// A later version can replace/enhance classification with an AI API.
+// ============================================================
+
+const NEWS_FEEDS = [
+  {
+    id: "SEC_PRESS",
+    name: "SEC Press Releases",
+    url: "https://www.sec.gov/news/pressreleases.rss",
+    trust: 100,
+    type: "OFFICIAL",
+  },
+  {
+    id: "FED_ALL",
+    name: "Federal Reserve Press Releases",
+    url: "https://www.federalreserve.gov/feeds/press_all.xml",
+    trust: 100,
+    type: "OFFICIAL",
+  },
+  {
+    id: "FED_MONETARY",
+    name: "Federal Reserve Monetary Policy",
+    url: "https://www.federalreserve.gov/feeds/press_monetary.xml",
+    trust: 100,
+    type: "OFFICIAL",
+  },
+] as const;
+
+// Keep X queries narrow to control noise and API usage.
+// We search crypto/macro terms plus selected primary accounts.
+const X_QUERY =
+  '((bitcoin OR BTC OR ethereum OR ETH OR solana OR SOL OR XRP OR BNB OR crypto OR cryptocurrency OR stablecoin OR ETF OR "interest rates" OR FOMC) ' +
+  '(from:SECGov OR from:federalreserve OR from:CFTC OR from:WhiteHouse OR from:Ripple OR from:solana OR from:ethereum)) -is:retweet';
+
+type NewsItem = {
+  id: string;
+  source_id: string;
+  source_name: string;
+  source_type: string;
+  source_trust: number;
+  title: string;
+  text: string;
+  url: string | null;
+  published_at: string | null;
+  published_ms: number | null;
+  age_minutes: number | null;
+  origin: "RSS" | "X";
+  author?: string | null;
+  metrics?: AnyObj | null;
+};
+
+function decodeXml(s: string): string {
+  return s
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function firstXml(block: string, tag: string): string {
+  const re = new RegExp(
+    `<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,
+    "i"
+  );
+  const m = block.match(re);
+  return m ? decodeXml(m[1]) : "";
+}
+
+function parseDateMs(value: string): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function ageMinutes(ms: number | null): number | null {
+  if (ms === null) return null;
+  return Math.max(0, (Date.now() - ms) / 60_000);
+}
+
+function parseRssItems(
+  xml: string,
+  source: (typeof NEWS_FEEDS)[number],
+  limit = 20
+): NewsItem[] {
+  const blocks =
+    xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi) ??
+    xml.match(/<entry(?:\s[^>]*)?>[\s\S]*?<\/entry>/gi) ??
+    [];
+
+  return blocks.slice(0, limit).map((block, i) => {
+    const title = firstXml(block, "title");
+    const description =
+      firstXml(block, "description") ||
+      firstXml(block, "summary") ||
+      firstXml(block, "content");
+
+    let link = firstXml(block, "link");
+
+    if (!link) {
+      const href = block.match(
+        /<link[^>]+href=["']([^"']+)["'][^>]*>/i
+      );
+      link = href?.[1] ?? "";
+    }
+
+    const date =
+      firstXml(block, "pubDate") ||
+      firstXml(block, "updated") ||
+      firstXml(block, "published");
+
+    const publishedMs = parseDateMs(date);
+
+    const guid =
+      firstXml(block, "guid") ||
+      link ||
+      `${source.id}:${title}:${i}`;
+
+    return {
+      id: guid,
+      source_id: source.id,
+      source_name: source.name,
+      source_type: source.type,
+      source_trust: source.trust,
+      title,
+      text: `${title} ${description}`.trim(),
+      url: link || null,
+      published_at:
+        publishedMs !== null
+          ? new Date(publishedMs).toISOString()
+          : date || null,
+      published_ms: publishedMs,
+      age_minutes: ageMinutes(publishedMs),
+      origin: "RSS" as const,
+    };
+  });
+}
+
+async function fetchOfficialFeed(
+  source: (typeof NEWS_FEEDS)[number]
+): Promise<{
+  ok: boolean;
+  source: string;
+  status: number;
+  items: NewsItem[];
+  error?: string;
+}> {
+  try {
+    const response = await fetch(source.url, {
+      headers: {
+        "user-agent":
+          "cryptobot-readonly/1.3 contact=market-research",
+        accept:
+          "application/rss+xml, application/xml, text/xml, */*",
+      },
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        source: source.id,
+        status: response.status,
+        items: [],
+        error: text.slice(0, 250),
+      };
+    }
+
+    return {
+      ok: true,
+      source: source.id,
+      status: response.status,
+      items: parseRssItems(text, source),
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      source: source.id,
+      status: 0,
+      items: [],
+      error: error?.message ?? String(error),
+    };
+  }
+}
+
+function xTrust(username: string): number {
+  const u = username.toLowerCase();
+
+  const primary = new Set([
+    "secgov",
+    "federalreserve",
+    "cftc",
+    "whitehouse",
+    "ripple",
+    "solana",
+    "ethereum",
+  ]);
+
+  return primary.has(u) ? 100 : 70;
+}
+
+async function fetchXRecent(env: Env): Promise<{
+  enabled: boolean;
+  ok: boolean;
+  status: number | null;
+  query: string;
+  items: NewsItem[];
+  error?: string;
+}> {
+  const token = env?.X_API_BEARER_TOKEN;
+
+  if (!token) {
+    return {
+      enabled: false,
+      ok: false,
+      status: null,
+      query: X_QUERY,
+      items: [],
+      error: "X_API_BEARER_TOKEN_NOT_CONFIGURED",
+    };
+  }
+
+  const params = new URLSearchParams({
+    query: X_QUERY,
+    "tweet.fields":
+      "created_at,author_id,public_metrics",
+    expansions: "author_id",
+    "user.fields": "username,verified,name",
+    max_results: "20",
+  });
+
+  try {
+    const response = await fetch(
+      `https://api.x.com/2/tweets/search/recent?${params.toString()}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+        },
+      }
+    );
+
+    const body = await response.json<any>().catch(() => null);
+
+    if (!response.ok) {
+      return {
+        enabled: true,
+        ok: false,
+        status: response.status,
+        query: X_QUERY,
+        items: [],
+        error:
+          body?.detail ??
+          body?.title ??
+          JSON.stringify(body)?.slice(0, 300) ??
+          "X_API_ERROR",
+      };
+    }
+
+    const users = new Map<string, any>();
+
+    for (const user of body?.includes?.users ?? []) {
+      users.set(String(user?.id ?? ""), user);
+    }
+
+    const items: NewsItem[] = (body?.data ?? []).map(
+      (post: any) => {
+        const user = users.get(String(post?.author_id ?? ""));
+        const username = String(user?.username ?? "unknown");
+        const publishedMs = parseDateMs(post?.created_at ?? "");
+
+        return {
+          id: `x:${post?.id}`,
+          source_id: `X_${username}`,
+          source_name: `@${username}`,
+          source_type: "X_PRIMARY",
+          source_trust: xTrust(username),
+          title: String(post?.text ?? "").slice(0, 180),
+          text: String(post?.text ?? ""),
+          url:
+            username !== "unknown" && post?.id
+              ? `https://x.com/${username}/status/${post.id}`
+              : null,
+          published_at:
+            publishedMs !== null
+              ? new Date(publishedMs).toISOString()
+              : post?.created_at ?? null,
+          published_ms: publishedMs,
+          age_minutes: ageMinutes(publishedMs),
+          origin: "X" as const,
+          author: username,
+          metrics: post?.public_metrics ?? null,
+        };
+      }
+    );
+
+    return {
+      enabled: true,
+      ok: true,
+      status: response.status,
+      query: X_QUERY,
+      items,
+    };
+  } catch (error: any) {
+    return {
+      enabled: true,
+      ok: false,
+      status: 0,
+      query: X_QUERY,
+      items: [],
+      error: error?.message ?? String(error),
+    };
+  }
+}
+
+function dedupeNews(items: NewsItem[]): NewsItem[] {
+  const seen = new Set<string>();
+  const out: NewsItem[] = [];
+
+  for (const item of items) {
+    const key = (
+      item.id ||
+      `${item.source_id}:${item.title}`
+    ).toLowerCase();
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+
+  return out.sort(
+    (a, b) => (b.published_ms ?? 0) - (a.published_ms ?? 0)
+  );
+}
+
+function textHas(text: string, words: string[]): boolean {
+  const t = text.toLowerCase();
+  return words.some((w) => t.includes(w.toLowerCase()));
+}
+
+function coinRelevance(
+  coin: string,
+  text: string,
+  sourceId: string
+): number {
+  const t = text.toLowerCase();
+
+  const direct: Record<string, string[]> = {
+    BTC: ["bitcoin", " btc", "btc ", "$btc"],
+    ETH: ["ethereum", " ether", " eth", "$eth", "staking"],
+    SOL: ["solana", " sol", "$sol"],
+    XRP: ["xrp", "ripple", "$xrp"],
+    BNB: ["bnb", "binance", "$bnb"],
+  };
+
+  if (textHas(t, direct[coin] ?? [])) return 100;
+
+  // Macro / regulatory stories can affect the whole crypto complex.
+  const broadCrypto = [
+    "crypto",
+    "cryptocurrency",
+    "digital asset",
+    "stablecoin",
+    "spot etf",
+    "exchange-traded fund",
+    "blockchain",
+  ];
+
+  if (textHas(t, broadCrypto)) {
+    return coin === "BTC" || coin === "ETH" ? 80 : 65;
+  }
+
+  const macro = [
+    "fomc",
+    "federal funds",
+    "interest rate",
+    "rate cut",
+    "rate hike",
+    "monetary policy",
+    "inflation",
+    "liquidity",
+  ];
+
+  if (
+    sourceId.startsWith("FED") &&
+    textHas(t, macro)
+  ) {
+    if (coin === "BTC") return 75;
+    if (coin === "ETH") return 65;
+    return 50;
+  }
+
+  return 0;
+}
+
+function classifyDirection(text: string): {
+  signed: number;
+  direction: string;
+  matched_positive: string[];
+  matched_negative: string[];
+} {
+  const positive = [
+    "approve",
+    "approved",
+    "approval",
+    "launch",
+    "adoption",
+    "partnership",
+    "rate cut",
+    "cuts rates",
+    "easing",
+    "legal clarity",
+    "dismiss",
+    "dismissed",
+    "settlement",
+    "wins",
+    "victory",
+    "inflows",
+    "record inflow",
+  ];
+
+  const negative = [
+    "charges",
+    "charged",
+    "lawsuit",
+    "sues",
+    "fraud",
+    "hack",
+    "hacked",
+    "exploit",
+    "ban",
+    "banned",
+    "reject",
+    "rejected",
+    "rate hike",
+    "raises rates",
+    "enforcement",
+    "investigation",
+    "outflows",
+    "liquidation",
+    "sanction",
+  ];
+
+  const t = text.toLowerCase();
+
+  const p = positive.filter((x) => t.includes(x));
+  const n = negative.filter((x) => t.includes(x));
+
+  const raw = clampSigned((p.length - n.length) * 25);
+
+  return {
+    signed: raw,
+    direction: sideLabel(raw, 5),
+    matched_positive: p,
+    matched_negative: n,
+  };
+}
+
+function estimateImpact(
+  item: NewsItem,
+  relevance: number,
+  directionStrength: number
+): number {
+  const t = item.text.toLowerCase();
+
+  let impact = 25;
+
+  if (
+    textHas(t, [
+      "bitcoin",
+      "ethereum",
+      "xrp",
+      "ripple",
+      "solana",
+      "bnb",
+      "binance",
+      "crypto",
+      "digital asset",
+    ])
+  ) {
+    impact += 20;
+  }
+
+  if (
+    textHas(t, [
+      "sec",
+      "federal reserve",
+      "fomc",
+      "interest rate",
+      "etf",
+      "enforcement",
+      "lawsuit",
+      "approve",
+      "approved",
+      "hack",
+      "exploit",
+      "ban",
+    ])
+  ) {
+    impact += 25;
+  }
+
+  if (item.source_trust >= 95) impact += 10;
+  if (relevance >= 90) impact += 10;
+  if (directionStrength >= 50) impact += 10;
+
+  return clamp(impact);
+}
+
+function newsDecay(ageMin: number | null): number {
+  if (ageMin === null) return 0.25;
+
+  // Fast scalping decay:
+  // half-ish life around 10 minutes for immediate reaction.
+  // Keep a small tail for large regulatory/macro stories.
+  const tau = 14;
+  return Math.max(0.05, Math.exp(-ageMin / tau));
+}
+
+function classifyNewsForCoin(item: NewsItem, coin: string) {
+  const relevance = coinRelevance(
+    coin,
+    item.text,
+    item.source_id
+  );
+
+  const dir = classifyDirection(item.text);
+  const impact = estimateImpact(
+    item,
+    relevance,
+    Math.abs(dir.signed)
+  );
+
+  // Deterministic confidence: primary-source + explicit directional terms.
+  let confidence = 45;
+  if (item.source_trust >= 95) confidence += 25;
+  if (relevance >= 80) confidence += 15;
+  if (Math.abs(dir.signed) >= 25) confidence += 15;
+  confidence = clamp(confidence);
+
+  const decay = newsDecay(item.age_minutes);
+
+  const base =
+    (item.source_trust / 100) *
+    (relevance / 100) *
+    (impact / 100) *
+    (confidence / 100) *
+    decay *
+    100;
+
+  const signed =
+    dir.signed === 0
+      ? 0
+      : Math.sign(dir.signed) * base;
+
+  return {
+    id: item.id,
+    origin: item.origin,
+    source: item.source_name,
+    source_trust: item.source_trust,
+    title: item.title,
+    url: item.url,
+    published_at: item.published_at,
+    age_minutes:
+      item.age_minutes === null
+        ? null
+        : round(item.age_minutes, 2),
+
+    coin,
+    relevance,
+    impact,
+    confidence,
+    decay: round(decay, 4),
+
+    direction: sideLabel(signed, 1),
+    raw_direction_score: dir.signed,
+    score_signed: round(signed),
+    score_long: signed > 0 ? round(signed) : 0,
+    score_short: signed < 0 ? round(Math.abs(signed)) : 0,
+
+    matched_positive: dir.matched_positive,
+    matched_negative: dir.matched_negative,
+  };
+}
+
+function aggregateNewsForCoin(
+  coin: string,
+  items: NewsItem[]
+) {
+  const classified = items
+    .map((x) => classifyNewsForCoin(x, coin))
+    .filter((x) => x.relevance > 0)
+    .sort(
+      (a, b) =>
+        Math.abs(b.score_signed) -
+        Math.abs(a.score_signed)
+    );
+
+  // Prevent many similar low-value stories from simply summing to 100.
+  // Strongest item dominates, next items provide confirmation.
+  const top = classified.slice(0, 5);
+
+  let signed = 0;
+
+  const weights = [1.0, 0.45, 0.25, 0.15, 0.10];
+
+  for (let i = 0; i < top.length; i++) {
+    signed += top[i].score_signed * weights[i];
+  }
+
+  signed = clampSigned(signed);
+
+  const strongest = top[0] ?? null;
+
+  const breaking =
+    strongest !== null &&
+    strongest.source_trust >= 95 &&
+    strongest.relevance >= 80 &&
+    strongest.impact >= 75 &&
+    strongest.confidence >= 80 &&
+    (strongest.age_minutes ?? 9999) <= 15;
+
+  return {
+    coin,
+    items_considered: classified.length,
+    top_items: top,
+    signed_score: round(signed),
+    long_score: signed > 0 ? round(signed) : 0,
+    short_score: signed < 0 ? round(Math.abs(signed)) : 0,
+    bias: sideLabel(signed, 5),
+    breaking_high_impact: breaking,
+  };
+}
+
+async function collectNews(env: Env) {
+  const [feedResults, x] = await Promise.all([
+    Promise.all(NEWS_FEEDS.map((feed) => fetchOfficialFeed(feed))),
+    fetchXRecent(env),
+  ]);
+
+  const official = feedResults.flatMap((x) => x.items);
+
+  const all = dedupeNews([
+    ...official,
+    ...x.items,
+  ]);
+
+  return {
+    timestamp: Date.now(),
+    datetime: new Date().toISOString(),
+    official_feeds: feedResults.map((x) => ({
+      source: x.source,
+      ok: x.ok,
+      status: x.status,
+      items: x.items.length,
+      error: x.error ?? null,
+    })),
+    x: {
+      enabled: x.enabled,
+      ok: x.ok,
+      status: x.status,
+      items: x.items.length,
+      error: x.error ?? null,
+      query: x.query,
+    },
+    total_items: all.length,
+    items: all,
+  };
+}
+
+function combineMarketAndNews(
+  market: any,
+  news: any
+) {
+  const marketSigned = clampSigned(
+    Number(market?.signed_score ?? 0)
+  );
+
+  const newsSigned = clampSigned(
+    Number(news?.signed_score ?? 0)
+  );
+
+  let marketWeight = 0.70;
+  let newsWeight = 0.30;
+  let mode = "NORMAL";
+
+  if (news?.breaking_high_impact) {
+    marketWeight = 0.40;
+    newsWeight = 0.60;
+    mode = "BREAKING_NEWS";
+  }
+
+  const signed = clampSigned(
+    marketSigned * marketWeight +
+    newsSigned * newsWeight
+  );
+
+  const longScore = signed > 0 ? clamp(signed) : 0;
+  const shortScore = signed < 0 ? clamp(Math.abs(signed)) : 0;
+  const strength = Math.max(longScore, shortScore);
+
+  let status = "NO_TRADE";
+
+  if (strength >= 80) status = "STRONG";
+  else if (strength >= 65) status = "WATCH";
+  else if (strength >= 50) status = "WEAK";
+
+  return {
+    mode,
+    weights: {
+      market: marketWeight,
+      news_x: newsWeight,
+    },
+    components: {
+      market_signed: round(marketSigned),
+      news_x_signed: round(newsSigned),
+    },
+    signed_score: round(signed),
+    long_score: round(longScore),
+    short_score: round(shortScore),
+    bias: sideLabel(signed, 10),
+    status,
+    execution_allowed: false,
+    meaning:
+      "Combined market/news alignment score, not probability of profit",
+  };
+}
+
+async function buildNewsOnly(env: Env) {
+  const collected = await collectNews(env);
+
+  return {
+    ...collected,
+    scores: Object.fromEntries(
+      TRACKED_COINS.map((coin) => [
+        coin,
+        aggregateNewsForCoin(coin, collected.items),
+      ])
+    ),
+  };
+}
+
+async function buildFinalSignal(
+  coin: string,
+  env: Env,
+  preloadedNews?: any
+) {
+  const started = Date.now();
+
+  const [marketSignal, newsData] = await Promise.all([
+    buildSignal(coin),
+    preloadedNews
+      ? Promise.resolve(preloadedNews)
+      : buildNewsOnly(env),
+  ]);
+
+  const news =
+    newsData?.scores?.[coin] ??
+    aggregateNewsForCoin(coin, newsData?.items ?? []);
+
+  const final = combineMarketAndNews(
+    marketSignal.market,
+    news
+  );
+
+  return {
+    source: {
+      market: "HYPERLIQUID",
+      news: "OFFICIAL_RSS",
+      x:
+        newsData?.x?.enabled
+          ? "X_API_V2"
+          : "DISABLED_NO_TOKEN",
+    },
+    coin,
+    timestamp: Date.now(),
+    datetime: new Date().toISOString(),
+    processing_ms: Date.now() - started,
+
+    price: marketSignal.price,
+
+    market: marketSignal.market,
+    chart: marketSignal.chart,
+    microstructure: marketSignal.microstructure,
+    derivatives: marketSignal.derivatives,
+
+    news_x: news,
+
+    final,
+
+    execution: {
+      enabled: false,
+      paper_trade: false,
+      real_trade: false,
+    },
+  };
+}
+
+
 // ============================================================
 // DEBUG
 // ============================================================
@@ -1144,7 +1968,7 @@ async function debugHyperliquid() {
 // ============================================================
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -1184,7 +2008,9 @@ export default {
           order_book: true,
           derivatives_context: true,
           oi_change: false,
-          news_x: false,
+          news_x: true,
+          x_optional_bearer_token: true,
+          official_rss: true,
           paper_trading: false,
           real_trading: false,
         },
@@ -1199,11 +2025,15 @@ export default {
           charts: "/charts",
           signal: "/signal?coin=BTC",
           signals: "/signals",
+          news: "/news",
+          news_score: "/news-score?coin=BTC",
+          final_signal: "/final-signal?coin=BTC",
+          final_signals: "/final-signals",
           debug: "/debug-hyperliquid",
         },
 
         next_version:
-          "V1.3 NEWS/X ENGINE",
+          "V1.4 HISTORICAL SNAPSHOTS + OI CHANGE + PAPER DATA",
       });
     }
 
@@ -1473,6 +2303,151 @@ export default {
           {
             success: false,
             error: "ALL_SIGNALS_FAILED",
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
+    // NEWS RAW + SCORES
+    if (url.pathname === "/news") {
+      try {
+        const data = await buildNewsOnly(env);
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "READ_ONLY",
+          ...data,
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "NEWS_ENGINE_FAILED",
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
+    // NEWS SCORE FOR ONE COIN
+    if (url.pathname === "/news-score") {
+      const coin = (
+        url.searchParams.get("coin") ?? "BTC"
+      ).toUpperCase();
+
+      if (!validCoin(coin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      try {
+        const data = await buildNewsOnly(env);
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "READ_ONLY",
+          coin,
+          x: data.x,
+          official_feeds: data.official_feeds,
+          news_x: data.scores[coin],
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "NEWS_SCORE_FAILED",
+            coin,
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
+    // FINAL MARKET + NEWS SIGNAL
+    if (url.pathname === "/final-signal") {
+      const coin = (
+        url.searchParams.get("coin") ?? "BTC"
+      ).toUpperCase();
+
+      if (!validCoin(coin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      try {
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "READ_ONLY",
+          trading: "DISABLED",
+          ...(await buildFinalSignal(coin, env)),
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "FINAL_SIGNAL_FAILED",
+            coin,
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
+    // ALL FINAL SIGNALS
+    if (url.pathname === "/final-signals") {
+      const started = Date.now();
+
+      try {
+        // Load news once and reuse it for all five coins.
+        const newsData = await buildNewsOnly(env);
+
+        const results = await Promise.all(
+          TRACKED_COINS.map((coin) =>
+            buildFinalSignal(coin, env, newsData)
+          )
+        );
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "READ_ONLY",
+          trading: "DISABLED",
+          timestamp: Date.now(),
+          processing_ms: Date.now() - started,
+          total: results.length,
+          x: newsData.x,
+          official_feeds: newsData.official_feeds,
+          signals: results,
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "ALL_FINAL_SIGNALS_FAILED",
             message: error?.message ?? String(error),
           },
           500
