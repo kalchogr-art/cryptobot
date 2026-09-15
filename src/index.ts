@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.3 NEWS/X ENGINE";
+const VERSION = "V1.3.1 NEWS CLASSIFIER FIX";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1461,9 +1461,27 @@ function dedupeNews(items: NewsItem[]): NewsItem[] {
   );
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function phraseMatch(text: string, phrase: string): boolean {
+  const normalizedText = text.toLowerCase();
+  const normalizedPhrase = phrase.toLowerCase().trim();
+
+  // $TOKEN forms are handled literally.
+  if (normalizedPhrase.startsWith("$")) {
+    return normalizedText.includes(normalizedPhrase);
+  }
+
+  // Use alphanumeric boundaries so "sues" does NOT match "issues".
+  const escaped = escapeRegExp(normalizedPhrase).replace(/\s+/g, "\\s+");
+  const re = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i");
+  return re.test(normalizedText);
+}
+
 function textHas(text: string, words: string[]): boolean {
-  const t = text.toLowerCase();
-  return words.some((w) => t.includes(w.toLowerCase()));
+  return words.some((w) => phraseMatch(text, w));
 }
 
 function coinRelevance(
@@ -1569,18 +1587,27 @@ function classifyDirection(text: string): {
     "sanction",
   ];
 
-  const t = text.toLowerCase();
-
-  const p = positive.filter((x) => t.includes(x));
-  const n = negative.filter((x) => t.includes(x));
+  const p = positive.filter((x) => phraseMatch(text, x));
+  const n = negative.filter((x) => phraseMatch(text, x));
 
   const raw = clampSigned((p.length - n.length) * 25);
 
+  const policyUnchanged = textHas(text, [
+    "maintain the target range",
+    "kept rates unchanged",
+    "rates unchanged",
+    "unchanged target range",
+  ]);
+
   return {
     signed: raw,
-    direction: sideLabel(raw, 5),
+    direction:
+      raw === 0 && policyUnchanged
+        ? "NEUTRAL_POLICY_UNCHANGED"
+        : sideLabel(raw, 5),
     matched_positive: p,
     matched_negative: n,
+    policy_unchanged: policyUnchanged,
   };
 }
 
@@ -1635,14 +1662,21 @@ function estimateImpact(
   return clamp(impact);
 }
 
-function newsDecay(ageMin: number | null): number {
-  if (ageMin === null) return 0.25;
+function newsDecay(
+  ageMin: number | null,
+  highImpactContext = false
+): number {
+  if (ageMin === null) return 0;
 
-  // Fast scalping decay:
-  // half-ish life around 10 minutes for immediate reaction.
-  // Keep a small tail for large regulatory/macro stories.
-  const tau = 14;
-  return Math.max(0.05, Math.exp(-ageMin / tau));
+  // Scalping engine: stale news must not influence a live entry.
+  // Normal stories expire after 6h. Major macro/regulatory context
+  // may retain a decaying tail for up to 24h.
+  const hardExpiryMin = highImpactContext ? 24 * 60 : 6 * 60;
+
+  if (ageMin > hardExpiryMin) return 0;
+
+  const tau = highImpactContext ? 90 : 14;
+  return Math.exp(-ageMin / tau);
 }
 
 function classifyNewsForCoin(item: NewsItem, coin: string) {
@@ -1666,7 +1700,15 @@ function classifyNewsForCoin(item: NewsItem, coin: string) {
   if (Math.abs(dir.signed) >= 25) confidence += 15;
   confidence = clamp(confidence);
 
-  const decay = newsDecay(item.age_minutes);
+  const highImpactContext =
+    item.source_trust >= 95 &&
+    relevance >= 75 &&
+    impact >= 75;
+
+  const decay = newsDecay(
+    item.age_minutes,
+    highImpactContext
+  );
 
   const base =
     (item.source_trust / 100) *
@@ -1699,6 +1741,8 @@ function classifyNewsForCoin(item: NewsItem, coin: string) {
     impact,
     confidence,
     decay: round(decay, 4),
+    active_for_live_signal: decay > 0,
+    expired: decay === 0,
 
     direction: sideLabel(signed, 1),
     raw_direction_score: dir.signed,
@@ -1708,6 +1752,7 @@ function classifyNewsForCoin(item: NewsItem, coin: string) {
 
     matched_positive: dir.matched_positive,
     matched_negative: dir.matched_negative,
+    policy_unchanged: dir.policy_unchanged,
   };
 }
 
@@ -1726,7 +1771,11 @@ function aggregateNewsForCoin(
 
   // Prevent many similar low-value stories from simply summing to 100.
   // Strongest item dominates, next items provide confirmation.
-  const top = classified.slice(0, 5);
+  const active = classified.filter(
+    (x) => x.active_for_live_signal
+  );
+
+  const top = active.slice(0, 5);
 
   let signed = 0;
 
@@ -1751,6 +1800,8 @@ function aggregateNewsForCoin(
   return {
     coin,
     items_considered: classified.length,
+    active_items: active.length,
+    expired_items: classified.length - active.length,
     top_items: top,
     signed_score: round(signed),
     long_score: signed > 0 ? round(signed) : 0,
@@ -2033,7 +2084,7 @@ export default {
         },
 
         next_version:
-          "V1.4 HISTORICAL SNAPSHOTS + OI CHANGE + PAPER DATA",
+          "V1.3.2 X ACTIVATION + SOURCE EXPANSION",
       });
     }
 
