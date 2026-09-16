@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.5.2 PAPER ANALYTICS + SIGNAL BUCKETS";
+const VERSION = "V1.6 SIGNAL EPISODES + OUTCOME RESEARCH";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1446,6 +1446,59 @@ async function ensurePaperTables(env: Env): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_paper_obs_bucket
     ON paper_signal_observations (score_bucket, side, ts DESC)
   `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_episodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      start_ts INTEGER NOT NULL,
+      start_datetime TEXT NOT NULL,
+      start_price REAL NOT NULL,
+      start_score REAL NOT NULL,
+      start_bucket TEXT NOT NULL,
+      peak_score REAL NOT NULL,
+      peak_ts INTEGER NOT NULL,
+      peak_price REAL NOT NULL,
+      qualifies_entry INTEGER NOT NULL DEFAULT 0,
+      market_signed REAL,
+      news_signed REAL,
+      final_signed REAL,
+      chart_signed REAL,
+      order_flow_persistent_signed REAL,
+      oi_change_signed REAL,
+      funding_premium_signed REAL,
+      history_mode TEXT,
+      end_ts INTEGER,
+      end_datetime TEXT,
+      end_price REAL,
+      end_reason TEXT,
+      return_1m_pct REAL,
+      return_5m_pct REAL,
+      return_15m_pct REAL,
+      return_30m_pct REAL,
+      mfe_pct REAL,
+      mae_pct REAL,
+      tp_hit INTEGER NOT NULL DEFAULT 0,
+      sl_hit INTEGER NOT NULL DEFAULT 0,
+      first_barrier TEXT,
+      first_barrier_ts INTEGER,
+      outcome_complete INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_signal_episodes_coin_status
+    ON signal_episodes (coin, status, start_ts DESC)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_signal_episodes_start
+    ON signal_episodes (start_ts DESC)
+  `).run();
 }
 
 function scoreBucket(score: number): string {
@@ -1517,6 +1570,374 @@ async function recordPaperObservation(
     side,
     score: round(score),
     score_bucket: scoreBucket(score),
+    qualifies_entry: score >= PAPER_ENTRY_SCORE,
+  };
+}
+
+function directionalReturnPct(
+  side: string,
+  entry: number,
+  current: number
+): number {
+  if (!entry) return 0;
+  const raw = ((current - entry) / entry) * 100;
+  return side === "SHORT" ? -raw : raw;
+}
+
+async function nearestSnapshotPrice(
+  env: Env,
+  coin: string,
+  targetTs: number,
+  toleranceMs = 90000
+): Promise<{ ts: number; price: number } | null> {
+  const row: any = await env.DB!.prepare(`
+    SELECT ts, price
+    FROM market_snapshots
+    WHERE coin = ?
+      AND ts BETWEEN ? AND ?
+    ORDER BY ABS(ts - ?) ASC
+    LIMIT 1
+  `).bind(
+    coin,
+    targetTs - toleranceMs,
+    targetTs + toleranceMs,
+    targetTs
+  ).first();
+
+  if (!row) return null;
+  return {
+    ts: Number(row.ts),
+    price: Number(row.price),
+  };
+}
+
+async function updateEpisodeOutcomes(
+  env: Env,
+  coin: string
+): Promise<void> {
+  if (!env.DB) return;
+
+  const now = Date.now();
+  const activeOrRecent: any = await env.DB.prepare(`
+    SELECT *
+    FROM signal_episodes
+    WHERE coin = ?
+      AND outcome_complete = 0
+      AND start_ts <= ?
+    ORDER BY start_ts ASC
+    LIMIT 100
+  `).bind(coin, now).all();
+
+  for (const ep of activeOrRecent?.results ?? []) {
+    const startTs = Number(ep.start_ts);
+    const entry = Number(ep.start_price);
+    const side = String(ep.side);
+
+    const values: Record<string, number | null> = {
+      return_1m_pct: ep.return_1m_pct ?? null,
+      return_5m_pct: ep.return_5m_pct ?? null,
+      return_15m_pct: ep.return_15m_pct ?? null,
+      return_30m_pct: ep.return_30m_pct ?? null,
+    };
+
+    for (const [minutes, field] of [
+      [1, "return_1m_pct"],
+      [5, "return_5m_pct"],
+      [15, "return_15m_pct"],
+      [30, "return_30m_pct"],
+    ] as const) {
+      if (values[field] !== null) continue;
+      const target = startTs + minutes * 60000;
+      if (now < target) continue;
+
+      const snap = await nearestSnapshotPrice(
+        env,
+        coin,
+        target
+      );
+      if (snap) {
+        values[field] = round(
+          directionalReturnPct(
+            side,
+            entry,
+            snap.price
+          )
+        );
+      }
+    }
+
+    const range: any = await env.DB.prepare(`
+      SELECT
+        MIN(price) AS min_price,
+        MAX(price) AS max_price
+      FROM market_snapshots
+      WHERE coin = ?
+        AND ts >= ?
+        AND ts <= ?
+    `).bind(
+      coin,
+      startTs,
+      Math.min(now, startTs + 30 * 60000)
+    ).first();
+
+    let mfe: number | null = null;
+    let mae: number | null = null;
+
+    if (
+      range &&
+      range.min_price !== null &&
+      range.max_price !== null
+    ) {
+      const minP = Number(range.min_price);
+      const maxP = Number(range.max_price);
+
+      if (side === "SHORT") {
+        mfe = round(
+          directionalReturnPct(side, entry, minP)
+        );
+        mae = round(
+          directionalReturnPct(side, entry, maxP)
+        );
+      } else {
+        mfe = round(
+          directionalReturnPct(side, entry, maxP)
+        );
+        mae = round(
+          directionalReturnPct(side, entry, minP)
+        );
+      }
+    }
+
+    const barrierRows: any = await env.DB.prepare(`
+      SELECT ts, price
+      FROM market_snapshots
+      WHERE coin = ?
+        AND ts >= ?
+        AND ts <= ?
+      ORDER BY ts ASC
+    `).bind(
+      coin,
+      startTs,
+      Math.min(now, startTs + 30 * 60000)
+    ).all();
+
+    let tpHit = 0;
+    let slHit = 0;
+    let firstBarrier: string | null =
+      ep.first_barrier ?? null;
+    let firstBarrierTs: number | null =
+      ep.first_barrier_ts ?? null;
+
+    const levels = paperLevels(side, entry);
+
+    for (const row of barrierRows?.results ?? []) {
+      const p = Number(row.price);
+      const ts = Number(row.ts);
+
+      const tp =
+        side === "SHORT"
+          ? p <= levels.tp
+          : p >= levels.tp;
+      const sl =
+        side === "SHORT"
+          ? p >= levels.sl
+          : p <= levels.sl;
+
+      if (tp) tpHit = 1;
+      if (sl) slHit = 1;
+
+      if (!firstBarrier && (tp || sl)) {
+        firstBarrier = tp ? "TP" : "SL";
+        firstBarrierTs = ts;
+      }
+    }
+
+    const complete =
+      now >= startTs + 30 * 60000 &&
+      values.return_30m_pct !== null;
+
+    await env.DB.prepare(`
+      UPDATE signal_episodes
+      SET
+        return_1m_pct = ?,
+        return_5m_pct = ?,
+        return_15m_pct = ?,
+        return_30m_pct = ?,
+        mfe_pct = ?,
+        mae_pct = ?,
+        tp_hit = ?,
+        sl_hit = ?,
+        first_barrier = ?,
+        first_barrier_ts = ?,
+        outcome_complete = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(
+      values.return_1m_pct,
+      values.return_5m_pct,
+      values.return_15m_pct,
+      values.return_30m_pct,
+      mfe,
+      mae,
+      tpHit,
+      slHit,
+      firstBarrier,
+      firstBarrierTs,
+      complete ? 1 : 0,
+      ep.id
+    ).run();
+  }
+}
+
+async function processSignalEpisode(
+  env: Env,
+  signal: any,
+  finalSignal: any
+): Promise<any> {
+  await ensurePaperTables(env);
+
+  const now = Date.now();
+  const price = Number(signal.price);
+  const finalSigned = Number(
+    finalSignal?.final?.signed_score ??
+    signal.market?.signed_score ??
+    0
+  );
+  const score = Math.abs(finalSigned);
+  const side = finalSigned >= 0 ? "LONG" : "SHORT";
+
+  const active: any = await env.DB!.prepare(`
+    SELECT *
+    FROM signal_episodes
+    WHERE coin = ? AND status = 'ACTIVE'
+    ORDER BY start_ts DESC
+    LIMIT 1
+  `).bind(signal.coin).first();
+
+  // An episode ends when strength drops below 50,
+  // direction flips, or 30 minutes have elapsed.
+  if (active) {
+    const ageMin =
+      (now - Number(active.start_ts)) / 60000;
+
+    let endReason: string | null = null;
+    if (score < PAPER_OBSERVATION_MIN_SCORE) {
+      endReason = "SCORE_BELOW_50";
+    } else if (String(active.side) !== side) {
+      endReason = "DIRECTION_FLIP";
+    } else if (ageMin >= 30) {
+      endReason = "MAX_30M";
+    }
+
+    if (endReason) {
+      await env.DB!.prepare(`
+        UPDATE signal_episodes
+        SET
+          status = 'CLOSED',
+          end_ts = ?,
+          end_datetime = ?,
+          end_price = ?,
+          end_reason = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(
+        now,
+        new Date(now).toISOString(),
+        price,
+        endReason,
+        active.id
+      ).run();
+    } else {
+      // Same continuous signal: do not create another episode.
+      if (score > Number(active.peak_score)) {
+        await env.DB!.prepare(`
+          UPDATE signal_episodes
+          SET
+            peak_score = ?,
+            peak_ts = ?,
+            peak_price = ?,
+            qualifies_entry =
+              CASE WHEN ? >= ? THEN 1
+                   ELSE qualifies_entry END,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).bind(
+          score,
+          now,
+          price,
+          score,
+          PAPER_ENTRY_SCORE,
+          active.id
+        ).run();
+      }
+
+      return {
+        action: "EPISODE_CONTINUES",
+        episode_id: active.id,
+        side,
+        current_score: round(score),
+        peak_score: round(
+          Math.max(score, Number(active.peak_score))
+        ),
+      };
+    }
+  }
+
+  if (score < PAPER_OBSERVATION_MIN_SCORE) {
+    return {
+      action: "NO_EPISODE",
+      reason: "BELOW_50",
+      score: round(score),
+    };
+  }
+
+  const insert: any = await env.DB!.prepare(`
+    INSERT INTO signal_episodes (
+      coin, side, status,
+      start_ts, start_datetime,
+      start_price, start_score, start_bucket,
+      peak_score, peak_ts, peak_price,
+      qualifies_entry,
+      market_signed, news_signed, final_signed,
+      chart_signed, order_flow_persistent_signed,
+      oi_change_signed, funding_premium_signed,
+      history_mode
+    ) VALUES (
+      ?, ?, 'ACTIVE',
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?
+    )
+  `).bind(
+    signal.coin,
+    side,
+    now,
+    new Date(now).toISOString(),
+    price,
+    score,
+    scoreBucket(score),
+    score,
+    now,
+    price,
+    score >= PAPER_ENTRY_SCORE ? 1 : 0,
+    signal.market?.signed_score ?? null,
+    finalSignal?.news_x?.signed_score ?? null,
+    finalSigned,
+    signal.market?.components?.chart_signed ?? null,
+    signal.market?.components
+      ?.order_flow_persistent_signed ?? null,
+    signal.market?.components?.oi_change_signed ?? null,
+    signal.market?.components?.funding_premium_signed ?? null,
+    signal.market?.weights?.mode ?? null
+  ).run();
+
+  return {
+    action: "EPISODE_OPENED",
+    episode_id:
+      insert?.meta?.last_row_id ?? null,
+    side,
+    start_score: round(score),
+    start_bucket: scoreBucket(score),
     qualifies_entry: score >= PAPER_ENTRY_SCORE,
   };
 }
@@ -3235,6 +3656,8 @@ export default {
           paper_summary: "/paper-summary",
           paper_analytics: "/paper-analytics",
           paper_observations: "/paper-observations?limit=100",
+          episodes: "/episodes?limit=50",
+          episode_analytics: "/episode-analytics",
           debug: "/debug-hyperliquid",
         },
 
@@ -3659,6 +4082,137 @@ export default {
           500
         );
       }
+    }
+
+    // V1.6 DEDUPLICATED SIGNAL EPISODES
+    if (url.pathname === "/episodes") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          Number(url.searchParams.get("limit") ?? 50),
+          500
+        )
+      );
+
+      const result: any = await env.DB.prepare(`
+        SELECT *
+        FROM signal_episodes
+        ORDER BY start_ts DESC
+        LIMIT ?
+      `).bind(limit).all();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "OUTCOME_RESEARCH",
+        total: result?.results?.length ?? 0,
+        episodes: result?.results ?? [],
+      });
+    }
+
+    if (url.pathname === "/episode-analytics") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const byBucket: any = await env.DB.prepare(`
+        SELECT
+          start_bucket AS score_bucket,
+          side,
+          COUNT(*) AS episodes,
+          SUM(outcome_complete) AS completed_30m,
+          AVG(return_1m_pct) AS avg_1m_pct,
+          AVG(return_5m_pct) AS avg_5m_pct,
+          AVG(return_15m_pct) AS avg_15m_pct,
+          AVG(return_30m_pct) AS avg_30m_pct,
+          AVG(mfe_pct) AS avg_mfe_pct,
+          AVG(mae_pct) AS avg_mae_pct,
+          SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) AS tp_first,
+          SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) AS sl_first,
+          AVG(peak_score) AS avg_peak_score
+        FROM signal_episodes
+        GROUP BY start_bucket, side
+        ORDER BY
+          CASE start_bucket
+            WHEN '80+' THEN 1
+            WHEN '75-79' THEN 2
+            WHEN '70-74' THEN 3
+            WHEN '65-69' THEN 4
+            WHEN '60-64' THEN 5
+            WHEN '55-59' THEN 6
+            WHEN '50-54' THEN 7
+            ELSE 8
+          END,
+          side
+      `).all();
+
+      const byCoin: any = await env.DB.prepare(`
+        SELECT
+          coin,
+          side,
+          COUNT(*) AS episodes,
+          SUM(outcome_complete) AS completed_30m,
+          AVG(return_5m_pct) AS avg_5m_pct,
+          AVG(return_15m_pct) AS avg_15m_pct,
+          AVG(return_30m_pct) AS avg_30m_pct,
+          AVG(mfe_pct) AS avg_mfe_pct,
+          AVG(mae_pct) AS avg_mae_pct,
+          SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) AS tp_first,
+          SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) AS sl_first
+        FROM signal_episodes
+        GROUP BY coin, side
+        ORDER BY coin, side
+      `).all();
+
+      const totals: any = await env.DB.prepare(`
+        SELECT
+          COUNT(*) AS total_episodes,
+          SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) AS closed,
+          SUM(outcome_complete) AS completed_30m,
+          SUM(CASE WHEN qualifies_entry=1 THEN 1 ELSE 0 END) AS reached_65,
+          SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) AS tp_first,
+          SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) AS sl_first
+        FROM signal_episodes
+      `).first();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "OUTCOME_RESEARCH",
+        trading: "REAL_TRADING_DISABLED",
+        methodology: {
+          episode_start: "FINAL_SCORE_ABS >= 50",
+          dedup:
+            "same coin + same direction remains one episode",
+          episode_end:
+            "score below 50, direction flip, or 30 minutes",
+          horizons_minutes: [1, 5, 15, 30],
+          tp_pct: PAPER_TP_PCT,
+          sl_pct: PAPER_SL_PCT,
+          barrier_method:
+            "minute snapshot approximation; not tick-level ordering",
+        },
+        totals,
+        by_score_bucket: byBucket?.results ?? [],
+        by_coin_side: byCoin?.results ?? [],
+      });
     }
 
     // V1.5.2 PAPER ANALYTICS
@@ -4179,11 +4733,24 @@ export default {
           final,
         };
 
-        // V1.5.2 shadow observation:
-        // record 50+ signals even when they do not qualify
-        // for a simulated trade. This does NOT change entries.
+        // V1.6: update 1m/5m/15m/30m outcomes for
+        // previously opened independent signal episodes.
+        await updateEpisodeOutcomes(
+          env,
+          coin
+        );
+
+        // Keep raw minute observations for backward comparison.
         const observation =
           await recordPaperObservation(
+            env,
+            signal,
+            finalSignal
+          );
+
+        // Deduplicated signal episode engine.
+        const episode =
+          await processSignalEpisode(
             env,
             signal,
             finalSignal
@@ -4205,6 +4772,7 @@ export default {
           final_score: final?.signed_score ?? 0,
           final_mode: final?.mode ?? null,
           observation,
+          episode,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
