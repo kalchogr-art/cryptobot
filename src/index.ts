@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.1 SIGNAL LIFETIME + 30M OUTCOMES";
+const VERSION = "V1.6.2 LIFETIME BACKFILL FIX";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1715,7 +1715,10 @@ async function updateEpisodeOutcomes(
     SELECT *
     FROM signal_episodes
     WHERE coin = ?
-      AND outcome_complete = 0
+      AND (
+        outcome_complete = 0
+        OR (status = 'CLOSED' AND lifetime_return_pct IS NULL)
+      )
       AND start_ts <= ?
     ORDER BY start_ts ASC
     LIMIT 100
