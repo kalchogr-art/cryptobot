@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.4 SNAPSHOT HISTORY + OI CHANGE";
+const VERSION = "V1.4.1 DYNAMIC OI WEIGHT";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1394,19 +1394,59 @@ function buildMarketScore(
   // Until enough OI history exists, preserve V1.3 weights.
   // Once ΔOI becomes available, switch automatically to:
   // Chart 55 / persistent Order Flow 25 / ΔOI 15 / Funding 5.
-  const weights = oiAvailable
-    ? {
-        chart: 0.55,
-        order_flow: 0.25,
-        oi_change: 0.15,
-        funding_premium: 0.05,
-      }
-    : {
-        chart: 0.65,
-        order_flow: 0.30,
-        oi_change: 0,
-        funding_premium: 0.05,
-      };
+  // V1.4.1: Do not give ΔOI the full 15% weight as soon as
+  // only the 1m window becomes available.
+  //
+  // History maturity:
+  //   no OI windows      -> OI 0%
+  //   1m only            -> OI 5%
+  //   1m + 5m            -> OI 10%
+  //   1m + 5m + 15m      -> OI 15%
+  //
+  // The unused OI weight stays with Chart / persistent L2.
+  const oiWindows = history?.oi_change?.windows ?? {};
+
+  const oi1m =
+    oiWindows?.["1m"]?.available === true;
+  const oi5m =
+    oiWindows?.["5m"]?.available === true;
+  const oi15m =
+    oiWindows?.["15m"]?.available === true;
+
+  let oiMaturity = 0;
+
+  if (oi1m) oiMaturity = 1;
+  if (oi1m && oi5m) oiMaturity = 2;
+  if (oi1m && oi5m && oi15m) oiMaturity = 3;
+
+  const weights =
+    oiMaturity === 3
+      ? {
+          chart: 0.55,
+          order_flow: 0.25,
+          oi_change: 0.15,
+          funding_premium: 0.05,
+        }
+      : oiMaturity === 2
+      ? {
+          chart: 0.58,
+          order_flow: 0.27,
+          oi_change: 0.10,
+          funding_premium: 0.05,
+        }
+      : oiMaturity === 1
+      ? {
+          chart: 0.61,
+          order_flow: 0.29,
+          oi_change: 0.05,
+          funding_premium: 0.05,
+        }
+      : {
+          chart: 0.65,
+          order_flow: 0.30,
+          oi_change: 0,
+          funding_premium: 0.05,
+        };
 
   const signed =
     c * weights.chart +
@@ -1441,9 +1481,21 @@ function buildMarketScore(
     weights: {
       ...weights,
       mode:
-        oiAvailable
-          ? "HISTORY_ACTIVE"
+        oiMaturity === 3
+          ? "HISTORY_FULL"
+          : oiMaturity === 2
+          ? "HISTORY_1M_5M"
+          : oiMaturity === 1
+          ? "HISTORY_1M"
           : "HISTORY_COLLECTING",
+      oi_maturity: {
+        level: oiMaturity,
+        available_windows: {
+          "1m": oi1m,
+          "5m": oi5m,
+          "15m": oi15m,
+        },
+      },
     },
 
     components: {
