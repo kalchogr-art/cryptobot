@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.5 PAPER TRADING ENGINE";
+const VERSION = "V1.5.1 FINAL SIGNAL PAPER ENGINE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1470,9 +1470,13 @@ async function openPaperTrade(
     };
   }
 
-  const marketSigned = Number(signal.market?.signed_score ?? 0);
+  const marketSigned = Number(
+    signal.market?.signed_score ?? 0
+  );
+
   const finalSigned = Number(
-    finalSignal?.final?.signed_score ?? marketSigned
+    finalSignal?.final?.signed_score ??
+    marketSigned
   );
 
   const score = Math.abs(finalSigned);
@@ -1487,11 +1491,9 @@ async function openPaperTrade(
     };
   }
 
-  if (
-    Math.abs(
-      Number(signal.market?.difference ?? finalSigned)
-    ) < PAPER_MIN_SCORE_GAP
-  ) {
+  const finalGap = Math.abs(finalSigned);
+
+  if (finalGap < PAPER_MIN_SCORE_GAP) {
     return {
       opened: false,
       reason: "SCORE_GAP_TOO_SMALL",
@@ -1548,8 +1550,10 @@ async function openPaperTrade(
     signal.market?.components?.order_flow_persistent_signed ?? null,
     signal.market?.components?.oi_change_signed ?? null,
     signal.market?.components?.funding_premium_signed ?? null,
-    signal.market?.weights?.mode ?? null,
-    finalSignal?.news?.signed_score ?? null,
+    finalSignal?.final?.mode
+      ? `${signal.market?.weights?.mode ?? "UNKNOWN"}|FINAL:${finalSignal.final.mode}`
+      : signal.market?.weights?.mode ?? null,
+    finalSignal?.news_x?.signed_score ?? null,
     finalSigned,
     levels.tp,
     levels.sl,
@@ -2858,11 +2862,28 @@ function combineMarketAndNews(
     Number(news?.signed_score ?? 0)
   );
 
-  let marketWeight = 0.70;
-  let newsWeight = 0.30;
-  let mode = "NORMAL";
+  // V1.5.1:
+  // No active news = do not dilute a valid market signal with zero.
+  // Active normal news = 70/30.
+  // Breaking high-impact news = 40/60.
+  const activeNewsItems = Number(
+    news?.active_items ?? 0
+  );
 
-  if (news?.breaking_high_impact) {
+  let marketWeight = 1.00;
+  let newsWeight = 0.00;
+  let mode = "MARKET_ONLY_NO_ACTIVE_NEWS";
+
+  if (activeNewsItems > 0) {
+    marketWeight = 0.70;
+    newsWeight = 0.30;
+    mode = "NORMAL_NEWS_ACTIVE";
+  }
+
+  if (
+    activeNewsItems > 0 &&
+    news?.breaking_high_impact
+  ) {
     marketWeight = 0.40;
     newsWeight = 0.60;
     mode = "BREAKING_NEWS";
@@ -3101,13 +3122,14 @@ export default {
           history: "/history?coin=BTC&minutes=20",
           snapshot_status: "/snapshot-status?coin=BTC",
           paper_status: "/paper-status",
+          paper_candidate: "/paper-candidate?coin=BTC",
           paper_trades: "/paper-trades?status=ALL&limit=50",
           paper_summary: "/paper-summary",
           debug: "/debug-hyperliquid",
         },
 
         next_version:
-          "V1.5.1 PAPER ANALYTICS + SIGNAL BUCKETS",
+          "V1.5.2 PAPER ANALYTICS + SIGNAL BUCKETS",
       });
     }
 
@@ -3529,6 +3551,71 @@ export default {
       }
     }
 
+    // FINAL SIGNAL -> PAPER ENTRY DIAGNOSTIC
+    if (url.pathname === "/paper-candidate") {
+      const coin = (
+        url.searchParams.get("coin") ?? "BTC"
+      ).toUpperCase();
+
+      if (!validCoin(coin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      try {
+        const finalSignal = await buildFinalSignal(
+          coin,
+          env
+        );
+
+        const score = Math.abs(
+          Number(finalSignal.final?.signed_score ?? 0)
+        );
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "PAPER_ONLY",
+          trading: "REAL_TRADING_DISABLED",
+          coin,
+          price: finalSignal.price,
+          market: finalSignal.market,
+          news_x: finalSignal.news_x,
+          final: finalSignal.final,
+          paper_entry_check: {
+            qualifies:
+              score >= PAPER_ENTRY_SCORE &&
+              score >= PAPER_MIN_SCORE_GAP,
+            side:
+              Number(finalSignal.final?.signed_score ?? 0) >= 0
+                ? "LONG"
+                : "SHORT",
+            score: round(score),
+            required_score: PAPER_ENTRY_SCORE,
+            required_gap: PAPER_MIN_SCORE_GAP,
+            note:
+              "Diagnostic only. This HTTP endpoint never opens a paper trade.",
+          },
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "PAPER_CANDIDATE_FAILED",
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
     // PAPER TRADING — READ ONLY REPORTING
     if (url.pathname === "/paper-trades") {
       if (!env.DB) {
@@ -3789,22 +3876,67 @@ export default {
 
     await ensureSnapshotTable(env);
 
+    // Fetch news once per cron run, not once per coin.
+    // A feed failure must not stop market snapshots/paper tracking.
+    let newsData: any = null;
+
+    try {
+      newsData = await buildNewsOnly(env);
+    } catch (error: any) {
+      console.log(
+        "V1.5.1 news preload failed:",
+        error?.message ?? String(error)
+      );
+    }
+
     const results = await Promise.allSettled(
       TRACKED_COINS.map(async (coin) => {
         const signal = await buildSignal(coin, env);
         await saveSnapshot(env, signal);
 
-        // V1.5 PAPER ONLY:
-        // update an existing simulated position or open a new
-        // simulated position if the market score qualifies.
+        const news =
+          newsData?.scores?.[coin] ??
+          {
+            coin,
+            items_considered: 0,
+            active_items: 0,
+            expired_items: 0,
+            top_items: [],
+            signed_score: 0,
+            long_score: 0,
+            short_score: 0,
+            bias: "NEUTRAL",
+            breaking_high_impact: false,
+          };
+
+        const final = combineMarketAndNews(
+          signal.market,
+          news
+        );
+
+        const finalSignal = {
+          coin,
+          price: signal.price,
+          market: signal.market,
+          news_x: news,
+          final,
+        };
+
+        // PAPER ONLY. No real order path exists here.
         const paper = await processPaperCoin(
           env,
-          signal
+          signal,
+          finalSignal
         );
 
         return {
           coin,
           price: signal.price,
+          market_score: signal.market?.signed_score ?? 0,
+          news_score: news?.signed_score ?? 0,
+          active_news_items: news?.active_items ?? 0,
+          final_score: final?.signed_score ?? 0,
+          final_mode: final?.mode ?? null,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
