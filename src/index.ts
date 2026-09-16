@@ -3108,7 +3108,6 @@ export default {
 
         next_version:
           "V1.5.1 PAPER ANALYTICS + SIGNAL BUCKETS",
-          "V1.5 PAPER TRADING ENGINE",
       });
     }
 
