@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.3.1 NEWS CLASSIFIER FIX";
+const VERSION = "V1.3.2 FAST NEWS ENGINE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1148,6 +1148,20 @@ const NEWS_FEEDS = [
     trust: 100,
     type: "OFFICIAL",
   },
+  {
+    id: "CFTC_GENERAL",
+    name: "CFTC General Press Releases",
+    url: "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+    trust: 100,
+    type: "OFFICIAL",
+  },
+  {
+    id: "CFTC_ENFORCEMENT",
+    name: "CFTC Enforcement Press Releases",
+    url: "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",
+    trust: 100,
+    type: "OFFICIAL",
+  },
 ] as const;
 
 // Keep X queries narrow to control noise and API usage.
@@ -1504,12 +1518,22 @@ function coinRelevance(
   // Macro / regulatory stories can affect the whole crypto complex.
   const broadCrypto = [
     "crypto",
+    "crypto asset",
+    "crypto assets",
     "cryptocurrency",
     "digital asset",
+    "digital assets",
+    "digital commodity",
+    "digital commodities",
     "stablecoin",
+    "stablecoins",
     "spot etf",
     "exchange-traded fund",
     "blockchain",
+    "perpetual contract",
+    "perpetual contracts",
+    "self-custodial",
+    "self custody",
   ];
 
   if (textHas(t, broadCrypto)) {
@@ -1526,6 +1550,14 @@ function coinRelevance(
     "inflation",
     "liquidity",
   ];
+
+  if (
+    sourceId.startsWith("CFTC") &&
+    textHas(t, broadCrypto)
+  ) {
+    if (coin === "BTC" || coin === "ETH") return 85;
+    return 70;
+  }
 
   if (
     sourceId.startsWith("FED") &&
@@ -1705,6 +1737,19 @@ function classifyNewsForCoin(item: NewsItem, coin: string) {
     relevance >= 75 &&
     impact >= 75;
 
+  const freshness =
+    item.age_minutes === null
+      ? "UNKNOWN"
+      : item.age_minutes <= 5
+      ? "BREAKING_0_5M"
+      : item.age_minutes <= 30
+      ? "FRESH_5_30M"
+      : item.age_minutes <= 120
+      ? "RECENT_30_120M"
+      : item.age_minutes <= 360
+      ? "AGING_2_6H"
+      : "STALE";
+
   const decay = newsDecay(
     item.age_minutes,
     highImpactContext
@@ -1741,6 +1786,7 @@ function classifyNewsForCoin(item: NewsItem, coin: string) {
     impact,
     confidence,
     decay: round(decay, 4),
+    freshness,
     active_for_live_signal: decay > 0,
     expired: decay === 0,
 
@@ -1908,8 +1954,21 @@ function combineMarketAndNews(
 async function buildNewsOnly(env: Env) {
   const collected = await collectNews(env);
 
+  const sourceHealth = {
+    configured_official_feeds: NEWS_FEEDS.length,
+    working_official_feeds: collected.official_feeds.filter(
+      (x: any) => x.ok
+    ).length,
+    failed_official_feeds: collected.official_feeds.filter(
+      (x: any) => !x.ok
+    ).length,
+    x_enabled: collected.x.enabled,
+    x_ok: collected.x.ok,
+  };
+
   return {
     ...collected,
+    source_health: sourceHealth,
     scores: Object.fromEntries(
       TRACKED_COINS.map((coin) => [
         coin,
@@ -2062,6 +2121,9 @@ export default {
           news_x: true,
           x_optional_bearer_token: true,
           official_rss: true,
+          fast_news_engine: true,
+          cftc_rss: true,
+          stale_news_hard_expiry: true,
           paper_trading: false,
           real_trading: false,
         },
@@ -2084,7 +2146,7 @@ export default {
         },
 
         next_version:
-          "V1.3.2 X ACTIVATION + SOURCE EXPANSION",
+          "V1.4 SNAPSHOT HISTORY + OI CHANGE",
       });
     }
 
