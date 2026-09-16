@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.3 BACKFILL DIAGNOSTIC";
+const VERSION = "V1.6.4 DIRECT CLOSED EPISODE BACKFILL";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -4204,7 +4204,7 @@ export default {
       }
     }
 
-    // V1.6.3 MANUAL LIFETIME BACKFILL DIAGNOSTIC
+    // V1.6.4 DIRECT CLOSED EPISODE BACKFILL
     // READ/RESEARCH endpoint: recalculates lifetime fields for CLOSED episodes
     // whose lifetime outcome has not yet been measured, and returns each step.
     if (url.pathname === "/episode-backfill") {
@@ -4240,13 +4240,16 @@ export default {
         )
       );
 
+      // V1.6.4 FIX: fetch CLOSED episodes first without filtering on any
+      // lifetime column. Some D1 rows created before the lifetime migration
+      // were not being selected reliably by the previous SQL predicate.
+      // Missing lifetime fields are filtered in JavaScript instead.
       const query = requestedCoin
         ? `
           SELECT *
           FROM signal_episodes
           WHERE coin = ?
             AND status = 'CLOSED'
-            AND lifetime_return_pct IS NULL
           ORDER BY start_ts ASC
           LIMIT ?
         `
@@ -4254,20 +4257,27 @@ export default {
           SELECT *
           FROM signal_episodes
           WHERE status = 'CLOSED'
-            AND lifetime_return_pct IS NULL
           ORDER BY start_ts ASC
           LIMIT ?
         `;
 
-      const pending: any = requestedCoin
+      const closed: any = requestedCoin
         ? await env.DB.prepare(query).bind(requestedCoin, limit).all()
         : await env.DB.prepare(query).bind(limit).all();
+
+      const closedRows: any[] = closed?.results ?? [];
+      const pendingRows: any[] = closedRows.filter((ep: any) =>
+        ep.signal_lifetime_minutes == null ||
+        ep.lifetime_return_pct == null ||
+        ep.lifetime_mfe_pct == null ||
+        ep.lifetime_mae_pct == null
+      );
 
       const diagnostics: any[] = [];
       let updated = 0;
       let failed = 0;
 
-      for (const ep of pending?.results ?? []) {
+      for (const ep of pendingRows) {
         try {
           const snapshots: any = await env.DB.prepare(`
             SELECT COUNT(*) AS count
@@ -4321,7 +4331,6 @@ export default {
               updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND status = 'CLOSED'
-              AND lifetime_return_pct IS NULL
           `).bind(
             lifetime.signal_lifetime_minutes,
             lifetime.lifetime_return_pct,
@@ -4389,7 +4398,8 @@ export default {
         mode: "LIFETIME_BACKFILL_DIAGNOSTIC",
         trading: "REAL_TRADING_DISABLED",
         requested_coin: requestedCoin || "ALL",
-        episodes_found: pending?.results?.length ?? 0,
+        closed_episodes_found: closedRows.length,
+        episodes_found: pendingRows.length,
         episodes_updated: updated,
         episodes_failed: failed,
         diagnostics,
