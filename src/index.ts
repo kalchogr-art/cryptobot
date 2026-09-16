@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.2 LIFETIME BACKFILL FIX";
+const VERSION = "V1.6.3 BACKFILL DIAGNOSTIC";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -4202,6 +4202,198 @@ export default {
           500
         );
       }
+    }
+
+    // V1.6.3 MANUAL LIFETIME BACKFILL DIAGNOSTIC
+    // READ/RESEARCH endpoint: recalculates lifetime fields for CLOSED episodes
+    // whose lifetime outcome has not yet been measured, and returns each step.
+    if (url.pathname === "/episode-backfill") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const requestedCoin = String(
+        url.searchParams.get("coin") ?? ""
+      ).trim().toUpperCase();
+
+      if (requestedCoin && !validCoin(requestedCoin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          Number(url.searchParams.get("limit") ?? 20),
+          100
+        )
+      );
+
+      const query = requestedCoin
+        ? `
+          SELECT *
+          FROM signal_episodes
+          WHERE coin = ?
+            AND status = 'CLOSED'
+            AND lifetime_return_pct IS NULL
+          ORDER BY start_ts ASC
+          LIMIT ?
+        `
+        : `
+          SELECT *
+          FROM signal_episodes
+          WHERE status = 'CLOSED'
+            AND lifetime_return_pct IS NULL
+          ORDER BY start_ts ASC
+          LIMIT ?
+        `;
+
+      const pending: any = requestedCoin
+        ? await env.DB.prepare(query).bind(requestedCoin, limit).all()
+        : await env.DB.prepare(query).bind(limit).all();
+
+      const diagnostics: any[] = [];
+      let updated = 0;
+      let failed = 0;
+
+      for (const ep of pending?.results ?? []) {
+        try {
+          const snapshots: any = await env.DB.prepare(`
+            SELECT COUNT(*) AS count
+            FROM market_snapshots
+            WHERE coin = ?
+              AND ts >= ?
+              AND ts <= ?
+          `).bind(
+            ep.coin,
+            Number(ep.start_ts),
+            Number(ep.end_ts)
+          ).first();
+
+          const lifetime = await computeSignalLifetimeOutcome(
+            env,
+            ep
+          );
+
+          if (!lifetime) {
+            failed += 1;
+            diagnostics.push({
+              id: ep.id,
+              coin: ep.coin,
+              side: ep.side,
+              status: ep.status,
+              snapshots_found: Number(snapshots?.count ?? 0),
+              calculation_success: false,
+              update_success: false,
+              reason: "LIFETIME_CALCULATION_RETURNED_NULL",
+              inputs: {
+                start_ts: ep.start_ts,
+                end_ts: ep.end_ts,
+                start_price: ep.start_price,
+                end_price: ep.end_price,
+              },
+            });
+            continue;
+          }
+
+          const write: any = await env.DB.prepare(`
+            UPDATE signal_episodes
+            SET
+              signal_lifetime_minutes = ?,
+              lifetime_return_pct = ?,
+              lifetime_mfe_pct = ?,
+              lifetime_mae_pct = ?,
+              lifetime_tp_hit = ?,
+              lifetime_sl_hit = ?,
+              lifetime_first_barrier = ?,
+              lifetime_first_barrier_ts = ?,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'CLOSED'
+              AND lifetime_return_pct IS NULL
+          `).bind(
+            lifetime.signal_lifetime_minutes,
+            lifetime.lifetime_return_pct,
+            lifetime.lifetime_mfe_pct,
+            lifetime.lifetime_mae_pct,
+            lifetime.lifetime_tp_hit,
+            lifetime.lifetime_sl_hit,
+            lifetime.lifetime_first_barrier,
+            lifetime.lifetime_first_barrier_ts,
+            ep.id
+          ).run();
+
+          const verify: any = await env.DB.prepare(`
+            SELECT
+              signal_lifetime_minutes,
+              lifetime_return_pct,
+              lifetime_mfe_pct,
+              lifetime_mae_pct,
+              lifetime_tp_hit,
+              lifetime_sl_hit,
+              lifetime_first_barrier,
+              lifetime_first_barrier_ts
+            FROM signal_episodes
+            WHERE id = ?
+          `).bind(ep.id).first();
+
+          const updateSuccess =
+            verify?.lifetime_return_pct !== null &&
+            verify?.lifetime_return_pct !== undefined;
+
+          if (updateSuccess) updated += 1;
+          else failed += 1;
+
+          diagnostics.push({
+            id: ep.id,
+            coin: ep.coin,
+            side: ep.side,
+            snapshots_found: Number(snapshots?.count ?? 0),
+            calculation_success: true,
+            calculated: lifetime,
+            d1_write: {
+              success: write?.success ?? null,
+              changes: write?.meta?.changes ?? null,
+            },
+            update_success: updateSuccess,
+            stored: verify ?? null,
+          });
+        } catch (error: any) {
+          failed += 1;
+          diagnostics.push({
+            id: ep.id,
+            coin: ep.coin,
+            side: ep.side,
+            calculation_success: false,
+            update_success: false,
+            error: error?.message ?? String(error),
+          });
+        }
+      }
+
+      return json({
+        success: failed === 0,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "LIFETIME_BACKFILL_DIAGNOSTIC",
+        trading: "REAL_TRADING_DISABLED",
+        requested_coin: requestedCoin || "ALL",
+        episodes_found: pending?.results?.length ?? 0,
+        episodes_updated: updated,
+        episodes_failed: failed,
+        diagnostics,
+      });
     }
 
     // V1.6 DEDUPLICATED SIGNAL EPISODES
