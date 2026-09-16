@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.5.1 FINAL SIGNAL PAPER ENGINE";
+const VERSION = "V1.5.2 PAPER ANALYTICS + SIGNAL BUCKETS";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1353,6 +1353,7 @@ async function buildHistoryContext(
 // ============================================================
 
 const PAPER_ENTRY_SCORE = 65;
+const PAPER_OBSERVATION_MIN_SCORE = 50;
 const PAPER_MIN_SCORE_GAP = 20;
 const PAPER_TP_PCT = 0.35;
 const PAPER_SL_PCT = 0.25;
@@ -1411,6 +1412,113 @@ async function ensurePaperTables(env: Env): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_ts
     ON paper_trades (entry_ts DESC)
   `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS paper_signal_observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      coin TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      datetime TEXT NOT NULL,
+      price REAL NOT NULL,
+      side TEXT NOT NULL,
+      score REAL NOT NULL,
+      score_bucket TEXT NOT NULL,
+      qualifies_entry INTEGER NOT NULL DEFAULT 0,
+      market_signed REAL,
+      news_signed REAL,
+      final_signed REAL,
+      chart_signed REAL,
+      order_flow_persistent_signed REAL,
+      oi_change_signed REAL,
+      funding_premium_signed REAL,
+      history_mode TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(coin, ts)
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_paper_obs_coin_ts
+    ON paper_signal_observations (coin, ts DESC)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_paper_obs_bucket
+    ON paper_signal_observations (score_bucket, side, ts DESC)
+  `).run();
+}
+
+function scoreBucket(score: number): string {
+  if (score >= 80) return "80+";
+  if (score >= 75) return "75-79";
+  if (score >= 70) return "70-74";
+  if (score >= 65) return "65-69";
+  if (score >= 60) return "60-64";
+  if (score >= 55) return "55-59";
+  if (score >= 50) return "50-54";
+  return "<50";
+}
+
+async function recordPaperObservation(
+  env: Env,
+  signal: any,
+  finalSignal: any
+): Promise<any> {
+  await ensurePaperTables(env);
+
+  const finalSigned = Number(
+    finalSignal?.final?.signed_score ??
+    signal.market?.signed_score ??
+    0
+  );
+  const score = Math.abs(finalSigned);
+
+  if (score < PAPER_OBSERVATION_MIN_SCORE) {
+    return {
+      recorded: false,
+      reason: "BELOW_OBSERVATION_THRESHOLD",
+      score: round(score),
+    };
+  }
+
+  const side = finalSigned >= 0 ? "LONG" : "SHORT";
+  const ts = Date.now();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO paper_signal_observations (
+      coin, ts, datetime, price,
+      side, score, score_bucket, qualifies_entry,
+      market_signed, news_signed, final_signed,
+      chart_signed, order_flow_persistent_signed,
+      oi_change_signed, funding_premium_signed,
+      history_mode
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    signal.coin,
+    ts,
+    new Date(ts).toISOString(),
+    Number(signal.price),
+    side,
+    score,
+    scoreBucket(score),
+    score >= PAPER_ENTRY_SCORE ? 1 : 0,
+    signal.market?.signed_score ?? null,
+    finalSignal?.news_x?.signed_score ?? null,
+    finalSigned,
+    signal.market?.components?.chart_signed ?? null,
+    signal.market?.components?.order_flow_persistent_signed ?? null,
+    signal.market?.components?.oi_change_signed ?? null,
+    signal.market?.components?.funding_premium_signed ?? null,
+    signal.market?.weights?.mode ?? null
+  ).run();
+
+  return {
+    recorded: true,
+    side,
+    score: round(score),
+    score_bucket: scoreBucket(score),
+    qualifies_entry: score >= PAPER_ENTRY_SCORE,
+  };
 }
 
 function paperReturnPct(
@@ -3125,6 +3233,8 @@ export default {
           paper_candidate: "/paper-candidate?coin=BTC",
           paper_trades: "/paper-trades?status=ALL&limit=50",
           paper_summary: "/paper-summary",
+          paper_analytics: "/paper-analytics",
+          paper_observations: "/paper-observations?limit=100",
           debug: "/debug-hyperliquid",
         },
 
@@ -3551,6 +3661,153 @@ export default {
       }
     }
 
+    // V1.5.2 PAPER ANALYTICS
+    if (url.pathname === "/paper-analytics") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const buckets = await env.DB.prepare(`
+        SELECT
+          CASE
+            WHEN entry_score >= 80 THEN '80+'
+            WHEN entry_score >= 75 THEN '75-79'
+            WHEN entry_score >= 70 THEN '70-74'
+            WHEN entry_score >= 65 THEN '65-69'
+            ELSE '<65'
+          END AS score_bucket,
+          side,
+          COUNT(*) AS trades,
+          SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) AS closed,
+          SUM(CASE WHEN status='CLOSED' AND net_return_pct > 0 THEN 1 ELSE 0 END) AS wins,
+          AVG(CASE WHEN status='CLOSED' THEN net_return_pct END) AS avg_net_return_pct,
+          SUM(CASE WHEN status='CLOSED' THEN pnl_usd ELSE 0 END) AS pnl_usd,
+          AVG(CASE WHEN status='CLOSED' THEN mfe_pct END) AS avg_mfe_pct,
+          AVG(CASE WHEN status='CLOSED' THEN mae_pct END) AS avg_mae_pct
+        FROM paper_trades
+        GROUP BY score_bucket, side
+        ORDER BY
+          CASE score_bucket
+            WHEN '80+' THEN 1
+            WHEN '75-79' THEN 2
+            WHEN '70-74' THEN 3
+            WHEN '65-69' THEN 4
+            ELSE 5
+          END,
+          side
+      `).all();
+
+      const coins = await env.DB.prepare(`
+        SELECT
+          coin,
+          side,
+          COUNT(*) AS trades,
+          SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) AS closed,
+          SUM(CASE WHEN status='CLOSED' AND net_return_pct > 0 THEN 1 ELSE 0 END) AS wins,
+          AVG(CASE WHEN status='CLOSED' THEN net_return_pct END) AS avg_net_return_pct,
+          SUM(CASE WHEN status='CLOSED' THEN pnl_usd ELSE 0 END) AS pnl_usd,
+          AVG(CASE WHEN status='CLOSED' THEN mfe_pct END) AS avg_mfe_pct,
+          AVG(CASE WHEN status='CLOSED' THEN mae_pct END) AS avg_mae_pct
+        FROM paper_trades
+        GROUP BY coin, side
+        ORDER BY coin, side
+      `).all();
+
+      const exits = await env.DB.prepare(`
+        SELECT
+          exit_reason,
+          COUNT(*) AS trades,
+          AVG(net_return_pct) AS avg_net_return_pct,
+          SUM(pnl_usd) AS pnl_usd
+        FROM paper_trades
+        WHERE status='CLOSED'
+        GROUP BY exit_reason
+        ORDER BY trades DESC
+      `).all();
+
+      const observations = await env.DB.prepare(`
+        SELECT
+          score_bucket,
+          side,
+          COUNT(*) AS observations,
+          SUM(qualifies_entry) AS qualified
+        FROM paper_signal_observations
+        GROUP BY score_bucket, side
+        ORDER BY
+          CASE score_bucket
+            WHEN '80+' THEN 1
+            WHEN '75-79' THEN 2
+            WHEN '70-74' THEN 3
+            WHEN '65-69' THEN 4
+            WHEN '60-64' THEN 5
+            WHEN '55-59' THEN 6
+            WHEN '50-54' THEN 7
+            ELSE 8
+          END,
+          side
+      `).all();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "PAPER_ONLY",
+        trading: "REAL_TRADING_DISABLED",
+        summary: await paperSummary(env),
+        by_score_bucket: buckets?.results ?? [],
+        by_coin_side: coins?.results ?? [],
+        by_exit_reason: exits?.results ?? [],
+        shadow_observations_50_plus:
+          observations?.results ?? [],
+        note:
+          "50-64 observations are research samples only and do not change the paper-entry threshold.",
+      });
+    }
+
+    if (url.pathname === "/paper-observations") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          Number(url.searchParams.get("limit") ?? 100),
+          500
+        )
+      );
+
+      const result = await env.DB.prepare(`
+        SELECT *
+        FROM paper_signal_observations
+        ORDER BY ts DESC
+        LIMIT ?
+      `).bind(limit).all();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "RESEARCH_OBSERVATIONS",
+        observation_min_score:
+          PAPER_OBSERVATION_MIN_SCORE,
+        paper_entry_score:
+          PAPER_ENTRY_SCORE,
+        total: result?.results?.length ?? 0,
+        observations: result?.results ?? [],
+      });
+    }
+
     // FINAL SIGNAL -> PAPER ENTRY DIAGNOSTIC
     if (url.pathname === "/paper-candidate") {
       const coin = (
@@ -3922,6 +4179,16 @@ export default {
           final,
         };
 
+        // V1.5.2 shadow observation:
+        // record 50+ signals even when they do not qualify
+        // for a simulated trade. This does NOT change entries.
+        const observation =
+          await recordPaperObservation(
+            env,
+            signal,
+            finalSignal
+          );
+
         // PAPER ONLY. No real order path exists here.
         const paper = await processPaperCoin(
           env,
@@ -3937,6 +4204,7 @@ export default {
           active_news_items: news?.active_items ?? 0,
           final_score: final?.signed_score ?? 0,
           final_mode: final?.mode ?? null,
+          observation,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
