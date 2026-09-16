@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.3.2 FAST NEWS ENGINE";
+const VERSION = "V1.4 SNAPSHOT HISTORY + OI CHANGE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -54,6 +54,9 @@ type Env = {
   // Optional. Add with:
   // npx wrangler secret put X_API_BEARER_TOKEN
   X_API_BEARER_TOKEN?: string;
+
+  // Cloudflare D1 binding. Recommended binding name: DB
+  DB?: any;
 };
 
 type Candle = {
@@ -958,6 +961,391 @@ function buildDerivatives(ctx: any) {
   };
 }
 
+
+// ============================================================
+// V1.4 SNAPSHOT HISTORY + OI CHANGE
+// D1 READ/WRITE ONLY FOR MARKET SNAPSHOTS — NO TRADING
+// ============================================================
+
+type SnapshotRow = {
+  coin: string;
+  ts: number;
+  price: number;
+  order_flow_signed: number;
+  open_interest: number | null;
+  funding: number | null;
+  premium: number | null;
+  chart_signed: number;
+};
+
+function dbReady(env?: Env): boolean {
+  return !!env?.DB;
+}
+
+async function ensureSnapshotTable(env: Env): Promise<void> {
+  if (!env.DB) return;
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS market_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      coin TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      datetime TEXT NOT NULL,
+      price REAL NOT NULL,
+      chart_signed REAL NOT NULL,
+      order_flow_signed REAL NOT NULL,
+      open_interest REAL,
+      funding REAL,
+      premium REAL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_market_snapshots_coin_ts
+    ON market_snapshots (coin, ts DESC)
+  `).run();
+}
+
+async function saveSnapshot(
+  env: Env,
+  signal: any
+): Promise<boolean> {
+  if (!env.DB) return false;
+
+  await ensureSnapshotTable(env);
+
+  await env.DB.prepare(`
+    INSERT INTO market_snapshots (
+      coin, ts, datetime, price,
+      chart_signed, order_flow_signed,
+      open_interest, funding, premium
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    signal.coin,
+    signal.timestamp,
+    signal.datetime,
+    Number(signal.price ?? 0),
+    Number(
+      signal.chart?.final?.long_score ?? 0
+    ) - Number(
+      signal.chart?.final?.short_score ?? 0
+    ),
+    Number(
+      signal.microstructure?.order_flow?.signed_score ?? 0
+    ),
+    signal.derivatives?.open_interest ?? null,
+    signal.derivatives?.funding ?? null,
+    signal.derivatives?.premium ?? null
+  ).run();
+
+  return true;
+}
+
+async function getRecentSnapshots(
+  env: Env,
+  coin: string,
+  minutes = 20,
+  limit = 120
+): Promise<SnapshotRow[]> {
+  if (!env.DB) return [];
+
+  await ensureSnapshotTable(env);
+
+  const since = Date.now() - minutes * 60_000;
+
+  const result = await env.DB.prepare(`
+    SELECT
+      coin, ts, price, chart_signed,
+      order_flow_signed, open_interest,
+      funding, premium
+    FROM market_snapshots
+    WHERE coin = ? AND ts >= ?
+    ORDER BY ts ASC
+    LIMIT ?
+  `).bind(
+    coin,
+    since,
+    Math.max(1, Math.min(limit, 500))
+  ).all();
+
+  return (result?.results ?? []) as SnapshotRow[];
+}
+
+function nearestSnapshot(
+  rows: SnapshotRow[],
+  targetTs: number,
+  toleranceMs: number
+): SnapshotRow | null {
+  let best: SnapshotRow | null = null;
+  let bestDistance = Infinity;
+
+  for (const row of rows) {
+    const d = Math.abs(Number(row.ts) - targetTs);
+    if (d <= toleranceMs && d < bestDistance) {
+      best = row;
+      bestDistance = d;
+    }
+  }
+
+  return best;
+}
+
+function pctChange(
+  current: number | null,
+  previous: number | null
+): number | null {
+  if (
+    current === null ||
+    previous === null ||
+    !Number.isFinite(current) ||
+    !Number.isFinite(previous) ||
+    previous === 0
+  ) {
+    return null;
+  }
+
+  return ((current - previous) / Math.abs(previous)) * 100;
+}
+
+function buildOiChangeWindow(
+  current: {
+    ts: number;
+    price: number;
+    oi: number | null;
+  },
+  rows: SnapshotRow[],
+  minutes: number
+) {
+  const previous = nearestSnapshot(
+    rows,
+    current.ts - minutes * 60_000,
+    90_000
+  );
+
+  if (!previous) {
+    return {
+      available: false,
+      minutes,
+      reason: "NO_SNAPSHOT_NEAR_TARGET",
+    };
+  }
+
+  const oiPct = pctChange(
+    current.oi,
+    previous.open_interest
+  );
+
+  const pricePct = pctChange(
+    current.price,
+    previous.price
+  );
+
+  if (oiPct === null || pricePct === null) {
+    return {
+      available: false,
+      minutes,
+      reason: "MISSING_OI_OR_PRICE",
+    };
+  }
+
+  // OI is context, not direction by itself.
+  // Rising OI + rising price => LONG confirmation.
+  // Rising OI + falling price => SHORT confirmation.
+  // Falling OI => deleveraging; deliberately lower score.
+  const oiMagnitude = clamp(
+    Math.abs(oiPct) / 0.20 * 100
+  );
+
+  const priceMagnitude = clamp(
+    Math.abs(pricePct) / 0.20 * 100
+  );
+
+  let signed = 0;
+  let interpretation = "NEUTRAL";
+
+  if (oiPct > 0.01 && pricePct > 0.01) {
+    signed =
+      Math.min(oiMagnitude, priceMagnitude) * 0.85;
+    interpretation = "RISING_OI_RISING_PRICE";
+  } else if (oiPct > 0.01 && pricePct < -0.01) {
+    signed =
+      -Math.min(oiMagnitude, priceMagnitude) * 0.85;
+    interpretation = "RISING_OI_FALLING_PRICE";
+  } else if (oiPct < -0.01 && pricePct > 0.01) {
+    signed = priceMagnitude * 0.25;
+    interpretation = "FALLING_OI_RISING_PRICE_DELEVERAGING";
+  } else if (oiPct < -0.01 && pricePct < -0.01) {
+    signed = -priceMagnitude * 0.25;
+    interpretation = "FALLING_OI_FALLING_PRICE_DELEVERAGING";
+  }
+
+  return {
+    available: true,
+    minutes,
+    previous_ts: previous.ts,
+    previous_price: round(previous.price),
+    previous_open_interest:
+      previous.open_interest === null
+        ? null
+        : round(previous.open_interest, 6),
+    price_change_pct: round(pricePct, 4),
+    open_interest_change_pct: round(oiPct, 4),
+    signed_score: round(clampSigned(signed)),
+    interpretation,
+  };
+}
+
+function buildOrderFlowPersistence(
+  rows: SnapshotRow[],
+  currentSigned: number
+) {
+  const values = [
+    ...rows.slice(-9).map(
+      (x) => Number(x.order_flow_signed ?? 0)
+    ),
+    currentSigned,
+  ].filter(Number.isFinite);
+
+  if (values.length < 3) {
+    return {
+      available: false,
+      samples: values.length,
+      signed_score: round(currentSigned),
+      reason: "NEED_AT_LEAST_3_SNAPSHOTS",
+    };
+  }
+
+  const avg =
+    values.reduce((a, b) => a + b, 0) /
+    values.length;
+
+  const sameDirection = values.filter(
+    (x) =>
+      Math.sign(x) === Math.sign(avg) &&
+      Math.abs(x) >= 10
+  ).length;
+
+  const persistence = sameDirection / values.length;
+
+  // Persistence prevents a single L2 wall from dominating.
+  const signed =
+    avg * (0.50 + persistence * 0.50);
+
+  return {
+    available: true,
+    samples: values.length,
+    average_signed: round(avg),
+    persistence_ratio: round(persistence, 4),
+    current_signed: round(currentSigned),
+    signed_score: round(clampSigned(signed)),
+    direction: sideLabel(signed, 10),
+  };
+}
+
+async function buildHistoryContext(
+  env: Env | undefined,
+  coin: string,
+  current: {
+    ts: number;
+    price: number;
+    oi: number | null;
+    orderFlowSigned: number;
+  }
+) {
+  if (!env?.DB) {
+    return {
+      storage: "D1_NOT_BOUND",
+      snapshots: 0,
+      order_flow_persistence: {
+        available: false,
+        signed_score: round(current.orderFlowSigned),
+      },
+      oi_change: {
+        available: false,
+        signed_score: 0,
+        status: "WAITING_FOR_D1_BINDING",
+      },
+    };
+  }
+
+  const rows = await getRecentSnapshots(
+    env,
+    coin,
+    20,
+    120
+  );
+
+  const flow = buildOrderFlowPersistence(
+    rows,
+    current.orderFlowSigned
+  );
+
+  const w1 = buildOiChangeWindow(
+    { ts: current.ts, price: current.price, oi: current.oi },
+    rows,
+    1
+  );
+  const w5 = buildOiChangeWindow(
+    { ts: current.ts, price: current.price, oi: current.oi },
+    rows,
+    5
+  );
+  const w15 = buildOiChangeWindow(
+    { ts: current.ts, price: current.price, oi: current.oi },
+    rows,
+    15
+  );
+
+  const available = [w1, w5, w15].filter(
+    (x: any) => x.available
+  );
+
+  let oiSigned = 0;
+
+  if (available.length) {
+    const weighted = [
+      { value: w1, weight: 0.25 },
+      { value: w5, weight: 0.45 },
+      { value: w15, weight: 0.30 },
+    ].filter((x: any) => x.value.available);
+
+    const weightSum = weighted.reduce(
+      (sum: number, x: any) => sum + x.weight,
+      0
+    );
+
+    oiSigned =
+      weighted.reduce(
+        (sum: number, x: any) =>
+          sum +
+          Number(x.value.signed_score ?? 0) *
+            x.weight,
+        0
+      ) / weightSum;
+  }
+
+  return {
+    storage: "D1",
+    snapshots: rows.length,
+    order_flow_persistence: flow,
+    oi_change: {
+      available: available.length > 0,
+      signed_score: round(clampSigned(oiSigned)),
+      windows: {
+        "1m": w1,
+        "5m": w5,
+        "15m": w15,
+      },
+      status:
+        available.length > 0
+          ? "ACTIVE"
+          : "COLLECTING_HISTORY",
+    },
+  };
+}
+
+
 // ============================================================
 // MARKET SIGNAL
 // ============================================================
@@ -972,38 +1360,64 @@ function chartSigned(chart: any): number {
 function buildMarketScore(
   chart: any,
   book: any,
-  derivatives: any
+  derivatives: any,
+  history?: any
 ) {
   const c = chartSigned(chart);
-  const of = clampSigned(
+
+  const rawOf = clampSigned(
     Number(book?.order_flow?.signed_score ?? 0)
   );
 
-  // OI change is deliberately 0 until we store historical snapshots.
-  const oi = 0;
+  const persistentOf =
+    history?.order_flow_persistence?.available
+      ? clampSigned(
+          Number(
+            history.order_flow_persistence.signed_score ?? rawOf
+          )
+        )
+      : rawOf;
+
+  const oiAvailable =
+    history?.oi_change?.available === true;
+
+  const oi = oiAvailable
+    ? clampSigned(
+        Number(history?.oi_change?.signed_score ?? 0)
+      )
+    : 0;
 
   const fundingContext = clampSigned(
     Number(derivatives?.contextual_signed_score ?? 0)
   );
 
-  // Current V1.2 effective weights:
-  // Chart      65%
-  // Order flow 30%
-  // Funding/premium 5%
-  //
-  // When OI-change becomes available:
-  // target is Chart 55 / OrderFlow 25 / OI 15 / Funding 5.
+  // Until enough OI history exists, preserve V1.3 weights.
+  // Once ΔOI becomes available, switch automatically to:
+  // Chart 55 / persistent Order Flow 25 / ΔOI 15 / Funding 5.
+  const weights = oiAvailable
+    ? {
+        chart: 0.55,
+        order_flow: 0.25,
+        oi_change: 0.15,
+        funding_premium: 0.05,
+      }
+    : {
+        chart: 0.65,
+        order_flow: 0.30,
+        oi_change: 0,
+        funding_premium: 0.05,
+      };
+
   const signed =
-    c * 0.65 +
-    of * 0.30 +
-    fundingContext * 0.05;
+    c * weights.chart +
+    persistentOf * weights.order_flow +
+    oi * weights.oi_change +
+    fundingContext * weights.funding_premium;
 
   const signedClamped = clampSigned(signed);
 
   const longScore =
-    signedClamped > 0
-      ? clamp(signedClamped)
-      : 0;
+    signedClamped > 0 ? clamp(signedClamped) : 0;
 
   const shortScore =
     signedClamped < 0
@@ -1025,22 +1439,18 @@ function buildMarketScore(
 
   return {
     weights: {
-      chart: 0.65,
-      order_flow: 0.30,
-      oi_change: 0,
-      funding_premium: 0.05,
-      future_target_after_oi_history: {
-        chart: 0.55,
-        order_flow: 0.25,
-        oi_change: 0.15,
-        funding_premium: 0.05,
-      },
+      ...weights,
+      mode:
+        oiAvailable
+          ? "HISTORY_ACTIVE"
+          : "HISTORY_COLLECTING",
     },
 
     components: {
       chart_signed: round(c),
-      order_flow_signed: round(of),
-      oi_change_signed: oi,
+      order_flow_raw_signed: round(rawOf),
+      order_flow_persistent_signed: round(persistentOf),
+      oi_change_signed: round(oi),
       funding_premium_signed: round(fundingContext),
     },
 
@@ -1055,7 +1465,7 @@ function buildMarketScore(
   };
 }
 
-async function buildSignal(coin: string) {
+async function buildSignal(coin: string, env?: Env) {
   const started = Date.now();
 
   const [chart, book, asset] = await Promise.all([
@@ -1065,10 +1475,40 @@ async function buildSignal(coin: string) {
   ]);
 
   const derivatives = buildDerivatives(asset.context);
+
+  const currentTs = Date.now();
+
+  const history = await buildHistoryContext(
+    env,
+    coin,
+    {
+      ts: currentTs,
+      price: Number(chart.price ?? 0),
+      oi:
+        derivatives?.open_interest === null ||
+        derivatives?.open_interest === undefined
+          ? null
+          : Number(derivatives.open_interest),
+      orderFlowSigned: Number(
+        book?.order_flow?.signed_score ?? 0
+      ),
+    }
+  );
+
+  derivatives.open_interest_change =
+    history?.oi_change?.available
+      ? history.oi_change
+      : null;
+
+  derivatives.open_interest_change_status =
+    history?.oi_change?.status ??
+    "WAITING_FOR_HISTORICAL_SNAPSHOTS";
+
   const market = buildMarketScore(
     chart.chart,
     book,
-    derivatives
+    derivatives,
+    history
   );
 
   return {
@@ -1096,6 +1536,8 @@ async function buildSignal(coin: string) {
     },
 
     derivatives,
+
+    history,
 
     market,
 
@@ -1986,7 +2428,7 @@ async function buildFinalSignal(
   const started = Date.now();
 
   const [marketSignal, newsData] = await Promise.all([
-    buildSignal(coin),
+    buildSignal(coin, env),
     preloadedNews
       ? Promise.resolve(preloadedNews)
       : buildNewsOnly(env),
@@ -2117,7 +2559,9 @@ export default {
           closed_candle_fix: true,
           order_book: true,
           derivatives_context: true,
-          oi_change: false,
+          oi_change: true,
+          d1_snapshot_history: true,
+          l2_persistence: true,
           news_x: true,
           x_optional_bearer_token: true,
           official_rss: true,
@@ -2142,11 +2586,13 @@ export default {
           news_score: "/news-score?coin=BTC",
           final_signal: "/final-signal?coin=BTC",
           final_signals: "/final-signals",
+          history: "/history?coin=BTC&minutes=20",
+          snapshot_status: "/snapshot-status?coin=BTC",
           debug: "/debug-hyperliquid",
         },
 
         next_version:
-          "V1.4 SNAPSHOT HISTORY + OI CHANGE",
+          "V1.5 PAPER TRADING ENGINE",
       });
     }
 
@@ -2375,7 +2821,7 @@ export default {
           version: VERSION,
           mode: "READ_ONLY",
           trading: "DISABLED",
-          ...(await buildSignal(coin)),
+          ...(await buildSignal(coin, env)),
         });
       } catch (error: any) {
         return json(
@@ -2396,7 +2842,7 @@ export default {
 
       try {
         const results = await Promise.all(
-          TRACKED_COINS.map((coin) => buildSignal(coin))
+          TRACKED_COINS.map((coin) => buildSignal(coin, env))
         );
 
         return json({
@@ -2568,6 +3014,109 @@ export default {
       }
     }
 
+    // SNAPSHOT HISTORY
+    if (url.pathname === "/history") {
+      const coin = (
+        url.searchParams.get("coin") ?? "BTC"
+      ).toUpperCase();
+
+      const minutes = Math.max(
+        1,
+        Math.min(
+          Number(url.searchParams.get("minutes") ?? 20),
+          1440
+        )
+      );
+
+      if (!validCoin(coin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      if (!env.DB) {
+        return json(
+          {
+            success: false,
+            error: "D1_NOT_BOUND",
+            required_binding: "DB",
+          },
+          503
+        );
+      }
+
+      const rows = await getRecentSnapshots(
+        env,
+        coin,
+        minutes,
+        500
+      );
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        coin,
+        minutes,
+        total: rows.length,
+        snapshots: rows,
+      });
+    }
+
+    // CURRENT HISTORY / ΔOI DIAGNOSTIC
+    if (url.pathname === "/snapshot-status") {
+      const coin = (
+        url.searchParams.get("coin") ?? "BTC"
+      ).toUpperCase();
+
+      if (!validCoin(coin)) {
+        return json(
+          {
+            success: false,
+            error: "INVALID_COIN",
+            allowed: TRACKED_COINS,
+          },
+          400
+        );
+      }
+
+      try {
+        const signal = await buildSignal(coin, env);
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          coin,
+          d1_bound: dbReady(env),
+          history: signal.history,
+          derivatives: {
+            open_interest:
+              signal.derivatives.open_interest,
+            open_interest_change:
+              signal.derivatives.open_interest_change,
+            open_interest_change_status:
+              signal.derivatives.open_interest_change_status,
+          },
+          market: signal.market,
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: "SNAPSHOT_STATUS_FAILED",
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
     // DEBUG
     if (url.pathname === "/debug-hyperliquid") {
       return json({
@@ -2585,6 +3134,46 @@ export default {
         path: url.pathname,
       },
       404
+    );
+  },
+
+  async scheduled(
+    _controller: any,
+    env: Env,
+    _ctx: any
+  ): Promise<void> {
+    if (!env.DB) {
+      console.log(
+        "V1.4 snapshot skipped: D1 binding DB is missing"
+      );
+      return;
+    }
+
+    await ensureSnapshotTable(env);
+
+    const results = await Promise.allSettled(
+      TRACKED_COINS.map(async (coin) => {
+        const signal = await buildSignal(coin, env);
+        await saveSnapshot(env, signal);
+
+        return {
+          coin,
+          price: signal.price,
+          oi: signal.derivatives?.open_interest ?? null,
+          order_flow:
+            signal.microstructure?.order_flow?.signed_score ?? 0,
+        };
+      })
+    );
+
+    console.log(
+      JSON.stringify({
+        worker: "cryptobot",
+        version: VERSION,
+        action: "SNAPSHOT_CRON",
+        timestamp: Date.now(),
+        results,
+      })
     );
   },
 };
