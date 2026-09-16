@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.4 DIRECT CLOSED EPISODE BACKFILL";
+const VERSION = "V1.6.5 FORCE CLOSED BACKFILL";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -4204,7 +4204,7 @@ export default {
       }
     }
 
-    // V1.6.4 DIRECT CLOSED EPISODE BACKFILL
+    // V1.6.5 FORCE CLOSED EPISODE BACKFILL
     // READ/RESEARCH endpoint: recalculates lifetime fields for CLOSED episodes
     // whose lifetime outcome has not yet been measured, and returns each step.
     if (url.pathname === "/episode-backfill") {
@@ -4240,7 +4240,7 @@ export default {
         )
       );
 
-      // V1.6.4 FIX: fetch CLOSED episodes first without filtering on any
+      // V1.6.5 FIX: fetch CLOSED episodes without filtering on any
       // lifetime column. Some D1 rows created before the lifetime migration
       // were not being selected reliably by the previous SQL predicate.
       // Missing lifetime fields are filtered in JavaScript instead.
@@ -4266,12 +4266,11 @@ export default {
         : await env.DB.prepare(query).bind(limit).all();
 
       const closedRows: any[] = closed?.results ?? [];
-      const pendingRows: any[] = closedRows.filter((ep: any) =>
-        ep.signal_lifetime_minutes == null ||
-        ep.lifetime_return_pct == null ||
-        ep.lifetime_mfe_pct == null ||
-        ep.lifetime_mae_pct == null
-      );
+
+      // V1.6.5 FIX: force every CLOSED episode through the lifetime
+      // calculation. Do not depend on migrated lifetime column values here.
+      // The calculation is deterministic, so rerunning this endpoint is safe.
+      const pendingRows: any[] = closedRows;
 
       const diagnostics: any[] = [];
       let updated = 0;
