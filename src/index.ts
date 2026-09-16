@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6 SIGNAL EPISODES + OUTCOME RESEARCH";
+const VERSION = "V1.6.1 SIGNAL LIFETIME + 30M OUTCOMES";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1474,6 +1474,14 @@ async function ensurePaperTables(env: Env): Promise<void> {
       end_datetime TEXT,
       end_price REAL,
       end_reason TEXT,
+      signal_lifetime_minutes REAL,
+      lifetime_return_pct REAL,
+      lifetime_mfe_pct REAL,
+      lifetime_mae_pct REAL,
+      lifetime_tp_hit INTEGER NOT NULL DEFAULT 0,
+      lifetime_sl_hit INTEGER NOT NULL DEFAULT 0,
+      lifetime_first_barrier TEXT,
+      lifetime_first_barrier_ts INTEGER,
       return_1m_pct REAL,
       return_5m_pct REAL,
       return_15m_pct REAL,
@@ -1611,6 +1619,91 @@ async function nearestSnapshotPrice(
   };
 }
 
+async function computeSignalLifetimeOutcome(
+  env: Env,
+  episode: any
+): Promise<any | null> {
+  if (!env.DB || !episode?.end_ts || episode?.end_price == null) {
+    return null;
+  }
+
+  const startTs = Number(episode.start_ts);
+  const endTs = Number(episode.end_ts);
+  const entry = Number(episode.start_price);
+  const endPrice = Number(episode.end_price);
+  const side = String(episode.side);
+
+  if (!Number.isFinite(startTs) || !Number.isFinite(endTs) ||
+      !Number.isFinite(entry) || !Number.isFinite(endPrice) || entry <= 0) {
+    return null;
+  }
+
+  const rows: any = await env.DB.prepare(`
+    SELECT ts, price
+    FROM market_snapshots
+    WHERE coin = ?
+      AND ts >= ?
+      AND ts <= ?
+    ORDER BY ts ASC
+  `).bind(
+    episode.coin,
+    startTs,
+    endTs
+  ).all();
+
+  // Include the exact episode end price even if the cron snapshot timestamp
+  // differs by a few milliseconds from end_ts.
+  const points = (rows?.results ?? []).map((r: any) => ({
+    ts: Number(r.ts),
+    price: Number(r.price),
+  })).filter((r: any) => Number.isFinite(r.price));
+
+  points.push({ ts: endTs, price: endPrice });
+  points.sort((a: any, b: any) => a.ts - b.ts);
+
+  let minP = entry;
+  let maxP = entry;
+  let tpHit = 0;
+  let slHit = 0;
+  let firstBarrier: string | null = null;
+  let firstBarrierTs: number | null = null;
+  const levels = paperLevels(side, entry);
+
+  for (const point of points) {
+    const p = point.price;
+    minP = Math.min(minP, p);
+    maxP = Math.max(maxP, p);
+
+    const tp = side === "SHORT" ? p <= levels.tp : p >= levels.tp;
+    const sl = side === "SHORT" ? p >= levels.sl : p <= levels.sl;
+
+    if (tp) tpHit = 1;
+    if (sl) slHit = 1;
+    if (!firstBarrier && (tp || sl)) {
+      firstBarrier = tp ? "TP" : "SL";
+      firstBarrierTs = point.ts;
+    }
+  }
+
+  const mfe = side === "SHORT"
+    ? directionalReturnPct(side, entry, minP)
+    : directionalReturnPct(side, entry, maxP);
+  const mae = side === "SHORT"
+    ? directionalReturnPct(side, entry, maxP)
+    : directionalReturnPct(side, entry, minP);
+
+  return {
+    signal_lifetime_minutes: round((endTs - startTs) / 60000),
+    lifetime_return_pct: round(directionalReturnPct(side, entry, endPrice)),
+    lifetime_mfe_pct: round(mfe),
+    lifetime_mae_pct: round(mae),
+    lifetime_tp_hit: tpHit,
+    lifetime_sl_hit: slHit,
+    lifetime_first_barrier: firstBarrier,
+    lifetime_first_barrier_ts: firstBarrierTs,
+  };
+}
+
 async function updateEpisodeOutcomes(
   env: Env,
   coin: string
@@ -1632,6 +1725,13 @@ async function updateEpisodeOutcomes(
     const startTs = Number(ep.start_ts);
     const entry = Number(ep.start_price);
     const side = String(ep.side);
+
+    // V1.6.1: once the episode is CLOSED, separately measure what
+    // happened only while the signal itself remained alive.
+    let lifetime: any = null;
+    if (String(ep.status) === "CLOSED" && ep.lifetime_return_pct == null) {
+      lifetime = await computeSignalLifetimeOutcome(env, ep);
+    }
 
     const values: Record<string, number | null> = {
       return_1m_pct: ep.return_1m_pct ?? null,
@@ -1759,6 +1859,14 @@ async function updateEpisodeOutcomes(
     await env.DB.prepare(`
       UPDATE signal_episodes
       SET
+        signal_lifetime_minutes = COALESCE(?, signal_lifetime_minutes),
+        lifetime_return_pct = COALESCE(?, lifetime_return_pct),
+        lifetime_mfe_pct = COALESCE(?, lifetime_mfe_pct),
+        lifetime_mae_pct = COALESCE(?, lifetime_mae_pct),
+        lifetime_tp_hit = CASE WHEN ? IS NULL THEN lifetime_tp_hit ELSE ? END,
+        lifetime_sl_hit = CASE WHEN ? IS NULL THEN lifetime_sl_hit ELSE ? END,
+        lifetime_first_barrier = COALESCE(?, lifetime_first_barrier),
+        lifetime_first_barrier_ts = COALESCE(?, lifetime_first_barrier_ts),
         return_1m_pct = ?,
         return_5m_pct = ?,
         return_15m_pct = ?,
@@ -1773,6 +1881,16 @@ async function updateEpisodeOutcomes(
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).bind(
+      lifetime?.signal_lifetime_minutes ?? null,
+      lifetime?.lifetime_return_pct ?? null,
+      lifetime?.lifetime_mfe_pct ?? null,
+      lifetime?.lifetime_mae_pct ?? null,
+      lifetime ? lifetime.lifetime_tp_hit : null,
+      lifetime?.lifetime_tp_hit ?? 0,
+      lifetime ? lifetime.lifetime_sl_hit : null,
+      lifetime?.lifetime_sl_hit ?? 0,
+      lifetime?.lifetime_first_barrier ?? null,
+      lifetime?.lifetime_first_barrier_ts ?? null,
       values.return_1m_pct,
       values.return_5m_pct,
       values.return_15m_pct,
@@ -3631,7 +3749,6 @@ export default {
           stale_news_hard_expiry: true,
           paper_trading: true,
           real_trading: false,
-          real_trading: false,
         },
 
         endpoints: {
@@ -4136,6 +4253,12 @@ export default {
           side,
           COUNT(*) AS episodes,
           SUM(outcome_complete) AS completed_30m,
+          AVG(signal_lifetime_minutes) AS avg_signal_lifetime_minutes,
+          AVG(lifetime_return_pct) AS avg_lifetime_return_pct,
+          AVG(lifetime_mfe_pct) AS avg_lifetime_mfe_pct,
+          AVG(lifetime_mae_pct) AS avg_lifetime_mae_pct,
+          SUM(CASE WHEN lifetime_first_barrier='TP' THEN 1 ELSE 0 END) AS lifetime_tp_first,
+          SUM(CASE WHEN lifetime_first_barrier='SL' THEN 1 ELSE 0 END) AS lifetime_sl_first,
           AVG(return_1m_pct) AS avg_1m_pct,
           AVG(return_5m_pct) AS avg_5m_pct,
           AVG(return_15m_pct) AS avg_15m_pct,
@@ -4167,6 +4290,12 @@ export default {
           side,
           COUNT(*) AS episodes,
           SUM(outcome_complete) AS completed_30m,
+          AVG(signal_lifetime_minutes) AS avg_signal_lifetime_minutes,
+          AVG(lifetime_return_pct) AS avg_lifetime_return_pct,
+          AVG(lifetime_mfe_pct) AS avg_lifetime_mfe_pct,
+          AVG(lifetime_mae_pct) AS avg_lifetime_mae_pct,
+          SUM(CASE WHEN lifetime_first_barrier='TP' THEN 1 ELSE 0 END) AS lifetime_tp_first,
+          SUM(CASE WHEN lifetime_first_barrier='SL' THEN 1 ELSE 0 END) AS lifetime_sl_first,
           AVG(return_5m_pct) AS avg_5m_pct,
           AVG(return_15m_pct) AS avg_15m_pct,
           AVG(return_30m_pct) AS avg_30m_pct,
@@ -4186,6 +4315,9 @@ export default {
           SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) AS closed,
           SUM(outcome_complete) AS completed_30m,
           SUM(CASE WHEN qualifies_entry=1 THEN 1 ELSE 0 END) AS reached_65,
+          SUM(CASE WHEN lifetime_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS lifetime_measured,
+          SUM(CASE WHEN lifetime_first_barrier='TP' THEN 1 ELSE 0 END) AS lifetime_tp_first,
+          SUM(CASE WHEN lifetime_first_barrier='SL' THEN 1 ELSE 0 END) AS lifetime_sl_first,
           SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) AS tp_first,
           SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) AS sl_first
         FROM signal_episodes
@@ -4203,6 +4335,10 @@ export default {
             "same coin + same direction remains one episode",
           episode_end:
             "score below 50, direction flip, or 30 minutes",
+          signal_lifetime_outcome:
+            "entry -> episode end; measures only while FINAL_SCORE_ABS stays >=50 in same direction",
+          fixed_horizon_outcome:
+            "entry -> 1/5/15/30m regardless of whether the episode has already closed",
           horizons_minutes: [1, 5, 15, 30],
           tp_pct: PAPER_TP_PCT,
           sl_pct: PAPER_SL_PCT,
