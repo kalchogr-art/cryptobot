@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.4.1 DYNAMIC OI WEIGHT";
+const VERSION = "V1.5 PAPER TRADING ENGINE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1346,6 +1346,465 @@ async function buildHistoryContext(
 }
 
 
+
+// ============================================================
+// V1.5 PAPER TRADING ENGINE
+// SIMULATION ONLY — NO ORDERS / NO WALLET / NO REAL MONEY
+// ============================================================
+
+const PAPER_ENTRY_SCORE = 65;
+const PAPER_MIN_SCORE_GAP = 20;
+const PAPER_TP_PCT = 0.35;
+const PAPER_SL_PCT = 0.25;
+const PAPER_MAX_HOLD_MINUTES = 30;
+const PAPER_FEE_RATE_PER_SIDE = 0.00035;
+const PAPER_NOTIONAL_USD = 100;
+
+async function ensurePaperTables(env: Env): Promise<void> {
+  if (!env.DB) return;
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS paper_trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      entry_ts INTEGER NOT NULL,
+      entry_datetime TEXT NOT NULL,
+      entry_price REAL NOT NULL,
+      entry_score REAL NOT NULL,
+      entry_market_status TEXT,
+      chart_signed REAL,
+      order_flow_raw_signed REAL,
+      order_flow_persistent_signed REAL,
+      oi_change_signed REAL,
+      funding_premium_signed REAL,
+      history_mode TEXT,
+      news_signed REAL,
+      final_signed REAL,
+      tp_price REAL NOT NULL,
+      sl_price REAL NOT NULL,
+      max_hold_minutes INTEGER NOT NULL,
+      exit_ts INTEGER,
+      exit_datetime TEXT,
+      exit_price REAL,
+      exit_reason TEXT,
+      gross_return_pct REAL,
+      fee_pct REAL,
+      net_return_pct REAL,
+      pnl_usd REAL,
+      mfe_pct REAL NOT NULL DEFAULT 0,
+      mae_pct REAL NOT NULL DEFAULT 0,
+      max_price REAL,
+      min_price REAL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_paper_trades_status_coin
+    ON paper_trades (status, coin, entry_ts DESC)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_ts
+    ON paper_trades (entry_ts DESC)
+  `).run();
+}
+
+function paperReturnPct(
+  side: string,
+  entry: number,
+  current: number
+): number {
+  if (!entry) return 0;
+  const raw = ((current - entry) / entry) * 100;
+  return side === "SHORT" ? -raw : raw;
+}
+
+function paperLevels(side: string, price: number) {
+  if (side === "SHORT") {
+    return {
+      tp: price * (1 - PAPER_TP_PCT / 100),
+      sl: price * (1 + PAPER_SL_PCT / 100),
+    };
+  }
+  return {
+    tp: price * (1 + PAPER_TP_PCT / 100),
+    sl: price * (1 - PAPER_SL_PCT / 100),
+  };
+}
+
+async function getOpenPaperTrade(
+  env: Env,
+  coin: string
+): Promise<any | null> {
+  if (!env.DB) return null;
+  await ensurePaperTables(env);
+
+  const row = await env.DB.prepare(`
+    SELECT *
+    FROM paper_trades
+    WHERE coin = ? AND status = 'OPEN'
+    ORDER BY entry_ts DESC
+    LIMIT 1
+  `).bind(coin).first();
+
+  return row ?? null;
+}
+
+async function openPaperTrade(
+  env: Env,
+  signal: any,
+  finalSignal?: any
+): Promise<any> {
+  await ensurePaperTables(env);
+
+  const existing = await getOpenPaperTrade(env, signal.coin);
+  if (existing) {
+    return {
+      opened: false,
+      reason: "OPEN_TRADE_ALREADY_EXISTS",
+      trade_id: existing.id,
+    };
+  }
+
+  const marketSigned = Number(signal.market?.signed_score ?? 0);
+  const finalSigned = Number(
+    finalSignal?.final?.signed_score ?? marketSigned
+  );
+
+  const score = Math.abs(finalSigned);
+  const side = finalSigned >= 0 ? "LONG" : "SHORT";
+
+  if (score < PAPER_ENTRY_SCORE) {
+    return {
+      opened: false,
+      reason: "SCORE_BELOW_ENTRY_THRESHOLD",
+      score: round(score),
+      required: PAPER_ENTRY_SCORE,
+    };
+  }
+
+  if (
+    Math.abs(
+      Number(signal.market?.difference ?? finalSigned)
+    ) < PAPER_MIN_SCORE_GAP
+  ) {
+    return {
+      opened: false,
+      reason: "SCORE_GAP_TOO_SMALL",
+      required_gap: PAPER_MIN_SCORE_GAP,
+    };
+  }
+
+  const price = Number(signal.price ?? 0);
+  if (!Number.isFinite(price) || price <= 0) {
+    return {
+      opened: false,
+      reason: "INVALID_ENTRY_PRICE",
+    };
+  }
+
+  const levels = paperLevels(side, price);
+  const now = Date.now();
+
+  const result = await env.DB.prepare(`
+    INSERT INTO paper_trades (
+      coin, side, status,
+      entry_ts, entry_datetime, entry_price,
+      entry_score, entry_market_status,
+      chart_signed,
+      order_flow_raw_signed,
+      order_flow_persistent_signed,
+      oi_change_signed,
+      funding_premium_signed,
+      history_mode,
+      news_signed,
+      final_signed,
+      tp_price, sl_price,
+      max_hold_minutes,
+      max_price, min_price
+    ) VALUES (
+      ?, ?, 'OPEN',
+      ?, ?, ?,
+      ?, ?,
+      ?, ?, ?, ?, ?, ?,
+      ?, ?,
+      ?, ?, ?,
+      ?, ?
+    )
+  `).bind(
+    signal.coin,
+    side,
+    now,
+    new Date(now).toISOString(),
+    price,
+    score,
+    signal.market?.status ?? null,
+    signal.market?.components?.chart_signed ?? null,
+    signal.market?.components?.order_flow_raw_signed ?? null,
+    signal.market?.components?.order_flow_persistent_signed ?? null,
+    signal.market?.components?.oi_change_signed ?? null,
+    signal.market?.components?.funding_premium_signed ?? null,
+    signal.market?.weights?.mode ?? null,
+    finalSignal?.news?.signed_score ?? null,
+    finalSigned,
+    levels.tp,
+    levels.sl,
+    PAPER_MAX_HOLD_MINUTES,
+    price,
+    price
+  ).run();
+
+  return {
+    opened: true,
+    trade_id:
+      result?.meta?.last_row_id ??
+      result?.meta?.lastRowId ??
+      null,
+    coin: signal.coin,
+    side,
+    entry_price: round(price),
+    score: round(score),
+    tp_price: round(levels.tp),
+    sl_price: round(levels.sl),
+    max_hold_minutes: PAPER_MAX_HOLD_MINUTES,
+  };
+}
+
+async function updatePaperTrade(
+  env: Env,
+  trade: any,
+  currentPrice: number
+): Promise<any> {
+  const now = Date.now();
+  const side = String(trade.side);
+  const entry = Number(trade.entry_price);
+  const currentReturn = paperReturnPct(
+    side,
+    entry,
+    currentPrice
+  );
+
+  const oldMfe = Number(trade.mfe_pct ?? 0);
+  const oldMae = Number(trade.mae_pct ?? 0);
+
+  const mfe = Math.max(oldMfe, currentReturn);
+  const mae = Math.min(oldMae, currentReturn);
+
+  const maxPrice = Math.max(
+    Number(trade.max_price ?? entry),
+    currentPrice
+  );
+  const minPrice = Math.min(
+    Number(trade.min_price ?? entry),
+    currentPrice
+  );
+
+  const ageMinutes =
+    (now - Number(trade.entry_ts)) / 60_000;
+
+  let exitReason: string | null = null;
+
+  if (side === "LONG") {
+    if (currentPrice >= Number(trade.tp_price)) {
+      exitReason = "TAKE_PROFIT";
+    } else if (currentPrice <= Number(trade.sl_price)) {
+      exitReason = "STOP_LOSS";
+    }
+  } else {
+    if (currentPrice <= Number(trade.tp_price)) {
+      exitReason = "TAKE_PROFIT";
+    } else if (currentPrice >= Number(trade.sl_price)) {
+      exitReason = "STOP_LOSS";
+    }
+  }
+
+  if (
+    !exitReason &&
+    ageMinutes >= Number(trade.max_hold_minutes)
+  ) {
+    exitReason = "TIME_EXIT";
+  }
+
+  if (!exitReason) {
+    await env.DB.prepare(`
+      UPDATE paper_trades
+      SET
+        mfe_pct = ?,
+        mae_pct = ?,
+        max_price = ?,
+        min_price = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status = 'OPEN'
+    `).bind(
+      mfe,
+      mae,
+      maxPrice,
+      minPrice,
+      trade.id
+    ).run();
+
+    return {
+      updated: true,
+      closed: false,
+      trade_id: trade.id,
+      current_return_pct: round(currentReturn, 4),
+      mfe_pct: round(mfe, 4),
+      mae_pct: round(mae, 4),
+      age_minutes: round(ageMinutes, 2),
+    };
+  }
+
+  const gross = currentReturn;
+  const feePct = PAPER_FEE_RATE_PER_SIDE * 2 * 100;
+  const net = gross - feePct;
+  const pnlUsd = PAPER_NOTIONAL_USD * (net / 100);
+
+  await env.DB.prepare(`
+    UPDATE paper_trades
+    SET
+      status = 'CLOSED',
+      exit_ts = ?,
+      exit_datetime = ?,
+      exit_price = ?,
+      exit_reason = ?,
+      gross_return_pct = ?,
+      fee_pct = ?,
+      net_return_pct = ?,
+      pnl_usd = ?,
+      mfe_pct = ?,
+      mae_pct = ?,
+      max_price = ?,
+      min_price = ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'OPEN'
+  `).bind(
+    now,
+    new Date(now).toISOString(),
+    currentPrice,
+    exitReason,
+    gross,
+    feePct,
+    net,
+    pnlUsd,
+    mfe,
+    mae,
+    maxPrice,
+    minPrice,
+    trade.id
+  ).run();
+
+  return {
+    updated: true,
+    closed: true,
+    trade_id: trade.id,
+    exit_reason: exitReason,
+    exit_price: round(currentPrice),
+    gross_return_pct: round(gross, 4),
+    fee_pct: round(feePct, 4),
+    net_return_pct: round(net, 4),
+    pnl_usd: round(pnlUsd, 4),
+    mfe_pct: round(mfe, 4),
+    mae_pct: round(mae, 4),
+  };
+}
+
+async function processPaperCoin(
+  env: Env,
+  signal: any,
+  finalSignal?: any
+): Promise<any> {
+  if (!env.DB) {
+    return {
+      success: false,
+      reason: "D1_NOT_BOUND",
+    };
+  }
+
+  await ensurePaperTables(env);
+
+  const open = await getOpenPaperTrade(env, signal.coin);
+
+  if (open) {
+    return {
+      action: "UPDATE_OPEN",
+      result: await updatePaperTrade(
+        env,
+        open,
+        Number(signal.price)
+      ),
+    };
+  }
+
+  return {
+    action: "CHECK_ENTRY",
+    result: await openPaperTrade(
+      env,
+      signal,
+      finalSignal
+    ),
+  };
+}
+
+async function paperSummary(env: Env) {
+  await ensurePaperTables(env);
+
+  const totals = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open,
+      SUM(CASE WHEN status = 'CLOSED' THEN 1 ELSE 0 END) AS closed,
+      SUM(CASE WHEN status = 'CLOSED' AND net_return_pct > 0 THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN status = 'CLOSED' AND net_return_pct <= 0 THEN 1 ELSE 0 END) AS losses,
+      AVG(CASE WHEN status = 'CLOSED' THEN net_return_pct END) AS avg_net_return_pct,
+      SUM(CASE WHEN status = 'CLOSED' THEN pnl_usd ELSE 0 END) AS pnl_usd,
+      AVG(CASE WHEN status = 'CLOSED' THEN mfe_pct END) AS avg_mfe_pct,
+      AVG(CASE WHEN status = 'CLOSED' THEN mae_pct END) AS avg_mae_pct
+    FROM paper_trades
+  `).first();
+
+  const closed = Number(totals?.closed ?? 0);
+  const wins = Number(totals?.wins ?? 0);
+
+  return {
+    total: Number(totals?.total ?? 0),
+    open: Number(totals?.open ?? 0),
+    closed,
+    wins,
+    losses: Number(totals?.losses ?? 0),
+    win_rate:
+      closed > 0 ? round((wins / closed) * 100, 2) : null,
+    avg_net_return_pct:
+      totals?.avg_net_return_pct == null
+        ? null
+        : round(Number(totals.avg_net_return_pct), 4),
+    pnl_usd: round(Number(totals?.pnl_usd ?? 0), 4),
+    avg_mfe_pct:
+      totals?.avg_mfe_pct == null
+        ? null
+        : round(Number(totals.avg_mfe_pct), 4),
+    avg_mae_pct:
+      totals?.avg_mae_pct == null
+        ? null
+        : round(Number(totals.avg_mae_pct), 4),
+    assumptions: {
+      paper_notional_usd: PAPER_NOTIONAL_USD,
+      entry_score: PAPER_ENTRY_SCORE,
+      min_score_gap: PAPER_MIN_SCORE_GAP,
+      take_profit_pct: PAPER_TP_PCT,
+      stop_loss_pct: PAPER_SL_PCT,
+      max_hold_minutes: PAPER_MAX_HOLD_MINUTES,
+      fee_rate_per_side: PAPER_FEE_RATE_PER_SIDE,
+      fee_pct_round_trip:
+        round(PAPER_FEE_RATE_PER_SIDE * 2 * 100, 4),
+    },
+  };
+}
+
+
 // ============================================================
 // MARKET SIGNAL
 // ============================================================
@@ -2620,7 +3079,8 @@ export default {
           fast_news_engine: true,
           cftc_rss: true,
           stale_news_hard_expiry: true,
-          paper_trading: false,
+          paper_trading: true,
+          real_trading: false,
           real_trading: false,
         },
 
@@ -2640,10 +3100,14 @@ export default {
           final_signals: "/final-signals",
           history: "/history?coin=BTC&minutes=20",
           snapshot_status: "/snapshot-status?coin=BTC",
+          paper_status: "/paper-status",
+          paper_trades: "/paper-trades?status=ALL&limit=50",
+          paper_summary: "/paper-summary",
           debug: "/debug-hyperliquid",
         },
 
         next_version:
+          "V1.5.1 PAPER ANALYTICS + SIGNAL BUCKETS",
           "V1.5 PAPER TRADING ENGINE",
       });
     }
@@ -3066,6 +3530,129 @@ export default {
       }
     }
 
+    // PAPER TRADING — READ ONLY REPORTING
+    if (url.pathname === "/paper-trades") {
+      if (!env.DB) {
+        return json(
+          {
+            success: false,
+            error: "D1_NOT_BOUND",
+            required_binding: "DB",
+          },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const status = (
+        url.searchParams.get("status") ?? "ALL"
+      ).toUpperCase();
+
+      const coin = (
+        url.searchParams.get("coin") ?? ""
+      ).toUpperCase();
+
+      const limit = Math.max(
+        1,
+        Math.min(
+          Number(url.searchParams.get("limit") ?? 50),
+          200
+        )
+      );
+
+      let sql = `
+        SELECT *
+        FROM paper_trades
+        WHERE 1 = 1
+      `;
+      const binds: any[] = [];
+
+      if (status === "OPEN" || status === "CLOSED") {
+        sql += ` AND status = ?`;
+        binds.push(status);
+      }
+
+      if (coin && validCoin(coin)) {
+        sql += ` AND coin = ?`;
+        binds.push(coin);
+      }
+
+      sql += ` ORDER BY entry_ts DESC LIMIT ?`;
+      binds.push(limit);
+
+      const result = await env.DB.prepare(sql)
+        .bind(...binds)
+        .all();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "PAPER_ONLY",
+        filters: {
+          status,
+          coin: coin || null,
+          limit,
+        },
+        total: result?.results?.length ?? 0,
+        trades: result?.results ?? [],
+      });
+    }
+
+    if (url.pathname === "/paper-summary") {
+      if (!env.DB) {
+        return json(
+          {
+            success: false,
+            error: "D1_NOT_BOUND",
+            required_binding: "DB",
+          },
+          503
+        );
+      }
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "PAPER_ONLY",
+        summary: await paperSummary(env),
+      });
+    }
+
+    if (url.pathname === "/paper-status") {
+      if (!env.DB) {
+        return json(
+          {
+            success: false,
+            error: "D1_NOT_BOUND",
+            required_binding: "DB",
+          },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+
+      const open = await env.DB.prepare(`
+        SELECT *
+        FROM paper_trades
+        WHERE status = 'OPEN'
+        ORDER BY entry_ts DESC
+      `).all();
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "PAPER_ONLY",
+        trading: "REAL_TRADING_DISABLED",
+        open_trades: open?.results ?? [],
+        summary: await paperSummary(env),
+      });
+    }
+
     // SNAPSHOT HISTORY
     if (url.pathname === "/history") {
       const coin = (
@@ -3208,12 +3795,21 @@ export default {
         const signal = await buildSignal(coin, env);
         await saveSnapshot(env, signal);
 
+        // V1.5 PAPER ONLY:
+        // update an existing simulated position or open a new
+        // simulated position if the market score qualifies.
+        const paper = await processPaperCoin(
+          env,
+          signal
+        );
+
         return {
           coin,
           price: signal.price,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
+          paper,
         };
       })
     );
