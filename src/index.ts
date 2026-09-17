@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.5 FORCE CLOSED BACKFILL";
+const VERSION = "V1.6.6 EPISODE CANDIDATES DIAGNOSTIC";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -3778,6 +3778,7 @@ export default {
           paper_observations: "/paper-observations?limit=100",
           episodes: "/episodes?limit=50",
           episode_analytics: "/episode-analytics",
+          episode_candidates: "/episode-candidates",
           debug: "/debug-hyperliquid",
         },
 
@@ -4197,6 +4198,171 @@ export default {
           {
             success: false,
             error: "ALL_FINAL_SIGNALS_FAILED",
+            message: error?.message ?? String(error),
+          },
+          500
+        );
+      }
+    }
+
+    // V1.6.6 EPISODE CANDIDATES DIAGNOSTIC
+    // Shows why each tracked coin is or is not creating an episode.
+    // READ ONLY: does not create/close episodes or paper trades.
+    if (url.pathname === "/episode-candidates") {
+      if (!env.DB) {
+        return json(
+          { success: false, error: "D1_NOT_BOUND" },
+          503
+        );
+      }
+
+      await ensurePaperTables(env);
+      const started = Date.now();
+
+      try {
+        // One news load reused across all five coins, matching /final-signals.
+        const newsData = await buildNewsOnly(env);
+        const finalSignals = await Promise.all(
+          TRACKED_COINS.map((coin) =>
+            buildFinalSignal(coin, env, newsData)
+          )
+        );
+
+        const candidates: any[] = [];
+
+        for (let i = 0; i < TRACKED_COINS.length; i++) {
+          const coin = TRACKED_COINS[i];
+          const fs: any = finalSignals[i];
+          const signed = Number(fs?.final?.signed_score ?? 0);
+          const absScore = Math.abs(signed);
+          const side = signed >= 0 ? "LONG" : "SHORT";
+
+          const activeEpisode: any = await env.DB.prepare(`
+            SELECT *
+            FROM signal_episodes
+            WHERE coin = ? AND status = 'ACTIVE'
+            ORDER BY start_ts DESC
+            LIMIT 1
+          `).bind(coin).first();
+
+          const lastEpisode: any = await env.DB.prepare(`
+            SELECT *
+            FROM signal_episodes
+            WHERE coin = ?
+            ORDER BY start_ts DESC
+            LIMIT 1
+          `).bind(coin).first();
+
+          const lastObservation: any = await env.DB.prepare(`
+            SELECT *
+            FROM paper_signal_observations
+            WHERE coin = ?
+            ORDER BY ts DESC
+            LIMIT 1
+          `).bind(coin).first();
+
+          const lastSnapshot: any = await env.DB.prepare(`
+            SELECT *
+            FROM market_snapshots
+            WHERE coin = ?
+            ORDER BY ts DESC
+            LIMIT 1
+          `).bind(coin).first();
+
+          let episodeAction = "NO_EPISODE";
+          let reason = "BELOW_50";
+
+          if (activeEpisode) {
+            const ageMin =
+              (Date.now() - Number(activeEpisode.start_ts)) / 60000;
+
+            if (absScore < PAPER_OBSERVATION_MIN_SCORE) {
+              episodeAction = "WOULD_CLOSE_ACTIVE";
+              reason = "SCORE_BELOW_50";
+            } else if (String(activeEpisode.side) !== side) {
+              episodeAction = "WOULD_CLOSE_AND_FLIP";
+              reason = "DIRECTION_FLIP";
+            } else if (ageMin >= 30) {
+              episodeAction = "WOULD_CLOSE_ACTIVE";
+              reason = "MAX_30M";
+            } else {
+              episodeAction = "EPISODE_CONTINUES";
+              reason = "ACTIVE_SAME_DIRECTION";
+            }
+          } else if (absScore >= PAPER_OBSERVATION_MIN_SCORE) {
+            episodeAction = "WOULD_START_EPISODE";
+            reason = "SCORE_AT_OR_ABOVE_50";
+          }
+
+          candidates.push({
+            coin,
+            price: fs?.price ?? null,
+            current_final_score: round(signed),
+            side,
+            abs_score: round(absScore),
+            episode_threshold: PAPER_OBSERVATION_MIN_SCORE,
+            episode_eligible: absScore >= PAPER_OBSERVATION_MIN_SCORE,
+            paper_entry_threshold: PAPER_ENTRY_SCORE,
+            paper_entry_eligible: absScore >= PAPER_ENTRY_SCORE,
+            episode_action_now: episodeAction,
+            reason,
+            history_mode:
+              fs?.market?.weights?.mode ?? null,
+            market_signed:
+              fs?.market?.signed_score ?? null,
+            news_signed:
+              fs?.news_x?.signed_score ?? null,
+            components: {
+              chart_signed:
+                fs?.market?.components?.chart_signed ?? null,
+              order_flow_persistent_signed:
+                fs?.market?.components?.order_flow_persistent_signed ?? null,
+              oi_change_signed:
+                fs?.market?.components?.oi_change_signed ?? null,
+              funding_premium_signed:
+                fs?.market?.components?.funding_premium_signed ?? null,
+            },
+            current_episode: activeEpisode ?? null,
+            last_episode: lastEpisode ?? null,
+            last_raw_observation: lastObservation ?? null,
+            last_snapshot: lastSnapshot ?? null,
+          });
+        }
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          mode: "EPISODE_CANDIDATES_DIAGNOSTIC",
+          trading: "REAL_TRADING_DISABLED",
+          read_only: true,
+          timestamp: Date.now(),
+          processing_ms: Date.now() - started,
+          thresholds: {
+            episode_abs_score: PAPER_OBSERVATION_MIN_SCORE,
+            paper_entry_abs_score: PAPER_ENTRY_SCORE,
+          },
+          summary: {
+            tracked: candidates.length,
+            episode_eligible_now: candidates.filter(
+              (x) => x.episode_eligible
+            ).length,
+            active_episodes: candidates.filter(
+              (x) => x.current_episode !== null
+            ).length,
+            coins_with_any_episode: candidates.filter(
+              (x) => x.last_episode !== null
+            ).length,
+          },
+          candidates,
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            worker: "cryptobot",
+            version: VERSION,
+            error: "EPISODE_CANDIDATES_DIAGNOSTIC_FAILED",
             message: error?.message ?? String(error),
           },
           500
