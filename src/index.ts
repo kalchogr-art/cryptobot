@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.7 EPISODE HARD 30M CAP";
+const VERSION = "V1.6.8 LEGACY 30M REPAIR";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -3729,6 +3729,201 @@ async function debugHyperliquid() {
 // WORKER
 // ============================================================
 
+
+// ============================================================
+// V1.6.8 LEGACY 30M REPAIR
+// Repairs historical CLOSED episodes whose stored signal lifetime
+// exceeded the hard 30-minute episode cap. This is research/data
+// cleanup only; it does not change scoring or trading thresholds.
+// ============================================================
+async function repairLegacyOver30mEpisodes(
+  env: Env,
+  requestedCoin: string | null = null,
+  limit = 100
+): Promise<any> {
+  if (!env.DB) {
+    return {
+      success: false,
+      error: "D1_NOT_BOUND",
+      legacy_found: 0,
+      repaired: 0,
+      failed: 0,
+      diagnostics: [],
+    };
+  }
+
+  await ensurePaperTables(env);
+
+  const sql = requestedCoin
+    ? `
+      SELECT *
+      FROM signal_episodes
+      WHERE status = 'CLOSED'
+        AND coin = ?
+        AND (
+          signal_lifetime_minutes > 30
+          OR (end_ts IS NOT NULL AND end_ts - start_ts > 1800000)
+        )
+      ORDER BY start_ts ASC
+      LIMIT ?
+    `
+    : `
+      SELECT *
+      FROM signal_episodes
+      WHERE status = 'CLOSED'
+        AND (
+          signal_lifetime_minutes > 30
+          OR (end_ts IS NOT NULL AND end_ts - start_ts > 1800000)
+        )
+      ORDER BY start_ts ASC
+      LIMIT ?
+    `;
+
+  const rows: any = requestedCoin
+    ? await env.DB.prepare(sql).bind(requestedCoin, limit).all()
+    : await env.DB.prepare(sql).bind(limit).all();
+
+  const legacy: any[] = rows?.results ?? [];
+  const diagnostics: any[] = [];
+  let repaired = 0;
+  let failed = 0;
+
+  for (const ep of legacy) {
+    try {
+      const startTs = Number(ep.start_ts);
+      const targetTs = startTs + 30 * 60000;
+
+      // Prefer the nearest stored snapshot to the exact 30m boundary.
+      const capSnapshot: any = await env.DB.prepare(`
+        SELECT ts, price
+        FROM market_snapshots
+        WHERE coin = ?
+        ORDER BY ABS(ts - ?) ASC
+        LIMIT 1
+      `).bind(ep.coin, targetTs).first();
+
+      if (
+        !capSnapshot ||
+        !Number.isFinite(Number(capSnapshot.ts)) ||
+        !Number.isFinite(Number(capSnapshot.price))
+      ) {
+        failed += 1;
+        diagnostics.push({
+          id: ep.id,
+          coin: ep.coin,
+          success: false,
+          reason: "NO_SNAPSHOT_FOR_30M_REPAIR",
+          old_lifetime_minutes: ep.signal_lifetime_minutes,
+          target_ts: targetTs,
+        });
+        continue;
+      }
+
+      const closeTs = Number(capSnapshot.ts);
+      const closePrice = Number(capSnapshot.price);
+      const syntheticEpisode = {
+        ...ep,
+        end_ts: closeTs,
+        end_datetime: new Date(closeTs).toISOString(),
+        end_price: closePrice,
+        end_reason: "MAX_30M",
+      };
+
+      const lifetime = await computeSignalLifetimeOutcome(
+        env,
+        syntheticEpisode
+      );
+
+      if (!lifetime) {
+        failed += 1;
+        diagnostics.push({
+          id: ep.id,
+          coin: ep.coin,
+          success: false,
+          reason: "LIFETIME_RECALCULATION_FAILED",
+          target_ts: targetTs,
+          snapshot_ts: closeTs,
+        });
+        continue;
+      }
+
+      const write: any = await env.DB.prepare(`
+        UPDATE signal_episodes
+        SET
+          end_ts = ?,
+          end_datetime = ?,
+          end_price = ?,
+          end_reason = 'MAX_30M',
+          signal_lifetime_minutes = ?,
+          lifetime_return_pct = ?,
+          lifetime_mfe_pct = ?,
+          lifetime_mae_pct = ?,
+          lifetime_tp_hit = ?,
+          lifetime_sl_hit = ?,
+          lifetime_first_barrier = ?,
+          lifetime_first_barrier_ts = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND status = 'CLOSED'
+      `).bind(
+        closeTs,
+        new Date(closeTs).toISOString(),
+        closePrice,
+        lifetime.signal_lifetime_minutes,
+        lifetime.lifetime_return_pct,
+        lifetime.lifetime_mfe_pct,
+        lifetime.lifetime_mae_pct,
+        lifetime.lifetime_tp_hit,
+        lifetime.lifetime_sl_hit,
+        lifetime.lifetime_first_barrier,
+        lifetime.lifetime_first_barrier_ts,
+        ep.id
+      ).run();
+
+      repaired += 1;
+      diagnostics.push({
+        id: ep.id,
+        coin: ep.coin,
+        side: ep.side,
+        success: true,
+        old: {
+          end_ts: ep.end_ts,
+          end_datetime: ep.end_datetime,
+          end_price: ep.end_price,
+          end_reason: ep.end_reason,
+          signal_lifetime_minutes: ep.signal_lifetime_minutes,
+        },
+        repaired: {
+          target_30m_ts: targetTs,
+          snapshot_ts: closeTs,
+          snapshot_distance_seconds: round(Math.abs(closeTs - targetTs) / 1000),
+          end_datetime: new Date(closeTs).toISOString(),
+          end_price: closePrice,
+          end_reason: "MAX_30M",
+          ...lifetime,
+        },
+        d1_changes: write?.meta?.changes ?? null,
+      });
+    } catch (error: any) {
+      failed += 1;
+      diagnostics.push({
+        id: ep.id,
+        coin: ep.coin,
+        success: false,
+        error: error?.message ?? String(error),
+      });
+    }
+  }
+
+  return {
+    success: failed === 0,
+    legacy_found: legacy.length,
+    repaired,
+    failed,
+    diagnostics,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -4599,6 +4794,45 @@ export default {
       });
     }
 
+    // V1.6.8 LEGACY REPAIR — manually repair historical episodes >30m.
+    if (url.pathname === "/episode-legacy-repair") {
+      if (!env.DB) {
+        return json({ success: false, error: "D1_NOT_BOUND" }, 503);
+      }
+
+      const requestedCoinRaw = String(
+        url.searchParams.get("coin") ?? ""
+      ).trim().toUpperCase();
+      const requestedCoin = requestedCoinRaw || null;
+
+      if (requestedCoin && !validCoin(requestedCoin)) {
+        return json(
+          { success: false, error: "INVALID_COIN", allowed: TRACKED_COINS },
+          400
+        );
+      }
+
+      const limit = Math.max(
+        1,
+        Math.min(Number(url.searchParams.get("limit") ?? 100), 500)
+      );
+
+      const result = await repairLegacyOver30mEpisodes(
+        env,
+        requestedCoin,
+        limit
+      );
+
+      return json({
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "LEGACY_30M_REPAIR",
+        trading: "REAL_TRADING_DISABLED",
+        requested_coin: requestedCoin ?? "ALL",
+        ...result,
+      });
+    }
+
     // V1.6 DEDUPLICATED SIGNAL EPISODES
     if (url.pathname === "/episodes") {
       if (!env.DB) {
@@ -5220,6 +5454,17 @@ export default {
     }
 
     await ensureSnapshotTable(env);
+
+    // V1.6.8: idempotent legacy cleanup. Once repaired to <=30m, a row
+    // no longer matches and will not be touched again.
+    try {
+      await repairLegacyOver30mEpisodes(env, null, 100);
+    } catch (error: any) {
+      console.log(
+        "V1.6.8 legacy repair failed:",
+        error?.message ?? String(error)
+      );
+    }
 
     // Fetch news once per cron run, not once per coin.
     // A feed failure must not stop market snapshots/paper tracking.
