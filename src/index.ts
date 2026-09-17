@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.8 LEGACY 30M REPAIR";
+const VERSION = "V1.6.9 SAFE LEGACY REPAIR";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -3731,7 +3731,7 @@ async function debugHyperliquid() {
 
 
 // ============================================================
-// V1.6.8 LEGACY 30M REPAIR
+// V1.6.9 SAFE LEGACY REPAIR
 // Repairs historical CLOSED episodes whose stored signal lifetime
 // exceeded the hard 30-minute episode cap. This is research/data
 // cleanup only; it does not change scoring or trading thresholds.
@@ -3741,187 +3741,76 @@ async function repairLegacyOver30mEpisodes(
   requestedCoin: string | null = null,
   limit = 100
 ): Promise<any> {
-  if (!env.DB) {
-    return {
-      success: false,
-      error: "D1_NOT_BOUND",
-      legacy_found: 0,
-      repaired: 0,
-      failed: 0,
-      diagnostics: [],
-    };
-  }
+  if (!env.DB) return { success:false, error:"D1_NOT_BOUND", legacy_found:0, repaired:0, unrecoverable:0, failed:0, diagnostics:[] };
 
   await ensurePaperTables(env);
-
-  const sql = requestedCoin
-    ? `
-      SELECT *
-      FROM signal_episodes
-      WHERE status = 'CLOSED'
-        AND coin = ?
-        AND (
-          signal_lifetime_minutes > 30
-          OR (end_ts IS NOT NULL AND end_ts - start_ts > 1800000)
-        )
-      ORDER BY start_ts ASC
-      LIMIT ?
-    `
-    : `
-      SELECT *
-      FROM signal_episodes
-      WHERE status = 'CLOSED'
-        AND (
-          signal_lifetime_minutes > 30
-          OR (end_ts IS NOT NULL AND end_ts - start_ts > 1800000)
-        )
-      ORDER BY start_ts ASC
-      LIMIT ?
-    `;
-
-  const rows: any = requestedCoin
+  const where = requestedCoin
+    ? `status='CLOSED' AND coin=? AND (signal_lifetime_minutes > 30 OR (end_ts IS NOT NULL AND end_ts-start_ts > 1800000) OR (end_reason='MAX_30M' AND (end_ts IS NULL OR end_ts < start_ts OR signal_lifetime_minutes < 0)))`
+    : `status='CLOSED' AND (signal_lifetime_minutes > 30 OR (end_ts IS NOT NULL AND end_ts-start_ts > 1800000) OR (end_reason='MAX_30M' AND (end_ts IS NULL OR end_ts < start_ts OR signal_lifetime_minutes < 0)))`;
+  const sql = `SELECT * FROM signal_episodes WHERE ${where} ORDER BY start_ts ASC LIMIT ?`;
+  const rows:any = requestedCoin
     ? await env.DB.prepare(sql).bind(requestedCoin, limit).all()
     : await env.DB.prepare(sql).bind(limit).all();
-
-  const legacy: any[] = rows?.results ?? [];
-  const diagnostics: any[] = [];
-  let repaired = 0;
-  let failed = 0;
+  const legacy:any[] = rows?.results ?? [];
+  const diagnostics:any[] = [];
+  let repaired=0, unrecoverable=0, failed=0;
+  const MAX_DISTANCE_MS = 90 * 1000; // must be genuinely near +30m
 
   for (const ep of legacy) {
     try {
-      const startTs = Number(ep.start_ts);
-      const targetTs = startTs + 30 * 60000;
+      const startTs=Number(ep.start_ts);
+      const targetTs=startTs + 30*60000;
+      const snap:any = await env.DB.prepare(`
+        SELECT ts, price FROM market_snapshots
+        WHERE coin=? AND ts>=? AND ts<=?
+        ORDER BY ABS(ts-?) ASC LIMIT 1
+      `).bind(ep.coin, targetTs-MAX_DISTANCE_MS, targetTs+MAX_DISTANCE_MS, targetTs).first();
 
-      // Prefer the nearest stored snapshot to the exact 30m boundary.
-      const capSnapshot: any = await env.DB.prepare(`
-        SELECT ts, price
-        FROM market_snapshots
-        WHERE coin = ?
-        ORDER BY ABS(ts - ?) ASC
-        LIMIT 1
-      `).bind(ep.coin, targetTs).first();
+      const snapTs = snap ? Number(snap.ts) : NaN;
+      const snapPrice = snap ? Number(snap.price) : NaN;
+      const valid = Number.isFinite(snapTs) && Number.isFinite(snapPrice) && snapTs >= startTs && Math.abs(snapTs-targetTs) <= MAX_DISTANCE_MS;
 
-      if (
-        !capSnapshot ||
-        !Number.isFinite(Number(capSnapshot.ts)) ||
-        !Number.isFinite(Number(capSnapshot.price))
-      ) {
-        failed += 1;
-        diagnostics.push({
-          id: ep.id,
-          coin: ep.coin,
-          success: false,
-          reason: "NO_SNAPSHOT_FOR_30M_REPAIR",
-          old_lifetime_minutes: ep.signal_lifetime_minutes,
-          target_ts: targetTs,
-        });
+      if (!valid) {
+        // Do not invent a 30m close. Quarantine corrupted/overlong legacy row
+        // from lifetime research while preserving its start and fixed-horizon fields.
+        await env.DB.prepare(`UPDATE signal_episodes SET
+          end_ts=NULL, end_datetime=NULL, end_price=NULL,
+          end_reason='LEGACY_30M_UNRECOVERABLE',
+          signal_lifetime_minutes=NULL, lifetime_return_pct=NULL,
+          lifetime_mfe_pct=NULL, lifetime_mae_pct=NULL,
+          lifetime_tp_hit=0, lifetime_sl_hit=0,
+          lifetime_first_barrier=NULL, lifetime_first_barrier_ts=NULL,
+          updated_at=CURRENT_TIMESTAMP
+          WHERE id=? AND status='CLOSED'`).bind(ep.id).run();
+        unrecoverable++;
+        diagnostics.push({id:ep.id,coin:ep.coin,success:false,quarantined:true,reason:'NO_SNAPSHOT_WITHIN_90S_OF_30M',target_ts:targetTs,target_datetime:new Date(targetTs).toISOString()});
         continue;
       }
 
-      const closeTs = Number(capSnapshot.ts);
-      const closePrice = Number(capSnapshot.price);
-      const syntheticEpisode = {
-        ...ep,
-        end_ts: closeTs,
-        end_datetime: new Date(closeTs).toISOString(),
-        end_price: closePrice,
-        end_reason: "MAX_30M",
-      };
-
-      const lifetime = await computeSignalLifetimeOutcome(
-        env,
-        syntheticEpisode
-      );
-
-      if (!lifetime) {
-        failed += 1;
-        diagnostics.push({
-          id: ep.id,
-          coin: ep.coin,
-          success: false,
-          reason: "LIFETIME_RECALCULATION_FAILED",
-          target_ts: targetTs,
-          snapshot_ts: closeTs,
-        });
+      const synthetic={...ep,end_ts:snapTs,end_datetime:new Date(snapTs).toISOString(),end_price:snapPrice,end_reason:'MAX_30M'};
+      const lifetime=await computeSignalLifetimeOutcome(env, synthetic);
+      if (!lifetime || Number(lifetime.signal_lifetime_minutes) < 0 || Number(lifetime.signal_lifetime_minutes) > 31.5) {
+        failed++;
+        diagnostics.push({id:ep.id,coin:ep.coin,success:false,reason:'SAFE_LIFETIME_VALIDATION_FAILED'});
         continue;
       }
-
-      const write: any = await env.DB.prepare(`
-        UPDATE signal_episodes
-        SET
-          end_ts = ?,
-          end_datetime = ?,
-          end_price = ?,
-          end_reason = 'MAX_30M',
-          signal_lifetime_minutes = ?,
-          lifetime_return_pct = ?,
-          lifetime_mfe_pct = ?,
-          lifetime_mae_pct = ?,
-          lifetime_tp_hit = ?,
-          lifetime_sl_hit = ?,
-          lifetime_first_barrier = ?,
-          lifetime_first_barrier_ts = ?,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-          AND status = 'CLOSED'
-      `).bind(
-        closeTs,
-        new Date(closeTs).toISOString(),
-        closePrice,
-        lifetime.signal_lifetime_minutes,
-        lifetime.lifetime_return_pct,
-        lifetime.lifetime_mfe_pct,
-        lifetime.lifetime_mae_pct,
-        lifetime.lifetime_tp_hit,
-        lifetime.lifetime_sl_hit,
-        lifetime.lifetime_first_barrier,
-        lifetime.lifetime_first_barrier_ts,
-        ep.id
-      ).run();
-
-      repaired += 1;
-      diagnostics.push({
-        id: ep.id,
-        coin: ep.coin,
-        side: ep.side,
-        success: true,
-        old: {
-          end_ts: ep.end_ts,
-          end_datetime: ep.end_datetime,
-          end_price: ep.end_price,
-          end_reason: ep.end_reason,
-          signal_lifetime_minutes: ep.signal_lifetime_minutes,
-        },
-        repaired: {
-          target_30m_ts: targetTs,
-          snapshot_ts: closeTs,
-          snapshot_distance_seconds: round(Math.abs(closeTs - targetTs) / 1000),
-          end_datetime: new Date(closeTs).toISOString(),
-          end_price: closePrice,
-          end_reason: "MAX_30M",
-          ...lifetime,
-        },
-        d1_changes: write?.meta?.changes ?? null,
-      });
-    } catch (error: any) {
-      failed += 1;
-      diagnostics.push({
-        id: ep.id,
-        coin: ep.coin,
-        success: false,
-        error: error?.message ?? String(error),
-      });
+      await env.DB.prepare(`UPDATE signal_episodes SET
+        end_ts=?, end_datetime=?, end_price=?, end_reason='MAX_30M',
+        signal_lifetime_minutes=?, lifetime_return_pct=?, lifetime_mfe_pct=?, lifetime_mae_pct=?,
+        lifetime_tp_hit=?, lifetime_sl_hit=?, lifetime_first_barrier=?, lifetime_first_barrier_ts=?,
+        updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='CLOSED'`).bind(
+          snapTs,new Date(snapTs).toISOString(),snapPrice,
+          lifetime.signal_lifetime_minutes,lifetime.lifetime_return_pct,lifetime.lifetime_mfe_pct,lifetime.lifetime_mae_pct,
+          lifetime.lifetime_tp_hit,lifetime.lifetime_sl_hit,lifetime.lifetime_first_barrier,lifetime.lifetime_first_barrier_ts,ep.id
+        ).run();
+      repaired++;
+      diagnostics.push({id:ep.id,coin:ep.coin,success:true,target_30m_ts:targetTs,snapshot_ts:snapTs,snapshot_distance_seconds:round(Math.abs(snapTs-targetTs)/1000),signal_lifetime_minutes:lifetime.signal_lifetime_minutes});
+    } catch(error:any) {
+      failed++;
+      diagnostics.push({id:ep.id,coin:ep.coin,success:false,error:error?.message ?? String(error)});
     }
   }
-
-  return {
-    success: failed === 0,
-    legacy_found: legacy.length,
-    repaired,
-    failed,
-    diagnostics,
-  };
+  return {success:failed===0,legacy_found:legacy.length,repaired,unrecoverable,failed,diagnostics};
 }
 
 export default {
@@ -5455,13 +5344,13 @@ export default {
 
     await ensureSnapshotTable(env);
 
-    // V1.6.8: idempotent legacy cleanup. Once repaired to <=30m, a row
+    // V1.6.9: safe idempotent legacy cleanup. Once repaired to <=30m, a row
     // no longer matches and will not be touched again.
     try {
       await repairLegacyOver30mEpisodes(env, null, 100);
     } catch (error: any) {
       console.log(
-        "V1.6.8 legacy repair failed:",
+        "V1.6.9 safe legacy repair failed:",
         error?.message ?? String(error)
       );
     }
