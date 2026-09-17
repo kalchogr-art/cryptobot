@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.6 EPISODE CANDIDATES DIAGNOSTIC";
+const VERSION = "V1.6.7 EPISODE HARD 30M CAP";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1951,6 +1951,34 @@ async function processSignalEpisode(
     }
 
     if (endReason) {
+      // V1.6.7 HARD CAP FIX:
+      // If an episode is discovered after its 30-minute deadline, close it
+      // at the stored market snapshot nearest start_ts + 30m instead of
+      // incorrectly using the much later current price/time.
+      let closeTs = now;
+      let closePrice = price;
+
+      if (ageMin >= 30) {
+        endReason = "MAX_30M";
+        const targetTs = Number(active.start_ts) + 30 * 60000;
+        const capSnapshot: any = await env.DB!.prepare(`
+          SELECT ts, price
+          FROM market_snapshots
+          WHERE coin = ?
+          ORDER BY ABS(ts - ?) ASC
+          LIMIT 1
+        `).bind(signal.coin, targetTs).first();
+
+        if (capSnapshot && Number.isFinite(Number(capSnapshot.ts)) && Number.isFinite(Number(capSnapshot.price))) {
+          closeTs = Number(capSnapshot.ts);
+          closePrice = Number(capSnapshot.price);
+        } else {
+          // Never record a lifetime beyond 30m even if historical snapshots
+          // are unavailable. Price falls back to current, timestamp stays capped.
+          closeTs = targetTs;
+        }
+      }
+
       await env.DB!.prepare(`
         UPDATE signal_episodes
         SET
@@ -1962,9 +1990,9 @@ async function processSignalEpisode(
           updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).bind(
-        now,
-        new Date(now).toISOString(),
-        price,
+        closeTs,
+        new Date(closeTs).toISOString(),
+        closePrice,
         endReason,
         active.id
       ).run();
