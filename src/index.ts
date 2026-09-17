@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.9 SAFE LEGACY REPAIR";
+const VERSION = "V1.6.10 REPAIR DIAGNOSTIC";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -4683,7 +4683,84 @@ export default {
       });
     }
 
-    // V1.6.8 LEGACY REPAIR — manually repair historical episodes >30m.
+    // V1.6.10 REPAIR DIAGNOSTIC — read-only inspection of legacy rows #4/#5.
+    // No database mutations are performed by this endpoint.
+    if (url.pathname === "/episode-repair-diagnostic") {
+      if (!env.DB) {
+        return json({ success: false, error: "D1_NOT_BOUND" }, 503);
+      }
+
+      await ensurePaperTables(env);
+
+      const result: any = await env.DB.prepare(`
+        SELECT * FROM signal_episodes
+        WHERE id IN (4,5)
+        ORDER BY id ASC
+      `).all();
+
+      const rows: any[] = result?.results ?? [];
+      const diagnostics = rows.map((ep: any) => {
+        const startTs = Number(ep.start_ts);
+        const endTs = ep.end_ts == null ? null : Number(ep.end_ts);
+        const lifetime = ep.signal_lifetime_minutes == null
+          ? null
+          : Number(ep.signal_lifetime_minutes);
+        const endReason = ep.end_reason == null ? null : String(ep.end_reason);
+
+        const checks = {
+          status_closed: String(ep.status) === "CLOSED",
+          lifetime_over_30: Number.isFinite(lifetime as number) && (lifetime as number) > 30,
+          stored_duration_over_30: Number.isFinite(startTs) && Number.isFinite(endTs as number) && ((endTs as number) - startTs) > 1800000,
+          end_before_start: Number.isFinite(startTs) && Number.isFinite(endTs as number) && (endTs as number) < startTs,
+          lifetime_negative: Number.isFinite(lifetime as number) && (lifetime as number) < 0,
+          end_reason_max_30m: endReason === "MAX_30M",
+          end_reason_unrecoverable: endReason === "LEGACY_30M_UNRECOVERABLE",
+        };
+
+        const matches_v169_selector =
+          checks.status_closed && (
+            checks.lifetime_over_30 ||
+            checks.stored_duration_over_30 ||
+            (checks.end_reason_max_30m && (
+              ep.end_ts == null ||
+              checks.end_before_start ||
+              checks.lifetime_negative
+            ))
+          );
+
+        return {
+          id: ep.id,
+          coin: ep.coin,
+          side: ep.side,
+          status: ep.status,
+          start_ts: ep.start_ts,
+          start_datetime: ep.start_datetime,
+          end_ts: ep.end_ts,
+          end_datetime: ep.end_datetime,
+          end_reason: ep.end_reason,
+          signal_lifetime_minutes: ep.signal_lifetime_minutes,
+          computed_duration_minutes: Number.isFinite(startTs) && Number.isFinite(endTs as number)
+            ? round(((endTs as number) - startTs) / 60000)
+            : null,
+          checks,
+          matches_v169_selector,
+        };
+      });
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        mode: "REPAIR_DIAGNOSTIC_READ_ONLY",
+        trading: "REAL_TRADING_DISABLED",
+        read_only: true,
+        requested_ids: [4,5],
+        rows_found: rows.length,
+        diagnostics,
+      });
+    }
+
+    // V1.6.9 LEGACY REPAIR — manually repair historical episodes >30m/corrupt.
     if (url.pathname === "/episode-legacy-repair") {
       if (!env.DB) {
         return json({ success: false, error: "D1_NOT_BOUND" }, 503);
