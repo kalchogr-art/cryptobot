@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.6.10 REPAIR DIAGNOSTIC";
+const VERSION = "V1.7 65 CROSSING ANALYTICS";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
@@ -1507,6 +1507,34 @@ async function ensurePaperTables(env: Env): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_signal_episodes_start
     ON signal_episodes (start_ts DESC)
   `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_65_crossings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      episode_id INTEGER NOT NULL UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      crossing_datetime TEXT NOT NULL,
+      crossing_price REAL NOT NULL,
+      crossing_score REAL NOT NULL,
+      market_signed REAL, news_signed REAL, final_signed REAL,
+      chart_signed REAL, order_flow_persistent_signed REAL,
+      oi_change_signed REAL, funding_premium_signed REAL, history_mode TEXT,
+      return_1m_pct REAL, return_5m_pct REAL, return_15m_pct REAL, return_30m_pct REAL,
+      mfe_pct REAL, mae_pct REAL,
+      tp_hit INTEGER NOT NULL DEFAULT 0, sl_hit INTEGER NOT NULL DEFAULT 0,
+      first_barrier TEXT, first_barrier_ts INTEGER,
+      outcome_complete INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_cross65_coin_ts
+    ON signal_65_crossings (coin, crossing_ts DESC)
+  `).run();
 }
 
 function scoreBucket(score: number): string {
@@ -2089,6 +2117,59 @@ async function processSignalEpisode(
     start_bucket: scoreBucket(score),
     qualifies_entry: score >= PAPER_ENTRY_SCORE,
   };
+}
+
+// ============================================================
+// V1.7 — FIRST 65 CROSSING ANALYTICS
+// ============================================================
+async function record65Crossing(env: Env, signal: any, finalSignal: any): Promise<any> {
+  if (!env.DB) return { recorded: false, reason: "D1_NOT_BOUND" };
+  const finalSigned = Number(finalSignal?.final?.signed_score ?? signal.market?.signed_score ?? 0);
+  const score = Math.abs(finalSigned);
+  if (score < PAPER_ENTRY_SCORE) return { recorded: false, reason: "BELOW_65", score: round(score) };
+  const side = finalSigned >= 0 ? "LONG" : "SHORT";
+  const episode: any = await env.DB.prepare(`
+    SELECT * FROM signal_episodes
+    WHERE coin=? AND status='ACTIVE' AND side=?
+    ORDER BY start_ts DESC LIMIT 1
+  `).bind(signal.coin, side).first();
+  if (!episode) return { recorded: false, reason: "NO_ACTIVE_EPISODE" };
+  const existing: any = await env.DB.prepare(`SELECT id FROM signal_65_crossings WHERE episode_id=? LIMIT 1`).bind(episode.id).first();
+  if (existing) return { recorded: false, reason: "ALREADY_RECORDED", crossing_id: existing.id, episode_id: episode.id };
+  const now=Date.now(), price=Number(signal.price);
+  const r:any=await env.DB.prepare(`
+    INSERT OR IGNORE INTO signal_65_crossings (
+      episode_id,coin,side,crossing_ts,crossing_datetime,crossing_price,crossing_score,
+      market_signed,news_signed,final_signed,chart_signed,order_flow_persistent_signed,
+      oi_change_signed,funding_premium_signed,history_mode
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).bind(episode.id,signal.coin,side,now,new Date(now).toISOString(),price,score,
+    signal.market?.signed_score??null,finalSignal?.news_x?.signed_score??null,finalSigned,
+    signal.market?.components?.chart_signed??null,signal.market?.components?.order_flow_persistent_signed??null,
+    signal.market?.components?.oi_change_signed??null,signal.market?.components?.funding_premium_signed??null,
+    signal.market?.weights?.mode??null).run();
+  return { recorded:true, crossing_id:r?.meta?.last_row_id??null, episode_id:episode.id, coin:signal.coin, side, crossing_score:round(score), crossing_price:price };
+}
+
+async function update65CrossingOutcomes(env: Env, coin: string): Promise<void> {
+  if (!env.DB) return;
+  const now=Date.now();
+  const pending:any=await env.DB.prepare(`SELECT * FROM signal_65_crossings WHERE coin=? AND outcome_complete=0 ORDER BY crossing_ts ASC LIMIT 100`).bind(coin).all();
+  for (const row of pending?.results??[]) {
+    const startTs=Number(row.crossing_ts), entry=Number(row.crossing_price), side=String(row.side);
+    const values:any={return_1m_pct:row.return_1m_pct??null,return_5m_pct:row.return_5m_pct??null,return_15m_pct:row.return_15m_pct??null,return_30m_pct:row.return_30m_pct??null};
+    for (const [m,f] of [[1,"return_1m_pct"],[5,"return_5m_pct"],[15,"return_15m_pct"],[30,"return_30m_pct"]] as const) {
+      if(values[f]!==null) continue; const target=startTs+m*60000; if(now<target) continue;
+      const snap=await nearestSnapshotPrice(env,coin,target); if(snap) values[f]=round(directionalReturnPct(side,entry,snap.price));
+    }
+    const points:any=await env.DB.prepare(`SELECT ts,price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC`).bind(coin,startTs,Math.min(now,startTs+30*60000)).all();
+    let minP=entry,maxP=entry,tpHit=0,slHit=0,firstBarrier:string|null=null,firstBarrierTs:number|null=null;
+    const levels=paperLevels(side,entry);
+    for(const p of points?.results??[]){const px=Number(p.price);if(!Number.isFinite(px))continue;minP=Math.min(minP,px);maxP=Math.max(maxP,px);const tp=side==="SHORT"?px<=levels.tp:px>=levels.tp;const sl=side==="SHORT"?px>=levels.sl:px<=levels.sl;if(tp)tpHit=1;if(sl)slHit=1;if(!firstBarrier&&(tp||sl)){firstBarrier=tp?"TP":"SL";firstBarrierTs=Number(p.ts);}}
+    const mfe=side==="SHORT"?directionalReturnPct(side,entry,minP):directionalReturnPct(side,entry,maxP);
+    const mae=side==="SHORT"?directionalReturnPct(side,entry,maxP):directionalReturnPct(side,entry,minP);
+    await env.DB.prepare(`UPDATE signal_65_crossings SET return_1m_pct=?,return_5m_pct=?,return_15m_pct=?,return_30m_pct=?,mfe_pct=?,mae_pct=?,tp_hit=?,sl_hit=?,first_barrier=?,first_barrier_ts=?,outcome_complete=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(values.return_1m_pct,values.return_5m_pct,values.return_15m_pct,values.return_30m_pct,round(mfe),round(mae),tpHit,slHit,firstBarrier,firstBarrierTs,values.return_30m_pct!==null?1:0,row.id).run();
+  }
 }
 
 function paperReturnPct(
@@ -4800,6 +4881,22 @@ export default {
     }
 
     // V1.6 DEDUPLICATED SIGNAL EPISODES
+    if (url.pathname === "/crossings-65") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+      const limit=Math.max(1,Math.min(Number(url.searchParams.get("limit")??100),500));
+      const r:any=await env.DB.prepare(`SELECT * FROM signal_65_crossings ORDER BY crossing_ts DESC LIMIT ?`).bind(limit).all();
+      return json({success:true,worker:"cryptobot",version:VERSION,mode:"65_CROSSING_RESEARCH",trading:"REAL_TRADING_DISABLED",threshold:PAPER_ENTRY_SCORE,total:r?.results?.length??0,crossings:r?.results??[]});
+    }
+
+    if (url.pathname === "/crossing-65-analytics") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+      const totals:any=await env.DB.prepare(`SELECT COUNT(*) crossings,SUM(outcome_complete) completed_30m,AVG(return_1m_pct) avg_1m_pct,AVG(return_5m_pct) avg_5m_pct,AVG(return_15m_pct) avg_15m_pct,AVG(return_30m_pct) avg_30m_pct,AVG(mfe_pct) avg_mfe_pct,AVG(mae_pct) avg_mae_pct,SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) tp_first,SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) sl_first FROM signal_65_crossings`).first();
+      const byCoinSide:any=await env.DB.prepare(`SELECT coin,side,COUNT(*) crossings,SUM(outcome_complete) completed_30m,AVG(crossing_score) avg_crossing_score,AVG(return_1m_pct) avg_1m_pct,AVG(return_5m_pct) avg_5m_pct,AVG(return_15m_pct) avg_15m_pct,AVG(return_30m_pct) avg_30m_pct,AVG(mfe_pct) avg_mfe_pct,AVG(mae_pct) avg_mae_pct,SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) tp_first,SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) sl_first FROM signal_65_crossings GROUP BY coin,side ORDER BY coin,side`).all();
+      return json({success:true,worker:"cryptobot",version:VERSION,mode:"65_CROSSING_ANALYTICS",trading:"REAL_TRADING_DISABLED",methodology:{trigger:"first observed FINAL_SCORE_ABS >= 65 inside each active episode",dedup:"one crossing per episode",horizons_minutes:[1,5,15,30],tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT,barrier_method:"minute snapshot approximation; not tick-level ordering",historical_note:"Collection starts with V1.7; old episodes are not assigned fabricated crossing timestamps."},totals,by_coin_side:byCoinSide?.results??[]});
+    }
+
     if (url.pathname === "/episodes") {
       if (!env.DB) {
         return json(
@@ -5501,6 +5598,10 @@ export default {
             finalSignal
           );
 
+        // V1.7: exact first >=65 crossing + forward outcome research.
+        await update65CrossingOutcomes(env, coin);
+        const crossing65 = await record65Crossing(env, signal, finalSignal);
+
         // PAPER ONLY. No real order path exists here.
         const paper = await processPaperCoin(
           env,
@@ -5518,6 +5619,7 @@ export default {
           final_mode: final?.mode ?? null,
           observation,
           episode,
+          crossing65,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
