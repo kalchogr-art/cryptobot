@@ -2,7 +2,7 @@
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
 // READ ONLY / NO TRADING
 //
-// Coins: BTC / ETH / SOL / XRP / BNB
+// Coins: BTC / ETH / SOL / XRP / BNB / DOGE / AVAX / LINK / SUI / HYPE
 //
 // FIXES / FEATURES:
 // - Closed candles used for historical volume/volatility/trend
@@ -33,10 +33,10 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.7 65 CROSSING ANALYTICS";
+const VERSION = "V1.8 EXPANDED MARKETS + 65 CROSSING ANALYTICS";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
-const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB"] as const;
+const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE"] as const;
 const ALLOWED_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h"] as const;
 
 const INTERVAL_MS: Record<string, number> = {
@@ -3227,6 +3227,11 @@ function coinRelevance(
     SOL: ["solana", " sol", "$sol"],
     XRP: ["xrp", "ripple", "$xrp"],
     BNB: ["bnb", "binance", "$bnb"],
+    DOGE: ["dogecoin", " doge", "doge ", "$doge"],
+    AVAX: ["avalanche", " avax", "avax ", "$avax"],
+    LINK: ["chainlink", " link", "link ", "$link"],
+    SUI: ["sui network", " sui", "sui ", "$sui"],
+    HYPE: ["hyperliquid", " hype", "hype ", "$hype"],
   };
 
   if (textHas(t, direct[coin] ?? [])) return 100;
@@ -3972,11 +3977,13 @@ export default {
           episodes: "/episodes?limit=50",
           episode_analytics: "/episode-analytics",
           episode_candidates: "/episode-candidates",
+          crossings_65: "/crossings-65?limit=100",
+          crossing_65_analytics: "/crossing-65-analytics",
           debug: "/debug-hyperliquid",
         },
 
         next_version:
-          "V1.5.2 PAPER ANALYTICS + SIGNAL BUCKETS",
+          "V1.9 — AFTER V1.8 LOAD + SIGNAL DATA REVIEW",
       });
     }
 
