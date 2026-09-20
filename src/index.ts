@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.2 TP SL MATRIX";
+const VERSION = "V1.8.3 TP SL MATRIX CPU FIX";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE"] as const;
@@ -4900,35 +4900,134 @@ export default {
     if (url.pathname === "/tp-sl-matrix") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
-      const q:any=await env.DB.prepare(`SELECT id,coin,side,crossing_ts,crossing_price,crossing_score,return_30m_pct,outcome_complete FROM signal_65_crossings WHERE outcome_complete=1 ORDER BY crossing_ts ASC`).all();
+
+      // V1.8.3 CPU/D1 FIX:
+      // 1 query for completed crossings + 1 query for all required snapshots.
+      // All 36 TP/SL simulations are then calculated in memory.
+      const q:any=await env.DB.prepare(`
+        SELECT id,coin,side,crossing_ts,crossing_price,crossing_score,
+               return_30m_pct,outcome_complete
+        FROM signal_65_crossings
+        WHERE outcome_complete=1
+        ORDER BY crossing_ts ASC
+      `).all();
       const crossings:any[]=q?.results??[];
+
+      if (!crossings.length) {
+        return json({
+          success:true,worker:"cryptobot",version:VERSION,
+          mode:"TP_SL_MATRIX_RESEARCH",trading:"REAL_TRADING_DISABLED",
+          crossings_used:0,combinations:0,top_by_net_return:[],matrix:[]
+        });
+      }
+
+      let minTs=Infinity,maxTs=-Infinity;
+      const coins=[...new Set(crossings.map((c:any)=>String(c.coin)))];
+      for(const c of crossings){
+        const t=Number(c.crossing_ts);
+        if(Number.isFinite(t)){minTs=Math.min(minTs,t);maxTs=Math.max(maxTs,t+30*60*1000)}
+      }
+
+      const placeholders=coins.map(()=>"?").join(",");
+      const snapQ:any=await env.DB.prepare(`
+        SELECT coin,ts,price
+        FROM market_snapshots
+        WHERE coin IN (${placeholders}) AND ts>=? AND ts<=?
+        ORDER BY coin ASC,ts ASC
+      `).bind(...coins,minTs,maxTs).all();
+
+      const snapshotsByCoin=new Map<string,any[]>();
+      for(const s of (snapQ?.results??[])){
+        const coin=String(s.coin);
+        if(!snapshotsByCoin.has(coin)) snapshotsByCoin.set(coin,[]);
+        snapshotsByCoin.get(coin)!.push(s);
+      }
+
+      // Pre-slice each crossing once. No D1 work inside the matrix loops.
+      const prepared=crossings.map((c:any)=>{
+        const t=Number(c.crossing_ts), end=t+30*60*1000;
+        const all=snapshotsByCoin.get(String(c.coin))??[];
+        const snaps=all.filter((s:any)=>Number(s.ts)>=t && Number(s.ts)<=end);
+        return {...c,_snaps:snaps};
+      });
+
       const tpValues=[0.20,0.25,0.30,0.35,0.40,0.50];
       const slValues=[0.15,0.20,0.25,0.30,0.35,0.40];
       const feePct=PAPER_FEE_RATE_PER_SIDE*2*100;
       const matrix:any[]=[];
-      for (const tp of tpValues) for (const sl of slValues) {
+
+      for(const tp of tpValues) for(const sl of slValues){
         let tpFirst=0,slFirst=0,timeExit=0,grossSum=0;
         const netReturns:number[]=[];
-        for (const c of crossings) {
-          const entryTs=Number(c.crossing_ts), entryPrice=Number(c.crossing_price);
-          if(!Number.isFinite(entryTs)||!Number.isFinite(entryPrice)||entryPrice<=0) continue;
-          const s:any=await env.DB.prepare(`SELECT ts,price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC`).bind(c.coin,entryTs,entryTs+30*60*1000).all();
-          let gross:number|null=null, hit:string|null=null;
-          for(const x of (s?.results??[])){
-            const px=Number(x.price); if(!Number.isFinite(px)||px<=0) continue;
-            const r=c.side==="SHORT"?((entryPrice-px)/entryPrice)*100:((px-entryPrice)/entryPrice)*100;
+
+        for(const c of prepared){
+          const entryPrice=Number(c.crossing_price);
+          if(!Number.isFinite(entryPrice)||entryPrice<=0) continue;
+
+          let gross:number|null=null,hit:string|null=null;
+          for(const x of c._snaps){
+            const px=Number(x.price);
+            if(!Number.isFinite(px)||px<=0) continue;
+            const r=c.side==="SHORT"
+              ? ((entryPrice-px)/entryPrice)*100
+              : ((px-entryPrice)/entryPrice)*100;
             if(r>=tp){gross=tp;hit="TP";break}
             if(r<=-sl){gross=-sl;hit="SL";break}
           }
-          if(hit==="TP")tpFirst++; else if(hit==="SL")slFirst++; else {timeExit++; const r=Number(c.return_30m_pct); gross=Number.isFinite(r)?r:0}
-          grossSum+=Number(gross??0); netReturns.push(Number(gross??0)-feePct);
+
+          if(hit==="TP") tpFirst++;
+          else if(hit==="SL") slFirst++;
+          else {
+            timeExit++;
+            const r=Number(c.return_30m_pct);
+            gross=Number.isFinite(r)?r:0;
+          }
+
+          grossSum+=Number(gross??0);
+          netReturns.push(Number(gross??0)-feePct);
         }
-        const netSum=netReturns.reduce((a,b)=>a+b,0), a=[...netReturns].sort((x,y)=>x-y);
+
+        const netSum=netReturns.reduce((a,b)=>a+b,0);
+        const a=[...netReturns].sort((x,y)=>x-y);
         const med=!a.length?null:(a.length%2?a[Math.floor(a.length/2)]:(a[a.length/2-1]+a[a.length/2])/2);
-        matrix.push({tp_pct:tp,sl_pct:sl,completed:netReturns.length,tp_first:tpFirst,sl_first:slFirst,time_exit_30m:timeExit,gross_return_sum_pct:round(grossSum,4),net_return_sum_pct:round(netSum,4),avg_net_return_pct:netReturns.length?round(netSum/netReturns.length,4):null,median_net_return_pct:med===null?null:round(med,4),pnl_usd_at_100_notional_each:round(netSum,4),profitable_after_fees:netSum>0});
+
+        matrix.push({
+          tp_pct:tp,sl_pct:sl,completed:netReturns.length,
+          tp_first:tpFirst,sl_first:slFirst,time_exit_30m:timeExit,
+          gross_return_sum_pct:round(grossSum,4),
+          net_return_sum_pct:round(netSum,4),
+          avg_net_return_pct:netReturns.length?round(netSum/netReturns.length,4):null,
+          median_net_return_pct:med===null?null:round(med,4),
+          pnl_usd_at_100_notional_each:round(netSum,4),
+          profitable_after_fees:netSum>0
+        });
       }
+
       const ranked=[...matrix].sort((a:any,b:any)=>Number(b.net_return_sum_pct)-Number(a.net_return_sum_pct));
-      return json({success:true,worker:"cryptobot",version:VERSION,mode:"TP_SL_MATRIX_RESEARCH",trading:"REAL_TRADING_DISABLED",methodology:{trigger:"completed >=65 crossings only",replay:"minute market_snapshots from crossing through +30m",tp_values_pct:tpValues,sl_values_pct:slValues,round_trip_fee_pct:round(feePct,4),time_exit:"directional return_30m_pct if neither sampled barrier is reached",limitation:"minute sampled prices can miss intraminute TP/SL touches; this is research, not tick-level execution"},crossings_used:crossings.length,combinations:matrix.length,current_config:{tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT},top_by_net_return:ranked.slice(0,10),matrix});
+
+      return json({
+        success:true,worker:"cryptobot",version:VERSION,
+        mode:"TP_SL_MATRIX_RESEARCH",trading:"REAL_TRADING_DISABLED",
+        performance:{
+          d1_queries_for_matrix:2,
+          previous_design_max_queries:1+(36*crossings.length),
+          snapshots_loaded:(snapQ?.results??[]).length,
+          calculation:"IN_MEMORY"
+        },
+        methodology:{
+          trigger:"completed >=65 crossings only",
+          replay:"minute market_snapshots from crossing through +30m",
+          tp_values_pct:tpValues,sl_values_pct:slValues,
+          round_trip_fee_pct:round(feePct,4),
+          time_exit:"directional return_30m_pct if neither sampled barrier is reached",
+          limitation:"minute sampled prices can miss intraminute TP/SL touches; research only"
+        },
+        crossings_used:crossings.length,
+        combinations:matrix.length,
+        current_config:{tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT},
+        top_by_net_return:ranked.slice(0,10),
+        matrix
+      });
     }
 
     if (url.pathname === "/crossing-65-analytics") {
