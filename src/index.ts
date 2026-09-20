@@ -33,10 +33,10 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.4 MATRIX DATA WINDOW FIX";
+const VERSION = "V1.8.5 20 MARKETS + 60-64 CONTROL";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
-const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE"] as const;
+const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
 const ALLOWED_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h"] as const;
 
 const INTERVAL_MS: Record<string, number> = {
@@ -1535,6 +1535,29 @@ async function ensurePaperTables(env: Env): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_cross65_coin_ts
     ON signal_65_crossings (coin, crossing_ts DESC)
   `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_60_64_crossings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      episode_id INTEGER NOT NULL UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      crossing_datetime TEXT NOT NULL,
+      crossing_price REAL NOT NULL,
+      crossing_score REAL NOT NULL,
+      return_1m_pct REAL, return_5m_pct REAL, return_15m_pct REAL, return_30m_pct REAL,
+      mfe_pct REAL, mae_pct REAL,
+      outcome_complete INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_cross60_64_coin_ts
+    ON signal_60_64_crossings (coin, crossing_ts DESC)
+  `).run();
 }
 
 function scoreBucket(score: number): string {
@@ -2117,6 +2140,49 @@ async function processSignalEpisode(
     start_bucket: scoreBucket(score),
     qualifies_entry: score >= PAPER_ENTRY_SCORE,
   };
+}
+
+// ============================================================
+// V1.8.5 — 60-64 CONTROL CROSSINGS
+// Separate research cohort. Does NOT qualify for paper entry.
+// ============================================================
+async function record6064Crossing(env: Env, signal: any, finalSignal: any): Promise<any> {
+  if (!env.DB) return {recorded:false,reason:"D1_NOT_BOUND"};
+  const signed=Number(finalSignal?.final?.signed_score??signal.market?.signed_score??0);
+  const score=Math.abs(signed);
+  if(score<60||score>=65) return {recorded:false,reason:"OUTSIDE_60_64",score:round(score)};
+  const side=signed>=0?"LONG":"SHORT";
+  const ep:any=await env.DB.prepare(`SELECT * FROM signal_episodes WHERE coin=? AND status='ACTIVE' AND side=? ORDER BY start_ts DESC LIMIT 1`).bind(signal.coin,side).first();
+  if(!ep) return {recorded:false,reason:"NO_ACTIVE_EPISODE"};
+  const old:any=await env.DB.prepare(`SELECT id FROM signal_60_64_crossings WHERE episode_id=? LIMIT 1`).bind(ep.id).first();
+  if(old) return {recorded:false,reason:"ALREADY_RECORDED",crossing_id:old.id};
+  const now=Date.now(),price=Number(signal.price);
+  const r:any=await env.DB.prepare(`INSERT OR IGNORE INTO signal_60_64_crossings
+    (episode_id,coin,side,crossing_ts,crossing_datetime,crossing_price,crossing_score)
+    VALUES (?,?,?,?,?,?,?)`).bind(ep.id,signal.coin,side,now,new Date(now).toISOString(),price,score).run();
+  return {recorded:true,crossing_id:r?.meta?.last_row_id??null,episode_id:ep.id,coin:signal.coin,side,crossing_score:round(score),crossing_price:price};
+}
+
+async function update6064CrossingOutcomes(env: Env, coin: string): Promise<void> {
+  if(!env.DB)return;
+  const now=Date.now();
+  const q:any=await env.DB.prepare(`SELECT * FROM signal_60_64_crossings WHERE coin=? AND outcome_complete=0 ORDER BY crossing_ts ASC LIMIT 100`).bind(coin).all();
+  for(const row of q?.results??[]){
+    const start=Number(row.crossing_ts),entry=Number(row.crossing_price),side=String(row.side);
+    const v:any={return_1m_pct:row.return_1m_pct??null,return_5m_pct:row.return_5m_pct??null,return_15m_pct:row.return_15m_pct??null,return_30m_pct:row.return_30m_pct??null};
+    for(const [m,f] of [[1,"return_1m_pct"],[5,"return_5m_pct"],[15,"return_15m_pct"],[30,"return_30m_pct"]] as const){
+      if(v[f]!==null||now<start+m*60000)continue;
+      const snap=await nearestSnapshotPrice(env,coin,start+m*60000);
+      if(snap)v[f]=round(directionalReturnPct(side,entry,snap.price));
+    }
+    const pts:any=await env.DB.prepare(`SELECT price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC`).bind(coin,start,Math.min(now,start+30*60000)).all();
+    let minP=entry,maxP=entry;
+    for(const x of pts?.results??[]){const px=Number(x.price);if(Number.isFinite(px)){minP=Math.min(minP,px);maxP=Math.max(maxP,px)}}
+    const mfe=side==="SHORT"?directionalReturnPct(side,entry,minP):directionalReturnPct(side,entry,maxP);
+    const mae=side==="SHORT"?directionalReturnPct(side,entry,maxP):directionalReturnPct(side,entry,minP);
+    await env.DB.prepare(`UPDATE signal_60_64_crossings SET return_1m_pct=?,return_5m_pct=?,return_15m_pct=?,return_30m_pct=?,mfe_pct=?,mae_pct=?,outcome_complete=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+      .bind(v.return_1m_pct,v.return_5m_pct,v.return_15m_pct,v.return_30m_pct,round(mfe),round(mae),v.return_30m_pct!==null?1:0,row.id).run();
+  }
 }
 
 // ============================================================
@@ -3978,6 +4044,8 @@ export default {
           episode_analytics: "/episode-analytics",
           episode_candidates: "/episode-candidates",
           crossings_65: "/crossings-65?limit=100",
+          control_crossings_60_64: "/crossings-60-64?limit=100",
+          control_60_64_analytics: "/crossing-60-64-analytics",
           crossing_65_analytics: "/crossing-65-analytics",
           tp_sl_matrix: "/tp-sl-matrix",
           debug: "/debug-hyperliquid",
@@ -4889,6 +4957,28 @@ export default {
     }
 
     // V1.6 DEDUPLICATED SIGNAL EPISODES
+    if (url.pathname === "/crossings-60-64") {
+      if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+      const limit=Math.max(1,Math.min(Number(url.searchParams.get("limit")??100),500));
+      const r:any=await env.DB.prepare(`SELECT * FROM signal_60_64_crossings ORDER BY crossing_ts DESC LIMIT ?`).bind(limit).all();
+      return json({success:true,worker:"cryptobot",version:VERSION,mode:"60_64_CONTROL_CROSSINGS",trading:"REAL_TRADING_DISABLED",range:"60 <= score < 65",total:r?.results?.length??0,crossings:r?.results??[]});
+    }
+
+    if (url.pathname === "/crossing-60-64-analytics") {
+      if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+      const r:any=await env.DB.prepare(`SELECT * FROM signal_60_64_crossings WHERE outcome_complete=1 ORDER BY crossing_ts ASC`).all();
+      const rows:any[]=r?.results??[];
+      const avg=(key:string)=>rows.length?round(rows.reduce((s:any,x:any)=>s+Number(x[key]??0),0)/rows.length,4):null;
+      return json({success:true,worker:"cryptobot",version:VERSION,mode:"60_64_CONTROL_ANALYTICS",trading:"REAL_TRADING_DISABLED",
+        methodology:{cohort:"first observed score from 60 inclusive to 65 exclusive inside an active episode",paper_entry:false,purpose:"control group against >=65 crossings"},
+        completed:rows.length,
+        averages:{return_1m_pct:avg("return_1m_pct"),return_5m_pct:avg("return_5m_pct"),return_15m_pct:avg("return_15m_pct"),return_30m_pct:avg("return_30m_pct"),mfe_pct:avg("mfe_pct"),mae_pct:avg("mae_pct")},
+        by_side:["LONG","SHORT"].map(side=>{const a=rows.filter(x=>x.side===side);const av=(k:string)=>a.length?round(a.reduce((s,x)=>s+Number(x[k]??0),0)/a.length,4):null;return {side,count:a.length,avg_30m_pct:av("return_30m_pct"),avg_mfe_pct:av("mfe_pct"),avg_mae_pct:av("mae_pct")}})
+      });
+    }
+
     if (url.pathname === "/crossings-65") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
@@ -5892,9 +5982,11 @@ export default {
             finalSignal
           );
 
-        // V1.7: exact first >=65 crossing + forward outcome research.
+        // >=65 primary research + separate 60-64 control cohort.
         await update65CrossingOutcomes(env, coin);
+        await update6064CrossingOutcomes(env, coin);
         const crossing65 = await record65Crossing(env, signal, finalSignal);
+        const crossing6064 = await record6064Crossing(env, signal, finalSignal);
 
         // PAPER ONLY. No real order path exists here.
         const paper = await processPaperCoin(
@@ -5914,6 +6006,7 @@ export default {
           observation,
           episode,
           crossing65,
+          crossing6064,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
