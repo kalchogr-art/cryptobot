@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8 EXPANDED MARKETS + 65 CROSSING ANALYTICS";
+const VERSION = "V1.8.1 CROSSING ANALYTICS UPGRADE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE"] as const;
@@ -4899,9 +4899,144 @@ export default {
     if (url.pathname === "/crossing-65-analytics") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
+
       const totals:any=await env.DB.prepare(`SELECT COUNT(*) crossings,SUM(outcome_complete) completed_30m,AVG(return_1m_pct) avg_1m_pct,AVG(return_5m_pct) avg_5m_pct,AVG(return_15m_pct) avg_15m_pct,AVG(return_30m_pct) avg_30m_pct,AVG(mfe_pct) avg_mfe_pct,AVG(mae_pct) avg_mae_pct,SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) tp_first,SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) sl_first FROM signal_65_crossings`).first();
+
       const byCoinSide:any=await env.DB.prepare(`SELECT coin,side,COUNT(*) crossings,SUM(outcome_complete) completed_30m,AVG(crossing_score) avg_crossing_score,AVG(return_1m_pct) avg_1m_pct,AVG(return_5m_pct) avg_5m_pct,AVG(return_15m_pct) avg_15m_pct,AVG(return_30m_pct) avg_30m_pct,AVG(mfe_pct) avg_mfe_pct,AVG(mae_pct) avg_mae_pct,SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) tp_first,SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) sl_first FROM signal_65_crossings GROUP BY coin,side ORDER BY coin,side`).all();
-      return json({success:true,worker:"cryptobot",version:VERSION,mode:"65_CROSSING_ANALYTICS",trading:"REAL_TRADING_DISABLED",methodology:{trigger:"first observed FINAL_SCORE_ABS >= 65 inside each active episode",dedup:"one crossing per episode",horizons_minutes:[1,5,15,30],tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT,barrier_method:"minute snapshot approximation; not tick-level ordering",historical_note:"Collection starts with V1.7; old episodes are not assigned fabricated crossing timestamps."},totals,by_coin_side:byCoinSide?.results??[]});
+
+      // V1.8.1: richer research analytics. No signal/trading logic is changed.
+      const raw:any=await env.DB.prepare(`
+        SELECT id,coin,side,crossing_score,return_1m_pct,return_5m_pct,
+               return_15m_pct,return_30m_pct,mfe_pct,mae_pct,
+               first_barrier,outcome_complete
+        FROM signal_65_crossings
+        ORDER BY crossing_ts ASC
+      `).all();
+      const rows:any[] = raw?.results ?? [];
+
+      const nums=(items:any[], field:string):number[] =>
+        items.map((r:any)=>Number(r?.[field])).filter((v:number)=>Number.isFinite(v));
+
+      const median=(values:number[]):number|null => {
+        if (!values.length) return null;
+        const a=[...values].sort((x,y)=>x-y);
+        const m=Math.floor(a.length/2);
+        return round(a.length%2 ? a[m] : (a[m-1]+a[m])/2,4);
+      };
+
+      const avg=(values:number[]):number|null =>
+        values.length ? round(values.reduce((s,v)=>s+v,0)/values.length,4) : null;
+
+      const bucket65=(score:number):string => {
+        if (score >= 80) return "80+";
+        if (score >= 75) return "75-79";
+        if (score >= 70) return "70-74";
+        return "65-69";
+      };
+
+      const completed=rows.filter((r:any)=>Number(r.outcome_complete)===1 && Number.isFinite(Number(r.return_30m_pct)));
+      const feePct=PAPER_FEE_RATE_PER_SIDE*2*100;
+
+      const strategyFor=(items:any[]) => {
+        const done=items.filter((r:any)=>Number(r.outcome_complete)===1 && Number.isFinite(Number(r.return_30m_pct)));
+        let tp=0,sl=0,timeExit=0;
+        const grossReturns:number[]=[];
+        const netReturns:number[]=[];
+        for (const r of done) {
+          let gross:number;
+          if (r.first_barrier==="TP") { gross=PAPER_TP_PCT; tp++; }
+          else if (r.first_barrier==="SL") { gross=-PAPER_SL_PCT; sl++; }
+          else { gross=Number(r.return_30m_pct); timeExit++; }
+          grossReturns.push(gross);
+          netReturns.push(gross-feePct);
+        }
+        const totalNet=netReturns.reduce((s,v)=>s+v,0);
+        return {
+          completed: done.length,
+          tp_first: tp,
+          sl_first: sl,
+          time_exit_30m: timeExit,
+          fee_pct_per_trade: round(feePct,4),
+          gross_return_sum_pct: round(grossReturns.reduce((s,v)=>s+v,0),4),
+          net_return_sum_pct: round(totalNet,4),
+          avg_net_return_pct: avg(netReturns),
+          median_net_return_pct: median(netReturns),
+          pnl_usd_at_100_notional_each: round(totalNet,4),
+          profitable_after_fees: totalNet > 0
+        };
+      };
+
+      const medianReturns={
+        return_1m_pct: median(nums(rows,"return_1m_pct")),
+        return_5m_pct: median(nums(rows,"return_5m_pct")),
+        return_15m_pct: median(nums(rows,"return_15m_pct")),
+        return_30m_pct: median(nums(rows,"return_30m_pct")),
+        mfe_pct: median(nums(rows,"mfe_pct")),
+        mae_pct: median(nums(rows,"mae_pct"))
+      };
+
+      const sides=["LONG","SHORT"].map(side=>{
+        const x=rows.filter((r:any)=>r.side===side);
+        return {
+          side,
+          crossings:x.length,
+          completed_30m:x.filter((r:any)=>Number(r.outcome_complete)===1).length,
+          avg_crossing_score:avg(nums(x,"crossing_score")),
+          avg_1m_pct:avg(nums(x,"return_1m_pct")),
+          avg_5m_pct:avg(nums(x,"return_5m_pct")),
+          avg_15m_pct:avg(nums(x,"return_15m_pct")),
+          avg_30m_pct:avg(nums(x,"return_30m_pct")),
+          median_30m_pct:median(nums(x,"return_30m_pct")),
+          avg_mfe_pct:avg(nums(x,"mfe_pct")),
+          avg_mae_pct:avg(nums(x,"mae_pct")),
+          strategy:strategyFor(x)
+        };
+      }).filter(x=>x.crossings>0);
+
+      const bucketNames=["65-69","70-74","75-79","80+"];
+      const byScoreBucket=bucketNames.map(bucket=>{
+        const x=rows.filter((r:any)=>bucket65(Number(r.crossing_score))===bucket);
+        return {
+          score_bucket:bucket,
+          crossings:x.length,
+          completed_30m:x.filter((r:any)=>Number(r.outcome_complete)===1).length,
+          avg_crossing_score:avg(nums(x,"crossing_score")),
+          avg_1m_pct:avg(nums(x,"return_1m_pct")),
+          avg_5m_pct:avg(nums(x,"return_5m_pct")),
+          avg_15m_pct:avg(nums(x,"return_15m_pct")),
+          avg_30m_pct:avg(nums(x,"return_30m_pct")),
+          median_30m_pct:median(nums(x,"return_30m_pct")),
+          avg_mfe_pct:avg(nums(x,"mfe_pct")),
+          avg_mae_pct:avg(nums(x,"mae_pct")),
+          strategy:strategyFor(x)
+        };
+      }).filter(x=>x.crossings>0);
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"65_CROSSING_ANALYTICS_V2",
+        trading:"REAL_TRADING_DISABLED",
+        methodology:{
+          trigger:"first observed FINAL_SCORE_ABS >= 65 inside each active episode",
+          dedup:"one crossing per episode",
+          horizons_minutes:[1,5,15,30],
+          tp_pct:PAPER_TP_PCT,
+          sl_pct:PAPER_SL_PCT,
+          fee_rate_per_side:PAPER_FEE_RATE_PER_SIDE,
+          round_trip_fee_pct:round(feePct,4),
+          strategy_exit:"TP first => +TP%; SL first => -SL%; otherwise directional 30m return; then subtract round-trip fee",
+          barrier_method:"minute snapshot approximation; not tick-level ordering",
+          historical_note:"Collection starts with V1.7; old episodes are not assigned fabricated crossing timestamps."
+        },
+        totals,
+        median_returns:medianReturns,
+        strategy_simulation:strategyFor(rows),
+        by_side:sides,
+        by_score_bucket:byScoreBucket,
+        by_coin_side:byCoinSide?.results??[]
+      });
     }
 
     if (url.pathname === "/episodes") {
