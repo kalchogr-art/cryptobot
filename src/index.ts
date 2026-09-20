@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.1 CROSSING ANALYTICS UPGRADE";
+const VERSION = "V1.8.2 TP SL MATRIX";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE"] as const;
@@ -3979,6 +3979,7 @@ export default {
           episode_candidates: "/episode-candidates",
           crossings_65: "/crossings-65?limit=100",
           crossing_65_analytics: "/crossing-65-analytics",
+          tp_sl_matrix: "/tp-sl-matrix",
           debug: "/debug-hyperliquid",
         },
 
@@ -4894,6 +4895,40 @@ export default {
       const limit=Math.max(1,Math.min(Number(url.searchParams.get("limit")??100),500));
       const r:any=await env.DB.prepare(`SELECT * FROM signal_65_crossings ORDER BY crossing_ts DESC LIMIT ?`).bind(limit).all();
       return json({success:true,worker:"cryptobot",version:VERSION,mode:"65_CROSSING_RESEARCH",trading:"REAL_TRADING_DISABLED",threshold:PAPER_ENTRY_SCORE,total:r?.results?.length??0,crossings:r?.results??[]});
+    }
+
+    if (url.pathname === "/tp-sl-matrix") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+      const q:any=await env.DB.prepare(`SELECT id,coin,side,crossing_ts,crossing_price,crossing_score,return_30m_pct,outcome_complete FROM signal_65_crossings WHERE outcome_complete=1 ORDER BY crossing_ts ASC`).all();
+      const crossings:any[]=q?.results??[];
+      const tpValues=[0.20,0.25,0.30,0.35,0.40,0.50];
+      const slValues=[0.15,0.20,0.25,0.30,0.35,0.40];
+      const feePct=PAPER_FEE_RATE_PER_SIDE*2*100;
+      const matrix:any[]=[];
+      for (const tp of tpValues) for (const sl of slValues) {
+        let tpFirst=0,slFirst=0,timeExit=0,grossSum=0;
+        const netReturns:number[]=[];
+        for (const c of crossings) {
+          const entryTs=Number(c.crossing_ts), entryPrice=Number(c.crossing_price);
+          if(!Number.isFinite(entryTs)||!Number.isFinite(entryPrice)||entryPrice<=0) continue;
+          const s:any=await env.DB.prepare(`SELECT ts,price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC`).bind(c.coin,entryTs,entryTs+30*60*1000).all();
+          let gross:number|null=null, hit:string|null=null;
+          for(const x of (s?.results??[])){
+            const px=Number(x.price); if(!Number.isFinite(px)||px<=0) continue;
+            const r=c.side==="SHORT"?((entryPrice-px)/entryPrice)*100:((px-entryPrice)/entryPrice)*100;
+            if(r>=tp){gross=tp;hit="TP";break}
+            if(r<=-sl){gross=-sl;hit="SL";break}
+          }
+          if(hit==="TP")tpFirst++; else if(hit==="SL")slFirst++; else {timeExit++; const r=Number(c.return_30m_pct); gross=Number.isFinite(r)?r:0}
+          grossSum+=Number(gross??0); netReturns.push(Number(gross??0)-feePct);
+        }
+        const netSum=netReturns.reduce((a,b)=>a+b,0), a=[...netReturns].sort((x,y)=>x-y);
+        const med=!a.length?null:(a.length%2?a[Math.floor(a.length/2)]:(a[a.length/2-1]+a[a.length/2])/2);
+        matrix.push({tp_pct:tp,sl_pct:sl,completed:netReturns.length,tp_first:tpFirst,sl_first:slFirst,time_exit_30m:timeExit,gross_return_sum_pct:round(grossSum,4),net_return_sum_pct:round(netSum,4),avg_net_return_pct:netReturns.length?round(netSum/netReturns.length,4):null,median_net_return_pct:med===null?null:round(med,4),pnl_usd_at_100_notional_each:round(netSum,4),profitable_after_fees:netSum>0});
+      }
+      const ranked=[...matrix].sort((a:any,b:any)=>Number(b.net_return_sum_pct)-Number(a.net_return_sum_pct));
+      return json({success:true,worker:"cryptobot",version:VERSION,mode:"TP_SL_MATRIX_RESEARCH",trading:"REAL_TRADING_DISABLED",methodology:{trigger:"completed >=65 crossings only",replay:"minute market_snapshots from crossing through +30m",tp_values_pct:tpValues,sl_values_pct:slValues,round_trip_fee_pct:round(feePct,4),time_exit:"directional return_30m_pct if neither sampled barrier is reached",limitation:"minute sampled prices can miss intraminute TP/SL touches; this is research, not tick-level execution"},crossings_used:crossings.length,combinations:matrix.length,current_config:{tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT},top_by_net_return:ranked.slice(0,10),matrix});
     }
 
     if (url.pathname === "/crossing-65-analytics") {
