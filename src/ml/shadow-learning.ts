@@ -401,14 +401,136 @@ export async function getMLShadowStatus(env: Env): Promise<any> {
     WHERE model_key = ?
   `).bind(MODEL_KEY).first();
 
+  const filterRows: any = await env.DB.prepare(`
+    SELECT
+      threshold,
+      COUNT(*) AS signals,
+      SUM(CASE WHEN actual_label = 1 THEN 1 ELSE 0 END) AS tp,
+      SUM(CASE WHEN actual_label = 0 THEN 1 ELSE 0 END) AS sl
+    FROM (
+      SELECT 0.50 AS threshold, actual_label
+      FROM ml_shadow_predictions
+      WHERE model_key = ? AND predicted_tp_probability >= 0.50
+
+      UNION ALL
+
+      SELECT 0.55 AS threshold, actual_label
+      FROM ml_shadow_predictions
+      WHERE model_key = ? AND predicted_tp_probability >= 0.55
+
+      UNION ALL
+
+      SELECT 0.60 AS threshold, actual_label
+      FROM ml_shadow_predictions
+      WHERE model_key = ? AND predicted_tp_probability >= 0.60
+
+      UNION ALL
+
+      SELECT 0.65 AS threshold, actual_label
+      FROM ml_shadow_predictions
+      WHERE model_key = ? AND predicted_tp_probability >= 0.65
+
+      UNION ALL
+
+      SELECT 0.70 AS threshold, actual_label
+      FROM ml_shadow_predictions
+      WHERE model_key = ? AND predicted_tp_probability >= 0.70
+    )
+    GROUP BY threshold
+    ORDER BY threshold ASC
+  `).bind(MODEL_KEY, MODEL_KEY, MODEL_KEY, MODEL_KEY, MODEL_KEY).all();
+
   const predictions = Math.max(0, Math.trunc(finite(stats?.predictions)));
   const correct = Math.max(0, Math.trunc(finite(stats?.correct)));
+  const actualTP = Math.max(0, Math.trunc(finite(stats?.actual_tp)));
+  const actualSL = Math.max(0, Math.trunc(finite(stats?.actual_sl)));
+  const mechanicalRate =
+    predictions > 0
+      ? Number(((actualTP / predictions) * 100).toFixed(2))
+      : null;
+
+  const thresholds = [0.50, 0.55, 0.60, 0.65, 0.70];
+  const rawRows = filterRows?.results ?? [];
+
+  const mlFilters = thresholds.map((threshold) => {
+    const row = rawRows.find(
+      (r: any) => Math.abs(finite(r.threshold) - threshold) < 0.0001
+    );
+
+    const signals = Math.max(0, Math.trunc(finite(row?.signals)));
+    const tp = Math.max(0, Math.trunc(finite(row?.tp)));
+    const sl = Math.max(0, Math.trunc(finite(row?.sl)));
+    const tpRate =
+      signals > 0 ? Number(((tp / signals) * 100).toFixed(2)) : null;
+
+    return {
+      minimum_ml_probability: `${Math.round(threshold * 100)}%`,
+      signals_selected: signals,
+      tp,
+      sl,
+      tp_rate_pct: tpRate,
+      difference_vs_all_65_pct_points:
+        tpRate != null && mechanicalRate != null
+          ? Number((tpRate - mechanicalRate).toFixed(2))
+          : null,
+    };
+  });
+
+  // Human-readable summary for quick checking from a phone/browser.
+  let simpleConclusion = "Още няма достатъчно ML прогнози за сравнение.";
+  if (predictions > 0) {
+    const usable = mlFilters.filter((x) => x.signals_selected >= 10);
+    if (usable.length === 0) {
+      simpleConclusion =
+        "Има данни, но още няма ML праг с поне 10 избрани сигнала. Остави модела да събира още.";
+    } else {
+      const best = [...usable].sort((a, b) => {
+        const ar = a.tp_rate_pct ?? -1;
+        const br = b.tp_rate_pct ?? -1;
+        if (br !== ar) return br - ar;
+        return b.signals_selected - a.signals_selected;
+      })[0];
+
+      if (
+        best.tp_rate_pct != null &&
+        mechanicalRate != null &&
+        best.tp_rate_pct > mechanicalRate
+      ) {
+        simpleConclusion =
+          `Засега най-добрият наблюдаван ML филтър е ${best.minimum_ml_probability}: ` +
+          `${best.tp}/${best.signals_selected} TP (${best.tp_rate_pct}%), ` +
+          `с ${best.difference_vs_all_65_pct_points} процентни пункта над всички ≥65. ` +
+          `Това е само наблюдение, не доказателство — извадката още е малка.`;
+      } else {
+        simpleConclusion =
+          "Засега ML филтрите с поне 10 сигнала не подобряват TP процента на всички механични ≥65 сигнали.";
+      }
+    }
+  }
 
   return {
     module: MODULE,
     runs: Math.max(0, Math.trunc(finite(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
+
+    easy_read: {
+      what_are_we_testing:
+        "Дали ML може да отсява по-добрите сигнали измежду вече избраните механични ≥65.",
+      all_mechanical_65: {
+        signals: predictions,
+        tp: actualTP,
+        sl: actualSL,
+        tp_rate_pct: mechanicalRate,
+      },
+      ml_filters: mlFilters,
+      how_to_read:
+        "Пример: ML ≥60% означава, че взимаме само ≥65 сигналите, на които ML е дал поне 60% вероятност за TP. По-висок TP % от all_mechanical_65 е подобрение върху тази извадка.",
+      simple_conclusion: simpleConclusion,
+      warning:
+        "Малките извадки могат да подвеждат. Не използвай този резултат за промяна на реалната стратегия, докато не натрупаме значително повече независими сигнали.",
+    },
+
     model: {
       model_key: MODEL_KEY,
       samples_trained: Math.max(
@@ -426,20 +548,24 @@ export async function getMLShadowStatus(env: Env): Promise<any> {
         funding: finite(model?.weight_funding),
       },
     },
-    evaluation: {
+
+    technical_evaluation: {
       predictions,
       correct,
-      accuracy:
+      classification_accuracy_pct:
         predictions > 0
-          ? Number((correct / predictions).toFixed(4))
+          ? Number(((correct / predictions) * 100).toFixed(2))
           : null,
-      actual_tp: Math.max(0, Math.trunc(finite(stats?.actual_tp))),
-      actual_sl: Math.max(0, Math.trunc(finite(stats?.actual_sl))),
-      avg_predicted_tp_probability:
+      actual_tp: actualTP,
+      actual_sl: actualSL,
+      avg_predicted_tp_probability_pct:
         stats?.avg_predicted_tp_probability == null
           ? null
-          : Number(finite(stats.avg_predicted_tp_probability).toFixed(4)),
+          : Number(
+              (finite(stats.avg_predicted_tp_probability) * 100).toFixed(2)
+            ),
     },
+
     label_definition: "TP_FIRST=1, SL_FIRST=0",
     excluded_from_training: "TIME_OR_NO_BARRIER",
     trading: "REAL_TRADING_DISABLED",
