@@ -1,17 +1,20 @@
 // ============================================================
-// HYPERLIQUID SIGNING DIAGNOSTIC V5 — SIGNED NOOP
+// HYPERLIQUID SIGNING DIAGNOSTIC V6 — DRY-RUN ORDER BUILDER
 //
-// PURPOSE:
-// - Submit Hyperliquid's supported L1 `noop` action.
-// - Prove that Hyperliquid accepts the API-wallet signature.
-// - `noop` places NO order and moves NO funds.
-// - Its protocol effect is only to mark this nonce as used.
+// SAFE:
+// - Builds a REAL Hyperliquid order-wire structure locally.
+// - Signs the order action locally with the authorized API wallet.
+// - Verifies the signer locally.
+// - DOES NOT call /exchange.
+// - DOES NOT place an order.
+// - DOES NOT move funds.
 //
-// SAFETY:
-// - REAL_TRADING_DISABLED remains true.
-// - No order/cancel/transfer/withdraw/leverage/margin action.
-// - Private key is read only from Cloudflare Secret and never returned/logged.
-// - Full signature is not returned.
+// Diagnostic order:
+//   BTC PERP, BUY/LONG, LIMIT GTC
+//   asset = 0
+//   price = "1"
+//   size  = "0.00001"
+// This payload is for STRUCTURE/SIGNING diagnostics only.
 // ============================================================
 
 import { encode } from "@msgpack/msgpack";
@@ -22,8 +25,6 @@ import {
   recoverTypedDataAddress,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-
-const EXCHANGE_URL = "https://api.hyperliquid.xyz/exchange";
 
 const EXPECTED_API_WALLET =
   "0xe9a5a9fed6a1a6c856b27477c761b135097d50ae";
@@ -60,97 +61,74 @@ function maskAddress(address: string): string {
   return `${address.slice(0, 8)}...${address.slice(-6)}`;
 }
 
-function signatureToRsv(signature: `0x${string}`): {
-  r: `0x${string}`;
-  s: `0x${string}`;
-  v: number;
-} {
-  const hex = signature.slice(2);
-
-  if (hex.length !== 130) {
-    throw new Error(`UNEXPECTED_SIGNATURE_LENGTH_${hex.length}`);
-  }
-
-  const r = `0x${hex.slice(0, 64)}` as `0x${string}`;
-  const s = `0x${hex.slice(64, 128)}` as `0x${string}`;
-
-  const rawV = parseInt(hex.slice(128, 130), 16);
-  const v = rawV < 27 ? rawV + 27 : rawV;
-
-  return { r, s, v };
-}
-
 export async function getHyperliquidSigningDiagnostic(
   env: HyperliquidSigningEnv
 ): Promise<Record<string, any>> {
   const secret = normalizePrivateKey(env?.HYPERLIQUID_API_PRIVATE_KEY);
-
   const secretPresent = secret.length > 0;
   const formatOk = secretPresent && privateKeyFormatOk(secret);
 
   if (!formatOk) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V5 SIGNED NOOP",
-      mode: "SUPPORTED_NOOP_SIGNATURE_TEST",
-      network: "MAINNET",
+      version: "V6 DRY-RUN ORDER BUILDER",
       success: false,
       error: "PRIVATE_KEY_MISSING_OR_INVALID_FORMAT",
-      secret: {
-        binding_name: "HYPERLIQUID_API_PRIVATE_KEY",
-        present: secretPresent,
-        format_ok: formatOk,
-        value_returned: false,
-        value_logged: false,
-      },
-      hyperliquid_exchange: {
-        endpoint_called: false,
-        request_sent: false,
-      },
       trading: "REAL_TRADING_DISABLED",
       timestamp: new Date().toISOString(),
     };
   }
 
   const account = privateKeyToAccount(secret as `0x${string}`);
+  const derived = account.address.toLowerCase();
+  const expected = EXPECTED_API_WALLET.toLowerCase();
 
-  const derivedAddress = account.address.toLowerCase();
-  const expectedAddress = EXPECTED_API_WALLET.toLowerCase();
-
-  if (derivedAddress !== expectedAddress) {
+  if (derived !== expected) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V5 SIGNED NOOP",
-      mode: "SUPPORTED_NOOP_SIGNATURE_TEST",
-      network: "MAINNET",
+      version: "V6 DRY-RUN ORDER BUILDER",
       success: false,
       error: "API_WALLET_IDENTITY_MISMATCH",
-      identity: {
-        derived_api_wallet_masked: maskAddress(derivedAddress),
-        api_wallet_match: false,
-      },
-      hyperliquid_exchange: {
-        endpoint_called: false,
-        request_sent: false,
-      },
+      derived_api_wallet_masked: maskAddress(derived),
       trading: "REAL_TRADING_DISABLED",
       timestamp: new Date().toISOString(),
     };
   }
 
-  // Official supported Hyperliquid no-operation L1 action.
-  // It does not place/cancel an order or move funds.
-  const action = {
-    type: "noop",
+  // Official Hyperliquid order wire keys:
+  // a = asset
+  // b = isBuy
+  // p = limit price as wire string
+  // s = size as wire string
+  // r = reduceOnly
+  // t = order type
+  //
+  // BTC is asset 0 on the default perp dex.
+  const orderWire = {
+    a: 0,
+    b: true,
+    p: "1",
+    s: "0.00001",
+    r: false,
+    t: {
+      limit: {
+        tif: "Gtc",
+      },
+    },
   };
 
-  // Hyperliquid recommends current timestamp in milliseconds.
+  // Official order action shape.
+  const action = {
+    type: "order",
+    orders: [orderWire],
+    grouping: "na",
+  };
+
   const nonce = Date.now();
 
   // Hyperliquid L1 action hash:
-  // msgpack(action) || nonce_u64_be || vault_marker
-  //
-  // vaultAddress = null => marker 0x00.
+  // msgpack(action) || nonce_u64_be || vault marker.
+  // vaultAddress = null => 0x00.
   const packedAction = encode(action);
 
   const hashInput = concat([
@@ -161,7 +139,6 @@ export async function getHyperliquidSigningDiagnostic(
 
   const actionHash = keccak256(hashInput);
 
-  // Hyperliquid mainnet phantom agent.
   const domain = {
     chainId: 1337,
     name: "Exchange",
@@ -182,176 +159,95 @@ export async function getHyperliquidSigningDiagnostic(
     connectionId: actionHash,
   } as const;
 
-  // Sign locally with the authorized API wallet.
-  const serializedSignature = await account.signTypedData({
+  const signature = await account.signTypedData({
     domain,
     types,
     primaryType: "Agent",
     message,
   });
 
-  // Local verification before any request is sent.
-  const recoveredAddress = (
+  const recovered = (
     await recoverTypedDataAddress({
       domain,
       types,
       primaryType: "Agent",
       message,
-      signature: serializedSignature,
+      signature,
     })
   ).toLowerCase();
 
-  const signerVerifiedLocally =
-    recoveredAddress === expectedAddress;
-
-  if (!signerVerifiedLocally) {
-    return {
-      module: "hyperliquid-signing-diagnostic",
-      version: "V5 SIGNED NOOP",
-      mode: "SUPPORTED_NOOP_SIGNATURE_TEST",
-      network: "MAINNET",
-      success: false,
-      error: "LOCAL_SIGNATURE_RECOVERY_MISMATCH",
-      identity: {
-        api_wallet_match: true,
-        recovered_signer_masked: maskAddress(recoveredAddress),
-      },
-      hyperliquid_exchange: {
-        endpoint_called: false,
-        request_sent: false,
-      },
-      trading: "REAL_TRADING_DISABLED",
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  const signature = signatureToRsv(serializedSignature);
-
-  const requestBody = {
-    action,
-    nonce,
-    signature,
-    vaultAddress: null,
-  };
-
-  let httpStatus: number | null = null;
-  let responseText = "";
-  let responseJson: any = null;
-  let fetchError: string | null = null;
-
-  try {
-    const response = await fetch(EXCHANGE_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    httpStatus = response.status;
-    responseText = await response.text();
-
-    try {
-      responseJson =
-        responseText.length > 0
-          ? JSON.parse(responseText)
-          : null;
-    } catch {
-      responseJson = null;
-    }
-  } catch (error: any) {
-    fetchError = error?.message ?? String(error);
-  }
-
-  const exchangeAccepted =
-    httpStatus === 200 &&
-    responseJson?.status === "ok";
-
-  const expectedDefaultResponse =
-    exchangeAccepted &&
-    responseJson?.response?.type === "default";
+  const signerValid = recovered === expected;
 
   return {
     module: "hyperliquid-signing-diagnostic",
-    version: "V5 SIGNED NOOP",
-    mode: "SUPPORTED_NOOP_SIGNATURE_TEST",
+    version: "V6 DRY-RUN ORDER BUILDER",
+    mode: "LOCAL_ORDER_BUILD_AND_SIGN_ONLY",
     network: "MAINNET",
 
     master_account: MASTER_ACCOUNT,
     expected_api_wallet: EXPECTED_API_WALLET,
 
-    secret: {
-      binding_name: "HYPERLIQUID_API_PRIVATE_KEY",
-      present: true,
-      format_ok: true,
-      value_returned: false,
-      value_logged: false,
-    },
-
     identity: {
       api_wallet_match: true,
-      derived_api_wallet_masked: maskAddress(derivedAddress),
-      recovered_signer_masked: maskAddress(recoveredAddress),
-      signer_verified_locally: true,
+      derived_api_wallet_masked: maskAddress(derived),
+      recovered_signer_masked: maskAddress(recovered),
+      signer_verified_locally: signerValid,
     },
 
-    noop: {
-      action_type: "noop",
+    dry_run_order: {
+      market: "BTC-PERP",
+      asset: 0,
+      side: "BUY_LONG",
+      limit_price: "1",
+      size: "0.00001",
+      reduce_only: false,
+      tif: "Gtc",
+      grouping: "na",
+
+      order_wire: orderWire,
+      action,
+
       nonce,
-      action_hash: actionHash,
-      signature_created: true,
       vault_address: null,
-      protocol_effect:
-        "MARK_THIS_NONCE_AS_USED_ONLY",
-      order_effect: false,
-      funds_effect: false,
+      action_hash: actionHash,
+
+      signature_created: true,
+      signature_returned_in_full: false,
+      signer_verified_locally: signerValid,
     },
 
     hyperliquid_exchange: {
-      endpoint_called: true,
-      request_sent: true,
-      http_status: httpStatus,
-      response_json: responseJson,
-      response_text:
-        responseJson === null
-          ? responseText.slice(0, 1000)
-          : null,
-      fetch_error: fetchError,
-      accepted: exchangeAccepted,
-      expected_default_response: expectedDefaultResponse,
+      endpoint_called: false,
+      request_sent: false,
+      reason:
+        "V6 is local DRY RUN only. The signed order action is intentionally not transmitted.",
     },
 
     validation: {
-      local_signature_valid: true,
-      hyperliquid_accepted_signature: exchangeAccepted,
-      noop_success:
-        exchangeAccepted && expectedDefaultResponse,
-      ready_for_dry_run_order_builder:
-        exchangeAccepted && expectedDefaultResponse,
+      order_wire_built: true,
+      order_action_built: true,
+      action_hash_created: true,
+      l1_signature_created: true,
+      local_signature_valid: signerValid,
+      ready_for_controlled_order_test: signerValid,
     },
 
     orders: {
-      created: false,
+      constructed_locally: true,
       sent: false,
+      placed: false,
+      filled: false,
       cancelled: false,
-      modified: false,
-    },
-
-    funds_action: {
-      transfer: false,
-      withdrawal: false,
-      leverage_change: false,
-      margin_change: false,
     },
 
     safety: {
       private_key_exposed_in_response: false,
       private_key_logged: false,
       full_signature_exposed: false,
+      exchange_request_sent: false,
       real_order_payload_sent: false,
-      noop_nonce_consumed_if_accepted: exchangeAccepted,
+      funds_can_move: false,
       real_trading_enabled: false,
-      funds_can_move_from_this_action: false,
       trading: "REAL_TRADING_DISABLED",
     },
 
