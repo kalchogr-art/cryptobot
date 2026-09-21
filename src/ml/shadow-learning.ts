@@ -1,25 +1,446 @@
-// src/ml/shadow-learning.ts
-// BASE V0.1 — safe module test. No trading, no schema assumptions.
-export interface Env { DB: D1Database; }
+// ============================================================
+// CRYPTOBOT ML — SHADOW LEARNING V0.2
+// SHADOW / RESEARCH ONLY — NO TRADING
+//
+// Purpose:
+// - Learns ONLY from completed signal_65_crossings.
+// - Compares ML probability against the existing >=65 mechanical signals.
+// - Predicts BEFORE learning each crossing, then updates online.
+// - Does NOT modify mechanical score, signals, paper trades or forward shadows.
+// - Uses only rows where first_barrier is TP or SL.
+// - TIME / no-barrier rows are excluded from training for now.
+//
+// Features (direction-normalized to the signal side):
+//   score, chart, orderFlow, funding
+//
+// model.ts remains the shared ML math module.
+// ============================================================
 
-export async function updateMLShadowLearning(env: Env): Promise<void> {
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ml_module_health (
-    module TEXT PRIMARY KEY,
-    runs INTEGER NOT NULL DEFAULT 0,
-    last_run TEXT,
-    status TEXT NOT NULL DEFAULT 'NEW'
-  )`).run();
+import {
+  INITIAL_WEIGHTS,
+  predictTP,
+  learnOne,
+  type MLFeatures,
+  type MLWeights,
+} from "./model";
 
-  await env.DB.prepare(`
-    INSERT INTO ml_module_health(module,runs,last_run,status)
-    VALUES('shadow-learning',1,CURRENT_TIMESTAMP,'OK')
-    ON CONFLICT(module) DO UPDATE SET
-      runs=runs+1,last_run=CURRENT_TIMESTAMP,status='OK'
-  `).run();
+export interface Env {
+  DB: D1Database;
 }
 
-export async function getMLShadowStatus(env: Env) {
-  return await env.DB.prepare(
-    `SELECT * FROM ml_module_health WHERE module='shadow-learning'`
-  ).first();
+const MODULE = "shadow-learning";
+const MODEL_KEY = "cross65_tp_vs_sl_v1";
+const LEARNING_RATE = 0.03;
+const MAX_ROWS_PER_RUN = 100;
+
+function finite(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sideDirection(side: unknown): number {
+  return String(side).toUpperCase() === "SHORT" ? -1 : 1;
+}
+
+function featureVector(row: any): MLFeatures {
+  const dir = sideDirection(row.side);
+
+  // All score-like values are approximately on a -100..100 scale.
+  // Convert to roughly -1..1 so online gradient updates remain stable.
+  return {
+    score: clamp(Math.abs(finite(row.crossing_score)) / 100, 0, 1),
+    chart: clamp((finite(row.chart_signed) * dir) / 100, -1, 1),
+    orderFlow: clamp(
+      (finite(row.order_flow_persistent_signed) * dir) / 100,
+      -1,
+      1
+    ),
+    funding: clamp(
+      (finite(row.funding_premium_signed) * dir) / 100,
+      -1,
+      1
+    ),
+  };
+}
+
+function labelFromRow(row: any): 0 | 1 | null {
+  const barrier = String(row.first_barrier ?? "").toUpperCase();
+  if (barrier === "TP") return 1;
+  if (barrier === "SL") return 0;
+  return null;
+}
+
+async function ensureTables(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ml_module_health (
+      module TEXT PRIMARY KEY,
+      runs INTEGER NOT NULL DEFAULT 0,
+      last_run TEXT,
+      status TEXT NOT NULL DEFAULT 'NEW'
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ml_shadow_model (
+      model_key TEXT PRIMARY KEY,
+      bias REAL NOT NULL DEFAULT 0,
+      weight_score REAL NOT NULL DEFAULT 0,
+      weight_chart REAL NOT NULL DEFAULT 0,
+      weight_order_flow REAL NOT NULL DEFAULT 0,
+      weight_funding REAL NOT NULL DEFAULT 0,
+      samples_trained INTEGER NOT NULL DEFAULT 0,
+      tp_labels INTEGER NOT NULL DEFAULT 0,
+      sl_labels INTEGER NOT NULL DEFAULT 0,
+      learning_rate REAL NOT NULL DEFAULT 0.03,
+      last_crossing_ts INTEGER,
+      last_crossing_id INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ml_shadow_predictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      crossing_id INTEGER NOT NULL UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      crossing_datetime TEXT,
+      crossing_score REAL NOT NULL,
+
+      feature_score REAL NOT NULL,
+      feature_chart REAL NOT NULL,
+      feature_order_flow REAL NOT NULL,
+      feature_funding REAL NOT NULL,
+
+      predicted_tp_probability REAL NOT NULL,
+      predicted_class INTEGER NOT NULL,
+      actual_label INTEGER NOT NULL,
+      actual_barrier TEXT NOT NULL,
+      prediction_correct INTEGER NOT NULL,
+
+      model_samples_before INTEGER NOT NULL,
+      model_key TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ml_shadow_predictions_ts
+    ON ml_shadow_predictions (crossing_ts DESC)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ml_shadow_predictions_coin
+    ON ml_shadow_predictions (coin, crossing_ts DESC)
+  `).run();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO ml_shadow_model (
+      model_key,
+      bias,
+      weight_score,
+      weight_chart,
+      weight_order_flow,
+      weight_funding,
+      samples_trained,
+      tp_labels,
+      sl_labels,
+      learning_rate
+    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+  `).bind(
+    MODEL_KEY,
+    INITIAL_WEIGHTS.bias,
+    INITIAL_WEIGHTS.score,
+    INITIAL_WEIGHTS.chart,
+    INITIAL_WEIGHTS.orderFlow,
+    INITIAL_WEIGHTS.funding,
+    LEARNING_RATE
+  ).run();
+}
+
+async function loadModel(env: Env): Promise<{
+  weights: MLWeights;
+  samples: number;
+  tpLabels: number;
+  slLabels: number;
+}> {
+  const row: any = await env.DB.prepare(`
+    SELECT *
+    FROM ml_shadow_model
+    WHERE model_key = ?
+    LIMIT 1
+  `).bind(MODEL_KEY).first();
+
+  if (!row) {
+    return {
+      weights: { ...INITIAL_WEIGHTS },
+      samples: 0,
+      tpLabels: 0,
+      slLabels: 0,
+    };
+  }
+
+  return {
+    weights: {
+      bias: finite(row.bias),
+      score: finite(row.weight_score),
+      chart: finite(row.weight_chart),
+      orderFlow: finite(row.weight_order_flow),
+      funding: finite(row.weight_funding),
+    },
+    samples: Math.max(0, Math.trunc(finite(row.samples_trained))),
+    tpLabels: Math.max(0, Math.trunc(finite(row.tp_labels))),
+    slLabels: Math.max(0, Math.trunc(finite(row.sl_labels))),
+  };
+}
+
+async function saveModel(
+  env: Env,
+  weights: MLWeights,
+  samples: number,
+  tpLabels: number,
+  slLabels: number,
+  lastRow: any
+): Promise<void> {
+  await env.DB.prepare(`
+    UPDATE ml_shadow_model
+    SET
+      bias = ?,
+      weight_score = ?,
+      weight_chart = ?,
+      weight_order_flow = ?,
+      weight_funding = ?,
+      samples_trained = ?,
+      tp_labels = ?,
+      sl_labels = ?,
+      learning_rate = ?,
+      last_crossing_ts = ?,
+      last_crossing_id = ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE model_key = ?
+  `).bind(
+    weights.bias,
+    weights.score,
+    weights.chart,
+    weights.orderFlow,
+    weights.funding,
+    samples,
+    tpLabels,
+    slLabels,
+    LEARNING_RATE,
+    lastRow?.crossing_ts ?? null,
+    lastRow?.id ?? null,
+    MODEL_KEY
+  ).run();
+}
+
+async function markHealth(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    INSERT INTO ml_module_health (module, runs, last_run, status)
+    VALUES (?, 1, CURRENT_TIMESTAMP, 'OK')
+    ON CONFLICT(module) DO UPDATE SET
+      runs = runs + 1,
+      last_run = CURRENT_TIMESTAMP,
+      status = 'OK'
+  `).bind(MODULE).run();
+}
+
+export async function updateMLShadowLearning(env: Env): Promise<any> {
+  await ensureTables(env);
+
+  // Only fully resolved TP/SL examples are valid labels.
+  // LEFT JOIN prevents the same crossing from ever being learned twice.
+  const pending: any = await env.DB.prepare(`
+    SELECT c.*
+    FROM signal_65_crossings c
+    LEFT JOIN ml_shadow_predictions p
+      ON p.crossing_id = c.id
+    WHERE c.outcome_complete = 1
+      AND c.first_barrier IN ('TP', 'SL')
+      AND p.crossing_id IS NULL
+    ORDER BY c.crossing_ts ASC, c.id ASC
+    LIMIT ?
+  `).bind(MAX_ROWS_PER_RUN).all();
+
+  let model = await loadModel(env);
+  let weights: MLWeights = { ...model.weights };
+  let samples = model.samples;
+  let tpLabels = model.tpLabels;
+  let slLabels = model.slLabels;
+
+  let processed = 0;
+  let correct = 0;
+  let lastRow: any = null;
+
+  for (const row of pending?.results ?? []) {
+    const label = labelFromRow(row);
+    if (label === null) continue;
+
+    const features = featureVector(row);
+
+    // IMPORTANT: prediction is generated using the model as it existed
+    // BEFORE this crossing is learned. This keeps the stored result honest.
+    const probability = predictTP(features, weights);
+    const predictedClass = probability >= 0.5 ? 1 : 0;
+    const isCorrect = predictedClass === label ? 1 : 0;
+
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO ml_shadow_predictions (
+        crossing_id,
+        coin,
+        side,
+        crossing_ts,
+        crossing_datetime,
+        crossing_score,
+        feature_score,
+        feature_chart,
+        feature_order_flow,
+        feature_funding,
+        predicted_tp_probability,
+        predicted_class,
+        actual_label,
+        actual_barrier,
+        prediction_correct,
+        model_samples_before,
+        model_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      row.id,
+      row.coin,
+      row.side,
+      row.crossing_ts,
+      row.crossing_datetime ?? null,
+      finite(row.crossing_score),
+      features.score,
+      features.chart,
+      features.orderFlow,
+      features.funding,
+      probability,
+      predictedClass,
+      label,
+      label === 1 ? "TP" : "SL",
+      isCorrect,
+      samples,
+      MODEL_KEY
+    ).run();
+
+    // Online update happens only AFTER the out-of-sample-style prediction.
+    weights = learnOne(features, label, weights, LEARNING_RATE);
+
+    samples += 1;
+    if (label === 1) tpLabels += 1;
+    else slLabels += 1;
+
+    processed += 1;
+    correct += isCorrect;
+    lastRow = row;
+  }
+
+  if (processed > 0) {
+    await saveModel(
+      env,
+      weights,
+      samples,
+      tpLabels,
+      slLabels,
+      lastRow
+    );
+  }
+
+  await markHealth(env);
+
+  return {
+    module: MODULE,
+    mode: "SHADOW_LEARNING",
+    trading: "REAL_TRADING_DISABLED",
+    model_key: MODEL_KEY,
+    processed_this_run: processed,
+    correct_this_run: correct,
+    accuracy_this_run:
+      processed > 0 ? Number((correct / processed).toFixed(4)) : null,
+    samples_trained_total: samples,
+    tp_labels: tpLabels,
+    sl_labels: slLabels,
+    learning_rate: LEARNING_RATE,
+    weights,
+  };
+}
+
+export async function getMLShadowStatus(env: Env): Promise<any> {
+  await ensureTables(env);
+
+  const health: any = await env.DB.prepare(`
+    SELECT module, runs, last_run, status
+    FROM ml_module_health
+    WHERE module = ?
+    LIMIT 1
+  `).bind(MODULE).first();
+
+  const model: any = await env.DB.prepare(`
+    SELECT *
+    FROM ml_shadow_model
+    WHERE model_key = ?
+    LIMIT 1
+  `).bind(MODEL_KEY).first();
+
+  const stats: any = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS predictions,
+      SUM(prediction_correct) AS correct,
+      SUM(CASE WHEN actual_label = 1 THEN 1 ELSE 0 END) AS actual_tp,
+      SUM(CASE WHEN actual_label = 0 THEN 1 ELSE 0 END) AS actual_sl,
+      AVG(predicted_tp_probability) AS avg_predicted_tp_probability
+    FROM ml_shadow_predictions
+    WHERE model_key = ?
+  `).bind(MODEL_KEY).first();
+
+  const predictions = Math.max(0, Math.trunc(finite(stats?.predictions)));
+  const correct = Math.max(0, Math.trunc(finite(stats?.correct)));
+
+  return {
+    module: MODULE,
+    runs: Math.max(0, Math.trunc(finite(health?.runs))),
+    last_run: health?.last_run ?? null,
+    status: health?.status ?? "NEW",
+    model: {
+      model_key: MODEL_KEY,
+      samples_trained: Math.max(
+        0,
+        Math.trunc(finite(model?.samples_trained))
+      ),
+      tp_labels: Math.max(0, Math.trunc(finite(model?.tp_labels))),
+      sl_labels: Math.max(0, Math.trunc(finite(model?.sl_labels))),
+      learning_rate: finite(model?.learning_rate, LEARNING_RATE),
+      weights: {
+        bias: finite(model?.bias),
+        score: finite(model?.weight_score),
+        chart: finite(model?.weight_chart),
+        orderFlow: finite(model?.weight_order_flow),
+        funding: finite(model?.weight_funding),
+      },
+    },
+    evaluation: {
+      predictions,
+      correct,
+      accuracy:
+        predictions > 0
+          ? Number((correct / predictions).toFixed(4))
+          : null,
+      actual_tp: Math.max(0, Math.trunc(finite(stats?.actual_tp))),
+      actual_sl: Math.max(0, Math.trunc(finite(stats?.actual_sl))),
+      avg_predicted_tp_probability:
+        stats?.avg_predicted_tp_probability == null
+          ? null
+          : Number(finite(stats.avg_predicted_tp_probability).toFixed(4)),
+    },
+    label_definition: "TP_FIRST=1, SL_FIRST=0",
+    excluded_from_training: "TIME_OR_NO_BARRIER",
+    trading: "REAL_TRADING_DISABLED",
+  };
 }
