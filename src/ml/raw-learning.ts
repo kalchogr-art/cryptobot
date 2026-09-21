@@ -1,13 +1,14 @@
 // ============================================================
-// CRYPTOBOT ML — RAW LEARNING V0.2 DATASET COLLECTOR
+// CRYPTOBOT ML — RAW LEARNING V0.2.1 CPU SAFE
 // RESEARCH ONLY / NO TRADING / NO EFFECT ON MECHANICAL SYSTEM
 //
-// Goal:
-// - Learn later from ALL market states, not only mechanical >=65 signals.
-// - Uses existing market_snapshots as the raw source.
-// - Copies each snapshot once into an independent ML dataset.
-// - Fills future labels when +5m / +15m / +30m prices become available.
-// - Does NOT train a model yet. First we build a clean dataset.
+// CPU FIX:
+// - NO historical 500-row backfill loops.
+// - Collect only the latest snapshot for each coin.
+// - One batch INSERT statement per run.
+// - Labels are filled with 3 set-based UPDATE statements (5m/15m/30m).
+// - No per-row future-price SELECT loops.
+// - Existing ml_raw_dataset from V0.2 is preserved.
 // ============================================================
 
 export interface Env {
@@ -15,17 +16,10 @@ export interface Env {
 }
 
 const MODULE = "raw-learning";
-const COLLECT_LIMIT = 500;
-const LABEL_LIMIT = 500;
 
-function finiteOrNull(v: unknown): number | null {
-  if (v === null || v === undefined) return null;
+function num(v: unknown, fallback = 0): number {
   const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function pct(entry: number, future: number): number {
-  return ((future / entry) - 1) * 100;
+  return Number.isFinite(n) ? n : fallback;
 }
 
 async function ensureTables(env: Env): Promise<void> {
@@ -84,10 +78,34 @@ async function ensureTables(env: Env): Promise<void> {
       snapshot_ts
     )
   `).run();
+
+  // Helps the set-based future-price lookups.
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_market_snapshots_coin_ts
+    ON market_snapshots (coin, ts)
+  `).run();
 }
 
-async function collectSnapshots(env: Env): Promise<number> {
-  const rows: any = await env.DB.prepare(`
+// ============================================================
+// COLLECT — latest snapshot per coin only
+// ============================================================
+
+async function collectLatestPerCoin(env: Env): Promise<number> {
+  // At most ~20 rows with the current tracked universe.
+  // One SQL statement; no JS row loop.
+  const result: any = await env.DB.prepare(`
+    INSERT OR IGNORE INTO ml_raw_dataset (
+      source_snapshot_id,
+      coin,
+      snapshot_ts,
+      snapshot_datetime,
+      price,
+      chart_signed,
+      order_flow_signed,
+      open_interest,
+      funding,
+      premium
+    )
     SELECT
       s.id,
       s.coin,
@@ -100,193 +118,165 @@ async function collectSnapshots(env: Env): Promise<number> {
       s.funding,
       s.premium
     FROM market_snapshots s
-    LEFT JOIN ml_raw_dataset r
-      ON r.source_snapshot_id = s.id
-    WHERE r.source_snapshot_id IS NULL
-      AND s.price IS NOT NULL
+    INNER JOIN (
+      SELECT coin, MAX(ts) AS max_ts
+      FROM market_snapshots
+      GROUP BY coin
+    ) latest
+      ON latest.coin = s.coin
+     AND latest.max_ts = s.ts
+    WHERE s.price IS NOT NULL
       AND s.price > 0
-    ORDER BY s.ts ASC, s.id ASC
-    LIMIT ?
-  `).bind(COLLECT_LIMIT).all();
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ml_raw_dataset r
+        WHERE r.source_snapshot_id = s.id
+      )
+  `).run();
 
-  let inserted = 0;
-
-  for (const row of rows?.results ?? []) {
-    const result: any = await env.DB.prepare(`
-      INSERT OR IGNORE INTO ml_raw_dataset (
-        source_snapshot_id,
-        coin,
-        snapshot_ts,
-        snapshot_datetime,
-        price,
-        chart_signed,
-        order_flow_signed,
-        open_interest,
-        funding,
-        premium
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      row.id,
-      row.coin,
-      row.ts,
-      row.datetime ?? null,
-      row.price,
-      finiteOrNull(row.chart_signed),
-      finiteOrNull(row.order_flow_signed),
-      finiteOrNull(row.open_interest),
-      finiteOrNull(row.funding),
-      finiteOrNull(row.premium)
-    ).run();
-
-    if (result?.meta?.changes > 0) inserted += 1;
-  }
-
-  return inserted;
+  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
-async function findFuturePrice(
-  env: Env,
-  coin: string,
-  targetTs: number
-): Promise<{ price: number; ts: number } | null> {
-  // Accept the nearest snapshot from target time to +2 minutes.
-  // This avoids using an earlier price and tolerates occasional missed cron runs.
-  const row: any = await env.DB.prepare(`
-    SELECT price, ts
-    FROM market_snapshots
-    WHERE coin = ?
-      AND ts >= ?
-      AND ts <= ?
-      AND price IS NOT NULL
-      AND price > 0
-    ORDER BY ts ASC
-    LIMIT 1
-  `).bind(coin, targetTs, targetTs + 120000).first();
+// ============================================================
+// LABELS — set based, no per-row loops
+// ============================================================
 
-  if (!row) return null;
+async function fill5m(env: Env): Promise<number> {
+  const result: any = await env.DB.prepare(`
+    UPDATE ml_raw_dataset
+    SET
+      price_5m = (
+        SELECT s.price
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+        ORDER BY s.ts ASC
+        LIMIT 1
+      ),
+      return_5m_pct = (
+        (
+          SELECT s.price
+          FROM market_snapshots s
+          WHERE s.coin = ml_raw_dataset.coin
+            AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
+            AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
+            AND s.price IS NOT NULL
+            AND s.price > 0
+          ORDER BY s.ts ASC
+          LIMIT 1
+        ) / price - 1.0
+      ) * 100.0,
+      label_5m_ready = 1,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE label_5m_ready = 0
+      AND snapshot_ts <= ? - 300000
+      AND EXISTS (
+        SELECT 1
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+      )
+  `).bind(Date.now()).run();
 
-  const price = finiteOrNull(row.price);
-  const ts = finiteOrNull(row.ts);
-  if (price === null || ts === null) return null;
-
-  return { price, ts };
+  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
-async function fillLabels(env: Env): Promise<{
-  rows_checked: number;
-  labels_5m_added: number;
-  labels_15m_added: number;
-  labels_30m_added: number;
-}> {
-  const now = Date.now();
+async function fill15m(env: Env): Promise<number> {
+  const result: any = await env.DB.prepare(`
+    UPDATE ml_raw_dataset
+    SET
+      price_15m = (
+        SELECT s.price
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+        ORDER BY s.ts ASC
+        LIMIT 1
+      ),
+      return_15m_pct = (
+        (
+          SELECT s.price
+          FROM market_snapshots s
+          WHERE s.coin = ml_raw_dataset.coin
+            AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
+            AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
+            AND s.price IS NOT NULL
+            AND s.price > 0
+          ORDER BY s.ts ASC
+          LIMIT 1
+        ) / price - 1.0
+      ) * 100.0,
+      label_15m_ready = 1,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE label_15m_ready = 0
+      AND snapshot_ts <= ? - 900000
+      AND EXISTS (
+        SELECT 1
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+      )
+  `).bind(Date.now()).run();
 
-  const rows: any = await env.DB.prepare(`
-    SELECT *
-    FROM ml_raw_dataset
-    WHERE
-      (label_5m_ready = 0 AND snapshot_ts <= ?)
-      OR (label_15m_ready = 0 AND snapshot_ts <= ?)
-      OR (label_30m_ready = 0 AND snapshot_ts <= ?)
-    ORDER BY snapshot_ts ASC
-    LIMIT ?
-  `).bind(
-    now - 5 * 60 * 1000,
-    now - 15 * 60 * 1000,
-    now - 30 * 60 * 1000,
-    LABEL_LIMIT
-  ).all();
+  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
+}
 
-  let labels5 = 0;
-  let labels15 = 0;
-  let labels30 = 0;
-  let checked = 0;
+async function fill30m(env: Env): Promise<number> {
+  const result: any = await env.DB.prepare(`
+    UPDATE ml_raw_dataset
+    SET
+      price_30m = (
+        SELECT s.price
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+        ORDER BY s.ts ASC
+        LIMIT 1
+      ),
+      return_30m_pct = (
+        (
+          SELECT s.price
+          FROM market_snapshots s
+          WHERE s.coin = ml_raw_dataset.coin
+            AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
+            AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
+            AND s.price IS NOT NULL
+            AND s.price > 0
+          ORDER BY s.ts ASC
+          LIMIT 1
+        ) / price - 1.0
+      ) * 100.0,
+      label_30m_ready = 1,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE label_30m_ready = 0
+      AND snapshot_ts <= ? - 1800000
+      AND EXISTS (
+        SELECT 1
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_dataset.coin
+          AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
+          AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+      )
+  `).bind(Date.now()).run();
 
-  for (const row of rows?.results ?? []) {
-    checked += 1;
-
-    const entryPrice = finiteOrNull(row.price);
-    const baseTs = finiteOrNull(row.snapshot_ts);
-    if (entryPrice === null || entryPrice <= 0 || baseTs === null) continue;
-
-    let p5: number | null = null;
-    let r5: number | null = null;
-    let ready5 = Number(row.label_5m_ready) === 1 ? 1 : 0;
-
-    let p15: number | null = null;
-    let r15: number | null = null;
-    let ready15 = Number(row.label_15m_ready) === 1 ? 1 : 0;
-
-    let p30: number | null = null;
-    let r30: number | null = null;
-    let ready30 = Number(row.label_30m_ready) === 1 ? 1 : 0;
-
-    if (!ready5 && baseTs <= now - 5 * 60 * 1000) {
-      const future = await findFuturePrice(env, row.coin, baseTs + 5 * 60 * 1000);
-      if (future) {
-        p5 = future.price;
-        r5 = pct(entryPrice, future.price);
-        ready5 = 1;
-        labels5 += 1;
-      }
-    }
-
-    if (!ready15 && baseTs <= now - 15 * 60 * 1000) {
-      const future = await findFuturePrice(env, row.coin, baseTs + 15 * 60 * 1000);
-      if (future) {
-        p15 = future.price;
-        r15 = pct(entryPrice, future.price);
-        ready15 = 1;
-        labels15 += 1;
-      }
-    }
-
-    if (!ready30 && baseTs <= now - 30 * 60 * 1000) {
-      const future = await findFuturePrice(env, row.coin, baseTs + 30 * 60 * 1000);
-      if (future) {
-        p30 = future.price;
-        r30 = pct(entryPrice, future.price);
-        ready30 = 1;
-        labels30 += 1;
-      }
-    }
-
-    if (
-      (p5 !== null && Number(row.label_5m_ready) !== 1) ||
-      (p15 !== null && Number(row.label_15m_ready) !== 1) ||
-      (p30 !== null && Number(row.label_30m_ready) !== 1)
-    ) {
-      await env.DB.prepare(`
-        UPDATE ml_raw_dataset
-        SET
-          price_5m = COALESCE(?, price_5m),
-          return_5m_pct = COALESCE(?, return_5m_pct),
-          label_5m_ready = ?,
-
-          price_15m = COALESCE(?, price_15m),
-          return_15m_pct = COALESCE(?, return_15m_pct),
-          label_15m_ready = ?,
-
-          price_30m = COALESCE(?, price_30m),
-          return_30m_pct = COALESCE(?, return_30m_pct),
-          label_30m_ready = ?,
-
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).bind(
-        p5, r5, ready5,
-        p15, r15, ready15,
-        p30, r30, ready30,
-        row.id
-      ).run();
-    }
-  }
-
-  return {
-    rows_checked: checked,
-    labels_5m_added: labels5,
-    labels_15m_added: labels15,
-    labels_30m_added: labels30,
-  };
+  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
 async function markHealth(env: Env): Promise<void> {
@@ -300,22 +290,37 @@ async function markHealth(env: Env): Promise<void> {
   `).bind(MODULE).run();
 }
 
+// ============================================================
+// CRON ENTRY
+// ============================================================
+
 export async function updateRawML(env: Env): Promise<any> {
   await ensureTables(env);
 
-  const collected = await collectSnapshots(env);
-  const labels = await fillLabels(env);
+  const snapshotsAdded = await collectLatestPerCoin(env);
+
+  // Only 3 batch UPDATEs regardless of dataset size.
+  const labels5 = await fill5m(env);
+  const labels15 = await fill15m(env);
+  const labels30 = await fill30m(env);
 
   await markHealth(env);
 
   return {
     module: MODULE,
-    mode: "RAW_DATASET_COLLECTOR",
+    version: "V0.2.1 CPU SAFE",
+    mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
-    snapshots_added: collected,
-    ...labels,
+    snapshots_added: snapshotsAdded,
+    labels_5m_added: labels5,
+    labels_15m_added: labels15,
+    labels_30m_added: labels30,
   };
 }
+
+// ============================================================
+// STATUS
+// ============================================================
 
 export async function getRawMLStatus(env: Env): Promise<any> {
   await ensureTables(env);
@@ -335,70 +340,50 @@ export async function getRawMLStatus(env: Env): Promise<any> {
       MAX(snapshot_datetime) AS latest_snapshot,
       SUM(label_5m_ready) AS ready_5m,
       SUM(label_15m_ready) AS ready_15m,
-      SUM(label_30m_ready) AS ready_30m,
-      AVG(return_5m_pct) AS avg_return_5m,
-      AVG(return_15m_pct) AS avg_return_15m,
-      AVG(return_30m_pct) AS avg_return_30m
+      SUM(label_30m_ready) AS ready_30m
     FROM ml_raw_dataset
   `).first();
 
-  const byCoin: any = await env.DB.prepare(`
-    SELECT
-      coin,
-      COUNT(*) AS rows,
-      SUM(label_5m_ready) AS ready_5m,
-      SUM(label_15m_ready) AS ready_15m,
-      SUM(label_30m_ready) AS ready_30m
-    FROM ml_raw_dataset
-    GROUP BY coin
-    ORDER BY coin ASC
-  `).all();
-
-  const totalRows = Math.max(0, Math.trunc(Number(totals?.total_rows ?? 0)));
-  const ready30 = Math.max(0, Math.trunc(Number(totals?.ready_30m ?? 0)));
+  const totalRows = Math.max(0, Math.trunc(num(totals?.total_rows)));
+  const ready5 = Math.max(0, Math.trunc(num(totals?.ready_5m)));
+  const ready15 = Math.max(0, Math.trunc(num(totals?.ready_15m)));
+  const ready30 = Math.max(0, Math.trunc(num(totals?.ready_30m)));
+  const coins = Math.max(0, Math.trunc(num(totals?.coins)));
 
   return {
     module: MODULE,
-    runs: Math.max(0, Math.trunc(Number(health?.runs ?? 0))),
+    version: "V0.2.1 CPU SAFE",
+    runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
 
     easy_read: {
-      what_is_this:
-        "Независим ML dataset от всички market snapshots. Тук няма филтър ≥65.",
+      mode: "CPU SAFE STREAMING",
+      explanation:
+        "Всеки run взима само най-новия snapshot за всяка монета. Не наваксва стотици стари редове наведнъж.",
       total_market_states_collected: totalRows,
-      coins_seen: Math.max(0, Math.trunc(Number(totals?.coins ?? 0))),
+      coins_seen: coins,
       future_results_ready: {
-        after_5m: Math.max(0, Math.trunc(Number(totals?.ready_5m ?? 0))),
-        after_15m: Math.max(0, Math.trunc(Number(totals?.ready_15m ?? 0))),
+        after_5m: ready5,
+        after_15m: ready15,
         after_30m: ready30,
       },
       first_snapshot: totals?.first_snapshot ?? null,
       latest_snapshot: totals?.latest_snapshot ?? null,
-      ready_for_first_training:
-        ready30 >= 1000,
+      ready_for_first_training: ready30 >= 1000,
       simple_conclusion:
         ready30 >= 1000
-          ? "Имаме поне 1000 записа с известен 30-минутен резултат. Можем да започнем първия Raw ML training експеримент."
-          : `Събираме чист dataset. За първия training тест целим поне 1000 записа с готов 30-минутен резултат; в момента са ${ready30}.`,
+          ? "Имаме поне 1000 записа с готов 30m резултат. Можем да подготвим първия Raw ML training тест."
+          : `Събираме dataset постепенно. Готови 30m резултати: ${ready30}/1000 за първия training тест.`,
     },
 
-    averages_research_only: {
-      return_5m_pct:
-        totals?.avg_return_5m == null
-          ? null
-          : Number(Number(totals.avg_return_5m).toFixed(5)),
-      return_15m_pct:
-        totals?.avg_return_15m == null
-          ? null
-          : Number(Number(totals.avg_return_15m).toFixed(5)),
-      return_30m_pct:
-        totals?.avg_return_30m == null
-          ? null
-          : Number(Number(totals.avg_return_30m).toFixed(5)),
+    cpu_safety: {
+      historical_backfill_loop: false,
+      per_row_label_queries: false,
+      collection: "LATEST_PER_COIN_ONLY",
+      label_updates_per_run: 3,
     },
 
-    by_coin: byCoin?.results ?? [],
     training: "NOT_STARTED_YET",
     mechanical_score_filter: "NONE",
     trading: "REAL_TRADING_DISABLED",
