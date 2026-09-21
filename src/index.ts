@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.7 LONG SHORT TP SL MATRIX";
+const VERSION = "V1.8.8 FORWARD LONG SHADOW";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -3965,6 +3965,96 @@ async function repairLegacyOver30mEpisodes(
   return {success:failed===0,legacy_found:legacy.length,repaired,unrecoverable,failed,diagnostics};
 }
 
+
+async function updateForwardLongShadow(env:any):Promise<void>{
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS forward_long_shadow (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      crossing_id INTEGER UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      crossing_datetime TEXT,
+      entry_price REAL NOT NULL,
+      score REAL,
+      tp_pct REAL NOT NULL DEFAULT 0.50,
+      sl_pct REAL NOT NULL DEFAULT 0.15,
+      tp_price REAL,
+      sl_price REAL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      exit_type TEXT,
+      exit_ts INTEGER,
+      exit_datetime TEXT,
+      exit_price REAL,
+      gross_return_pct REAL,
+      fee_pct REAL NOT NULL DEFAULT 0.07,
+      net_return_pct REAL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  // A crossing is eligible only while still incomplete, so deployment does not backfill historical completed rows.
+  const fresh:any=await env.DB.prepare(`
+    SELECT id, coin, side, crossing_ts, crossing_datetime, crossing_price, crossing_score
+    FROM signal_65_crossings
+    WHERE side='LONG' AND outcome_complete=0
+    ORDER BY crossing_ts ASC
+  `).all();
+
+  for(const c of (fresh?.results??[])){
+    const entry=Number(c.crossing_price);
+    if(!Number.isFinite(entry)||entry<=0) continue;
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO forward_long_shadow
+      (crossing_id,coin,side,crossing_ts,crossing_datetime,entry_price,score,tp_pct,sl_pct,tp_price,sl_price,status,fee_pct)
+      VALUES(?,?,?,?,?,?,?,0.50,0.15,?,?,'OPEN',0.07)
+    `).bind(
+      c.id,c.coin,"LONG",c.crossing_ts,c.crossing_datetime,entry,Number(c.crossing_score??0),
+      entry*1.005,entry*0.9985
+    ).run();
+  }
+
+  const open:any=await env.DB.prepare(`
+    SELECT * FROM forward_long_shadow WHERE status='OPEN' ORDER BY crossing_ts ASC
+  `).all();
+
+  for(const t of (open?.results??[])){
+    const snaps:any=await env.DB.prepare(`
+      SELECT ts, datetime, price
+      FROM market_snapshots
+      WHERE coin=? AND ts>? AND ts<=?
+      ORDER BY ts ASC
+    `).bind(t.coin,t.crossing_ts,t.crossing_ts+30*60*1000).all();
+
+    const arr:any[]=snaps?.results??[];
+    let exitType:string|null=null, exitPrice:number|null=null, exitTs:number|null=null, exitDt:string|null=null;
+    for(const s of arr){
+      const px=Number(s.price);
+      if(px>=Number(t.tp_price)){ exitType="TP"; exitPrice=Number(t.tp_price); exitTs=s.ts; exitDt=s.datetime; break; }
+      if(px<=Number(t.sl_price)){ exitType="SL"; exitPrice=Number(t.sl_price); exitTs=s.ts; exitDt=s.datetime; break; }
+    }
+
+    const now=Date.now();
+    if(!exitType && now>=Number(t.crossing_ts)+30*60*1000){
+      const last=arr.length?arr[arr.length-1]:null;
+      if(last){
+        exitType="TIME_30M"; exitPrice=Number(last.price); exitTs=last.ts; exitDt=last.datetime;
+      }
+    }
+    if(!exitType||exitPrice===null) continue;
+
+    const gross=(exitPrice/Number(t.entry_price)-1)*100;
+    const net=gross-0.07;
+    await env.DB.prepare(`
+      UPDATE forward_long_shadow
+      SET status='CLOSED',exit_type=?,exit_ts=?,exit_datetime=?,exit_price=?,
+          gross_return_pct=?,net_return_pct=?,updated_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).bind(exitType,exitTs,exitDt,exitPrice,gross,net,t.id).run();
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -4050,6 +4140,7 @@ export default {
           crossing_65_analytics: "/crossing-65-analytics",
           tp_sl_matrix: "/tp-sl-matrix",
           tp_sl_matrix_by_side: "/tp-sl-matrix-by-side",
+          forward_long_shadow: "/forward-long-shadow",
           debug: "/debug-hyperliquid",
         },
 
@@ -5140,6 +5231,102 @@ export default {
       });
     }
 
+
+    if (url.pathname === "/forward-long-shadow") {
+      await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS forward_long_shadow (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          crossing_id INTEGER UNIQUE,
+          coin TEXT NOT NULL,
+          side TEXT NOT NULL,
+          crossing_ts INTEGER NOT NULL,
+          crossing_datetime TEXT,
+          entry_price REAL NOT NULL,
+          score REAL,
+          tp_pct REAL NOT NULL DEFAULT 0.50,
+          sl_pct REAL NOT NULL DEFAULT 0.15,
+          tp_price REAL,
+          sl_price REAL,
+          status TEXT NOT NULL DEFAULT 'OPEN',
+          exit_type TEXT,
+          exit_ts INTEGER,
+          exit_datetime TEXT,
+          exit_price REAL,
+          gross_return_pct REAL,
+          fee_pct REAL NOT NULL DEFAULT 0.07,
+          net_return_pct REAL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+
+      const rows:any = await env.DB.prepare(`
+        SELECT id, crossing_id, coin, side, crossing_ts, crossing_datetime,
+               entry_price, score, tp_pct, sl_pct, tp_price, sl_price,
+               status, exit_type, exit_ts, exit_datetime, exit_price,
+               gross_return_pct, fee_pct, net_return_pct
+        FROM forward_long_shadow
+        ORDER BY crossing_ts DESC
+        LIMIT 200
+      `).all();
+
+      const trades:any[] = rows?.results ?? [];
+      const closed = trades.filter((x:any)=>x.status==="CLOSED");
+      const wins = closed.filter((x:any)=>x.exit_type==="TP").length;
+      const losses = closed.filter((x:any)=>x.exit_type==="SL").length;
+      const time = closed.filter((x:any)=>x.exit_type==="TIME_30M").length;
+      const net = closed.reduce((s:number,x:any)=>s+Number(x.net_return_pct??0),0);
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"FORWARD_LONG_SHADOW_READABLE",
+        trading:"REAL_TRADING_DISABLED",
+        strategy:{
+          threshold:">=65",
+          side:"LONG",
+          tp_pct:0.50,
+          sl_pct:0.15,
+          fee_round_trip_pct:0.07,
+          max_hold_minutes:30,
+          start_rule:"ONLY crossings first seen after V1.8.8 deploy; old crossings are not backfilled"
+        },
+        summary:{
+          total:trades.length,
+          open:trades.filter((x:any)=>x.status==="OPEN").length,
+          closed:closed.length,
+          tp:wins,
+          sl:losses,
+          time_exit:time,
+          net_return_sum_pct:Number(net.toFixed(4)),
+          pnl_usd_at_100_notional:Number(net.toFixed(2)),
+          pnl_usd_at_1000_notional:Number((net*10).toFixed(2))
+        },
+        columns_explained:{
+          entry:"price when >=65 LONG crossing was first captured",
+          tp:"target +0.50%",
+          sl:"stop -0.15%",
+          result:"OPEN / TP / SL / TIME_30M",
+          net:"result after 0.07% assumed round-trip fee"
+        },
+        trades:trades.map((x:any)=>({
+          id:x.id,
+          coin:x.coin,
+          date:x.crossing_datetime,
+          score:x.score,
+          entry:x.entry_price,
+          tp:x.tp_price,
+          sl:x.sl_price,
+          result:x.status==="OPEN" ? "OPEN" : x.exit_type,
+          exit:x.exit_price,
+          gross_pct:x.gross_return_pct,
+          fee_pct:x.fee_pct,
+          net_pct:x.net_return_pct
+        }))
+      });
+    }
+
     if (url.pathname === "/tp-sl-matrix-by-side") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
@@ -6202,6 +6389,8 @@ export default {
     env: Env,
     _ctx: any
   ): Promise<void> {
+      await updateForwardLongShadow(env);
+
     if (!env.DB) {
       console.log(
         "V1.4 snapshot skipped: D1 binding DB is missing"
