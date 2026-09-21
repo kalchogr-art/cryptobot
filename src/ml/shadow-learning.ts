@@ -1,5 +1,5 @@
 // ============================================================
-// CRYPTOBOT ML — SHADOW LEARNING V0.2
+// CRYPTOBOT ML — SHADOW LEARNING V0.4
 // SHADOW / RESEARCH ONLY — NO TRADING
 //
 // Purpose:
@@ -11,7 +11,7 @@
 // - TIME / no-barrier rows are excluded from training for now.
 //
 // Features (direction-normalized to the signal side):
-//   score, chart, orderFlow, funding
+//   score, chart, orderFlow, oiChange, funding
 //
 // model.ts remains the shared ML math module.
 // ============================================================
@@ -33,6 +33,14 @@ const MODEL_KEY = "cross65_tp_vs_sl_v1";
 const LEARNING_RATE = 0.03;
 const MAX_ROWS_PER_RUN = 100;
 
+type ShadowFeatures = MLFeatures & {
+  oiChange: number;
+};
+
+type ShadowWeights = MLWeights & {
+  oiChange: number;
+};
+
 function finite(value: unknown, fallback = 0): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -46,11 +54,10 @@ function sideDirection(side: unknown): number {
   return String(side).toUpperCase() === "SHORT" ? -1 : 1;
 }
 
-function featureVector(row: any): MLFeatures {
+function featureVector(row: any): ShadowFeatures {
   const dir = sideDirection(row.side);
 
-  // All score-like values are approximately on a -100..100 scale.
-  // Convert to roughly -1..1 so online gradient updates remain stable.
+  // Direction-normalized and scaled to roughly -1..1.
   return {
     score: clamp(Math.abs(finite(row.crossing_score)) / 100, 0, 1),
     chart: clamp((finite(row.chart_signed) * dir) / 100, -1, 1),
@@ -59,11 +66,47 @@ function featureVector(row: any): MLFeatures {
       -1,
       1
     ),
+    oiChange: clamp(
+      (finite(row.oi_change_signed) * dir) / 100,
+      -1,
+      1
+    ),
     funding: clamp(
       (finite(row.funding_premium_signed) * dir) / 100,
       -1,
       1
     ),
+  };
+}
+
+function predictShadowTP(x: ShadowFeatures, w: ShadowWeights) {
+  // Reuse model.ts for the original 4 features and add OI explicitly.
+  const base = predictTP(x, w);
+  const baseP = clamp(base.probability, 0.000001, 0.999999);
+  const baseLogit = Math.log(baseP / (1 - baseP));
+  const z = baseLogit + w.oiChange * x.oiChange;
+  const probability = 1 / (1 + Math.exp(-clamp(z, -20, 20)));
+  return {
+    probability,
+    prediction: probability >= 0.5 ? "TP" : "NOT_TP",
+  };
+}
+
+function learnShadowOne(
+  x: ShadowFeatures,
+  y: 0 | 1,
+  w: ShadowWeights,
+  learningRate = LEARNING_RATE
+): ShadowWeights {
+  const p = predictShadowTP(x, w).probability;
+  const e = y - p;
+  return {
+    bias: w.bias + learningRate * e,
+    score: w.score + learningRate * e * x.score,
+    chart: w.chart + learningRate * e * x.chart,
+    orderFlow: w.orderFlow + learningRate * e * x.orderFlow,
+    oiChange: w.oiChange + learningRate * e * x.oiChange,
+    funding: w.funding + learningRate * e * x.funding,
   };
 }
 
@@ -91,6 +134,7 @@ async function ensureTables(env: Env): Promise<void> {
       weight_score REAL NOT NULL DEFAULT 0,
       weight_chart REAL NOT NULL DEFAULT 0,
       weight_order_flow REAL NOT NULL DEFAULT 0,
+      weight_oi_change REAL NOT NULL DEFAULT 0,
       weight_funding REAL NOT NULL DEFAULT 0,
       samples_trained INTEGER NOT NULL DEFAULT 0,
       tp_labels INTEGER NOT NULL DEFAULT 0,
@@ -116,6 +160,7 @@ async function ensureTables(env: Env): Promise<void> {
       feature_score REAL NOT NULL,
       feature_chart REAL NOT NULL,
       feature_order_flow REAL NOT NULL,
+      feature_oi_change REAL NOT NULL,
       feature_funding REAL NOT NULL,
 
       predicted_tp_probability REAL NOT NULL,
@@ -129,6 +174,21 @@ async function ensureTables(env: Env): Promise<void> {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `).run();
+
+  // V0.4 safe migration for databases created by V0.2/V0.3.
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE ml_shadow_model
+      ADD COLUMN weight_oi_change REAL NOT NULL DEFAULT 0
+    `).run();
+  } catch (_) {}
+
+  try {
+    await env.DB.prepare(`
+      ALTER TABLE ml_shadow_predictions
+      ADD COLUMN feature_oi_change REAL NOT NULL DEFAULT 0
+    `).run();
+  } catch (_) {}
 
   await env.DB.prepare(`
     CREATE INDEX IF NOT EXISTS idx_ml_shadow_predictions_ts
@@ -147,25 +207,27 @@ async function ensureTables(env: Env): Promise<void> {
       weight_score,
       weight_chart,
       weight_order_flow,
+      weight_oi_change,
       weight_funding,
       samples_trained,
       tp_labels,
       sl_labels,
       learning_rate
-    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
   `).bind(
     MODEL_KEY,
     INITIAL_WEIGHTS.bias,
     INITIAL_WEIGHTS.score,
     INITIAL_WEIGHTS.chart,
     INITIAL_WEIGHTS.orderFlow,
+    0,
     INITIAL_WEIGHTS.funding,
     LEARNING_RATE
   ).run();
 }
 
 async function loadModel(env: Env): Promise<{
-  weights: MLWeights;
+  weights: ShadowWeights;
   samples: number;
   tpLabels: number;
   slLabels: number;
@@ -179,7 +241,7 @@ async function loadModel(env: Env): Promise<{
 
   if (!row) {
     return {
-      weights: { ...INITIAL_WEIGHTS },
+      weights: { ...INITIAL_WEIGHTS, oiChange: 0 },
       samples: 0,
       tpLabels: 0,
       slLabels: 0,
@@ -192,6 +254,7 @@ async function loadModel(env: Env): Promise<{
       score: finite(row.weight_score),
       chart: finite(row.weight_chart),
       orderFlow: finite(row.weight_order_flow),
+      oiChange: finite(row.weight_oi_change),
       funding: finite(row.weight_funding),
     },
     samples: Math.max(0, Math.trunc(finite(row.samples_trained))),
@@ -202,7 +265,7 @@ async function loadModel(env: Env): Promise<{
 
 async function saveModel(
   env: Env,
-  weights: MLWeights,
+  weights: ShadowWeights,
   samples: number,
   tpLabels: number,
   slLabels: number,
@@ -215,6 +278,7 @@ async function saveModel(
       weight_score = ?,
       weight_chart = ?,
       weight_order_flow = ?,
+      weight_oi_change = ?,
       weight_funding = ?,
       samples_trained = ?,
       tp_labels = ?,
@@ -229,6 +293,7 @@ async function saveModel(
     weights.score,
     weights.chart,
     weights.orderFlow,
+    weights.oiChange,
     weights.funding,
     samples,
     tpLabels,
@@ -269,7 +334,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
   `).bind(MAX_ROWS_PER_RUN).all();
 
   let model = await loadModel(env);
-  let weights: MLWeights = { ...model.weights };
+  let weights: ShadowWeights = { ...model.weights };
   let samples = model.samples;
   let tpLabels = model.tpLabels;
   let slLabels = model.slLabels;
@@ -286,7 +351,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
 
     // IMPORTANT: prediction is generated using the model as it existed
     // BEFORE this crossing is learned. This keeps the stored result honest.
-    const prediction = predictTP(features, weights);
+    const prediction = predictShadowTP(features, weights);
     const probability = prediction.probability;
     const predictedClass = prediction.prediction === "TP" ? 1 : 0;
     const isCorrect = predictedClass === label ? 1 : 0;
@@ -302,6 +367,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
         feature_score,
         feature_chart,
         feature_order_flow,
+        feature_oi_change,
         feature_funding,
         predicted_tp_probability,
         predicted_class,
@@ -310,7 +376,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
         prediction_correct,
         model_samples_before,
         model_key
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       row.id,
       row.coin,
@@ -321,6 +387,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
       features.score,
       features.chart,
       features.orderFlow,
+      features.oiChange,
       features.funding,
       probability,
       predictedClass,
@@ -332,7 +399,7 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
     ).run();
 
     // Online update happens only AFTER the out-of-sample-style prediction.
-    weights = learnOne(features, label, weights, LEARNING_RATE);
+    weights = learnShadowOne(features, label, weights, LEARNING_RATE);
 
     samples += 1;
     if (label === 1) tpLabels += 1;
@@ -545,6 +612,7 @@ export async function getMLShadowStatus(env: Env): Promise<any> {
         score: finite(model?.weight_score),
         chart: finite(model?.weight_chart),
         orderFlow: finite(model?.weight_order_flow),
+        oiChange: finite(model?.weight_oi_change),
         funding: finite(model?.weight_funding),
       },
     },
