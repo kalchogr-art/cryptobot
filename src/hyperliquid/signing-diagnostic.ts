@@ -1,5 +1,5 @@
 // ============================================================
-// HYPERLIQUID SIGNING DIAGNOSTIC V11 — REAL BTC ENTRY + TP/SL
+// HYPERLIQUID SIGNING DIAGNOSTIC V11.1 — REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX
 //
 // REAL TEST:
 // BTC LONG, LIMIT 80000, Cross leverage already set separately.
@@ -107,7 +107,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (!privateKeyFormatOk(secret)) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V11 REAL BTC ENTRY + TP/SL",
+      version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
       success: false,
       error: "PRIVATE_KEY_MISSING_OR_INVALID_FORMAT",
       timestamp: new Date().toISOString(),
@@ -121,7 +121,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (derived !== expected) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V11 REAL BTC ENTRY + TP/SL",
+      version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
       success: false,
       error: "API_WALLET_IDENTITY_MISMATCH",
       timestamp: new Date().toISOString(),
@@ -164,7 +164,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (!leverageOk) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V11 REAL BTC ENTRY + TP/SL",
+      version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
       success: false,
       error: "LEVERAGE_PREFLIGHT_FAILED",
       expected: {
@@ -218,8 +218,8 @@ export async function getHyperliquidSigningDiagnostic(
     r: true,
     t: {
       trigger: {
-        triggerPx: tpPriceWire,
         isMarket: true,
+        triggerPx: tpPriceWire,
         tpsl: "tp",
       },
     },
@@ -233,8 +233,8 @@ export async function getHyperliquidSigningDiagnostic(
     r: true,
     t: {
       trigger: {
-        triggerPx: slPriceWire,
         isMarket: true,
+        triggerPx: slPriceWire,
         tpsl: "sl",
       },
     },
@@ -297,7 +297,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (recovered !== expected) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V11 REAL BTC ENTRY + TP/SL",
+      version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
       success: false,
       error: "LOCAL_SIGNATURE_RECOVERY_MISMATCH",
       exchange_request_sent: false,
@@ -329,7 +329,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (!CONFIG.LIVE_TRADING) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V11 REAL BTC ENTRY + TP/SL",
+      version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
       mode: "DRY_RUN",
       success: true,
       config: CONFIG,
@@ -402,7 +402,7 @@ export async function getHyperliquidSigningDiagnostic(
 
   return {
     module: "hyperliquid-signing-diagnostic",
-    version: "V11 REAL BTC ENTRY + TP/SL",
+    version: "V11.1 REAL BTC ENTRY + TP/SL — TRIGGER SERIALIZATION FIX",
     mode: "LIVE_REAL_GROUPED_TPSL_ORDER",
     network: "MAINNET",
 
@@ -449,6 +449,7 @@ export async function getHyperliquidSigningDiagnostic(
     tp_sl: {
       sent: true,
       grouping: "normalTpsl",
+      trigger_wire_order: "isMarket -> triggerPx -> tpsl",
       take_profit_pct: CONFIG.TAKE_PROFIT_PCT,
       take_profit_trigger: tpPriceWire,
       stop_loss_pct: CONFIG.STOP_LOSS_PCT,
