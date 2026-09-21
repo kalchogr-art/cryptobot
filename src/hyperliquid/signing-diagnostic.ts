@@ -1,14 +1,14 @@
 // ============================================================
-// HYPERLIQUID SIGNING DIAGNOSTIC V10 — REAL BTC LIMIT ENTRY
+// HYPERLIQUID SIGNING DIAGNOSTIC V11 — REAL BTC ENTRY + TP/SL
 //
 // REAL TEST:
 // BTC LONG, LIMIT 80000, Cross leverage already set separately.
-// Builds size from ORDER_USD and exchange szDecimals.
-// Sends the real GTC order and leaves it open if accepted.
+// Builds position notional from MARGIN_USD × LEVERAGE and exchange szDecimals.
+// Sends ENTRY + TP + SL as one grouped normalTpsl request.
 //
 // NO auto-cancel.
 // NO leverage update.
-// NO TP/SL yet.
+// ENTRY + TP + SL are submitted together with grouping=normalTpsl.
 // ============================================================
 
 import { encode } from "@msgpack/msgpack";
@@ -30,7 +30,7 @@ const CONFIG = {
   SIDE: "LONG" as "LONG" | "SHORT",
 
   ORDER_PRICE: 80000,
-  ORDER_USD: 10.40,
+  MARGIN_USD: 1.04,
 
   // Expected account setup; V10 verifies but does not change it.
   LEVERAGE: 10,
@@ -107,7 +107,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (!privateKeyFormatOk(secret)) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V10 REAL BTC LIMIT ENTRY",
+      version: "V11 REAL BTC ENTRY + TP/SL",
       success: false,
       error: "PRIVATE_KEY_MISSING_OR_INVALID_FORMAT",
       timestamp: new Date().toISOString(),
@@ -121,7 +121,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (derived !== expected) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V10 REAL BTC LIMIT ENTRY",
+      version: "V11 REAL BTC ENTRY + TP/SL",
       success: false,
       error: "API_WALLET_IDENTITY_MISMATCH",
       timestamp: new Date().toISOString(),
@@ -164,7 +164,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (!leverageOk) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V10 REAL BTC LIMIT ENTRY",
+      version: "V11 REAL BTC ENTRY + TP/SL",
       success: false,
       error: "LEVERAGE_PREFLIGHT_FAILED",
       expected: {
@@ -181,7 +181,8 @@ export async function getHyperliquidSigningDiagnostic(
   }
 
   const price = CONFIG.ORDER_PRICE;
-  const rawSize = CONFIG.ORDER_USD / price;
+  const positionUsd = CONFIG.MARGIN_USD * CONFIG.LEVERAGE;
+  const rawSize = positionUsd / price;
 
   // Round UP so the precision step does not drop us below $10.
   const size = ceilSize(rawSize, szDecimals);
@@ -202,10 +203,49 @@ export async function getHyperliquidSigningDiagnostic(
     t: { limit: { tif: "Gtc" } },
   };
 
+  const tpPrice = price * (1 + CONFIG.TAKE_PROFIT_PCT / 100);
+  const slPrice = price * (1 - CONFIG.STOP_LOSS_PCT / 100);
+  const tpPriceWire = toWire(tpPrice, 8);
+  const slPriceWire = toWire(slPrice, 8);
+
+  // For a LONG entry, TP and SL close by SELLING the same size.
+  // Both children are reduce-only market-trigger orders.
+  const tpWire = {
+    a: asset,
+    b: false,
+    p: tpPriceWire,
+    s: sizeWire,
+    r: true,
+    t: {
+      trigger: {
+        triggerPx: tpPriceWire,
+        isMarket: true,
+        tpsl: "tp",
+      },
+    },
+  };
+
+  const slWire = {
+    a: asset,
+    b: false,
+    p: slPriceWire,
+    s: sizeWire,
+    r: true,
+    t: {
+      trigger: {
+        triggerPx: slPriceWire,
+        isMarket: true,
+        tpsl: "sl",
+      },
+    },
+  };
+
+  // Hyperliquid grouped bracket:
+  // parent entry first, then TP and SL children.
   const action = {
     type: "order",
-    orders: [orderWire],
-    grouping: "na",
+    orders: [orderWire, tpWire, slWire],
+    grouping: "normalTpsl",
   };
 
   const nonce = Date.now();
@@ -257,7 +297,7 @@ export async function getHyperliquidSigningDiagnostic(
   if (recovered !== expected) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V10 REAL BTC LIMIT ENTRY",
+      version: "V11 REAL BTC ENTRY + TP/SL",
       success: false,
       error: "LOCAL_SIGNATURE_RECOVERY_MISMATCH",
       exchange_request_sent: false,
@@ -272,7 +312,8 @@ export async function getHyperliquidSigningDiagnostic(
     sz_decimals: szDecimals,
     leverage: currentLeverage,
     leverage_type: currentLeverageType,
-    requested_order_usd: CONFIG.ORDER_USD,
+    margin_usd: CONFIG.MARGIN_USD,
+    position_usd_target: positionUsd,
     limit_price: priceWire,
     submitted_size: sizeWire,
     actual_notional_usd: Number(actualNotional.toFixed(8)),
@@ -280,12 +321,15 @@ export async function getHyperliquidSigningDiagnostic(
     mid_px: ctx?.midPx ?? null,
     available_to_trade: activeBefore?.availableToTrade ?? null,
     tif: "Gtc",
+    take_profit_trigger: tpPriceWire,
+    stop_loss_trigger: slPriceWire,
+    grouping: "normalTpsl",
   };
 
   if (!CONFIG.LIVE_TRADING) {
     return {
       module: "hyperliquid-signing-diagnostic",
-      version: "V10 REAL BTC LIMIT ENTRY",
+      version: "V11 REAL BTC ENTRY + TP/SL",
       mode: "DRY_RUN",
       success: true,
       config: CONFIG,
@@ -358,8 +402,8 @@ export async function getHyperliquidSigningDiagnostic(
 
   return {
     module: "hyperliquid-signing-diagnostic",
-    version: "V10 REAL BTC LIMIT ENTRY",
-    mode: "LIVE_REAL_LIMIT_ORDER",
+    version: "V11 REAL BTC ENTRY + TP/SL",
+    mode: "LIVE_REAL_GROUPED_TPSL_ORDER",
     network: "MAINNET",
 
     config: CONFIG,
@@ -403,10 +447,14 @@ export async function getHyperliquidSigningDiagnostic(
     },
 
     tp_sl: {
-      sent: false,
+      sent: true,
+      grouping: "normalTpsl",
       take_profit_pct: CONFIG.TAKE_PROFIT_PCT,
+      take_profit_trigger: tpPriceWire,
       stop_loss_pct: CONFIG.STOP_LOSS_PCT,
-      note: "TP/SL intentionally deferred until entry-order path is confirmed.",
+      stop_loss_trigger: slPriceWire,
+      reduce_only: true,
+      trigger_execution: "market",
     },
 
     safety: {
