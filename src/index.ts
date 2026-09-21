@@ -1,3 +1,6 @@
+import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning";
+import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
+
 // ============================================================
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
 // READ ONLY / NO TRADING
@@ -33,7 +36,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.1 DAILY FORWARD DASHBOARD";
+const VERSION = "V1.9.2 ML MODULE BASE TEST";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -6670,6 +6673,56 @@ export default {
       }
     }
 
+    // V1.9.2 — ML MODULE BASE TEST
+    // Safe health endpoints only. They do not change signals or place trades.
+    if (url.pathname === "/ml-shadow") {
+      if (!env.DB) {
+        return json({ success: false, error: "D1_NOT_BOUND", required_binding: "DB" }, 503);
+      }
+      try {
+        await updateMLShadowLearning(env as any);
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "shadow-learning",
+          mode: "BASE_TEST",
+          trading: "REAL_TRADING_DISABLED",
+          status: await getMLShadowStatus(env as any),
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          error: "ML_SHADOW_BASE_TEST_FAILED",
+          message: error?.message ?? String(error),
+        }, 500);
+      }
+    }
+
+    if (url.pathname === "/ml-raw") {
+      if (!env.DB) {
+        return json({ success: false, error: "D1_NOT_BOUND", required_binding: "DB" }, 503);
+      }
+      try {
+        await updateRawML(env as any);
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "raw-learning",
+          mode: "BASE_TEST",
+          trading: "REAL_TRADING_DISABLED",
+          status: await getRawMLStatus(env as any),
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          error: "ML_RAW_BASE_TEST_FAILED",
+          message: error?.message ?? String(error),
+        }, 500);
+      }
+    }
+
     // DEBUG
     if (url.pathname === "/debug-hyperliquid") {
       return json({
@@ -6819,6 +6872,20 @@ export default {
         };
       })
     );
+
+    // V1.9.2 — isolated ML module health runs.
+    // A module failure must never break the existing CryptoBot cron.
+    try {
+      await updateMLShadowLearning(env as any);
+    } catch (error: any) {
+      console.log("ML shadow module failed:", error?.message ?? String(error));
+    }
+
+    try {
+      await updateRawML(env as any);
+    } catch (error: any) {
+      console.log("ML raw module failed:", error?.message ?? String(error));
+    }
 
     console.log(
       JSON.stringify({
