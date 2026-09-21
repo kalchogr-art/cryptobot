@@ -24,7 +24,7 @@ import { privateKeyToAccount } from "viem/accounts";
 // EASY CONFIG
 // ============================================================
 const CONFIG = {
-  LIVE_TRADING: true,
+  LIVE_TRADING: false,
 
   COIN: "BTC",
   SIDE: "LONG" as "LONG" | "SHORT",
