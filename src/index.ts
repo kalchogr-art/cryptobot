@@ -1,6 +1,7 @@
 import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning";
 import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
 import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
+import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
 
 // ============================================================
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
@@ -64,6 +65,9 @@ type Env = {
 
   // Public Hyperliquid account address used by READ ONLY account module.
   HYPERLIQUID_ACCOUNT_ADDRESS?: string;
+
+  // Encrypted Cloudflare Secret. NEVER put its value in source code.
+  HYPERLIQUID_API_PRIVATE_KEY?: string;
 };
 
 type Candle = {
@@ -6695,6 +6699,30 @@ export default {
           worker: "cryptobot",
           version: VERSION,
           error: "HYPERLIQUID_ACCOUNT_READ_ONLY_FAILED",
+          message: error?.message ?? String(error),
+          trading: "REAL_TRADING_DISABLED",
+        }, 500);
+      }
+    }
+
+
+    // HYPERLIQUID SIGNING DIAGNOSTIC V1 — SAFE SECRET CHECK
+    // Does NOT sign, does NOT call /exchange, does NOT place an order.
+    if (url.pathname === "/hyperliquid-signing-diagnostic") {
+      try {
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          status: await getHyperliquidSigningDiagnostic(env),
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          error: "HYPERLIQUID_SIGNING_DIAGNOSTIC_FAILED",
           message: error?.message ?? String(error),
           trading: "REAL_TRADING_DISABLED",
         }, 500);
