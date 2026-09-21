@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.9 FORWARD SHADOW DASHBOARD";
+const VERSION = "V1.9.1 DAILY FORWARD DASHBOARD";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4055,6 +4055,96 @@ async function updateForwardLongShadow(env:any):Promise<void>{
   }
 }
 
+async function updateForwardShortShadow(env:any):Promise<void>{
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS forward_short_shadow (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      crossing_id INTEGER UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      crossing_datetime TEXT,
+      entry_price REAL NOT NULL,
+      score REAL,
+      tp_pct REAL NOT NULL DEFAULT 0.50,
+      sl_pct REAL NOT NULL DEFAULT 0.40,
+      tp_price REAL,
+      sl_price REAL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      exit_type TEXT,
+      exit_ts INTEGER,
+      exit_datetime TEXT,
+      exit_price REAL,
+      gross_return_pct REAL,
+      fee_pct REAL NOT NULL DEFAULT 0.07,
+      net_return_pct REAL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  // A crossing is eligible only while still incomplete, so deployment does not backfill historical completed rows.
+  const fresh:any=await env.DB.prepare(`
+    SELECT id, coin, side, crossing_ts, crossing_datetime, crossing_price, crossing_score
+    FROM signal_65_crossings
+    WHERE side='SHORT' AND outcome_complete=0
+    ORDER BY crossing_ts ASC
+  `).all();
+
+  for(const c of (fresh?.results??[])){
+    const entry=Number(c.crossing_price);
+    if(!Number.isFinite(entry)||entry<=0) continue;
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO forward_short_shadow
+      (crossing_id,coin,side,crossing_ts,crossing_datetime,entry_price,score,tp_pct,sl_pct,tp_price,sl_price,status,fee_pct)
+      VALUES(?,?,?,?,?,?,?,0.50,0.40,?,?,'OPEN',0.07)
+    `).bind(
+      c.id,c.coin,"SHORT",c.crossing_ts,c.crossing_datetime,entry,Number(c.crossing_score??0),
+      entry*0.995,entry*1.004
+    ).run();
+  }
+
+  const open:any=await env.DB.prepare(`
+    SELECT * FROM forward_short_shadow WHERE status='OPEN' ORDER BY crossing_ts ASC
+  `).all();
+
+  for(const t of (open?.results??[])){
+    const snaps:any=await env.DB.prepare(`
+      SELECT ts, datetime, price
+      FROM market_snapshots
+      WHERE coin=? AND ts>? AND ts<=?
+      ORDER BY ts ASC
+    `).bind(t.coin,t.crossing_ts,t.crossing_ts+30*60*1000).all();
+
+    const arr:any[]=snaps?.results??[];
+    let exitType:string|null=null, exitPrice:number|null=null, exitTs:number|null=null, exitDt:string|null=null;
+    for(const s of arr){
+      const px=Number(s.price);
+      if(px<=Number(t.tp_price)){ exitType="TP"; exitPrice=Number(t.tp_price); exitTs=s.ts; exitDt=s.datetime; break; }
+      if(px>=Number(t.sl_price)){ exitType="SL"; exitPrice=Number(t.sl_price); exitTs=s.ts; exitDt=s.datetime; break; }
+    }
+
+    const now=Date.now();
+    if(!exitType && now>=Number(t.crossing_ts)+30*60*1000){
+      const last=arr.length?arr[arr.length-1]:null;
+      if(last){
+        exitType="TIME_30M"; exitPrice=Number(last.price); exitTs=last.ts; exitDt=last.datetime;
+      }
+    }
+    if(!exitType||exitPrice===null) continue;
+
+    const gross=(Number(t.entry_price)/exitPrice-1)*100;
+    const net=gross-0.07;
+    await env.DB.prepare(`
+      UPDATE forward_short_shadow
+      SET status='CLOSED',exit_type=?,exit_ts=?,exit_datetime=?,exit_price=?,
+          gross_return_pct=?,net_return_pct=?,updated_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `).bind(exitType,exitTs,exitDt,exitPrice,gross,net,t.id).run();
+  }
+}
+
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -5233,6 +5323,89 @@ export default {
     }
 
 
+
+    if (url.pathname === "/forward-dashboard") {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS forward_short_shadow (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, crossing_id INTEGER UNIQUE, coin TEXT NOT NULL, side TEXT NOT NULL,
+        crossing_ts INTEGER NOT NULL, crossing_datetime TEXT, entry_price REAL NOT NULL, score REAL,
+        tp_pct REAL NOT NULL DEFAULT 0.50, sl_pct REAL NOT NULL DEFAULT 0.40, tp_price REAL, sl_price REAL,
+        status TEXT NOT NULL DEFAULT 'OPEN', exit_type TEXT, exit_ts INTEGER, exit_datetime TEXT, exit_price REAL,
+        gross_return_pct REAL, fee_pct REAL NOT NULL DEFAULT 0.07, net_return_pct REAL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`).run();
+
+      const lq:any=await env.DB.prepare(`SELECT * FROM forward_long_shadow ORDER BY crossing_ts DESC LIMIT 3000`).all();
+      const sq:any=await env.DB.prepare(`SELECT * FROM forward_short_shadow ORDER BY crossing_ts DESC LIMIT 3000`).all();
+      const all:any[]=[...(lq?.results??[]),...(sq?.results??[])].sort((a:any,b:any)=>Number(b.crossing_ts)-Number(a.crossing_ts));
+
+      const dayKey=(ts:any)=>{
+        const d=new Date(Number(ts));
+        const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Sofia",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(d);
+        const o:any={}; for(const p of parts) o[p.type]=p.value;
+        return `${o.year}-${o.month}-${o.day}`;
+      };
+      const now=Date.now(), today=dayKey(now), yesterday=dayKey(now-86400000);
+      const period=(url.searchParams.get("period")||"today").toLowerCase();
+      const selected=all.filter((x:any)=>{
+        const k=dayKey(x.crossing_ts);
+        if(period==="all") return true;
+        if(period==="7d") return Number(x.crossing_ts)>=now-7*86400000;
+        if(period==="yesterday") return k===yesterday;
+        return k===today;
+      });
+
+      const stats=(rows:any[],side?:string)=>{
+        const r=side?rows.filter(x=>x.side===side):rows;
+        const c=r.filter(x=>x.status==="CLOSED"),tp=c.filter(x=>x.exit_type==="TP").length,sl=c.filter(x=>x.exit_type==="SL").length;
+        const net=c.reduce((s:number,x:any)=>s+Number(x.net_return_pct??0),0);
+        return {total:r.length,open:r.filter(x=>x.status==="OPEN").length,closed:c.length,tp,sl,time:c.filter(x=>x.exit_type==="TIME_30M").length,
+          wr:c.length?tp/c.length*100:0,net,avg:c.length?net/c.length:0};
+      };
+      const LS=stats(selected,"LONG"), SS=stats(selected,"SHORT"), AS=stats(selected);
+
+      const groups:any={};
+      for(const x of selected){const k=dayKey(x.crossing_ts);(groups[k]??=[]).push(x);}
+      const days=Object.keys(groups).sort().reverse();
+
+      const fmt=(v:any)=>{const n=Number(v);if(!Number.isFinite(n))return"—";return (Math.abs(n)>=100?n.toFixed(2):Math.abs(n)>=1?n.toFixed(4):n.toFixed(6)).replace(/0+$/,"").replace(/\.$/,"")};
+      const pct=(v:any)=>{const n=Number(v);return Number.isFinite(n)?`${n>0?"+":""}${n.toFixed(2)}%`:"—"};
+      const dt=(v:any)=>{try{return new Intl.DateTimeFormat("bg-BG",{timeZone:"Europe/Sofia",hour:"2-digit",minute:"2-digit"}).format(new Date(v))}catch{return"—"}};
+      const badge=(x:any)=>x.status==="OPEN"?'<span class="badge open">● OPEN</span>':x.exit_type==="TP"?'<span class="badge win">✓ TP</span>':x.exit_type==="SL"?'<span class="badge loss">✕ SL</span>':'<span class="badge time">◷ TIME</span>';
+      const side=(x:any)=>x.side==="LONG"?'<span class="side long">↑ LONG</span>':'<span class="side short">↓ SHORT</span>';
+      const duration=(x:any)=>x.exit_ts?`${Math.max(0,Math.round((Number(x.exit_ts)-Number(x.crossing_ts))/60000))}m`:"OPEN";
+
+      const panel=(name:string,s:any,cls:string,rule:string)=>`<section class="panel ${cls}">
+        <div class="ph"><div><h2>${name}</h2><small>${rule}</small></div><b class="${s.net>=0?"pos":"neg"}">${pct(s.net)}</b></div>
+        <div class="metrics"><div><small>Сделки</small><b>${s.total}</b></div><div><small>TP / SL</small><b>${s.tp} / ${s.sl}</b></div><div><small>Win rate</small><b>${s.wr.toFixed(1)}%</b></div><div><small>Avg net</small><b class="${s.avg>=0?"pos":"neg"}">${pct(s.avg)}</b></div><div><small>P/L $1000</small><b class="${s.net>=0?"pos":"neg"}">$${(s.net*10).toFixed(2)}</b></div></div>
+      </section>`;
+
+      const dayBlocks=days.map((d:string,di:number)=>{
+        const rows=groups[d], ds=stats(rows);
+        const cards=rows.map((x:any)=>`<div class="trade">
+          <div class="top"><div><b>${x.coin}</b> ${side(x)}</div>${badge(x)}</div>
+          <div class="meta">${dt(x.crossing_datetime)} · Score ${Number(x.score??0).toFixed(2)} · ${duration(x)}</div>
+          <div class="prices"><div><small>ENTRY</small><b>${fmt(x.entry_price)}</b></div><div><small>TP</small><b class="pos">${fmt(x.tp_price)}</b></div><div><small>SL</small><b class="neg">${fmt(x.sl_price)}</b></div><div><small>NET</small><b class="${Number(x.net_return_pct??0)>=0?"pos":"neg"}">${x.status==="OPEN"?"—":pct(x.net_return_pct)}</b></div></div>
+        </div>`).join("");
+        const pretty=d.split("-").reverse().join(".");
+        return `<details class="day" ${di===0?"open":""}><summary><div><b>📅 ${pretty}</b><span>${rows.length} сделки · ${ds.tp} TP / ${ds.sl} SL</span></div><strong class="${ds.net>=0?"pos":"neg"}">${pct(ds.net)}</strong></summary><div class="daybody">${cards}</div></details>`;
+      }).join("");
+
+      const history=Object.keys(all.reduce((g:any,x:any)=>{const k=dayKey(x.crossing_ts);(g[k]??=[]).push(x);return g;},{})).sort().reverse().slice(0,14).map((d:string)=>{
+        const rows=all.filter(x=>dayKey(x.crossing_ts)===d), l=stats(rows,"LONG"), s=stats(rows,"SHORT"), a=stats(rows);
+        return `<tr><td>${d.split("-").reverse().join(".")}</td><td>${rows.length}</td><td class="${l.net>=0?"pos":"neg"}">${pct(l.net)}</td><td class="${s.net>=0?"pos":"neg"}">${pct(s.net)}</td><td class="${a.net>=0?"pos":"neg"}"><b>${pct(a.net)}</b></td></tr>`;
+      }).join("");
+
+      const tab=(key:string,label:string)=>`<a class="${period===key?"active":""}" href="/forward-dashboard?period=${key}">${label}</a>`;
+      const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>CryptoBot Forward</title>
+      <style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1050px;margin:auto;padding:16px}h1{margin:0;font-size:24px}.sub,.meta,small{color:#8292aa}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.live{color:#64dda0;font-size:12px}.tabs{display:flex;gap:7px;overflow:auto;margin:17px 0}.tabs a{white-space:nowrap;text-decoration:none;color:#a8b5ca;background:#121b2e;border:1px solid #27344e;padding:9px 13px;border-radius:999px;font-size:13px}.tabs a.active{background:#263d69;color:white;border-color:#5578ba}.compare{display:grid;grid-template-columns:1fr 1fr;gap:11px}.panel{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.lp{border-top:3px solid #62dc9d}.sp{border-top:3px solid #ff8490}.ph{display:flex;justify-content:space-between}.ph h2{margin:0;font-size:18px}.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:12px}.metrics div,.prices div{background:#0a1323;border-radius:9px;padding:8px}.metrics small,.prices small{display:block;font-size:9px}.metrics b{font-size:14px}.pos{color:#62dc9d}.neg{color:#ff7f8d}.sectiontitle{margin:21px 0 9px}.day{background:#10192b;border:1px solid #25324b;border-radius:14px;margin-bottom:9px;overflow:hidden}.day summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:13px;list-style:none}.day summary span{display:block;color:#7f90aa;font-size:11px;margin-top:3px}.daybody{padding:0 10px 10px}.trade{background:#0b1425;border-radius:11px;padding:11px;margin-top:7px}.top{display:flex;justify-content:space-between}.side,.badge{font-size:9px;font-weight:800;border-radius:999px;padding:4px 6px}.long,.win{background:#14382b;color:#6ce2a3}.short,.loss{background:#40202a;color:#ff8c98}.open{background:#413716;color:#ffdb72}.time{background:#25314a;color:#b7c5dc}.prices{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}.prices b{font-size:11px}.history{overflow:auto;background:#10192b;border:1px solid #25324b;border-radius:14px}table{width:100%;border-collapse:collapse;min-width:520px}th,td{padding:10px;text-align:left;border-bottom:1px solid #202c43;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:720px){.wrap{padding:11px}.head{display:block}.live{margin-top:4px}.compare{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.prices{grid-template-columns:repeat(2,1fr)}}</style></head>
+      <body><main class="wrap"><div class="head"><div><h1>📊 Forward LONG vs SHORT</h1><div class="sub">≥65 · Sofia time · fee 0.07%</div></div><div class="live">● PAPER · refresh 30s</div></div>
+      <nav class="tabs">${tab("today","Днес")}${tab("yesterday","Вчера")}${tab("7d","7 дни")}${tab("all","Всички")}</nav>
+      <div class="compare">${panel("↑ LONG",LS,"lp","TP +0.50% · SL −0.15%")}${panel("↓ SHORT",SS,"sp","TP +0.50% · SL −0.40%")}</div>
+      <h3 class="sectiontitle">Сделки по дни</h3>${dayBlocks||'<div class="day"><summary>Няма сделки за периода.</summary></div>'}
+      <h3 class="sectiontitle">Последни 14 дни</h3><div class="history"><table><thead><tr><th>Дата</th><th>Сделки</th><th>LONG</th><th>SHORT</th><th>Общо net</th></tr></thead><tbody>${history||'<tr><td colspan="5">Няма данни</td></tr>'}</tbody></table></div>
+      <div class="foot">V1.9.1 · Дните са по Europe/Sofia. При 7 дни/Всички всеки ден се разгъва отделно.</div></main></body></html>`;
+      return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+    }
 
     if (url.pathname === "/forward-long-shadow-dashboard") {
       await env.DB.prepare(`
@@ -6523,6 +6696,7 @@ export default {
     _ctx: any
   ): Promise<void> {
       await updateForwardLongShadow(env);
+      await updateForwardShortShadow(env);
 
     if (!env.DB) {
       console.log(
