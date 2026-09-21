@@ -286,8 +286,9 @@ export async function updateMLShadowLearning(env: Env): Promise<any> {
 
     // IMPORTANT: prediction is generated using the model as it existed
     // BEFORE this crossing is learned. This keeps the stored result honest.
-    const probability = predictTP(features, weights);
-    const predictedClass = probability >= 0.5 ? 1 : 0;
+    const prediction = predictTP(features, weights);
+    const probability = prediction.probability;
+    const predictedClass = prediction.prediction === "TP" ? 1 : 0;
     const isCorrect = predictedClass === label ? 1 : 0;
 
     await env.DB.prepare(`
