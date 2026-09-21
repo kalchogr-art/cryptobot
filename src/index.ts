@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.5 HYPERLIQUID EXECUTION READ ONLY STATUS";
+const VERSION = "V1.9.6 ONE TRADE PER COIN PER EPISODE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -6749,6 +6749,9 @@ export default {
             module: "hyperliquid-execution",
             source: "LATEST_SIGNAL_65_CROSSING",
             read_only_endpoint: true,
+            trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
+            same_episode_reentry: false,
+            concurrent_different_coins: true,
             latest_crossing: latest,
             execution,
           },
@@ -6986,12 +6989,18 @@ export default {
         const crossing65 = await record65Crossing(env, signal, finalSignal);
         const crossing6064 = await record6064Crossing(env, signal, finalSignal);
 
-        // V1.9.3 — NEW >=65 crossing -> Hyperliquid DRY RUN execution candidate.
-        // HARD SAFETY: execution.ts has LIVE_TRADING=false and never calls /exchange.
+        // HYPERLIQUID EXECUTION POLICY:
+        // - ONE TRADE PER COIN PER SIGNAL EPISODE.
+        // - record65Crossing() is the episode-level idempotency guard:
+        //   only the first >=65 crossing in that episode can create a candidate.
+        // - Different coins remain independent and may trade concurrently.
+        // - No same-episode re-entry after TP/SL.
+        // - HARD SAFETY: execution.ts currently has LIVE_TRADING=false.
         let hyperliquidExecution: any = {
           eligible: false,
           status: "SKIPPED",
-          reason: "NO_NEW_65_CROSSING",
+          reason: "NO_NEW_65_CROSSING_OR_EPISODE_ALREADY_TRADED",
+          trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
           live_trading: false,
           exchange_request_sent: false,
         };
