@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.4 HYPERLIQUID EXECUTION COMPLETE — DEFAULT FALSE";
+const VERSION = "V1.9.5 HYPERLIQUID EXECUTION READ ONLY STATUS";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -6679,6 +6679,89 @@ export default {
           },
           500
         );
+      }
+    }
+
+
+    // HYPERLIQUID EXECUTION V1 — READ ONLY
+    // Shows the latest >=65 crossing as the exact DRY-RUN bracket that the
+    // execution module would build. Never signs and never calls /exchange
+    // because execution.ts currently has LIVE_TRADING=false.
+    if (url.pathname === "/hyperliquid-execution") {
+      try {
+        if (!env.DB) {
+          return json({
+            success: false,
+            worker: "cryptobot",
+            version: VERSION,
+            error: "D1_NOT_BOUND",
+            trading: "REAL_TRADING_DISABLED",
+          }, 500);
+        }
+
+        const latest: any = await env.DB.prepare(`
+          SELECT
+            id,
+            episode_id,
+            coin,
+            side,
+            crossing_ts,
+            crossing_datetime,
+            crossing_price,
+            crossing_score
+          FROM signal_65_crossings
+          ORDER BY crossing_ts DESC
+          LIMIT 1
+        `).first();
+
+        if (!latest) {
+          return json({
+            success: true,
+            worker: "cryptobot",
+            version: VERSION,
+            trading: "REAL_TRADING_DISABLED",
+            status: {
+              module: "hyperliquid-execution",
+              live_trading: false,
+              exchange_request_sent: false,
+              latest_crossing: null,
+              execution: null,
+              message: "NO_65_CROSSING_FOUND",
+            },
+          });
+        }
+
+        const execution = await buildHyperliquidExecutionCandidate({
+          coin: String(latest.coin),
+          side: String(latest.side) as "LONG" | "SHORT",
+          score: Number(latest.crossing_score),
+          price: Number(latest.crossing_price),
+          crossing_id: latest.id,
+          episode_id: latest.episode_id,
+        }, env);
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          status: {
+            module: "hyperliquid-execution",
+            source: "LATEST_SIGNAL_65_CROSSING",
+            read_only_endpoint: true,
+            latest_crossing: latest,
+            execution,
+          },
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          error: "HYPERLIQUID_EXECUTION_READ_ONLY_FAILED",
+          message: error?.message ?? String(error),
+          trading: "REAL_TRADING_DISABLED",
+        }, 500);
       }
     }
 
