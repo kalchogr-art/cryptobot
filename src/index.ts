@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.3 HYPERLIQUID SIGNAL DRY RUN";
+const VERSION = "V1.9.4 HYPERLIQUID EXECUTION COMPLETE — DEFAULT FALSE";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -6922,7 +6922,7 @@ export default {
               price: Number(crossing65.crossing_price),
               crossing_id: crossing65.crossing_id ?? null,
               episode_id: crossing65.episode_id ?? null,
-            });
+            }, env);
           } catch (error: any) {
             hyperliquidExecution = {
               eligible: false,
