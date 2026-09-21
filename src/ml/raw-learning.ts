@@ -1,5 +1,5 @@
 // ============================================================
-// CRYPTOBOT ML — RAW LEARNING V0.4 MOVE CLASSIFIER
+// CRYPTOBOT ML — RAW LEARNING V0.5 FORWARD VALIDATION
 // RESEARCH ONLY / NO TRADING / NO EFFECT ON MECHANICAL SYSTEM
 //
 // CPU FIX:
@@ -552,31 +552,420 @@ async function markHealth(env: Env): Promise<void> {
   `).bind(MODULE).run();
 }
 
+
+// ============================================================
+// FORWARD VALIDATION V0.5
+// Frozen model from the first V0.4 chronological experiment.
+// IMPORTANT: these weights DO NOT learn/update during forward validation.
+// A prediction is stored before the future 30m result is known.
+// ============================================================
+
+const FORWARD_MODEL_KEY = "raw_v04_frozen_20260921";
+const FORWARD_MOVE_THRESHOLD_PCT = 0.30;
+
+const FROZEN_FORWARD_WEIGHTS: RawWeights = {
+  bias: 0.013707958318924383,
+  chart: -1.297549085886353,
+  orderFlow: -0.15473076917499598,
+  funding: -0.12655864188528854,
+  premium: -0.2055513587849824,
+};
+
+async function ensureForwardTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ml_raw_forward_predictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      model_key TEXT NOT NULL,
+      source_snapshot_id INTEGER NOT NULL,
+      coin TEXT NOT NULL,
+      snapshot_ts INTEGER NOT NULL,
+      snapshot_datetime TEXT,
+      entry_price REAL NOT NULL,
+
+      feature_chart REAL,
+      feature_order_flow REAL,
+      feature_funding REAL,
+      feature_premium REAL,
+
+      probability_long REAL NOT NULL,
+      predicted_side TEXT NOT NULL,
+      confidence REAL NOT NULL,
+
+      future_price_30m REAL,
+      return_30m_pct REAL,
+      actual_class TEXT,
+      correct INTEGER,
+      outcome_ready INTEGER NOT NULL DEFAULT 0,
+
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TEXT,
+
+      UNIQUE(model_key, source_snapshot_id)
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ml_raw_forward_model_ts
+    ON ml_raw_forward_predictions (model_key, snapshot_ts)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ml_raw_forward_pending
+    ON ml_raw_forward_predictions (model_key, outcome_ready, snapshot_ts)
+  `).run();
+}
+
+async function createForwardPredictions(env: Env): Promise<number> {
+  // Only the latest snapshot for each coin is eligible on each run.
+  // Existing source_snapshot_id values are protected by UNIQUE.
+  const rows: any = await env.DB.prepare(`
+    SELECT
+      s.id,
+      s.coin,
+      s.ts,
+      s.datetime,
+      s.price,
+      s.chart_signed,
+      s.order_flow_signed,
+      s.funding,
+      s.premium
+    FROM market_snapshots s
+    INNER JOIN (
+      SELECT coin, MAX(ts) AS max_ts
+      FROM market_snapshots
+      GROUP BY coin
+    ) latest
+      ON latest.coin = s.coin
+     AND latest.max_ts = s.ts
+    WHERE s.price IS NOT NULL
+      AND s.price > 0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ml_raw_forward_predictions p
+        WHERE p.model_key = ?
+          AND p.source_snapshot_id = s.id
+      )
+  `).bind(FORWARD_MODEL_KEY).all();
+
+  let inserted = 0;
+
+  // Max ~20 rows/run. Prediction math is tiny and no training occurs here.
+  for (const row of rows?.results ?? []) {
+    const x = rawFeatures(row);
+    const pLong = rawProbability(x, FROZEN_FORWARD_WEIGHTS);
+    const predictedSide = pLong >= 0.5 ? "LONG" : "SHORT";
+    const confidence = Math.max(pLong, 1 - pLong);
+
+    const result: any = await env.DB.prepare(`
+      INSERT OR IGNORE INTO ml_raw_forward_predictions (
+        model_key,
+        source_snapshot_id,
+        coin,
+        snapshot_ts,
+        snapshot_datetime,
+        entry_price,
+        feature_chart,
+        feature_order_flow,
+        feature_funding,
+        feature_premium,
+        probability_long,
+        predicted_side,
+        confidence
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      FORWARD_MODEL_KEY,
+      row.id,
+      row.coin,
+      row.ts,
+      row.datetime ?? null,
+      row.price,
+      x.chart,
+      x.orderFlow,
+      x.funding,
+      x.premium,
+      pLong,
+      predictedSide,
+      confidence
+    ).run();
+
+    inserted += Math.max(0, Math.trunc(num(result?.meta?.changes)));
+  }
+
+  return inserted;
+}
+
+async function resolveForwardPredictions(env: Env): Promise<number> {
+  // Set-based resolution. Neutral moves are retained as NEUTRAL and do not
+  // count as correct/incorrect in directional accuracy.
+  const now = Date.now();
+
+  const result: any = await env.DB.prepare(`
+    UPDATE ml_raw_forward_predictions
+    SET
+      future_price_30m = (
+        SELECT s.price
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_forward_predictions.coin
+          AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+          AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+        ORDER BY s.ts ASC
+        LIMIT 1
+      ),
+
+      return_30m_pct = (
+        (
+          SELECT s.price
+          FROM market_snapshots s
+          WHERE s.coin = ml_raw_forward_predictions.coin
+            AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+            AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+            AND s.price IS NOT NULL
+            AND s.price > 0
+          ORDER BY s.ts ASC
+          LIMIT 1
+        ) / entry_price - 1.0
+      ) * 100.0,
+
+      actual_class = CASE
+        WHEN (
+          (
+            SELECT s.price
+            FROM market_snapshots s
+            WHERE s.coin = ml_raw_forward_predictions.coin
+              AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+              AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+              AND s.price IS NOT NULL
+              AND s.price > 0
+            ORDER BY s.ts ASC
+            LIMIT 1
+          ) / entry_price - 1.0
+        ) * 100.0 >= 0.30 THEN 'LONG'
+
+        WHEN (
+          (
+            SELECT s.price
+            FROM market_snapshots s
+            WHERE s.coin = ml_raw_forward_predictions.coin
+              AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+              AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+              AND s.price IS NOT NULL
+              AND s.price > 0
+            ORDER BY s.ts ASC
+            LIMIT 1
+          ) / entry_price - 1.0
+        ) * 100.0 <= -0.30 THEN 'SHORT'
+
+        ELSE 'NEUTRAL'
+      END,
+
+      correct = CASE
+        WHEN ABS(
+          (
+            (
+              SELECT s.price
+              FROM market_snapshots s
+              WHERE s.coin = ml_raw_forward_predictions.coin
+                AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+                AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+                AND s.price IS NOT NULL
+                AND s.price > 0
+              ORDER BY s.ts ASC
+              LIMIT 1
+            ) / entry_price - 1.0
+          ) * 100.0
+        ) < 0.30 THEN NULL
+
+        WHEN predicted_side = CASE
+          WHEN (
+            (
+              SELECT s.price
+              FROM market_snapshots s
+              WHERE s.coin = ml_raw_forward_predictions.coin
+                AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+                AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+                AND s.price IS NOT NULL
+                AND s.price > 0
+              ORDER BY s.ts ASC
+              LIMIT 1
+            ) / entry_price - 1.0
+          ) * 100.0 >= 0.30 THEN 'LONG'
+          ELSE 'SHORT'
+        END THEN 1
+        ELSE 0
+      END,
+
+      outcome_ready = 1,
+      resolved_at = CURRENT_TIMESTAMP
+
+    WHERE model_key = ?
+      AND outcome_ready = 0
+      AND snapshot_ts <= ? - 1800000
+      AND EXISTS (
+        SELECT 1
+        FROM market_snapshots s
+        WHERE s.coin = ml_raw_forward_predictions.coin
+          AND s.ts >= ml_raw_forward_predictions.snapshot_ts + 1800000
+          AND s.ts <= ml_raw_forward_predictions.snapshot_ts + 1920000
+          AND s.price IS NOT NULL
+          AND s.price > 0
+      )
+  `).bind(FORWARD_MODEL_KEY, now).run();
+
+  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
+}
+
+async function getForwardStatus(env: Env): Promise<any> {
+  const totals: any = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS predictions,
+      SUM(CASE WHEN outcome_ready = 0 THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN outcome_ready = 1 THEN 1 ELSE 0 END) AS resolved,
+      SUM(CASE WHEN actual_class = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral,
+      SUM(CASE WHEN actual_class IN ('LONG','SHORT') THEN 1 ELSE 0 END) AS directional,
+      SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct
+    FROM ml_raw_forward_predictions
+    WHERE model_key = ?
+  `).bind(FORWARD_MODEL_KEY).first();
+
+  const thresholdRows: any = await env.DB.prepare(`
+    SELECT
+      CASE
+        WHEN confidence >= 0.70 THEN '70'
+        WHEN confidence >= 0.65 THEN '65'
+        WHEN confidence >= 0.60 THEN '60'
+        WHEN confidence >= 0.55 THEN '55'
+        ELSE 'UNDER55'
+      END AS bucket,
+      COUNT(*) AS predictions,
+      SUM(CASE WHEN outcome_ready = 0 THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN actual_class IN ('LONG','SHORT') THEN 1 ELSE 0 END) AS directional,
+      SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct,
+      SUM(CASE WHEN predicted_side = 'LONG' THEN 1 ELSE 0 END) AS predicted_long,
+      SUM(CASE WHEN predicted_side = 'SHORT' THEN 1 ELSE 0 END) AS predicted_short
+    FROM ml_raw_forward_predictions
+    WHERE model_key = ?
+    GROUP BY bucket
+  `).bind(FORWARD_MODEL_KEY).all();
+
+  const rawBuckets: Record<string, any> = {};
+  for (const r of thresholdRows?.results ?? []) rawBuckets[String(r.bucket)] = r;
+
+  const thresholds = [0.55, 0.60, 0.65, 0.70].map((t) => {
+    const min = Math.round(t * 100);
+    const eligible = Object.entries(rawBuckets)
+      .filter(([key]) => key !== "UNDER55" && Number(key) >= min)
+      .map(([, value]) => value);
+
+    const predictions = eligible.reduce((a, r) => a + num(r.predictions), 0);
+    const pending = eligible.reduce((a, r) => a + num(r.pending), 0);
+    const directional = eligible.reduce((a, r) => a + num(r.directional), 0);
+    const correct = eligible.reduce((a, r) => a + num(r.correct), 0);
+    const predictedLong = eligible.reduce((a, r) => a + num(r.predicted_long), 0);
+    const predictedShort = eligible.reduce((a, r) => a + num(r.predicted_short), 0);
+
+    return {
+      minimum_confidence: `${min}%`,
+      predictions,
+      pending,
+      directional_resolved: directional,
+      correct,
+      accuracy_pct:
+        directional > 0
+          ? Number(((correct / directional) * 100).toFixed(2))
+          : null,
+      predicted_long: predictedLong,
+      predicted_short: predictedShort,
+    };
+  });
+
+  const coins: any = await env.DB.prepare(`
+    SELECT
+      coin,
+      COUNT(*) AS predictions,
+      SUM(CASE WHEN outcome_ready = 0 THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN actual_class IN ('LONG','SHORT') THEN 1 ELSE 0 END) AS directional,
+      SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct,
+      SUM(CASE WHEN predicted_side = 'LONG' THEN 1 ELSE 0 END) AS predicted_long,
+      SUM(CASE WHEN predicted_side = 'SHORT' THEN 1 ELSE 0 END) AS predicted_short
+    FROM ml_raw_forward_predictions
+    WHERE model_key = ?
+    GROUP BY coin
+    ORDER BY coin ASC
+  `).bind(FORWARD_MODEL_KEY).all();
+
+  const byCoin = (coins?.results ?? []).map((r: any) => ({
+    coin: r.coin,
+    predictions: num(r.predictions),
+    pending: num(r.pending),
+    directional_resolved: num(r.directional),
+    correct: num(r.correct),
+    accuracy_pct:
+      num(r.directional) > 0
+        ? Number(((num(r.correct) / num(r.directional)) * 100).toFixed(2))
+        : null,
+    predicted_long: num(r.predicted_long),
+    predicted_short: num(r.predicted_short),
+  }));
+
+  const directional = num(totals?.directional);
+  const correct = num(totals?.correct);
+
+  return {
+    model_key: FORWARD_MODEL_KEY,
+    model: "FROZEN_V0.4_WEIGHTS",
+    move_threshold_pct: FORWARD_MOVE_THRESHOLD_PCT,
+    predictions: num(totals?.predictions),
+    pending: num(totals?.pending),
+    resolved: num(totals?.resolved),
+    neutral_resolved: num(totals?.neutral),
+    directional_resolved: directional,
+    correct,
+    directional_accuracy_pct:
+      directional > 0
+        ? Number(((correct / directional) * 100).toFixed(2))
+        : null,
+    confidence_filters: thresholds,
+    by_coin: byCoin,
+    weights_frozen: FROZEN_FORWARD_WEIGHTS,
+    note:
+      "Predictions are created before the 30m outcome exists. Neutral outcomes are excluded from directional accuracy. Weights never update in this forward test.",
+  };
+}
+
 // ============================================================
 // CRON ENTRY
 // ============================================================
 
 export async function updateRawML(env: Env): Promise<any> {
   await ensureTables(env);
+  await ensureForwardTable(env);
 
   const snapshotsAdded = await collectLatestPerCoin(env);
 
-  // Only 3 batch UPDATEs regardless of dataset size.
+  // CPU-safe raw labels.
   const labels5 = await fill5m(env);
   const labels15 = await fill15m(env);
   const labels30 = await fill30m(env);
+
+  // Frozen forward validation: predict newest snapshots, then resolve old ones.
+  const forwardPredictionsAdded = await createForwardPredictions(env);
+  const forwardResolved = await resolveForwardPredictions(env);
 
   await markHealth(env);
 
   return {
     module: MODULE,
-    version: "V0.4 MOVE CLASSIFIER",
+    version: "V0.5 FORWARD VALIDATION",
     mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
     snapshots_added: snapshotsAdded,
     labels_5m_added: labels5,
     labels_15m_added: labels15,
     labels_30m_added: labels30,
+    forward_predictions_added: forwardPredictionsAdded,
+    forward_resolved: forwardResolved,
   };
 }
 
@@ -586,6 +975,7 @@ export async function updateRawML(env: Env): Promise<any> {
 
 export async function getRawMLStatus(env: Env): Promise<any> {
   await ensureTables(env);
+  await ensureForwardTable(env);
 
   const health: any = await env.DB.prepare(`
     SELECT module, runs, last_run, status
@@ -607,6 +997,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
   `).first();
 
   const training = await runFirstTraining(env);
+  const forward = await getForwardStatus(env);
 
   const totalRows = Math.max(0, Math.trunc(num(totals?.total_rows)));
   const ready5 = Math.max(0, Math.trunc(num(totals?.ready_5m)));
@@ -616,7 +1007,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.4 MOVE CLASSIFIER",
+    version: "V0.5 FORWARD VALIDATION",
     runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
@@ -649,6 +1040,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
     },
 
     first_training: training,
+    forward_validation: forward,
     training_note:
       "Training runs only when /ml-raw status is requested; normal cron collection does not train the model.",
     mechanical_score_filter: "NONE",
