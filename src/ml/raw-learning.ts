@@ -1,5 +1,5 @@
 // ============================================================
-// CRYPTOBOT ML — RAW LEARNING V0.3 FIRST TRAINING
+// CRYPTOBOT ML — RAW LEARNING V0.4 MOVE CLASSIFIER
 // RESEARCH ONLY / NO TRADING / NO EFFECT ON MECHANICAL SYSTEM
 //
 // CPU FIX:
@@ -350,8 +350,10 @@ function learnRaw(
 }
 
 async function runFirstTraining(env: Env): Promise<any> {
-  // Keep training bounded for Worker CPU. 2700-ish current rows are fine,
-  // but cap the experiment to the latest 5000 labelled rows.
+  const MOVE_THRESHOLD_PCT = 0.30;
+
+  // Latest 5000 completed 30m examples, ordered chronologically.
+  // Neutral moves are excluded from training/evaluation.
   const data: any = await env.DB.prepare(`
     SELECT
       id, coin, snapshot_ts, chart_signed, order_flow_signed,
@@ -363,18 +365,28 @@ async function runFirstTraining(env: Env): Promise<any> {
     LIMIT 5000
   `).all();
 
-  const rows = data?.results ?? [];
-  if (rows.length < 100) {
+  const allRows = data?.results ?? [];
+  const directional = allRows.filter(
+    (row: any) => Math.abs(num(row.return_30m_pct)) >= MOVE_THRESHOLD_PCT
+  );
+
+  const neutralCount = allRows.length - directional.length;
+
+  if (directional.length < 100) {
     return {
-      status: "WAITING_FOR_DATA",
-      labelled_rows: rows.length,
-      required_minimum: 100,
+      status: "WAITING_FOR_DIRECTIONAL_DATA",
+      target: "30M_MOVE_LONG_VS_SHORT",
+      move_threshold_pct: MOVE_THRESHOLD_PCT,
+      total_completed_rows: allRows.length,
+      directional_rows: directional.length,
+      neutral_rows_excluded: neutralCount,
+      required_directional_minimum: 100,
     };
   }
 
-  const split = Math.max(1, Math.floor(rows.length * 0.70));
-  const train = rows.slice(0, split);
-  const test = rows.slice(split);
+  const split = Math.max(1, Math.floor(directional.length * 0.70));
+  const train = directional.slice(0, split);
+  const test = directional.slice(split);
 
   let w: RawWeights = {
     bias: 0,
@@ -384,16 +396,14 @@ async function runFirstTraining(env: Env): Promise<any> {
     premium: 0,
   };
 
-  // One chronological pass only. No repeated epochs for this first test.
   for (const row of train) {
-    const ret = num(row.return_30m_pct);
-    const y: 0 | 1 = ret > 0 ? 1 : 0;
+    const y: 0 | 1 = num(row.return_30m_pct) >= MOVE_THRESHOLD_PCT ? 1 : 0;
     w = learnRaw(rawFeatures(row), y, w, 0.03);
   }
 
   let correct = 0;
-  let upActual = 0;
-  let downActual = 0;
+  let actualLong = 0;
+  let actualShort = 0;
 
   const thresholds = [0.55, 0.60, 0.65, 0.70];
   const buckets: Record<string, {
@@ -407,25 +417,50 @@ async function runFirstTraining(env: Env): Promise<any> {
     buckets[String(t)] = { selected: 0, correct: 0, long: 0, short: 0 };
   }
 
-  for (const row of test) {
-    const ret = num(row.return_30m_pct);
-    const actualUp = ret > 0;
-    if (actualUp) upActual += 1;
-    else downActual += 1;
+  const coinStats: Record<string, {
+    total: number;
+    correct: number;
+    actualLong: number;
+    actualShort: number;
+    predictedLong: number;
+    predictedShort: number;
+  }> = {};
 
-    const pUp = rawProbability(rawFeatures(row), w);
-    const predictedUp = pUp >= 0.5;
-    if (predictedUp === actualUp) correct += 1;
+  for (const row of test) {
+    const actualIsLong = num(row.return_30m_pct) >= MOVE_THRESHOLD_PCT;
+    if (actualIsLong) actualLong += 1;
+    else actualShort += 1;
+
+    const pLong = rawProbability(rawFeatures(row), w);
+    const predictedLong = pLong >= 0.5;
+    const isCorrect = predictedLong === actualIsLong;
+    if (isCorrect) correct += 1;
+
+    const coin = String(row.coin ?? "UNKNOWN");
+    if (!coinStats[coin]) {
+      coinStats[coin] = {
+        total: 0, correct: 0,
+        actualLong: 0, actualShort: 0,
+        predictedLong: 0, predictedShort: 0
+      };
+    }
+    const cs = coinStats[coin];
+    cs.total += 1;
+    if (isCorrect) cs.correct += 1;
+    if (actualIsLong) cs.actualLong += 1;
+    else cs.actualShort += 1;
+    if (predictedLong) cs.predictedLong += 1;
+    else cs.predictedShort += 1;
 
     for (const t of thresholds) {
-      const confidence = Math.max(pUp, 1 - pUp);
+      const confidence = Math.max(pLong, 1 - pLong);
       if (confidence < t) continue;
 
       const b = buckets[String(t)];
       b.selected += 1;
-      if (predictedUp) b.long += 1;
+      if (predictedLong) b.long += 1;
       else b.short += 1;
-      if (predictedUp === actualUp) b.correct += 1;
+      if (isCorrect) b.correct += 1;
     }
   }
 
@@ -444,6 +479,20 @@ async function runFirstTraining(env: Env): Promise<any> {
     };
   });
 
+  const byCoin = Object.entries(coinStats)
+    .map(([coin, x]) => ({
+      coin,
+      test_samples: x.total,
+      correct: x.correct,
+      accuracy_pct:
+        x.total > 0 ? Number(((x.correct / x.total) * 100).toFixed(2)) : null,
+      actual_long: x.actualLong,
+      actual_short: x.actualShort,
+      predicted_long: x.predictedLong,
+      predicted_short: x.predictedShort,
+    }))
+    .sort((a, b) => b.test_samples - a.test_samples);
+
   const testAccuracy =
     test.length > 0
       ? Number(((correct / test.length) * 100).toFixed(2))
@@ -452,27 +501,32 @@ async function runFirstTraining(env: Env): Promise<any> {
   const majorityBaseline =
     test.length > 0
       ? Number(
-          ((Math.max(upActual, downActual) / test.length) * 100).toFixed(2)
+          ((Math.max(actualLong, actualShort) / test.length) * 100).toFixed(2)
         )
       : null;
 
   return {
     status: "OK",
-    target: "30M_DIRECTION_UP_VS_DOWN",
+    target: "30M_MOVE_LONG_VS_SHORT",
+    label_definition: {
+      long: `return_30m_pct >= +${MOVE_THRESHOLD_PCT}%`,
+      short: `return_30m_pct <= -${MOVE_THRESHOLD_PCT}%`,
+      neutral: `between -${MOVE_THRESHOLD_PCT}% and +${MOVE_THRESHOLD_PCT}% (excluded)`,
+    },
     mechanical_score_used: false,
-    split: "CHRONOLOGICAL_70_30",
-    total_rows: rows.length,
-    train_rows: train.length,
-    test_rows: test.length,
-    test_period: {
-      first_ts: test[0]?.snapshot_ts ?? null,
-      last_ts: test[test.length - 1]?.snapshot_ts ?? null,
+    split: "CHRONOLOGICAL_70_30_DIRECTIONAL_ONLY",
+    dataset: {
+      total_completed_rows: allRows.length,
+      directional_rows: directional.length,
+      neutral_rows_excluded: neutralCount,
+      train_rows: train.length,
+      test_rows: test.length,
     },
     test_result: {
       correct,
       accuracy_pct: testAccuracy,
-      actual_up: upActual,
-      actual_down: downActual,
+      actual_long: actualLong,
+      actual_short: actualShort,
       majority_class_baseline_pct: majorityBaseline,
       beats_majority_baseline:
         testAccuracy != null &&
@@ -480,9 +534,10 @@ async function runFirstTraining(env: Env): Promise<any> {
         testAccuracy > majorityBaseline,
     },
     confidence_filters: filters,
+    by_coin: byCoin,
     weights: w,
     warning:
-      "First research test only. Adjacent minute snapshots remain correlated; do not use this result for trading decisions.",
+      "Research only. Neutral 30m moves are excluded. Adjacent minute observations remain correlated; do not use this result for trading decisions.",
   };
 }
 
@@ -515,7 +570,7 @@ export async function updateRawML(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.3 FIRST TRAINING",
+    version: "V0.4 MOVE CLASSIFIER",
     mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
     snapshots_added: snapshotsAdded,
@@ -561,7 +616,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.3 FIRST TRAINING",
+    version: "V0.4 MOVE CLASSIFIER",
     runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
