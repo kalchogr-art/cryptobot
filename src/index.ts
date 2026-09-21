@@ -2,6 +2,7 @@ import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning"
 import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
 import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
 import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
+import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 
 // ============================================================
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
@@ -38,7 +39,7 @@ import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnosti
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.2 ML MODULE BASE TEST";
+const VERSION = "V1.9.3 HYPERLIQUID SIGNAL DRY RUN";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -6902,7 +6903,38 @@ export default {
         const crossing65 = await record65Crossing(env, signal, finalSignal);
         const crossing6064 = await record6064Crossing(env, signal, finalSignal);
 
-        // PAPER ONLY. No real order path exists here.
+        // V1.9.3 — NEW >=65 crossing -> Hyperliquid DRY RUN execution candidate.
+        // HARD SAFETY: execution.ts has LIVE_TRADING=false and never calls /exchange.
+        let hyperliquidExecution: any = {
+          eligible: false,
+          status: "SKIPPED",
+          reason: "NO_NEW_65_CROSSING",
+          live_trading: false,
+          exchange_request_sent: false,
+        };
+
+        if (crossing65?.recorded === true) {
+          try {
+            hyperliquidExecution = await buildHyperliquidExecutionCandidate({
+              coin,
+              side: crossing65.side,
+              score: Number(crossing65.crossing_score),
+              price: Number(crossing65.crossing_price),
+              crossing_id: crossing65.crossing_id ?? null,
+              episode_id: crossing65.episode_id ?? null,
+            });
+          } catch (error: any) {
+            hyperliquidExecution = {
+              eligible: false,
+              status: "ERROR",
+              reason: error?.message ?? String(error),
+              live_trading: false,
+              exchange_request_sent: false,
+            };
+          }
+        }
+
+        // Existing PAPER engine remains unchanged.
         const paper = await processPaperCoin(
           env,
           signal,
@@ -6921,6 +6953,7 @@ export default {
           episode,
           crossing65,
           crossing6064,
+          hyperliquid_execution: hyperliquidExecution,
           oi: signal.derivatives?.open_interest ?? null,
           order_flow:
             signal.microstructure?.order_flow?.signed_score ?? 0,
