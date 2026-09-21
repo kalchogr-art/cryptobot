@@ -66,9 +66,28 @@ function toWire(value: number, decimals = 8): string {
   return value.toFixed(decimals).replace(/\.?0+$/, "");
 }
 
-function ceilSize(size: number, szDecimals: number): number {
+function bestValidSize(
+  targetSize: number,
+  price: number,
+  szDecimals: number
+): number {
   const scale = 10 ** szDecimals;
-  return Math.ceil(size * scale - 1e-12) / scale;
+  const minSize = Math.ceil((10 / price) * scale - 1e-12) / scale;
+
+  const floorSize = Math.floor(targetSize * scale + 1e-12) / scale;
+  const ceilSize = Math.ceil(targetSize * scale - 1e-12) / scale;
+
+  const candidates = [floorSize, ceilSize, minSize]
+    .filter((v, i, a) => v > 0 && v * price >= 10 && a.indexOf(v) === i);
+
+  if (!candidates.length) return minSize;
+
+  return candidates.reduce((best, current) =>
+    Math.abs(current * price - CONFIG.MARGIN_USD * CONFIG.LEVERAGE) <
+    Math.abs(best * price - CONFIG.MARGIN_USD * CONFIG.LEVERAGE)
+      ? current
+      : best
+  );
 }
 
 // Hyperliquid prices: max 5 significant figures and max (6 - szDecimals)
@@ -255,8 +274,13 @@ export async function buildHyperliquidExecutionCandidate(
   const entryWire = priceToWire(entryPrice, szDecimals);
   const normalizedEntry = Number(entryWire);
 
-  // Round UP so precision does not push the order below Hyperliquid's $10 minimum.
-  const size = ceilSize(positionUsdTarget / normalizedEntry, szDecimals);
+  // Choose the closest exchange-valid size to the target notional,
+  // while never allowing the position below Hyperliquid's $10 minimum.
+  const size = bestValidSize(
+    positionUsdTarget / normalizedEntry,
+    normalizedEntry,
+    szDecimals
+  );
   const sizeWire = toWire(size, szDecimals);
   const actualNotionalUsd = normalizedEntry * size;
 
@@ -361,6 +385,7 @@ export async function buildHyperliquidExecutionCandidate(
       stop_loss_pct: CONFIG.STOP_LOSS_PCT,
       stop_loss_trigger: slWire,
       grouping: "normalTpsl",
+      trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
       mark_px: contexts?.[asset]?.markPx ?? null,
       mid_px: contexts?.[asset]?.midPx ?? null,
     },
