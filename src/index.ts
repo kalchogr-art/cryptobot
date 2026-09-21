@@ -1,5 +1,6 @@
 import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning";
 import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
+import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
 
 // ============================================================
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
@@ -60,6 +61,9 @@ type Env = {
 
   // Cloudflare D1 binding. Recommended binding name: DB
   DB?: any;
+
+  // Public Hyperliquid account address used by READ ONLY account module.
+  HYPERLIQUID_ACCOUNT_ADDRESS?: string;
 };
 
 type Candle = {
@@ -6670,6 +6674,30 @@ export default {
           },
           500
         );
+      }
+    }
+
+
+    // HYPERLIQUID ACCOUNT V1 — READ ONLY
+    // Public /info reads only. NO private key, signing, /exchange, or orders.
+    if (url.pathname === "/hyperliquid-account") {
+      try {
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          status: await getHyperliquidAccountReadOnly(env),
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          error: "HYPERLIQUID_ACCOUNT_READ_ONLY_FAILED",
+          message: error?.message ?? String(error),
+          trading: "REAL_TRADING_DISABLED",
+        }, 500);
       }
     }
 
