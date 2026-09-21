@@ -1,5 +1,5 @@
 // ============================================================
-// CRYPTOBOT ML — RAW LEARNING V0.2.1 CPU SAFE
+// CRYPTOBOT ML — RAW LEARNING V0.3 FIRST TRAINING
 // RESEARCH ONLY / NO TRADING / NO EFFECT ON MECHANICAL SYSTEM
 //
 // CPU FIX:
@@ -8,7 +8,15 @@
 // - One batch INSERT statement per run.
 // - Labels are filled with 3 set-based UPDATE statements (5m/15m/30m).
 // - No per-row future-price SELECT loops.
-// - Existing ml_raw_dataset from V0.2 is preserved.
+// - Existing ml_raw_dataset is preserved.
+//
+// FIRST TRAINING:
+// - Uses ONLY rows with a ready 30m future return.
+// - Chronological split: oldest 70% TRAIN, newest 30% TEST.
+// - No random split: reduces leakage from adjacent minute snapshots.
+// - Simple logistic classifier: predicts UP vs DOWN after 30m.
+// - Mechanical >=65 score is NOT used.
+// - Training is research-only and does not affect trading/signals.
 // ============================================================
 
 export interface Env {
@@ -279,6 +287,205 @@ async function fill30m(env: Env): Promise<number> {
   return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
+
+type RawWeights = {
+  bias: number;
+  chart: number;
+  orderFlow: number;
+  funding: number;
+  premium: number;
+};
+
+type RawFeatures = {
+  chart: number;
+  orderFlow: number;
+  funding: number;
+  premium: number;
+};
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function sigmoid(z: number): number {
+  return 1 / (1 + Math.exp(-clamp(z, -20, 20)));
+}
+
+function rawFeatures(row: any): RawFeatures {
+  // Score-like values are scaled to roughly -1..1.
+  // Funding/premium are much smaller raw values, so use conservative scaling.
+  return {
+    chart: clamp(num(row.chart_signed) / 100, -1, 1),
+    orderFlow: clamp(num(row.order_flow_signed) / 100, -1, 1),
+    funding: clamp(num(row.funding) * 10000, -1, 1),
+    premium: clamp(num(row.premium) * 1000, -1, 1),
+  };
+}
+
+function rawProbability(x: RawFeatures, w: RawWeights): number {
+  return sigmoid(
+    w.bias +
+    w.chart * x.chart +
+    w.orderFlow * x.orderFlow +
+    w.funding * x.funding +
+    w.premium * x.premium
+  );
+}
+
+function learnRaw(
+  x: RawFeatures,
+  y: 0 | 1,
+  w: RawWeights,
+  lr = 0.03
+): RawWeights {
+  const p = rawProbability(x, w);
+  const e = y - p;
+  return {
+    bias: w.bias + lr * e,
+    chart: w.chart + lr * e * x.chart,
+    orderFlow: w.orderFlow + lr * e * x.orderFlow,
+    funding: w.funding + lr * e * x.funding,
+    premium: w.premium + lr * e * x.premium,
+  };
+}
+
+async function runFirstTraining(env: Env): Promise<any> {
+  // Keep training bounded for Worker CPU. 2700-ish current rows are fine,
+  // but cap the experiment to the latest 5000 labelled rows.
+  const data: any = await env.DB.prepare(`
+    SELECT
+      id, coin, snapshot_ts, chart_signed, order_flow_signed,
+      funding, premium, return_30m_pct
+    FROM ml_raw_dataset
+    WHERE label_30m_ready = 1
+      AND return_30m_pct IS NOT NULL
+    ORDER BY snapshot_ts ASC, id ASC
+    LIMIT 5000
+  `).all();
+
+  const rows = data?.results ?? [];
+  if (rows.length < 100) {
+    return {
+      status: "WAITING_FOR_DATA",
+      labelled_rows: rows.length,
+      required_minimum: 100,
+    };
+  }
+
+  const split = Math.max(1, Math.floor(rows.length * 0.70));
+  const train = rows.slice(0, split);
+  const test = rows.slice(split);
+
+  let w: RawWeights = {
+    bias: 0,
+    chart: 0,
+    orderFlow: 0,
+    funding: 0,
+    premium: 0,
+  };
+
+  // One chronological pass only. No repeated epochs for this first test.
+  for (const row of train) {
+    const ret = num(row.return_30m_pct);
+    const y: 0 | 1 = ret > 0 ? 1 : 0;
+    w = learnRaw(rawFeatures(row), y, w, 0.03);
+  }
+
+  let correct = 0;
+  let upActual = 0;
+  let downActual = 0;
+
+  const thresholds = [0.55, 0.60, 0.65, 0.70];
+  const buckets: Record<string, {
+    selected: number;
+    correct: number;
+    long: number;
+    short: number;
+  }> = {};
+
+  for (const t of thresholds) {
+    buckets[String(t)] = { selected: 0, correct: 0, long: 0, short: 0 };
+  }
+
+  for (const row of test) {
+    const ret = num(row.return_30m_pct);
+    const actualUp = ret > 0;
+    if (actualUp) upActual += 1;
+    else downActual += 1;
+
+    const pUp = rawProbability(rawFeatures(row), w);
+    const predictedUp = pUp >= 0.5;
+    if (predictedUp === actualUp) correct += 1;
+
+    for (const t of thresholds) {
+      const confidence = Math.max(pUp, 1 - pUp);
+      if (confidence < t) continue;
+
+      const b = buckets[String(t)];
+      b.selected += 1;
+      if (predictedUp) b.long += 1;
+      else b.short += 1;
+      if (predictedUp === actualUp) b.correct += 1;
+    }
+  }
+
+  const filters = thresholds.map((t) => {
+    const b = buckets[String(t)];
+    return {
+      minimum_confidence: `${Math.round(t * 100)}%`,
+      signals_selected: b.selected,
+      long_predictions: b.long,
+      short_predictions: b.short,
+      correct: b.correct,
+      accuracy_pct:
+        b.selected > 0
+          ? Number(((b.correct / b.selected) * 100).toFixed(2))
+          : null,
+    };
+  });
+
+  const testAccuracy =
+    test.length > 0
+      ? Number(((correct / test.length) * 100).toFixed(2))
+      : null;
+
+  const majorityBaseline =
+    test.length > 0
+      ? Number(
+          ((Math.max(upActual, downActual) / test.length) * 100).toFixed(2)
+        )
+      : null;
+
+  return {
+    status: "OK",
+    target: "30M_DIRECTION_UP_VS_DOWN",
+    mechanical_score_used: false,
+    split: "CHRONOLOGICAL_70_30",
+    total_rows: rows.length,
+    train_rows: train.length,
+    test_rows: test.length,
+    test_period: {
+      first_ts: test[0]?.snapshot_ts ?? null,
+      last_ts: test[test.length - 1]?.snapshot_ts ?? null,
+    },
+    test_result: {
+      correct,
+      accuracy_pct: testAccuracy,
+      actual_up: upActual,
+      actual_down: downActual,
+      majority_class_baseline_pct: majorityBaseline,
+      beats_majority_baseline:
+        testAccuracy != null &&
+        majorityBaseline != null &&
+        testAccuracy > majorityBaseline,
+    },
+    confidence_filters: filters,
+    weights: w,
+    warning:
+      "First research test only. Adjacent minute snapshots remain correlated; do not use this result for trading decisions.",
+  };
+}
+
 async function markHealth(env: Env): Promise<void> {
   await env.DB.prepare(`
     INSERT INTO ml_module_health(module, runs, last_run, status)
@@ -308,7 +515,7 @@ export async function updateRawML(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.2.1 CPU SAFE",
+    version: "V0.3 FIRST TRAINING",
     mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
     snapshots_added: snapshotsAdded,
@@ -344,6 +551,8 @@ export async function getRawMLStatus(env: Env): Promise<any> {
     FROM ml_raw_dataset
   `).first();
 
+  const training = await runFirstTraining(env);
+
   const totalRows = Math.max(0, Math.trunc(num(totals?.total_rows)));
   const ready5 = Math.max(0, Math.trunc(num(totals?.ready_5m)));
   const ready15 = Math.max(0, Math.trunc(num(totals?.ready_15m)));
@@ -352,7 +561,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.2.1 CPU SAFE",
+    version: "V0.3 FIRST TRAINING",
     runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
@@ -384,7 +593,9 @@ export async function getRawMLStatus(env: Env): Promise<any> {
       label_updates_per_run: 3,
     },
 
-    training: "NOT_STARTED_YET",
+    first_training: training,
+    training_note:
+      "Training runs only when /ml-raw status is requested; normal cron collection does not train the model.",
     mechanical_score_filter: "NONE",
     trading: "REAL_TRADING_DISABLED",
   };
