@@ -33,7 +33,7 @@
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.8.8 FORWARD LONG SHADOW";
+const VERSION = "V1.8.9 FORWARD SHADOW DASHBOARD";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4141,6 +4141,7 @@ export default {
           tp_sl_matrix: "/tp-sl-matrix",
           tp_sl_matrix_by_side: "/tp-sl-matrix-by-side",
           forward_long_shadow: "/forward-long-shadow",
+          forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
           debug: "/debug-hyperliquid",
         },
 
@@ -5231,6 +5232,138 @@ export default {
       });
     }
 
+
+
+    if (url.pathname === "/forward-long-shadow-dashboard") {
+      await env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS forward_long_shadow (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          crossing_id INTEGER UNIQUE,
+          coin TEXT NOT NULL,
+          side TEXT NOT NULL,
+          crossing_ts INTEGER NOT NULL,
+          crossing_datetime TEXT,
+          entry_price REAL NOT NULL,
+          score REAL,
+          tp_pct REAL NOT NULL DEFAULT 0.50,
+          sl_pct REAL NOT NULL DEFAULT 0.15,
+          tp_price REAL,
+          sl_price REAL,
+          status TEXT NOT NULL DEFAULT 'OPEN',
+          exit_type TEXT,
+          exit_ts INTEGER,
+          exit_datetime TEXT,
+          exit_price REAL,
+          gross_return_pct REAL,
+          fee_pct REAL NOT NULL DEFAULT 0.07,
+          net_return_pct REAL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+
+      const q:any=await env.DB.prepare(`
+        SELECT * FROM forward_long_shadow ORDER BY crossing_ts DESC LIMIT 200
+      `).all();
+      const trades:any[]=q?.results??[];
+      const closed=trades.filter((x:any)=>x.status==="CLOSED");
+      const tp=closed.filter((x:any)=>x.exit_type==="TP").length;
+      const sl=closed.filter((x:any)=>x.exit_type==="SL").length;
+      const time=closed.filter((x:any)=>x.exit_type==="TIME_30M").length;
+      const open=trades.filter((x:any)=>x.status==="OPEN").length;
+      const net=closed.reduce((s:number,x:any)=>s+Number(x.net_return_pct??0),0);
+      const avg=closed.length?net/closed.length:0;
+      const wr=closed.length?tp/closed.length*100:0;
+
+      const esc=(v:any)=>String(v??"").replace(/[&<>"']/g,(c:string)=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"} as any)[c]);
+      const fmt=(v:any)=>{
+        const n=Number(v); if(!Number.isFinite(n)) return "—";
+        if(Math.abs(n)>=100) return n.toFixed(2);
+        if(Math.abs(n)>=1) return n.toFixed(4).replace(/0+$/,"").replace(/\.$/,"");
+        return n.toFixed(6).replace(/0+$/,"").replace(/\.$/,"");
+      };
+      const pct=(v:any)=>{
+        const n=Number(v); if(!Number.isFinite(n)) return "—";
+        return `${n>0?"+":""}${n.toFixed(2)}%`;
+      };
+      const dur=(x:any)=>{
+        if(!x.exit_ts) return "OPEN";
+        const m=Math.max(0,Math.round((Number(x.exit_ts)-Number(x.crossing_ts))/60000));
+        return `${m}m`;
+      };
+      const localDate=(v:any)=>{
+        if(!v) return "—";
+        try{return new Intl.DateTimeFormat("bg-BG",{timeZone:"Europe/Sofia",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}).format(new Date(v));}
+        catch{return String(v);}
+      };
+      const badge=(x:any)=>{
+        if(x.status==="OPEN") return `<span class="badge open">● OPEN</span>`;
+        if(x.exit_type==="TP") return `<span class="badge win">✓ TP</span>`;
+        if(x.exit_type==="SL") return `<span class="badge loss">✕ SL</span>`;
+        return `<span class="badge time">◷ TIME</span>`;
+      };
+
+      const rows=trades.map((x:any,i:number)=>`
+        <tr>
+          <td class="num">#${trades.length-i}</td>
+          <td><strong>${esc(x.coin)}</strong><div class="muted">${localDate(x.crossing_datetime)}</div></td>
+          <td>${Number(x.score??0).toFixed(2)}</td>
+          <td>${fmt(x.entry_price)}</td>
+          <td class="tp">${fmt(x.tp_price)}</td>
+          <td class="sl">${fmt(x.sl_price)}</td>
+          <td>${badge(x)}</td>
+          <td>${fmt(x.exit_price)}</td>
+          <td>${dur(x)}</td>
+          <td class="${Number(x.net_return_pct??0)>0?"positive":Number(x.net_return_pct??0)<0?"negative":""}"><strong>${x.status==="OPEN"?"—":pct(x.net_return_pct)}</strong></td>
+        </tr>`).join("");
+
+      const cards=trades.map((x:any,i:number)=>`
+        <article class="trade-card">
+          <div class="trade-top"><div><span class="trade-no">#${trades.length-i}</span> <strong>${esc(x.coin)}</strong></div>${badge(x)}</div>
+          <div class="muted">${localDate(x.crossing_datetime)} · Score ${Number(x.score??0).toFixed(2)} · ${dur(x)}</div>
+          <div class="prices">
+            <div><span>ENTRY</span><b>${fmt(x.entry_price)}</b></div>
+            <div><span>TP +0.50%</span><b class="tp">${fmt(x.tp_price)}</b></div>
+            <div><span>SL −0.15%</span><b class="sl">${fmt(x.sl_price)}</b></div>
+          </div>
+          <div class="trade-bottom"><span>Exit ${fmt(x.exit_price)}</span><strong class="${Number(x.net_return_pct??0)>0?"positive":Number(x.net_return_pct??0)<0?"negative":""}">${x.status==="OPEN"?"OPEN":pct(x.net_return_pct)+" NET"}</strong></div>
+        </article>`).join("");
+
+      const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta http-equiv="refresh" content="30">
+      <title>CryptoBot Forward Shadow</title>
+      <style>
+      *{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf2f7;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+      .wrap{max-width:1180px;margin:auto;padding:22px}.head{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}
+      h1{font-size:24px;margin:0 0 5px}.sub,.muted{color:#8fa0bb;font-size:13px}.live{font-size:12px;color:#7ee2a8}
+      .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin:18px 0}
+      .stat{background:#131b2f;border:1px solid #24304a;border-radius:14px;padding:14px}.stat span{display:block;color:#8fa0bb;font-size:12px;margin-bottom:5px}.stat b{font-size:21px}
+      .strategy{background:#10182a;border:1px solid #253451;border-radius:14px;padding:13px 15px;margin-bottom:16px;font-size:14px}
+      .positive,.tp{color:#62d995}.negative,.sl{color:#ff7b88}.badge{display:inline-block;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:800}
+      .win{background:#153b2c;color:#72e7a6}.loss{background:#431e28;color:#ff8c98}.open{background:#423816;color:#ffd86b}.time{background:#25314c;color:#b9c8e5}
+      .tablebox{overflow:auto;background:#11192b;border:1px solid #24304a;border-radius:15px}table{width:100%;border-collapse:collapse;min-width:900px}
+      th,td{padding:12px 13px;text-align:left;border-bottom:1px solid #202b42;font-size:14px}th{color:#91a3bf;font-size:11px;text-transform:uppercase;letter-spacing:.06em;background:#151f34}
+      tr:last-child td{border-bottom:0}.num{color:#71809a}.cards{display:none}.foot{color:#71809a;font-size:12px;margin-top:13px}
+      @media(max-width:720px){.wrap{padding:14px}.head{align-items:flex-start;flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}.tablebox{display:none}.cards{display:grid;gap:10px}
+      .trade-card{background:#121b2e;border:1px solid #25314b;border-radius:15px;padding:14px}.trade-top,.trade-bottom{display:flex;justify-content:space-between;align-items:center}.trade-no{color:#71809a;font-size:12px}
+      .prices{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin:13px 0}.prices div{background:#0c1425;border-radius:10px;padding:9px}.prices span{display:block;color:#71809a;font-size:9px;margin-bottom:4px}.prices b{font-size:12px}.trade-bottom{border-top:1px solid #25314b;padding-top:10px;font-size:13px}}
+      </style></head><body><main class="wrap">
+      <div class="head"><div><h1>📈 Forward LONG Shadow</h1><div class="sub">≥65 LONG · TP +0.50% · SL −0.15% · max 30 min</div></div><div class="live">● PAPER / RESEARCH · refresh 30s</div></div>
+      <section class="stats">
+        <div class="stat"><span>Сделки</span><b>${trades.length}</b></div>
+        <div class="stat"><span>TP / SL</span><b>${tp} / ${sl}</b></div>
+        <div class="stat"><span>Win rate</span><b>${wr.toFixed(1)}%</b></div>
+        <div class="stat"><span>Avg net</span><b class="${avg>=0?"positive":"negative"}">${pct(avg)}</b></div>
+        <div class="stat"><span>Total net</span><b class="${net>=0?"positive":"negative"}">${pct(net)}</b></div>
+        <div class="stat"><span>P/L @ $1000</span><b class="${net>=0?"positive":"negative"}">$${(net*10).toFixed(2)}</b></div>
+      </section>
+      <div class="strategy">OPEN: <b>${open}</b> &nbsp; · &nbsp; TP: <b class="positive">${tp}</b> &nbsp; · &nbsp; SL: <b class="negative">${sl}</b> &nbsp; · &nbsp; TIME: <b>${time}</b> &nbsp; · &nbsp; Fee: 0.07% round trip</div>
+      <div class="tablebox"><table><thead><tr><th>#</th><th>Coin / време</th><th>Score</th><th>Entry</th><th>TP</th><th>SL</th><th>Резултат</th><th>Exit</th><th>Време</th><th>Net</th></tr></thead><tbody>${rows||'<tr><td colspan="10">Още няма forward сделки.</td></tr>'}</tbody></table></div>
+      <section class="cards">${cards||'<div class="trade-card">Още няма forward сделки.</div>'}</section>
+      <div class="foot">V1.8.9 · Само сделки след старта на forward теста · Цените са форматирани само визуално, изчисленията пазят пълната точност.</div>
+      </main></body></html>`;
+      return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+    }
 
     if (url.pathname === "/forward-long-shadow") {
       await env.DB.prepare(`
