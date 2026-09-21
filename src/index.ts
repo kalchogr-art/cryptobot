@@ -6706,8 +6706,8 @@ export default {
     }
 
 
-    // HYPERLIQUID SIGNING DIAGNOSTIC V1 — SAFE SECRET CHECK
-    // Does NOT sign, does NOT call /exchange, does NOT place an order.
+    // HYPERLIQUID SIGNING DIAGNOSTIC V2 — LOCAL API WALLET IDENTITY CHECK
+    // Derives API-wallet address locally. Does NOT sign/call /exchange/place orders.
     if (url.pathname === "/hyperliquid-signing-diagnostic") {
       try {
         return json({
