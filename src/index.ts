@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.10 LIFECYCLE PNL + MONITOR + FRESH EXECUTION + D1 IDEMPOTENCY";
+const VERSION = "V1.9.11 HYPERLIQUID RAW BALANCE DIAGNOSTIC";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4252,7 +4252,7 @@ export default {
         },
 
         next_version:
-          "V1.9.10 — LIFECYCLE PNL + BALANCE GUARD + MAX HOLD",
+          "V1.9.11 — RAW HYPERLIQUID BALANCE DIAGNOSTIC",
       });
     }
 
@@ -6882,6 +6882,103 @@ export default {
 
     // HYPERLIQUID ACCOUNT V1 — READ ONLY
     // Public /info reads only. NO private key, signing, /exchange, or orders.
+    if (url.pathname === "/hyperliquid-balance-diagnostic") {
+      const address = env.HYPERLIQUID_ACCOUNT_ADDRESS?.trim();
+      if (!address) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "hyperliquid-balance-diagnostic",
+          error: "HYPERLIQUID_ACCOUNT_ADDRESS_NOT_CONFIGURED",
+          safe_read_only: true,
+        }, 500);
+      }
+
+      const info = async (body: Record<string, any>) => {
+        try {
+          const r = await fetch("https://api.hyperliquid.xyz/info", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const text = await r.text();
+          let data: any = null;
+          try { data = JSON.parse(text); } catch { data = text; }
+          return { ok: r.ok, http_status: r.status, data };
+        } catch (err: any) {
+          return {
+            ok: false,
+            http_status: null,
+            error: String(err?.message ?? err),
+            data: null,
+          };
+        }
+      };
+
+      const [perps, spot, metaCtxs] = await Promise.all([
+        info({ type: "clearinghouseState", user: address }),
+        info({ type: "spotClearinghouseState", user: address }),
+        info({ type: "metaAndAssetCtxs" }),
+      ]);
+
+      const perpsData: any = perps?.data ?? {};
+      const margin = perpsData?.marginSummary ?? {};
+      const cross = perpsData?.crossMarginSummary ?? {};
+      const spotData: any = spot?.data ?? {};
+      const spotBalances = Array.isArray(spotData?.balances) ? spotData.balances : [];
+
+      const usdc = spotBalances.find((b: any) =>
+        String(b?.coin ?? b?.token ?? "").toUpperCase() === "USDC"
+      ) ?? null;
+
+      const positions = Array.isArray(perpsData?.assetPositions)
+        ? perpsData.assetPositions
+        : [];
+
+      const nonZeroPositions = positions.filter((p: any) => {
+        const pos = p?.position ?? p ?? {};
+        return Math.abs(Number(pos?.szi ?? 0)) > 0;
+      });
+
+      const accountValue = Number(margin?.accountValue);
+      const totalMarginUsed = Number(margin?.totalMarginUsed);
+      const withdrawable = Number(perpsData?.withdrawable);
+      const availableBySummary =
+        Number.isFinite(accountValue) && Number.isFinite(totalMarginUsed)
+          ? Math.max(0, accountValue - totalMarginUsed)
+          : null;
+
+      return json({
+        success: true,
+        worker: "cryptobot",
+        version: VERSION,
+        module: "hyperliquid-balance-diagnostic",
+        network: "MAINNET",
+        safe_read_only: true,
+        signing_performed: false,
+        exchange_endpoint_called: false,
+        address,
+        interpretation: {
+          perps_account_value: Number.isFinite(accountValue) ? accountValue : null,
+          perps_total_margin_used: Number.isFinite(totalMarginUsed) ? totalMarginUsed : null,
+          perps_withdrawable: Number.isFinite(withdrawable) ? withdrawable : null,
+          perps_available_by_summary: availableBySummary,
+          cross_account_value: Number.isFinite(Number(cross?.accountValue)) ? Number(cross.accountValue) : null,
+          cross_total_margin_used: Number.isFinite(Number(cross?.totalMarginUsed)) ? Number(cross.totalMarginUsed) : null,
+          open_perps_positions: nonZeroPositions.length,
+          spot_usdc: usdc,
+        },
+        raw: {
+          clearinghouseState: perps,
+          spotClearinghouseState: spot,
+          metaAndAssetCtxs: metaCtxs,
+        },
+        note: "READ ONLY. Raw Hyperliquid /info responses are returned so balance parsing can be verified before changing the ENTRY guard.",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     if (url.pathname === "/hyperliquid-account") {
       try {
         return json({
