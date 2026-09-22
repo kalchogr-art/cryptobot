@@ -1,3 +1,4 @@
+
 import { encode } from "@msgpack/msgpack";
 import {
   bytesToHex,
@@ -8,8 +9,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.3
-// SIGNAL -> MARKETABLE IOC ENTRY -> FILL -> TP/SL
+// HYPERLIQUID SIGNAL EXECUTION V2.4
+// SIGNAL -> AUTO LEVERAGE -> MARKETABLE IOC ENTRY -> FILL -> TP/SL
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
@@ -17,7 +18,8 @@ import { privateKeyToAccount } from "viem/accounts";
 // - When TRUE: signs/sends IOC ENTRY first, then fill-based positionTpsl protection.
 // - Triggered only by a NEW >=65 crossing supplied by index.ts.
 // - DRY RUN previews current-market IOC entry and post-fill TP/SL.
-// - LIVE path: IOC entry first; only after confirmed fill are TP/SL sent.
+// - LIVE path: guarantees configured leverage first, then IOC entry; only after confirmed fill are TP/SL sent.
+// - If leverage update fails, ENTRY is blocked.
 // - Uses the proven Hyperliquid L1 signing path.
 // ============================================================
 
@@ -350,6 +352,40 @@ export async function buildHyperliquidExecutionCandidate(
     grouping: "na",
   };
 
+  // Read current per-asset leverage. Hyperliquid leverage is configured per coin.
+  // This call is read-only and is safe in DRY RUN.
+  let activeAssetData: any = null;
+  try {
+    activeAssetData = await postInfo({
+      type: "activeAssetData",
+      user: MASTER_ACCOUNT,
+      coin,
+    });
+  } catch (e: any) {
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "ACTIVE_ASSET_DATA_UNAVAILABLE",
+      detail: e?.message ?? String(e),
+      coin,
+      live_trading: CONFIG.LIVE_TRADING,
+    };
+  }
+
+  const currentLeverageType = String(activeAssetData?.leverage?.type ?? "").toLowerCase();
+  const currentLeverageValue = Number(activeAssetData?.leverage?.value);
+  const desiredLeverageType = CONFIG.IS_CROSS ? "cross" : "isolated";
+  const leverageAlreadyCorrect =
+    currentLeverageType === desiredLeverageType &&
+    currentLeverageValue === CONFIG.LEVERAGE;
+
+  const leverageAction = {
+    type: "updateLeverage",
+    asset,
+    isCross: CONFIG.IS_CROSS,
+    leverage: CONFIG.LEVERAGE,
+  };
+
   // In DRY RUN there is no real fill. For preview only, use the current
   // market reference as the estimated fill. LIVE TP/SL are recalculated from
   // the actual Hyperliquid fill price returned by /exchange.
@@ -420,7 +456,14 @@ export async function buildHyperliquidExecutionCandidate(
       sz_decimals: szDecimals,
       margin_usd: CONFIG.MARGIN_USD,
       leverage: CONFIG.LEVERAGE,
-      leverage_type: CONFIG.IS_CROSS ? "cross" : "isolated",
+      leverage_type: desiredLeverageType,
+      leverage_policy: "AUTO_ENSURE_BEFORE_ENTRY",
+      current_exchange_leverage: {
+        type: currentLeverageType || null,
+        value: Number.isFinite(currentLeverageValue) ? currentLeverageValue : null,
+      },
+      leverage_already_correct: leverageAlreadyCorrect,
+      leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
       entry_mode: "MARKETABLE_IOC",
       entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
@@ -441,9 +484,12 @@ export async function buildHyperliquidExecutionCandidate(
     },
 
     action_preview: {
+      step_0_leverage: leverageAlreadyCorrect
+        ? { action: "NONE", reason: "ALREADY_CONFIGURED" }
+        : leverageAction,
       step_1_entry: entryAction,
       step_2_after_confirmed_fill: previewProtectionAction,
-      note: "DRY RUN TP/SL use current market as estimated fill; LIVE recalculates from actual fill price.",
+      note: "LIVE guarantees configured leverage before ENTRY. DRY RUN does not change leverage. TP/SL are recalculated from actual fill price in LIVE mode.",
     },
 
     safety: {
@@ -487,6 +533,57 @@ export async function buildHyperliquidExecutionCandidate(
     let json: any = null;
     try { json = text ? JSON.parse(text) : null; } catch {}
     return { nonce, actionHash: signed.actionHash, httpStatus: res.status, text, json };
+  }
+
+  // Guarantee the configured leverage for THIS coin before any order is sent.
+  // If the exchange does not confirm the update, do not send ENTRY.
+  let leverageResponse: any = null;
+  if (!leverageAlreadyCorrect) {
+    try {
+      leverageResponse = await sendSignedAction(leverageAction);
+    } catch (e: any) {
+      return {
+        ...result,
+        status: "LIVE_LEVERAGE_UPDATE_TRANSPORT_ERROR",
+        reason: e?.message ?? String(e),
+        exchange_request_sent: true,
+        live_leverage: { updated: false, required: true },
+        safety: {
+          live_trading: true,
+          signing_performed: true,
+          exchange_endpoint_called: true,
+          private_key_exposed: false,
+        },
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    const leverageAccepted =
+      leverageResponse?.httpStatus >= 200 &&
+      leverageResponse?.httpStatus < 300 &&
+      leverageResponse?.json?.status === "ok";
+
+    if (!leverageAccepted) {
+      return {
+        ...result,
+        status: "LIVE_LEVERAGE_UPDATE_REJECTED",
+        reason: "LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",
+        exchange_request_sent: true,
+        live_leverage: {
+          updated: false,
+          required: true,
+          http_status: leverageResponse?.httpStatus ?? null,
+          response_json: leverageResponse?.json ?? null,
+        },
+        safety: {
+          live_trading: true,
+          signing_performed: true,
+          exchange_endpoint_called: true,
+          private_key_exposed: false,
+        },
+        timestamp: new Date().toISOString(),
+      };
+    }
   }
 
   let entryResponse: any;
@@ -613,6 +710,12 @@ export async function buildHyperliquidExecutionCandidate(
     ...result,
     status: protectionErrors.length ? "LIVE_ENTRY_FILLED_TPSL_REJECTED" : "LIVE_ENTRY_FILLED_TPSL_SUBMITTED",
     exchange_request_sent: true,
+    live_leverage: {
+      required: !leverageAlreadyCorrect,
+      updated: leverageAlreadyCorrect ? false : true,
+      already_correct: leverageAlreadyCorrect,
+      target: { type: desiredLeverageType, value: CONFIG.LEVERAGE },
+    },
     live_entry: {
       filled: true,
       fill_price: fillPrice,
