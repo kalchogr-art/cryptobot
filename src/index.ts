@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.6 ONE TRADE PER COIN PER EPISODE";
+const VERSION = "V1.9.7 FRESH EXECUTION + D1 IDEMPOTENCY";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2226,7 +2226,7 @@ async function record65Crossing(env: Env, signal: any, finalSignal: any): Promis
     signal.market?.components?.chart_signed??null,signal.market?.components?.order_flow_persistent_signed??null,
     signal.market?.components?.oi_change_signed??null,signal.market?.components?.funding_premium_signed??null,
     signal.market?.weights?.mode??null).run();
-  return { recorded:true, crossing_id:r?.meta?.last_row_id??null, episode_id:episode.id, coin:signal.coin, side, crossing_score:round(score), crossing_price:price };
+  return { recorded:true, crossing_id:r?.meta?.last_row_id??null, episode_id:episode.id, coin:signal.coin, side, crossing_score:round(score), crossing_price:price, crossing_ts:now };
 }
 
 async function update65CrossingOutcomes(env: Env, coin: string): Promise<void> {
@@ -6738,6 +6738,8 @@ export default {
           price: Number(latest.crossing_price),
           crossing_id: latest.id,
           episode_id: latest.episode_id,
+          crossing_ts: Number(latest.crossing_ts),
+          execution_context: "READ_ONLY_STATUS",
         }, env);
 
         return json({
@@ -6995,6 +6997,9 @@ export default {
         //   only the first >=65 crossing in that episode can create a candidate.
         // - Different coins remain independent and may trade concurrently.
         // - No same-episode re-entry after TP/SL.
+        // - D1 execution ledger additionally claims crossing_id + episode_id exactly once.
+        // - Live execution accepts only a fresh crossing from SIGNAL_PIPELINE.
+        // - /hyperliquid-execution is permanently READ_ONLY_STATUS.
         // - HARD SAFETY: execution.ts currently has LIVE_TRADING=false.
         let hyperliquidExecution: any = {
           eligible: false,
@@ -7014,6 +7019,8 @@ export default {
               price: Number(crossing65.crossing_price),
               crossing_id: crossing65.crossing_id ?? null,
               episode_id: crossing65.episode_id ?? null,
+              crossing_ts: Number(crossing65.crossing_ts),
+              execution_context: "SIGNAL_PIPELINE",
             }, env);
           } catch (error: any) {
             hyperliquidExecution = {
