@@ -1,4 +1,3 @@
-
 import { encode } from "@msgpack/msgpack";
 import {
   bytesToHex,
@@ -47,10 +46,16 @@ const CONFIG = {
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
   TIF: "Ioc" as const,
+
+  // A real entry is allowed only immediately after a newly-created crossing.
+  // Old crossings may still be previewed by the read-only endpoint, but can
+  // never reach /exchange.
+  MAX_SIGNAL_AGE_MS: 120_000,
 };
 
 export type HyperliquidExecutionEnv = {
   HYPERLIQUID_API_PRIVATE_KEY?: string;
+  DB?: any;
 };
 
 export type HyperliquidExecutionSignal = {
@@ -60,6 +65,11 @@ export type HyperliquidExecutionSignal = {
   price: number;
   crossing_id?: number | string | null;
   episode_id?: number | string | null;
+  crossing_ts?: number | null;
+
+  // READ_ONLY_STATUS is used by /hyperliquid-execution and is permanently
+  // forbidden from sending live exchange actions even if LIVE_TRADING=true.
+  execution_context?: "SIGNAL_PIPELINE" | "READ_ONLY_STATUS";
 };
 
 function roundTo(value: number, decimals: number): number {
@@ -216,6 +226,114 @@ async function postInfo(body: Record<string, any>): Promise<any> {
   return JSON.parse(text);
 }
 
+
+async function ensureExecutionLedger(db: any): Promise<void> {
+  if (!db) throw new Error("D1_NOT_BOUND_FOR_LIVE_EXECUTION");
+
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS hyperliquid_execution_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      crossing_id TEXT NOT NULL UNIQUE,
+      episode_id TEXT NOT NULL UNIQUE,
+      coin TEXT NOT NULL,
+      side TEXT NOT NULL,
+      crossing_ts INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      claimed_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      entry_fill_price REAL,
+      entry_fill_size REAL,
+      entry_oid TEXT,
+      last_error TEXT
+    )
+  `).run();
+
+  await db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_hl_execution_ledger_coin_status
+    ON hyperliquid_execution_ledger (coin, status)
+  `).run();
+}
+
+async function claimExecutionOnce(
+  db: any,
+  signal: HyperliquidExecutionSignal,
+  coin: string,
+  side: string
+): Promise<{ claimed: boolean; existing?: any }> {
+  await ensureExecutionLedger(db);
+
+  const crossingId = String(signal.crossing_id ?? "");
+  const episodeId = String(signal.episode_id ?? "");
+  const crossingTs = Number(signal.crossing_ts);
+
+  if (!crossingId || !episodeId || !Number.isFinite(crossingTs)) {
+    return { claimed: false, existing: { status: "MISSING_EXECUTION_IDENTITY" } };
+  }
+
+  const now = Date.now();
+  const insert: any = await db.prepare(`
+    INSERT OR IGNORE INTO hyperliquid_execution_ledger (
+      crossing_id, episode_id, coin, side, crossing_ts,
+      status, claimed_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?)
+  `).bind(
+    crossingId,
+    episodeId,
+    coin,
+    side,
+    crossingTs,
+    now,
+    now
+  ).run();
+
+  const changes = Number(insert?.meta?.changes ?? 0);
+  if (changes > 0) return { claimed: true };
+
+  const existing: any = await db.prepare(`
+    SELECT *
+    FROM hyperliquid_execution_ledger
+    WHERE crossing_id = ? OR episode_id = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `).bind(crossingId, episodeId).first();
+
+  return { claimed: false, existing };
+}
+
+async function updateExecutionLedger(
+  db: any,
+  crossingId: number | string | null | undefined,
+  status: string,
+  fields: {
+    entry_fill_price?: number | null;
+    entry_fill_size?: number | null;
+    entry_oid?: string | number | null;
+    last_error?: string | null;
+  } = {}
+): Promise<void> {
+  if (!db || crossingId === null || crossingId === undefined) return;
+
+  await db.prepare(`
+    UPDATE hyperliquid_execution_ledger
+    SET
+      status = ?,
+      updated_at = ?,
+      entry_fill_price = COALESCE(?, entry_fill_price),
+      entry_fill_size = COALESCE(?, entry_fill_size),
+      entry_oid = COALESCE(?, entry_oid),
+      last_error = ?
+    WHERE crossing_id = ?
+  `).bind(
+    status,
+    Date.now(),
+    fields.entry_fill_price ?? null,
+    fields.entry_fill_size ?? null,
+    fields.entry_oid == null ? null : String(fields.entry_oid),
+    fields.last_error ?? null,
+    String(crossingId)
+  ).run();
+}
+
 export async function buildHyperliquidExecutionCandidate(
   signal: HyperliquidExecutionSignal,
   env?: HyperliquidExecutionEnv
@@ -224,6 +342,13 @@ export async function buildHyperliquidExecutionCandidate(
   const side = signal?.side;
   const score = Number(signal?.score);
   const entryPrice = Number(signal?.price);
+  const crossingTs = Number(signal?.crossing_ts);
+  const executionContext = signal?.execution_context ?? "SIGNAL_PIPELINE";
+  const signalAgeMs = Number.isFinite(crossingTs) ? Date.now() - crossingTs : null;
+  const signalFresh =
+    signalAgeMs !== null &&
+    signalAgeMs >= 0 &&
+    signalAgeMs <= CONFIG.MAX_SIGNAL_AGE_MS;
 
   if (!coin || (side !== "LONG" && side !== "SHORT")) {
     return {
@@ -445,6 +570,8 @@ export async function buildHyperliquidExecutionCandidate(
     signal: {
       crossing_id: signal.crossing_id ?? null,
       episode_id: signal.episode_id ?? null,
+      crossing_ts: Number.isFinite(crossingTs) ? crossingTs : null,
+      execution_context: executionContext,
       coin,
       side,
       score,
@@ -479,6 +606,12 @@ export async function buildHyperliquidExecutionCandidate(
       preview_take_profit_trigger: previewTpWire,
       preview_stop_loss_trigger: previewSlWire,
       trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
+      idempotency_policy: "D1_CROSSING_AND_EPISODE_UNIQUE",
+      freshness_policy: {
+        max_signal_age_ms: CONFIG.MAX_SIGNAL_AGE_MS,
+        signal_age_ms: signalAgeMs,
+        fresh_for_live_entry: signalFresh,
+      },
       mark_px: contexts?.[asset]?.markPx ?? null,
       mid_px: contexts?.[asset]?.midPx ?? null,
     },
@@ -505,14 +638,53 @@ export async function buildHyperliquidExecutionCandidate(
   // no signature is created and /exchange is never called.
   if (!CONFIG.LIVE_TRADING) return result;
 
-  // LIVE path: submit IOC entry first. TP/SL are never sent unless the
-  // entry is confirmed filled. They are calculated from the real fill price.
+  // The status endpoint is permanently read-only. This prevents a browser
+  // refresh of /hyperliquid-execution from ever becoming an order trigger.
+  if (executionContext !== "SIGNAL_PIPELINE") {
+    return {
+      ...result,
+      eligible: false,
+      status: "BLOCKED",
+      reason: "READ_ONLY_CONTEXT_LIVE_EXECUTION_FORBIDDEN",
+    };
+  }
+
+  // A live entry must come from a fresh crossing created by the current
+  // signal-processing run. Old database rows can never be executed.
+  if (!signalFresh) {
+    return {
+      ...result,
+      eligible: false,
+      status: "BLOCKED",
+      reason: "STALE_OR_MISSING_CROSSING_TIMESTAMP",
+      freshness: {
+        crossing_ts: Number.isFinite(crossingTs) ? crossingTs : null,
+        signal_age_ms: signalAgeMs,
+        max_signal_age_ms: CONFIG.MAX_SIGNAL_AGE_MS,
+      },
+    };
+  }
+
   const secret = normalizePrivateKey(env?.HYPERLIQUID_API_PRIVATE_KEY);
   if (!privateKeyFormatOk(secret)) {
     return {
       ...result,
       status: "BLOCKED",
       reason: "HYPERLIQUID_API_PRIVATE_KEY_MISSING_OR_INVALID",
+    };
+  }
+
+  const claim = await claimExecutionOnce(env?.DB, signal, coin, side);
+  if (!claim.claimed) {
+    return {
+      ...result,
+      eligible: false,
+      status: "BLOCKED",
+      reason:
+        claim?.existing?.status === "MISSING_EXECUTION_IDENTITY"
+          ? "MISSING_EXECUTION_IDENTITY"
+          : "EXECUTION_ALREADY_CLAIMED",
+      execution_ledger: claim.existing ?? null,
     };
   }
 
@@ -542,6 +714,9 @@ export async function buildHyperliquidExecutionCandidate(
     try {
       leverageResponse = await sendSignedAction(leverageAction);
     } catch (e: any) {
+      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_ERROR", {
+        last_error: e?.message ?? String(e),
+      });
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_TRANSPORT_ERROR",
@@ -590,6 +765,9 @@ export async function buildHyperliquidExecutionCandidate(
   try {
     entryResponse = await sendSignedAction(entryAction);
   } catch (e: any) {
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_ERROR", {
+      last_error: e?.message ?? String(e),
+    });
     return {
       ...result,
       status: "LIVE_ENTRY_TRANSPORT_ERROR",
@@ -610,6 +788,12 @@ export async function buildHyperliquidExecutionCandidate(
   const entryError = entryStatus?.error ?? null;
 
   if (!fill || entryError) {
+    await updateExecutionLedger(
+      env?.DB,
+      signal.crossing_id,
+      entryError ? "ENTRY_REJECTED" : "ENTRY_NOT_FILLED",
+      { last_error: entryError ?? "IOC_NOT_FILLED" }
+    );
     return {
       ...result,
       status: entryError ? "LIVE_ENTRY_REJECTED" : "LIVE_ENTRY_NOT_FILLED",
@@ -635,6 +819,9 @@ export async function buildHyperliquidExecutionCandidate(
   const fillPrice = Number(fill.avgPx ?? fill.px ?? fill.price);
   const fillSize = Number(fill.totalSz ?? fill.sz ?? sizeWire);
   if (!Number.isFinite(fillPrice) || fillPrice <= 0 || !Number.isFinite(fillSize) || fillSize <= 0) {
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILL_INVALID", {
+      last_error: "INVALID_FILL_DATA",
+    });
     return {
       ...result,
       status: "LIVE_ENTRY_FILLED_BUT_FILL_DATA_INVALID",
@@ -648,6 +835,13 @@ export async function buildHyperliquidExecutionCandidate(
       },
     };
   }
+
+  await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILLED", {
+    entry_fill_price: fillPrice,
+    entry_fill_size: fillSize,
+    entry_oid: fill?.oid ?? null,
+    last_error: null,
+  });
 
   const actualSizeWire = toWire(fillSize, szDecimals);
   const tpRaw = isLong
@@ -685,6 +879,9 @@ export async function buildHyperliquidExecutionCandidate(
   try {
     protectionResponse = await sendSignedAction(protectionAction);
   } catch (e: any) {
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "TPSL_ERROR", {
+      last_error: e?.message ?? String(e),
+    });
     return {
       ...result,
       status: "LIVE_ENTRY_FILLED_TPSL_TRANSPORT_ERROR",
@@ -705,6 +902,13 @@ export async function buildHyperliquidExecutionCandidate(
   const protectionErrors = Array.isArray(protectionStatuses)
     ? protectionStatuses.map((x: any) => x?.error ?? null).filter(Boolean)
     : [];
+
+  await updateExecutionLedger(
+    env?.DB,
+    signal.crossing_id,
+    protectionErrors.length ? "TPSL_REJECTED" : "PROTECTED",
+    { last_error: protectionErrors.length ? protectionErrors.join(" | ") : null }
+  );
 
   return {
     ...result,
