@@ -8,11 +8,16 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.7
+// HYPERLIQUID SIGNAL EXECUTION V2.7.1
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
+// V2.7.1:
+// - Lifecycle Telegram reports Gross P/L, fees and NET P/L when fills are available.
+// - MAX HOLD derives P/L from the confirmed close fill when exchange response omits closedPnl.
+// - MAX HOLD persists realized P/L in D1.
+// - Lifecycle signed actions use a monotonic nonce.
 // - When FALSE: builds the exact live action but never signs/sends it.
 // - When TRUE: signs/sends IOC ENTRY first, then fill-based positionTpsl protection.
 // - Triggered only by a NEW >=65 crossing supplied by index.ts.
@@ -577,7 +582,20 @@ async function getRecentFillsForCoin(coin: string): Promise<any[]> {
 }
 
 function lifecycleTelegram(a: any): string {
-  const pnl = Number.isFinite(Number(a.realizedPnl)) ? `$${Number(a.realizedPnl).toFixed(4)}` : "n/a";
+  const gross = Number(a.grossPnl);
+  const fees = Number(a.fees);
+  const net = Number(a.netPnl);
+  const legacy = Number(a.realizedPnl);
+
+  const pnlLines =
+    Number.isFinite(gross) || Number.isFinite(fees) || Number.isFinite(net)
+      ? [
+          `💵 Gross P/L: ${Number.isFinite(gross) ? `$${gross.toFixed(4)}` : "n/a"}`,
+          `💸 Fees: ${Number.isFinite(fees) ? `$${fees.toFixed(4)}` : "n/a"}`,
+          `💰 NET P/L: ${Number.isFinite(net) ? `$${net.toFixed(4)}` : "n/a"}`,
+        ]
+      : [`💵 Realized P/L: ${Number.isFinite(legacy) ? `$${legacy.toFixed(4)}` : "n/a"}`];
+
   return [
     `${a.emoji} <b>${escapeTelegramHtml(a.title)}</b>`, "",
     `🪙 <b>${escapeTelegramHtml(a.coin)}</b>`,
@@ -585,15 +603,60 @@ function lifecycleTelegram(a: any): string {
     `🎯 Entry: ${escapeTelegramHtml(a.entryPrice)}`,
     `🏁 Exit: ${escapeTelegramHtml(a.exitPrice ?? "n/a")}`,
     `📦 Size: ${escapeTelegramHtml(a.size ?? "n/a")}`,
-    `💵 Realized P/L: ${pnl}`,
+    ...pnlLines,
     `⏱ Held: ${Math.max(0, Math.round(Number(a.heldMs ?? 0) / 60000))} min`,
     `🆔 Crossing: ${escapeTelegramHtml(a.crossingId)}`,
     "", `🕐 ${new Date().toISOString()}`
   ].join("\n");
 }
 
+function lifecyclePnlFromFills(
+  fills: any[],
+  filledAt: number,
+  entryPrice: number,
+  exitPrice: number,
+  size: number,
+  side: string,
+  exchangeClosedPnl?: number | null
+) {
+  const relevant = (Array.isArray(fills) ? fills : []).filter((f: any) => {
+    const t = Number(f?.time ?? 0);
+    return t >= filledAt - 5000;
+  });
+
+  const fees = relevant.reduce((sum: number, f: any) => {
+    const fee = Number(f?.fee);
+    return sum + (Number.isFinite(fee) ? Math.abs(fee) : 0);
+  }, 0);
+
+  let grossPnl = Number(exchangeClosedPnl);
+  if (!Number.isFinite(grossPnl) && Number.isFinite(entryPrice) && Number.isFinite(exitPrice) && Number.isFinite(size)) {
+    grossPnl =
+      side === "SHORT"
+        ? (entryPrice - exitPrice) * Math.abs(size)
+        : (exitPrice - entryPrice) * Math.abs(size);
+  }
+
+  const netPnl = Number.isFinite(grossPnl)
+    ? grossPnl - (Number.isFinite(fees) ? fees : 0)
+    : NaN;
+
+  return {
+    grossPnl: Number.isFinite(grossPnl) ? grossPnl : null,
+    fees: Number.isFinite(fees) ? fees : null,
+    netPnl: Number.isFinite(netPnl) ? netPnl : null,
+  };
+}
+
+let lifecycleLastNonce = 0;
+function nextLifecycleNonce(): number {
+  const now = Date.now();
+  lifecycleLastNonce = Math.max(now, lifecycleLastNonce + 1);
+  return lifecycleLastNonce;
+}
+
 async function sendLifecycleSignedAction(action: Record<string, any>, secret: `0x${string}`) {
-  const nonce = Date.now();
+  const nonce = nextLifecycleNonce();
   const signed = await signHyperliquidAction(action, nonce, secret);
   const res = await fetch(EXCHANGE_URL, {
     method: "POST", headers: { "content-type": "application/json" },
@@ -633,6 +696,10 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         ?? fills.find((f:any) => Number(f?.time ?? 0) >= filledAt);
       const exitPrice = Number(exit?.px);
       const realizedPnl = Number(exit?.closedPnl);
+      const pnl = lifecyclePnlFromFills(
+        fills, filledAt, entryPrice, exitPrice, entrySize, side,
+        Number.isFinite(realizedPnl) ? realizedPnl : null
+      );
       const tpPct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
       const slPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
       const tp = side === "LONG" ? entryPrice*(1+tpPct/100) : entryPrice*(1-tpPct/100);
@@ -645,8 +712,16 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
       }
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=? WHERE id=?`)
-        .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,Number.isFinite(realizedPnl)?realizedPnl:null,row.id).run();
-      await sendTelegram(env,lifecycleTelegram({emoji,title,coin,side,entryPrice,exitPrice:Number.isFinite(exitPrice)?exitPrice:null,size:entrySize,realizedPnl,heldMs,crossingId:row.crossing_id}));
+        .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
+      await sendTelegram(env,lifecycleTelegram({
+        emoji,title,coin,side,entryPrice,
+        exitPrice:Number.isFinite(exitPrice)?exitPrice:null,
+        size:entrySize,
+        grossPnl:pnl.grossPnl,
+        fees:pnl.fees,
+        netPnl:pnl.netPnl,
+        heldMs,crossingId:row.crossing_id
+      }));
       out.push({coin,status:reason,exit_price:exitPrice});
       continue;
     }
@@ -679,10 +754,34 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       if (cancels.length) await sendLifecycleSignedAction({type:"cancel",cancels}, secretRaw as `0x${string}`);
     } catch {}
     const exitPrice = Number(st.filled?.avgPx ?? st.filled?.px);
-    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=? WHERE id=?`)
-      .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,row.id).run();
-    await sendTelegram(env,lifecycleTelegram({emoji:"⏱",title:"MAX HOLD 30M EXIT",coin,side,entryPrice,exitPrice,size:Math.abs(szi),realizedPnl:Number(st.filled?.closedPnl),heldMs,crossingId:row.crossing_id}));
-    out.push({coin,status:"MAX_HOLD_EXIT",exit_price:exitPrice});
+    const postCloseFills = await getRecentFillsForCoin(coin);
+    const closeFill = postCloseFills.find((f:any) =>
+      Number(f?.time ?? 0) >= Date.now() - 60_000 &&
+      Number.isFinite(Number(f?.px))
+    );
+    const exchangeClosedPnl = Number(closeFill?.closedPnl ?? st.filled?.closedPnl);
+    const pnl = lifecyclePnlFromFills(
+      postCloseFills,
+      filledAt,
+      entryPrice,
+      exitPrice,
+      Math.abs(szi),
+      side,
+      Number.isFinite(exchangeClosedPnl) ? exchangeClosedPnl : null
+    );
+
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=?,realized_pnl=? WHERE id=?`)
+      .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
+
+    await sendTelegram(env,lifecycleTelegram({
+      emoji:"⏱",title:"MAX HOLD 30M EXIT",coin,side,entryPrice,exitPrice,
+      size:Math.abs(szi),
+      grossPnl:pnl.grossPnl,
+      fees:pnl.fees,
+      netPnl:pnl.netPnl,
+      heldMs,crossingId:row.crossing_id
+    }));
+    out.push({coin,status:"MAX_HOLD_EXIT",exit_price:exitPrice,net_pnl:pnl.netPnl});
   }
   return { success:true, checked:items.length, results:out };
 }
