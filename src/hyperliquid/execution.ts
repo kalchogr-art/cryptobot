@@ -37,8 +37,10 @@ const CONFIG = {
   LEVERAGE: 10,
   IS_CROSS: true,
 
-  TAKE_PROFIT_PCT: 0.50,
-  STOP_LOSS_PCT: 0.25,
+  LONG_TAKE_PROFIT_PCT: 0.50,
+  LONG_STOP_LOSS_PCT: 0.15,
+  SHORT_TAKE_PROFIT_PCT: 0.50,
+  SHORT_STOP_LOSS_PCT: 0.40,
 
   TIF: "Gtc" as const,
 };
@@ -295,12 +297,19 @@ export async function buildHyperliquidExecutionCandidate(
   }
 
   const isLong = side === "LONG";
+  const takeProfitPct = isLong
+    ? CONFIG.LONG_TAKE_PROFIT_PCT
+    : CONFIG.SHORT_TAKE_PROFIT_PCT;
+  const stopLossPct = isLong
+    ? CONFIG.LONG_STOP_LOSS_PCT
+    : CONFIG.SHORT_STOP_LOSS_PCT;
+
   const tpRaw = isLong
-    ? normalizedEntry * (1 + CONFIG.TAKE_PROFIT_PCT / 100)
-    : normalizedEntry * (1 - CONFIG.TAKE_PROFIT_PCT / 100);
+    ? normalizedEntry * (1 + takeProfitPct / 100)
+    : normalizedEntry * (1 - takeProfitPct / 100);
   const slRaw = isLong
-    ? normalizedEntry * (1 - CONFIG.STOP_LOSS_PCT / 100)
-    : normalizedEntry * (1 + CONFIG.STOP_LOSS_PCT / 100);
+    ? normalizedEntry * (1 - stopLossPct / 100)
+    : normalizedEntry * (1 + stopLossPct / 100);
 
   const tpWire = priceToWire(tpRaw, szDecimals);
   const slWire = priceToWire(slRaw, szDecimals);
@@ -380,9 +389,9 @@ export async function buildHyperliquidExecutionCandidate(
       entry_price: entryWire,
       size: sizeWire,
       actual_notional_usd: Number(actualNotionalUsd.toFixed(8)),
-      take_profit_pct: CONFIG.TAKE_PROFIT_PCT,
+      take_profit_pct: takeProfitPct,
       take_profit_trigger: tpWire,
-      stop_loss_pct: CONFIG.STOP_LOSS_PCT,
+      stop_loss_pct: stopLossPct,
       stop_loss_trigger: slWire,
       grouping: "normalTpsl",
       trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
