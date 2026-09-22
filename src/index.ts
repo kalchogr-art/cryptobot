@@ -2,7 +2,7 @@ import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning"
 import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
 import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
 import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
-import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
+import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle } from "./hyperliquid/execution";
 
 // ============================================================
 // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.8 TELEGRAM TEST + FRESH EXECUTION + D1 IDEMPOTENCY";
+const VERSION = "V1.9.9 LIFECYCLE MONITOR + FRESH EXECUTION + D1 IDEMPOTENCY";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -7013,6 +7013,14 @@ export default {
     }
 
     await ensureSnapshotTable(env);
+
+    // V1.9.9: reconcile real Hyperliquid positions before processing new signals.
+    // Sends TP/SL close notifications and enforces MAX HOLD 30m.
+    try {
+      await monitorHyperliquidExecutionLifecycle(env);
+    } catch (error: any) {
+      console.log("Hyperliquid lifecycle monitor failed:", error?.message ?? String(error));
+    }
 
     // V1.6.9: safe idempotent legacy cleanup. Once repaired to <=30m, a row
     // no longer matches and will not be touched again.
