@@ -8,12 +8,18 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.7.1
+// HYPERLIQUID SIGNAL EXECUTION V2.7.2
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
-// V2.7.1:
+// V2.7.2:
+ // - ENTRY balance guard now uses Hyperliquid activeAssetData.availableToTrade for the exact coin/side.
+ // - clearinghouseState.withdrawable is no longer used as the live ENTRY availability source.
+ // - Account snapshots also expose USDC token state for diagnostics/Telegram.
+ // - Guard fails closed if activeAssetData is unavailable or malformed.
+ //
+ // V2.7.1:
 // - Lifecycle Telegram reports Gross P/L, fees and NET P/L when fills are available.
 // - MAX HOLD derives P/L from the confirmed close fill when exchange response omits closedPnl.
 // - MAX HOLD persists realized P/L in D1.
@@ -294,20 +300,35 @@ async function sendTelegram(
 
 async function getAccountSnapshot(): Promise<any> {
   try {
-    const state = await postInfo({
-      type: "clearinghouseState",
-      user: MASTER_ACCOUNT,
-    });
+    const [state, tokenState] = await Promise.all([
+      postInfo({
+        type: "clearinghouseState",
+        user: MASTER_ACCOUNT,
+      }),
+      postInfo({
+        type: "spotClearinghouseState",
+        user: MASTER_ACCOUNT,
+      }).catch(() => null),
+    ]);
 
     const accountValue = Number(state?.marginSummary?.accountValue);
     const totalMarginUsed = Number(state?.marginSummary?.totalMarginUsed);
     const withdrawable = Number(state?.withdrawable);
+
+    const balances = Array.isArray(tokenState?.balances) ? tokenState.balances : [];
+    const usdc = balances.find(
+      (x: any) => String(x?.coin ?? "").toUpperCase() === "USDC"
+    );
+    const usdcTotal = Number(usdc?.total);
+    const usdcHold = Number(usdc?.hold);
 
     return {
       success: true,
       account_value_usd: Number.isFinite(accountValue) ? accountValue : null,
       margin_used_usd: Number.isFinite(totalMarginUsed) ? totalMarginUsed : null,
       withdrawable_usd: Number.isFinite(withdrawable) ? withdrawable : null,
+      usdc_total: Number.isFinite(usdcTotal) ? usdcTotal : null,
+      usdc_hold: Number.isFinite(usdcHold) ? usdcHold : null,
     };
   } catch (e: any) {
     return {
@@ -316,6 +337,67 @@ async function getAccountSnapshot(): Promise<any> {
       account_value_usd: null,
       margin_used_usd: null,
       withdrawable_usd: null,
+      usdc_total: null,
+      usdc_hold: null,
+    };
+  }
+}
+
+async function getActiveAssetTradingAvailability(
+  coin: string,
+  side: "LONG" | "SHORT"
+): Promise<any> {
+  try {
+    const data = await postInfo({
+      type: "activeAssetData",
+      user: MASTER_ACCOUNT,
+      coin,
+    });
+
+    const available = Array.isArray(data?.availableToTrade)
+      ? data.availableToTrade
+      : [];
+    const maxTrade = Array.isArray(data?.maxTradeSzs)
+      ? data.maxTradeSzs
+      : [];
+
+    // Hyperliquid returns two directional values. LONG uses the buy-side
+    // availability (index 0), SHORT uses the sell-side availability (index 1).
+    const sideIndex = side === "LONG" ? 0 : 1;
+    const availableToTrade = Number(available[sideIndex]);
+    const maxTradeSz = Number(maxTrade[sideIndex]);
+    const markPx = Number(data?.markPx);
+
+    if (!Number.isFinite(availableToTrade)) {
+      return {
+        success: false,
+        error: "ACTIVE_ASSET_AVAILABLE_TO_TRADE_INVALID",
+        coin,
+        side,
+        raw: data,
+      };
+    }
+
+    return {
+      success: true,
+      source: "HYPERLIQUID_ACTIVE_ASSET_DATA",
+      coin,
+      side,
+      side_index: sideIndex,
+      available_to_trade: availableToTrade,
+      available_to_trade_raw: available[sideIndex] ?? null,
+      max_trade_sz: Number.isFinite(maxTradeSz) ? maxTradeSz : null,
+      mark_px: Number.isFinite(markPx) ? markPx : null,
+      leverage: data?.leverage ?? null,
+      raw_available_to_trade: available,
+      raw_max_trade_szs: maxTrade,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      error: e?.message ?? String(e),
+      coin,
+      side,
     };
   }
 }
@@ -356,6 +438,7 @@ function buildEntryTelegramMessage(args: {
         `Equity: $${Number(a.balance.account_value_usd ?? 0).toFixed(4)}`,
         `Margin used: $${Number(a.balance.margin_used_usd ?? 0).toFixed(4)}`,
         `Withdrawable: $${Number(a.balance.withdrawable_usd ?? 0).toFixed(4)}`,
+        `USDC state: $${Number(a.balance.usdc_total ?? 0).toFixed(6)}`,
       ].join("\n")
     : `💵 <b>ACCOUNT</b>\nBalance unavailable`;
 
@@ -1140,15 +1223,63 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
-  // V2.7 pre-entry guards: never let the exchange consume a partial amount
-  // merely because the configured margin is larger than available collateral.
-  const preEntryBalance = await getAccountSnapshot();
-  const availableMargin = Number(preEntryBalance?.withdrawable_usd);
-  if (!preEntryBalance?.success || !Number.isFinite(availableMargin) || availableMargin + CONFIG.MIN_MARGIN_HEADROOM_USD < CONFIG.MARGIN_USD) {
-    const reason = `INSUFFICIENT_AVAILABLE_MARGIN: required=$${CONFIG.MARGIN_USD.toFixed(2)} available=$${Number.isFinite(availableMargin)?availableMargin.toFixed(4):"unknown"}`;
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_BALANCE", { last_error: reason });
-    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason,balance:preEntryBalance}));
-    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_INSUFFICIENT_MARGIN",reason,account_balance:preEntryBalance,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
+  // V2.7.2 pre-entry guard:
+  // Use Hyperliquid's per-asset/per-direction availableToTrade, not
+  // clearinghouseState.withdrawable. The latter can be 0 while the account
+  // still reports USDC and Hyperliquid itself exposes tradable availability.
+  const [preEntryBalance, tradingAvailability] = await Promise.all([
+    getAccountSnapshot(),
+    getActiveAssetTradingAvailability(coin, side),
+  ]);
+
+  const availableMargin = Number(tradingAvailability?.available_to_trade);
+
+  if (
+    !tradingAvailability?.success ||
+    !Number.isFinite(availableMargin) ||
+    availableMargin + CONFIG.MIN_MARGIN_HEADROOM_USD < CONFIG.MARGIN_USD
+  ) {
+    const reason = tradingAvailability?.success
+      ? `INSUFFICIENT_AVAILABLE_TO_TRADE: required=$${CONFIG.MARGIN_USD.toFixed(2)} available=$${Number.isFinite(availableMargin) ? availableMargin.toFixed(6) : "unknown"} coin=${coin} side=${side}`
+      : `ACTIVE_ASSET_AVAILABILITY_UNAVAILABLE: ${String(tradingAvailability?.error ?? "unknown")}`;
+
+    await updateExecutionLedger(
+      env?.DB,
+      signal.crossing_id,
+      "ENTRY_BLOCKED_BALANCE",
+      { last_error: reason }
+    );
+
+    const tg = await sendTelegram(
+      env,
+      buildRejectedTelegramMessage({
+        coin,
+        side,
+        score,
+        crossingId: signal.crossing_id,
+        episodeId: signal.episode_id,
+        marginUsd: CONFIG.MARGIN_USD,
+        leverage: CONFIG.LEVERAGE,
+        reason,
+        balance: {
+          ...preEntryBalance,
+          active_asset_available_to_trade:
+            Number.isFinite(availableMargin) ? availableMargin : null,
+          active_asset_source: tradingAvailability?.source ?? null,
+        },
+      })
+    );
+
+    return {
+      ...result,
+      eligible: false,
+      status: "LIVE_ENTRY_BLOCKED_INSUFFICIENT_MARGIN",
+      reason,
+      account_balance: preEntryBalance,
+      trading_availability: tradingAvailability,
+      telegram: { sent: tg.sent, reason: tg.reason ?? null },
+      exchange_request_sent: false,
+    };
   }
 
   const existingPosition = await getOpenPositionForCoin(coin);
