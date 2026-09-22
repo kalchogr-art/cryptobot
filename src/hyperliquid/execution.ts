@@ -8,16 +8,17 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2
-// SIGNAL -> DRY RUN BRACKET BUILDER
+// HYPERLIQUID SIGNAL EXECUTION V2.3
+// SIGNAL -> MARKETABLE IOC ENTRY -> FILL -> TP/SL
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
 // - When FALSE: builds the exact live action but never signs/sends it.
-// - When TRUE: signs the same canonical normalTpsl action and sends /exchange.
+// - When TRUE: signs/sends IOC ENTRY first, then fill-based positionTpsl protection.
 // - Triggered only by a NEW >=65 crossing supplied by index.ts.
-// - One grouped request: ENTRY + TP + SL.
-// - Uses the proven V11.1 Hyperliquid L1 signing path.
+// - DRY RUN previews current-market IOC entry and post-fill TP/SL.
+// - LIVE path: IOC entry first; only after confirmed fill are TP/SL sent.
+// - Uses the proven Hyperliquid L1 signing path.
 // ============================================================
 
 const INFO_URL = "https://api.hyperliquid.xyz/info";
@@ -42,7 +43,8 @@ const CONFIG = {
   SHORT_TAKE_PROFIT_PCT: 0.50,
   SHORT_STOP_LOSS_PCT: 0.40,
 
-  TIF: "Gtc" as const,
+  MAX_ENTRY_SLIPPAGE_PCT: 0.30,
+  TIF: "Ioc" as const,
 };
 
 export type HyperliquidExecutionEnv = {
@@ -273,30 +275,59 @@ export async function buildHyperliquidExecutionCandidate(
   }
 
   const positionUsdTarget = CONFIG.MARGIN_USD * CONFIG.LEVERAGE;
-  const entryWire = priceToWire(entryPrice, szDecimals);
-  const normalizedEntry = Number(entryWire);
+  const isLong = side === "LONG";
 
-  // Choose the closest exchange-valid size to the target notional,
-  // while never allowing the position below Hyperliquid's $10 minimum.
-  const size = bestValidSize(
-    positionUsdTarget / normalizedEntry,
-    normalizedEntry,
-    szDecimals
-  );
-  const sizeWire = toWire(size, szDecimals);
-  const actualNotionalUsd = normalizedEntry * size;
+  // Market entry policy: use the current Hyperliquid market, not the old
+  // crossing price. A market order is represented as a marketable IOC limit.
+  const markPx = Number(contexts?.[asset]?.markPx);
+  const midPx = Number(contexts?.[asset]?.midPx);
+  const currentMarketPrice =
+    Number.isFinite(midPx) && midPx > 0
+      ? midPx
+      : Number.isFinite(markPx) && markPx > 0
+        ? markPx
+        : NaN;
 
-  if (actualNotionalUsd < 10) {
+  if (!Number.isFinite(currentMarketPrice) || currentMarketPrice <= 0) {
     return {
       eligible: false,
       status: "SKIPPED",
-      reason: "CALCULATED_NOTIONAL_BELOW_10",
-      actual_notional_usd: actualNotionalUsd,
+      reason: "CURRENT_MARKET_PRICE_UNAVAILABLE",
+      coin,
       live_trading: CONFIG.LIVE_TRADING,
     };
   }
 
-  const isLong = side === "LONG";
+  const marketReferenceWire = priceToWire(currentMarketPrice, szDecimals);
+  const marketReference = Number(marketReferenceWire);
+
+  // LONG pays up to +slippage; SHORT sells down to -slippage.
+  // IOC means fill immediately inside this protection band or cancel.
+  const iocLimitRaw = isLong
+    ? currentMarketPrice * (1 + CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100)
+    : currentMarketPrice * (1 - CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100);
+  const iocLimitWire = priceToWire(iocLimitRaw, szDecimals);
+  const iocLimitPrice = Number(iocLimitWire);
+
+  // Size from the current market reference, not the stale signal price.
+  const size = bestValidSize(
+    positionUsdTarget / marketReference,
+    marketReference,
+    szDecimals
+  );
+  const sizeWire = toWire(size, szDecimals);
+  const estimatedNotionalUsd = marketReference * size;
+
+  if (estimatedNotionalUsd < 10) {
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "CALCULATED_NOTIONAL_BELOW_10",
+      actual_notional_usd: estimatedNotionalUsd,
+      live_trading: CONFIG.LIVE_TRADING,
+    };
+  }
+
   const takeProfitPct = isLong
     ? CONFIG.LONG_TAKE_PROFIT_PCT
     : CONFIG.SHORT_TAKE_PROFIT_PCT;
@@ -304,63 +335,68 @@ export async function buildHyperliquidExecutionCandidate(
     ? CONFIG.LONG_STOP_LOSS_PCT
     : CONFIG.SHORT_STOP_LOSS_PCT;
 
-  const tpRaw = isLong
-    ? normalizedEntry * (1 + takeProfitPct / 100)
-    : normalizedEntry * (1 - takeProfitPct / 100);
-  const slRaw = isLong
-    ? normalizedEntry * (1 - stopLossPct / 100)
-    : normalizedEntry * (1 + stopLossPct / 100);
-
-  const tpWire = priceToWire(tpRaw, szDecimals);
-  const slWire = priceToWire(slRaw, szDecimals);
-
   const entryOrder = {
     a: asset,
     b: isLong,
-    p: entryWire,
+    p: iocLimitWire,
     s: sizeWire,
     r: false,
     t: { limit: { tif: CONFIG.TIF } },
   };
 
-  const closeIsBuy = !isLong;
+  const entryAction = {
+    type: "order",
+    orders: [entryOrder],
+    grouping: "na",
+  };
 
-  // IMPORTANT: canonical trigger insertion order:
-  // isMarket -> triggerPx -> tpsl
-  const tpOrder = {
+  // In DRY RUN there is no real fill. For preview only, use the current
+  // market reference as the estimated fill. LIVE TP/SL are recalculated from
+  // the actual Hyperliquid fill price returned by /exchange.
+  const previewFillPrice = marketReference;
+  const previewTpRaw = isLong
+    ? previewFillPrice * (1 + takeProfitPct / 100)
+    : previewFillPrice * (1 - takeProfitPct / 100);
+  const previewSlRaw = isLong
+    ? previewFillPrice * (1 - stopLossPct / 100)
+    : previewFillPrice * (1 + stopLossPct / 100);
+  const previewTpWire = priceToWire(previewTpRaw, szDecimals);
+  const previewSlWire = priceToWire(previewSlRaw, szDecimals);
+
+  const closeIsBuy = !isLong;
+  const previewTpOrder = {
     a: asset,
     b: closeIsBuy,
-    p: tpWire,
+    p: previewTpWire,
     s: sizeWire,
     r: true,
     t: {
       trigger: {
         isMarket: true,
-        triggerPx: tpWire,
+        triggerPx: previewTpWire,
         tpsl: "tp",
       },
     },
   };
-
-  const slOrder = {
+  const previewSlOrder = {
     a: asset,
     b: closeIsBuy,
-    p: slWire,
+    p: previewSlWire,
     s: sizeWire,
     r: true,
     t: {
       trigger: {
         isMarket: true,
-        triggerPx: slWire,
+        triggerPx: previewSlWire,
         tpsl: "sl",
       },
     },
   };
 
-  const action = {
+  const previewProtectionAction = {
     type: "order",
-    orders: [entryOrder, tpOrder, slOrder],
-    grouping: "normalTpsl",
+    orders: [previewTpOrder, previewSlOrder],
+    grouping: "positionTpsl",
   };
 
   const result: Record<string, any> = {
@@ -386,20 +422,29 @@ export async function buildHyperliquidExecutionCandidate(
       leverage: CONFIG.LEVERAGE,
       leverage_type: CONFIG.IS_CROSS ? "cross" : "isolated",
       position_usd_target: positionUsdTarget,
-      entry_price: entryWire,
+      entry_mode: "MARKETABLE_IOC",
+      entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
+      market_reference_price: marketReferenceWire,
+      max_entry_slippage_pct: CONFIG.MAX_ENTRY_SLIPPAGE_PCT,
+      ioc_limit_price: iocLimitWire,
       size: sizeWire,
-      actual_notional_usd: Number(actualNotionalUsd.toFixed(8)),
+      estimated_notional_usd: Number(estimatedNotionalUsd.toFixed(8)),
       take_profit_pct: takeProfitPct,
-      take_profit_trigger: tpWire,
       stop_loss_pct: stopLossPct,
-      stop_loss_trigger: slWire,
-      grouping: "normalTpsl",
+      tpsl_price_source_live: "ACTUAL_FILL_PRICE",
+      preview_fill_price: marketReferenceWire,
+      preview_take_profit_trigger: previewTpWire,
+      preview_stop_loss_trigger: previewSlWire,
       trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
       mark_px: contexts?.[asset]?.markPx ?? null,
       mid_px: contexts?.[asset]?.midPx ?? null,
     },
 
-    action_preview: action,
+    action_preview: {
+      step_1_entry: entryAction,
+      step_2_after_confirmed_fill: previewProtectionAction,
+      note: "DRY RUN TP/SL use current market as estimated fill; LIVE recalculates from actual fill price.",
+    },
 
     safety: {
       live_trading: CONFIG.LIVE_TRADING,
@@ -410,13 +455,12 @@ export async function buildHyperliquidExecutionCandidate(
 
     timestamp: new Date().toISOString(),
   };
-
   // Normal operating mode: full payload is built, but no secret is read,
   // no signature is created and /exchange is never called.
   if (!CONFIG.LIVE_TRADING) return result;
 
-  // LIVE path — kept complete now so we do not have to reconstruct the
-  // proven V11.1 signing/exchange implementation later.
+  // LIVE path: submit IOC entry first. TP/SL are never sent unless the
+  // entry is confirmed filled. They are calculated from the real fill price.
   const secret = normalizePrivateKey(env?.HYPERLIQUID_API_PRIVATE_KEY);
   if (!privateKeyFormatOk(secret)) {
     return {
@@ -426,15 +470,9 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
-  const nonce = Date.now();
-  const signed = await signHyperliquidAction(action, nonce, secret);
-
-  let httpStatus: number | null = null;
-  let responseJson: any = null;
-  let responseText = "";
-  let fetchError: string | null = null;
-
-  try {
+  async function sendSignedAction(action: Record<string, any>) {
+    const nonce = Date.now();
+    const signed = await signHyperliquidAction(action, nonce, secret as `0x${string}`);
     const res = await fetch(EXCHANGE_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -445,67 +483,162 @@ export async function buildHyperliquidExecutionCandidate(
         vaultAddress: null,
       }),
     });
-
-    httpStatus = res.status;
-    responseText = await res.text();
-
-    try {
-      responseJson = responseText ? JSON.parse(responseText) : null;
-    } catch {
-      responseJson = null;
-    }
-  } catch (e: any) {
-    fetchError = e?.message ?? String(e);
+    const text = await res.text();
+    let json: any = null;
+    try { json = text ? JSON.parse(text) : null; } catch {}
+    return { nonce, actionHash: signed.actionHash, httpStatus: res.status, text, json };
   }
 
-  const statuses = responseJson?.response?.data?.statuses ?? null;
-  const firstStatus = Array.isArray(statuses) ? statuses[0] : null;
-  const firstError = firstStatus?.error ?? null;
-  const restingOid = firstStatus?.resting?.oid ?? null;
-  const filledOid = firstStatus?.filled?.oid ?? null;
+  let entryResponse: any;
+  try {
+    entryResponse = await sendSignedAction(entryAction);
+  } catch (e: any) {
+    return {
+      ...result,
+      status: "LIVE_ENTRY_TRANSPORT_ERROR",
+      reason: e?.message ?? String(e),
+      exchange_request_sent: true,
+      safety: {
+        live_trading: true,
+        signing_performed: true,
+        exchange_endpoint_called: true,
+        private_key_exposed: false,
+      },
+    };
+  }
+
+  const entryStatuses = entryResponse?.json?.response?.data?.statuses ?? null;
+  const entryStatus = Array.isArray(entryStatuses) ? entryStatuses[0] : null;
+  const fill = entryStatus?.filled ?? null;
+  const entryError = entryStatus?.error ?? null;
+
+  if (!fill || entryError) {
+    return {
+      ...result,
+      status: entryError ? "LIVE_ENTRY_REJECTED" : "LIVE_ENTRY_NOT_FILLED",
+      reason: entryError ?? "IOC_NOT_FILLED",
+      exchange_request_sent: true,
+      live_entry: {
+        http_status: entryResponse.httpStatus,
+        response_json: entryResponse.json,
+        returned_statuses: entryStatuses,
+        filled: false,
+        error: entryError,
+      },
+      safety: {
+        live_trading: true,
+        signing_performed: true,
+        exchange_endpoint_called: true,
+        private_key_exposed: false,
+      },
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  const fillPrice = Number(fill.avgPx ?? fill.px ?? fill.price);
+  const fillSize = Number(fill.totalSz ?? fill.sz ?? sizeWire);
+  if (!Number.isFinite(fillPrice) || fillPrice <= 0 || !Number.isFinite(fillSize) || fillSize <= 0) {
+    return {
+      ...result,
+      status: "LIVE_ENTRY_FILLED_BUT_FILL_DATA_INVALID",
+      exchange_request_sent: true,
+      live_entry: { response_json: entryResponse.json, fill },
+      safety: {
+        live_trading: true,
+        signing_performed: true,
+        exchange_endpoint_called: true,
+        private_key_exposed: false,
+      },
+    };
+  }
+
+  const actualSizeWire = toWire(fillSize, szDecimals);
+  const tpRaw = isLong
+    ? fillPrice * (1 + takeProfitPct / 100)
+    : fillPrice * (1 - takeProfitPct / 100);
+  const slRaw = isLong
+    ? fillPrice * (1 - stopLossPct / 100)
+    : fillPrice * (1 + stopLossPct / 100);
+  const tpWire = priceToWire(tpRaw, szDecimals);
+  const slWire = priceToWire(slRaw, szDecimals);
+
+  const tpOrder = {
+    a: asset,
+    b: closeIsBuy,
+    p: tpWire,
+    s: actualSizeWire,
+    r: true,
+    t: { trigger: { isMarket: true, triggerPx: tpWire, tpsl: "tp" } },
+  };
+  const slOrder = {
+    a: asset,
+    b: closeIsBuy,
+    p: slWire,
+    s: actualSizeWire,
+    r: true,
+    t: { trigger: { isMarket: true, triggerPx: slWire, tpsl: "sl" } },
+  };
+  const protectionAction = {
+    type: "order",
+    orders: [tpOrder, slOrder],
+    grouping: "positionTpsl",
+  };
+
+  let protectionResponse: any;
+  try {
+    protectionResponse = await sendSignedAction(protectionAction);
+  } catch (e: any) {
+    return {
+      ...result,
+      status: "LIVE_ENTRY_FILLED_TPSL_TRANSPORT_ERROR",
+      reason: e?.message ?? String(e),
+      exchange_request_sent: true,
+      live_entry: { filled: true, fill_price: fillPrice, fill_size: actualSizeWire, fill },
+      safety: {
+        live_trading: true,
+        signing_performed: true,
+        exchange_endpoint_called: true,
+        private_key_exposed: false,
+      },
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  const protectionStatuses = protectionResponse?.json?.response?.data?.statuses ?? null;
+  const protectionErrors = Array.isArray(protectionStatuses)
+    ? protectionStatuses.map((x: any) => x?.error ?? null).filter(Boolean)
+    : [];
 
   return {
     ...result,
-    status:
-      responseJson?.status === "ok" && !firstError
-        ? "LIVE_SUBMITTED"
-        : "LIVE_REJECTED",
+    status: protectionErrors.length ? "LIVE_ENTRY_FILLED_TPSL_REJECTED" : "LIVE_ENTRY_FILLED_TPSL_SUBMITTED",
     exchange_request_sent: true,
-
-    signing: {
-      nonce,
-      action_hash: signed.actionHash,
-      signer_verified_locally: true,
-      expected_api_wallet: EXPECTED_API_WALLET,
-      private_key_exposed: false,
-      full_signature_exposed: false,
+    live_entry: {
+      filled: true,
+      fill_price: fillPrice,
+      fill_size: actualSizeWire,
+      fill_notional_usd: Number((fillPrice * fillSize).toFixed(8)),
+      oid: fill?.oid ?? null,
+      http_status: entryResponse.httpStatus,
+      returned_statuses: entryStatuses,
     },
-
-    hyperliquid_exchange: {
-      endpoint_called: true,
-      request_sent: true,
-      http_status: httpStatus,
-      response_json: responseJson,
-      response_text:
-        responseJson === null ? responseText.slice(0, 1500) : null,
-      fetch_error: fetchError,
-      returned_statuses: statuses,
+    live_tpsl: {
+      price_source: "ACTUAL_FILL_PRICE",
+      take_profit_pct: takeProfitPct,
+      take_profit_trigger: tpWire,
+      stop_loss_pct: stopLossPct,
+      stop_loss_trigger: slWire,
+      grouping: "positionTpsl",
+      http_status: protectionResponse.httpStatus,
+      returned_statuses: protectionStatuses,
+      errors: protectionErrors,
     },
-
-    order_result: {
-      resting: restingOid !== null,
-      filled: filledOid !== null,
-      oid: restingOid ?? filledOid,
-      error: firstError,
-    },
-
     safety: {
       live_trading: true,
       signing_performed: true,
       exchange_endpoint_called: true,
       private_key_exposed: false,
     },
-
     timestamp: new Date().toISOString(),
   };
 }
