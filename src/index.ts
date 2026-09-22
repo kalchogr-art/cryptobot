@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.12 HYPERLIQUID BALANCE DIAGNOSTIC ADDRESS FALLBACK";
+const VERSION = "V1.9.13 HYPERLIQUID ACTIVE ASSET READ ONLY";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4252,7 +4252,7 @@ export default {
         },
 
         next_version:
-          "V1.9.12 — BALANCE DIAGNOSTIC ADDRESS FALLBACK",
+          "V1.9.13 — ACTIVE ASSET READ ONLY DIAGNOSTIC",
       });
     }
 
@@ -6882,6 +6882,148 @@ export default {
 
     // HYPERLIQUID ACCOUNT V1 — READ ONLY
     // Public /info reads only. NO private key, signing, /exchange, or orders.
+    if (url.pathname === "/hyperliquid-available") {
+      const DEFAULT_HYPERLIQUID_MASTER_ADDRESS =
+        "0xf1CF243f05024AE78aE2dFa31c2Bec1e1F6c9196";
+
+      const envAddress = env.HYPERLIQUID_ACCOUNT_ADDRESS?.trim();
+      const address = envAddress || DEFAULT_HYPERLIQUID_MASTER_ADDRESS;
+      const addressSource = envAddress
+        ? "ENV_HYPERLIQUID_ACCOUNT_ADDRESS"
+        : "KNOWN_MASTER_ADDRESS_FALLBACK";
+
+      const coin = String(url.searchParams.get("coin") ?? "BCH")
+        .trim()
+        .toUpperCase();
+
+      const requestedSide = String(url.searchParams.get("side") ?? "LONG")
+        .trim()
+        .toUpperCase();
+
+      if (!validCoin(coin)) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "hyperliquid-available",
+          error: "INVALID_OR_UNTRACKED_COIN",
+          coin,
+          tracked_coins: TRACKED_COINS,
+          safe_read_only: true,
+        }, 400);
+      }
+
+      if (requestedSide !== "LONG" && requestedSide !== "SHORT") {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "hyperliquid-available",
+          error: "INVALID_SIDE_USE_LONG_OR_SHORT",
+          side: requestedSide,
+          safe_read_only: true,
+        }, 400);
+      }
+
+      try {
+        const response = await fetch(HYPERLIQUID_INFO, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            type: "activeAssetData",
+            user: address,
+            coin,
+          }),
+        });
+
+        const text = await response.text();
+        let data: any = null;
+        try { data = JSON.parse(text); } catch { data = text; }
+
+        if (!response.ok) {
+          return json({
+            success: false,
+            worker: "cryptobot",
+            version: VERSION,
+            module: "hyperliquid-available",
+            safe_read_only: true,
+            http_status: response.status,
+            address,
+            address_source: addressSource,
+            coin,
+            side: requestedSide,
+            raw: data,
+          }, 502);
+        }
+
+        const sideIndex = requestedSide === "LONG" ? 0 : 1;
+        const available = Array.isArray(data?.availableToTrade)
+          ? data.availableToTrade
+          : [];
+        const maxTrade = Array.isArray(data?.maxTradeSzs)
+          ? data.maxTradeSzs
+          : [];
+
+        const availableToTrade = Number(available[sideIndex]);
+        const maxTradeSz = Number(maxTrade[sideIndex]);
+        const markPx = Number(data?.markPx);
+
+        return json({
+          success: true,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "hyperliquid-available",
+          network: "MAINNET",
+          safe_read_only: true,
+          signing_performed: false,
+          exchange_endpoint_called: false,
+          address,
+          address_source: addressSource,
+          coin,
+          side: requestedSide,
+          side_index: sideIndex,
+          guard_view: {
+            configured_margin_example_usd: 10.04,
+            available_to_trade: Number.isFinite(availableToTrade)
+              ? availableToTrade
+              : null,
+            enough_for_10_04_margin:
+              Number.isFinite(availableToTrade)
+                ? availableToTrade >= 10.04
+                : null,
+          },
+          active_asset: {
+            available_to_trade: Number.isFinite(availableToTrade)
+              ? availableToTrade
+              : null,
+            available_to_trade_raw: available[sideIndex] ?? null,
+            available_to_trade_both_sides: available,
+            max_trade_sz: Number.isFinite(maxTradeSz) ? maxTradeSz : null,
+            max_trade_szs: maxTrade,
+            mark_px: Number.isFinite(markPx) ? markPx : null,
+            leverage: data?.leverage ?? null,
+          },
+          raw: data,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          module: "hyperliquid-available",
+          safe_read_only: true,
+          signing_performed: false,
+          exchange_endpoint_called: false,
+          address,
+          address_source: addressSource,
+          coin,
+          side: requestedSide,
+          error: String(err?.message ?? err),
+        }, 502);
+      }
+    }
+
     if (url.pathname === "/hyperliquid-balance-diagnostic") {
       // Public MASTER account address. Prefer env when configured,
       // otherwise use the same known master account used by this CryptoBot.
