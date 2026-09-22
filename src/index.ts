@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate } from "./hyperliquid/execution";
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.7 FRESH EXECUTION + D1 IDEMPOTENCY";
+const VERSION = "V1.9.8 TELEGRAM TEST + FRESH EXECUTION + D1 IDEMPOTENCY";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -69,6 +69,10 @@ type Env = {
 
   // Encrypted Cloudflare Secret. NEVER put its value in source code.
   HYPERLIQUID_API_PRIVATE_KEY?: string;
+
+  // Telegram notifications. Keep both as encrypted Cloudflare Secrets.
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
 };
 
 type Candle = {
@@ -6679,6 +6683,111 @@ export default {
           },
           500
         );
+      }
+    }
+
+
+    // TELEGRAM TEST — SAFE / NO HYPERLIQUID SIGNING / NO ORDERS
+    // Verifies TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID and sends one test message.
+    if (url.pathname === "/telegram-test") {
+      const token = String(env.TELEGRAM_BOT_TOKEN ?? "").trim();
+      const chatId = String(env.TELEGRAM_CHAT_ID ?? "").trim();
+
+      if (!token || !chatId) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          telegram: {
+            configured: false,
+            sent: false,
+            token_present: Boolean(token),
+            chat_id_present: Boolean(chatId),
+            reason: "TELEGRAM_SECRETS_NOT_CONFIGURED",
+          },
+          safety: {
+            hyperliquid_signing_performed: false,
+            exchange_endpoint_called: false,
+            order_sent: false,
+          },
+        }, 400);
+      }
+
+      try {
+        const message = [
+          "🧪 <b>CRYPTOBOT TELEGRAM TEST</b>",
+          "",
+          "✅ Bot connection: OK",
+          "🔒 Live trading: DISABLED",
+          "🤖 Worker: cryptobot",
+          `📦 Version: ${VERSION}`,
+          "",
+          `🕐 ${new Date().toISOString()}`,
+        ].join("\\n");
+
+        const response = await fetch(
+          `https://api.telegram.org/bot${token}/sendMessage`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text: message,
+              parse_mode: "HTML",
+              disable_web_page_preview: true,
+            }),
+          }
+        );
+
+        const raw = await response.text();
+        let telegramResponse: any = null;
+        try {
+          telegramResponse = raw ? JSON.parse(raw) : null;
+        } catch {}
+
+        const sent = response.ok && telegramResponse?.ok === true;
+
+        return json({
+          success: sent,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          telegram: {
+            configured: true,
+            sent,
+            http_status: response.status,
+            reason: sent ? null : "TELEGRAM_SEND_FAILED",
+            // Deliberately expose only harmless Telegram response metadata.
+            message_id: telegramResponse?.result?.message_id ?? null,
+            chat_type: telegramResponse?.result?.chat?.type ?? null,
+          },
+          safety: {
+            hyperliquid_signing_performed: false,
+            exchange_endpoint_called: false,
+            order_sent: false,
+            telegram_token_exposed: false,
+          },
+        }, sent ? 200 : 502);
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "cryptobot",
+          version: VERSION,
+          trading: "REAL_TRADING_DISABLED",
+          telegram: {
+            configured: true,
+            sent: false,
+            reason: "TELEGRAM_TRANSPORT_ERROR",
+            message: error?.message ?? String(error),
+          },
+          safety: {
+            hyperliquid_signing_performed: false,
+            exchange_endpoint_called: false,
+            order_sent: false,
+            telegram_token_exposed: false,
+          },
+        }, 500);
       }
     }
 
