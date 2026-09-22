@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.11 HYPERLIQUID RAW BALANCE DIAGNOSTIC";
+const VERSION = "V1.9.12 HYPERLIQUID BALANCE DIAGNOSTIC ADDRESS FALLBACK";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4252,7 +4252,7 @@ export default {
         },
 
         next_version:
-          "V1.9.11 — RAW HYPERLIQUID BALANCE DIAGNOSTIC",
+          "V1.9.12 — BALANCE DIAGNOSTIC ADDRESS FALLBACK",
       });
     }
 
@@ -6883,17 +6883,17 @@ export default {
     // HYPERLIQUID ACCOUNT V1 — READ ONLY
     // Public /info reads only. NO private key, signing, /exchange, or orders.
     if (url.pathname === "/hyperliquid-balance-diagnostic") {
-      const address = env.HYPERLIQUID_ACCOUNT_ADDRESS?.trim();
-      if (!address) {
-        return json({
-          success: false,
-          worker: "cryptobot",
-          version: VERSION,
-          module: "hyperliquid-balance-diagnostic",
-          error: "HYPERLIQUID_ACCOUNT_ADDRESS_NOT_CONFIGURED",
-          safe_read_only: true,
-        }, 500);
-      }
+      // Public MASTER account address. Prefer env when configured,
+      // otherwise use the same known master account used by this CryptoBot.
+      // This is a public address, never a private key.
+      const DEFAULT_HYPERLIQUID_MASTER_ADDRESS =
+        "0xf1CF243f05024AE78aE2dFa31c2Bec1e1F6c9196";
+
+      const envAddress = env.HYPERLIQUID_ACCOUNT_ADDRESS?.trim();
+      const address = envAddress || DEFAULT_HYPERLIQUID_MASTER_ADDRESS;
+      const addressSource = envAddress
+        ? "ENV_HYPERLIQUID_ACCOUNT_ADDRESS"
+        : "KNOWN_MASTER_ADDRESS_FALLBACK";
 
       const info = async (body: Record<string, any>) => {
         try {
@@ -6959,6 +6959,7 @@ export default {
         signing_performed: false,
         exchange_endpoint_called: false,
         address,
+        address_source: addressSource,
         interpretation: {
           perps_account_value: Number.isFinite(accountValue) ? accountValue : null,
           perps_total_margin_used: Number.isFinite(totalMarginUsed) ? totalMarginUsed : null,
