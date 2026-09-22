@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.9 LIFECYCLE MONITOR + FRESH EXECUTION + D1 IDEMPOTENCY";
+const VERSION = "V1.9.10 LIFECYCLE PNL + MONITOR + FRESH EXECUTION + D1 IDEMPOTENCY";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4252,7 +4252,7 @@ export default {
         },
 
         next_version:
-          "V1.9 — AFTER V1.8 LOAD + SIGNAL DATA REVIEW",
+          "V1.9.10 — LIFECYCLE PNL + BALANCE GUARD + MAX HOLD",
       });
     }
 
