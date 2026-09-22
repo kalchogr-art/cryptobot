@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.7.2
+// HYPERLIQUID SIGNAL EXECUTION V2.7.3
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -46,7 +46,7 @@ const CONFIG = {
 
   MIN_SIGNAL_SCORE: 65,
 
-  MARGIN_USD: 10.04,
+  MARGIN_USD: 11.04,
   LEVERAGE: 10,
   IS_CROSS: true,
 
@@ -1233,14 +1233,29 @@ export async function buildHyperliquidExecutionCandidate(
   ]);
 
   const availableMargin = Number(tradingAvailability?.available_to_trade);
+  const maxTradeSz = Number(tradingAvailability?.max_trade_sz);
+  const availabilityMarkPx = Number(tradingAvailability?.mark_px);
+
+  // Compare like-for-like notionals. CONFIG.MARGIN_USD is collateral/margin,
+  // while maxTradeSz is the maximum position size Hyperliquid currently allows.
+  const targetNotionalUsd = CONFIG.MARGIN_USD * CONFIG.LEVERAGE;
+  const maxTradableNotionalUsd =
+    Number.isFinite(maxTradeSz) && Number.isFinite(availabilityMarkPx)
+      ? maxTradeSz * availabilityMarkPx
+      : NaN;
+
+  // Small headroom prevents requesting the absolute exchange maximum and
+  // reduces partial IOC fills caused by price movement between check and order.
+  const requiredNotionalWithHeadroom =
+    targetNotionalUsd + CONFIG.MIN_MARGIN_HEADROOM_USD * CONFIG.LEVERAGE;
 
   if (
     !tradingAvailability?.success ||
-    !Number.isFinite(availableMargin) ||
-    availableMargin + CONFIG.MIN_MARGIN_HEADROOM_USD < CONFIG.MARGIN_USD
+    !Number.isFinite(maxTradableNotionalUsd) ||
+    maxTradableNotionalUsd < requiredNotionalWithHeadroom
   ) {
     const reason = tradingAvailability?.success
-      ? `INSUFFICIENT_AVAILABLE_TO_TRADE: required=$${CONFIG.MARGIN_USD.toFixed(2)} available=$${Number.isFinite(availableMargin) ? availableMargin.toFixed(6) : "unknown"} coin=${coin} side=${side}`
+      ? `INSUFFICIENT_MAX_TRADABLE_NOTIONAL: target=$${targetNotionalUsd.toFixed(4)} max=$${Number.isFinite(maxTradableNotionalUsd) ? maxTradableNotionalUsd.toFixed(4) : "unknown"} available=${Number.isFinite(availableMargin) ? availableMargin.toFixed(6) : "unknown"} coin=${coin} side=${side}`
       : `ACTIVE_ASSET_AVAILABILITY_UNAVAILABLE: ${String(tradingAvailability?.error ?? "unknown")}`;
 
     await updateExecutionLedger(
@@ -1277,6 +1292,13 @@ export async function buildHyperliquidExecutionCandidate(
       reason,
       account_balance: preEntryBalance,
       trading_availability: tradingAvailability,
+      notional_guard: {
+        target_notional_usd: targetNotionalUsd,
+        max_tradable_notional_usd: Number.isFinite(maxTradableNotionalUsd)
+          ? maxTradableNotionalUsd
+          : null,
+        required_with_headroom_usd: requiredNotionalWithHeadroom,
+      },
       telegram: { sent: tg.sent, reason: tg.reason ?? null },
       exchange_request_sent: false,
     };
