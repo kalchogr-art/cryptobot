@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.6.1
+// HYPERLIQUID SIGNAL EXECUTION V2.7
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -55,6 +55,10 @@ const CONFIG = {
   // Protection: initial TP/SL request + 3 retries = max 4 attempts.
   TPSL_MAX_ATTEMPTS: 4,
   TPSL_RETRY_DELAY_MS: 500,
+
+  // Position lifecycle safety.
+  MAX_HOLD_MS: 30 * 60 * 1000,
+  MIN_MARGIN_HEADROOM_USD: 0.01,
 };
 
 export type HyperliquidExecutionEnv = {
@@ -335,6 +339,11 @@ function buildEntryTelegramMessage(args: {
   const protection = a.protectionOk
     ? `✅ CONFIRMED (${a.protectionAttempts}/${CONFIG.TPSL_MAX_ATTEMPTS})`
     : `🚨 FAILED (${a.protectionAttempts}/${CONFIG.TPSL_MAX_ATTEMPTS})`;
+  const requestedNotional = a.marginUsd * a.leverage;
+  const fillRatio = requestedNotional > 0 ? a.fillNotional / requestedNotional : 1;
+  const partialLine = fillRatio < 0.98
+    ? `⚠️ PARTIAL FILL: ${(fillRatio * 100).toFixed(1)}% of requested notional`
+    : `✅ FULL FILL`;
 
   const bal = a.balance?.success
     ? [
@@ -356,7 +365,9 @@ function buildEntryTelegramMessage(args: {
     ``,
     `💰 Margin: $${a.marginUsd.toFixed(2)}`,
     `⚙️ Leverage: ${escapeTelegramHtml(a.leverageType)} ${a.leverage}x`,
+    `📊 Requested notional: $${requestedNotional.toFixed(4)}`,
     `📊 Filled notional: $${a.fillNotional.toFixed(4)}`,
+    partialLine,
     ``,
     `🎯 <b>ENTRY</b>`,
     `Fill: ${a.fillPrice}`,
@@ -430,6 +441,11 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       entry_fill_price REAL,
       entry_fill_size REAL,
       entry_oid TEXT,
+      entry_filled_at INTEGER,
+      closed_at INTEGER,
+      close_reason TEXT,
+      exit_price REAL,
+      realized_pnl REAL,
       last_error TEXT
     )
   `).run();
@@ -438,6 +454,17 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_hl_execution_ledger_coin_status
     ON hyperliquid_execution_ledger (coin, status)
   `).run();
+
+  // Safe schema upgrades for databases created by V2.5/V2.6.
+  for (const sql of [
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN entry_filled_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN closed_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN close_reason TEXT",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN exit_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN realized_pnl REAL"
+  ]) {
+    try { await db.prepare(sql).run(); } catch {}
+  }
 }
 
 async function claimExecutionOnce(
@@ -518,6 +545,146 @@ async function updateExecutionLedger(
     fields.last_error ?? null,
     String(crossingId)
   ).run();
+}
+
+
+async function getOpenPositionForCoin(coin: string): Promise<any | null> {
+  const state = await postInfo({ type: "clearinghouseState", user: MASTER_ACCOUNT });
+  const positions = Array.isArray(state?.assetPositions) ? state.assetPositions : [];
+  for (const row of positions) {
+    const p = row?.position ?? row;
+    if (String(p?.coin ?? "").toUpperCase() !== coin) continue;
+    const szi = Number(p?.szi);
+    if (Number.isFinite(szi) && Math.abs(szi) > 0) return p;
+  }
+  return null;
+}
+
+async function getOpenOrdersForCoin(coin: string): Promise<any[]> {
+  const rows = await postInfo({ type: "openOrders", user: MASTER_ACCOUNT });
+  return Array.isArray(rows)
+    ? rows.filter((x: any) => String(x?.coin ?? "").toUpperCase() === coin)
+    : [];
+}
+
+async function getRecentFillsForCoin(coin: string): Promise<any[]> {
+  try {
+    const rows = await postInfo({ type: "userFills", user: MASTER_ACCOUNT });
+    return Array.isArray(rows)
+      ? rows.filter((x: any) => String(x?.coin ?? "").toUpperCase() === coin)
+      : [];
+  } catch { return []; }
+}
+
+function lifecycleTelegram(a: any): string {
+  const pnl = Number.isFinite(Number(a.realizedPnl)) ? `$${Number(a.realizedPnl).toFixed(4)}` : "n/a";
+  return [
+    `${a.emoji} <b>${escapeTelegramHtml(a.title)}</b>`, "",
+    `🪙 <b>${escapeTelegramHtml(a.coin)}</b>`,
+    `${a.side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(a.side)}`,
+    `🎯 Entry: ${escapeTelegramHtml(a.entryPrice)}`,
+    `🏁 Exit: ${escapeTelegramHtml(a.exitPrice ?? "n/a")}`,
+    `📦 Size: ${escapeTelegramHtml(a.size ?? "n/a")}`,
+    `💵 Realized P/L: ${pnl}`,
+    `⏱ Held: ${Math.max(0, Math.round(Number(a.heldMs ?? 0) / 60000))} min`,
+    `🆔 Crossing: ${escapeTelegramHtml(a.crossingId)}`,
+    "", `🕐 ${new Date().toISOString()}`
+  ].join("\n");
+}
+
+async function sendLifecycleSignedAction(action: Record<string, any>, secret: `0x${string}`) {
+  const nonce = Date.now();
+  const signed = await signHyperliquidAction(action, nonce, secret);
+  const res = await fetch(EXCHANGE_URL, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action, nonce, signature: signed.signature, vaultAddress: null }),
+  });
+  const text = await res.text();
+  let json: any = null; try { json = text ? JSON.parse(text) : null; } catch {}
+  return { httpStatus: res.status, json, text };
+}
+
+export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
+  if (!env?.DB) return { success: false, reason: "D1_NOT_BOUND" };
+  await ensureExecutionLedger(env.DB);
+  const rows: any = await env.DB.prepare(`
+    SELECT * FROM hyperliquid_execution_ledger
+    WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
+    ORDER BY id ASC LIMIT 100
+  `).all();
+  const items = Array.isArray(rows?.results) ? rows.results : [];
+  const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  const secretOk = privateKeyFormatOk(secretRaw);
+  const out: any[] = [];
+
+  for (const row of items) {
+    const coin = String(row.coin ?? "").toUpperCase();
+    const side = String(row.side ?? "").toUpperCase();
+    const entryPrice = Number(row.entry_fill_price);
+    const entrySize = Number(row.entry_fill_size);
+    const filledAt = Number(row.entry_filled_at ?? row.updated_at ?? row.claimed_at);
+    const heldMs = Date.now() - filledAt;
+    let position: any = null;
+    try { position = await getOpenPositionForCoin(coin); } catch (e:any) { out.push({coin,error:e?.message??String(e)}); continue; }
+
+    if (!position) {
+      const fills = await getRecentFillsForCoin(coin);
+      const exit = fills.find((f:any) => Number(f?.time ?? 0) >= filledAt && Number(f?.closedPnl ?? 0) !== 0)
+        ?? fills.find((f:any) => Number(f?.time ?? 0) >= filledAt);
+      const exitPrice = Number(exit?.px);
+      const realizedPnl = Number(exit?.closedPnl);
+      const tpPct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
+      const slPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
+      const tp = side === "LONG" ? entryPrice*(1+tpPct/100) : entryPrice*(1-tpPct/100);
+      const sl = side === "LONG" ? entryPrice*(1-slPct/100) : entryPrice*(1+slPct/100);
+      let reason = "CLOSED_OTHER", title = "POSITION CLOSED", emoji = "⚪";
+      if (Number.isFinite(exitPrice)) {
+        const tpHit = side === "LONG" ? exitPrice >= tp*0.9999 : exitPrice <= tp*1.0001;
+        const slHit = side === "LONG" ? exitPrice <= sl*1.0001 : exitPrice >= sl*0.9999;
+        if (tpHit) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
+        else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
+      }
+      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=? WHERE id=?`)
+        .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,Number.isFinite(realizedPnl)?realizedPnl:null,row.id).run();
+      await sendTelegram(env,lifecycleTelegram({emoji,title,coin,side,entryPrice,exitPrice:Number.isFinite(exitPrice)?exitPrice:null,size:entrySize,realizedPnl,heldMs,crossingId:row.crossing_id}));
+      out.push({coin,status:reason,exit_price:exitPrice});
+      continue;
+    }
+
+    if (heldMs < CONFIG.MAX_HOLD_MS) { out.push({coin,status:"OPEN",held_ms:heldMs}); continue; }
+    if (!secretOk) { out.push({coin,status:"MAX_HOLD_BLOCKED",reason:"PRIVATE_KEY_INVALID"}); continue; }
+
+    // MAX HOLD: close the actual remaining position, not the original requested size.
+    const raw = await postInfo({ type: "metaAndAssetCtxs" });
+    const universe = Array.isArray(raw?.[0]?.universe) ? raw[0].universe : [];
+    const contexts = Array.isArray(raw?.[1]) ? raw[1] : [];
+    const asset = universe.findIndex((x:any)=>x?.name===coin);
+    if (asset < 0) { out.push({coin,status:"MAX_HOLD_BLOCKED",reason:"ASSET_NOT_FOUND"}); continue; }
+    const szDecimals = Number(universe[asset]?.szDecimals);
+    const szi = Number(position?.szi);
+    const mark = Number(contexts?.[asset]?.midPx ?? contexts?.[asset]?.markPx);
+    if (!Number.isFinite(szi)||szi===0||!Number.isFinite(mark)||mark<=0) continue;
+    const closeBuy = szi < 0;
+    const limit = closeBuy ? mark*(1+CONFIG.MAX_ENTRY_SLIPPAGE_PCT/100) : mark*(1-CONFIG.MAX_ENTRY_SLIPPAGE_PCT/100);
+    const closeAction = { type:"order", orders:[{a:asset,b:closeBuy,p:priceToWire(limit,szDecimals),s:toWire(Math.abs(szi),szDecimals),r:true,t:{limit:{tif:"Ioc"}}}], grouping:"na" };
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_CLOSING',updated_at=? WHERE id=?`).bind(Date.now(),row.id).run();
+    const closeRes = await sendLifecycleSignedAction(closeAction, secretRaw as `0x${string}`);
+    const st = closeRes?.json?.response?.data?.statuses?.[0];
+    if (!st?.filled) { out.push({coin,status:"MAX_HOLD_CLOSE_FAILED",response:closeRes.json}); continue; }
+
+    // Cancel any stale TP/SL orders left after the forced close.
+    try {
+      const open = await getOpenOrdersForCoin(coin);
+      const cancels = open.filter((o:any)=>o?.oid!=null).map((o:any)=>({a:asset,o:Number(o.oid)}));
+      if (cancels.length) await sendLifecycleSignedAction({type:"cancel",cancels}, secretRaw as `0x${string}`);
+    } catch {}
+    const exitPrice = Number(st.filled?.avgPx ?? st.filled?.px);
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=? WHERE id=?`)
+      .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,row.id).run();
+    await sendTelegram(env,lifecycleTelegram({emoji:"⏱",title:"MAX HOLD 30M EXIT",coin,side,entryPrice,exitPrice,size:Math.abs(szi),realizedPnl:Number(st.filled?.closedPnl),heldMs,crossingId:row.crossing_id}));
+    out.push({coin,status:"MAX_HOLD_EXIT",exit_price:exitPrice});
+  }
+  return { success:true, checked:items.length, results:out };
 }
 
 export async function buildHyperliquidExecutionCandidate(
@@ -874,6 +1041,26 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
+  // V2.7 pre-entry guards: never let the exchange consume a partial amount
+  // merely because the configured margin is larger than available collateral.
+  const preEntryBalance = await getAccountSnapshot();
+  const availableMargin = Number(preEntryBalance?.withdrawable_usd);
+  if (!preEntryBalance?.success || !Number.isFinite(availableMargin) || availableMargin + CONFIG.MIN_MARGIN_HEADROOM_USD < CONFIG.MARGIN_USD) {
+    const reason = `INSUFFICIENT_AVAILABLE_MARGIN: required=$${CONFIG.MARGIN_USD.toFixed(2)} available=$${Number.isFinite(availableMargin)?availableMargin.toFixed(4):"unknown"}`;
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_BALANCE", { last_error: reason });
+    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason,balance:preEntryBalance}));
+    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_INSUFFICIENT_MARGIN",reason,account_balance:preEntryBalance,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
+  }
+
+  const existingPosition = await getOpenPositionForCoin(coin);
+  const existingOrders = await getOpenOrdersForCoin(coin);
+  if (existingPosition || existingOrders.length > 0) {
+    const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN" : "EXISTING_OPEN_ORDERS_FOR_COIN";
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
+    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason,balance:preEntryBalance}));
+    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
+  }
+
   let lastNonce = 0;
   function nextNonce(): number {
     const now = Date.now();
@@ -907,9 +1094,10 @@ export async function buildHyperliquidExecutionCandidate(
     try {
       leverageResponse = await sendSignedAction(leverageAction);
     } catch (e: any) {
-      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_ERROR", {
-        last_error: e?.message ?? String(e),
-      });
+      const levReason = e?.message ?? String(e);
+      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_ERROR", { last_error: levReason });
+      const levBal = await getAccountSnapshot();
+      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:`LEVERAGE_ERROR: ${levReason}`,balance:levBal}));
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_TRANSPORT_ERROR",
@@ -932,9 +1120,9 @@ export async function buildHyperliquidExecutionCandidate(
       leverageResponse?.json?.status === "ok";
 
     if (!leverageAccepted) {
-      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_REJECTED", {
-        last_error: "LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",
-      });
+      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_REJECTED", { last_error: "LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED" });
+      const levBal = await getAccountSnapshot();
+      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:"LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",balance:levBal}));
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_REJECTED",
@@ -1055,9 +1243,9 @@ export async function buildHyperliquidExecutionCandidate(
   const fillPrice = Number(fill.avgPx ?? fill.px ?? fill.price);
   const fillSize = Number(fill.totalSz ?? fill.sz ?? sizeWire);
   if (!Number.isFinite(fillPrice) || fillPrice <= 0 || !Number.isFinite(fillSize) || fillSize <= 0) {
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILL_INVALID", {
-      last_error: "INVALID_FILL_DATA",
-    });
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILL_INVALID", { last_error: "INVALID_FILL_DATA_CRITICAL_POSITION_MAY_BE_OPEN" });
+    const invalidBal = await getAccountSnapshot();
+    await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:"CRITICAL: ENTRY REPORTED FILLED BUT FILL DATA INVALID — CHECK POSITION NOW",balance:invalidBal}));
     return {
       ...result,
       status: "LIVE_ENTRY_FILLED_BUT_FILL_DATA_INVALID",
@@ -1078,6 +1266,10 @@ export async function buildHyperliquidExecutionCandidate(
     entry_oid: fill?.oid ?? null,
     last_error: null,
   });
+  try {
+    await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=? WHERE crossing_id=?`)
+      .bind(Date.now(), String(signal.crossing_id)).run();
+  } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
   const tpRaw = isLong
