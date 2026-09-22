@@ -8,8 +8,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.4
-// SIGNAL -> AUTO LEVERAGE -> MARKETABLE IOC ENTRY -> FILL -> TP/SL
+// HYPERLIQUID SIGNAL EXECUTION V2.6.1
+// FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
@@ -51,11 +51,17 @@ const CONFIG = {
   // Old crossings may still be previewed by the read-only endpoint, but can
   // never reach /exchange.
   MAX_SIGNAL_AGE_MS: 120_000,
+
+  // Protection: initial TP/SL request + 3 retries = max 4 attempts.
+  TPSL_MAX_ATTEMPTS: 4,
+  TPSL_RETRY_DELAY_MS: 500,
 };
 
 export type HyperliquidExecutionEnv = {
   HYPERLIQUID_API_PRIVATE_KEY?: string;
   DB?: any;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
 };
 
 export type HyperliquidExecutionSignal = {
@@ -226,6 +232,186 @@ async function postInfo(body: Record<string, any>): Promise<any> {
   return JSON.parse(text);
 }
 
+
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function escapeTelegramHtml(v: unknown): string {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+async function sendTelegram(
+  env: HyperliquidExecutionEnv | undefined,
+  text: string
+): Promise<{ sent: boolean; reason?: string; http_status?: number; response?: any }> {
+  const token = String(env?.TELEGRAM_BOT_TOKEN ?? "").trim();
+  const chatId = String(env?.TELEGRAM_CHAT_ID ?? "").trim();
+
+  if (!token || !chatId) {
+    return { sent: false, reason: "TELEGRAM_SECRETS_NOT_CONFIGURED" };
+  }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+
+    const raw = await res.text();
+    let json: any = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch {}
+
+    return {
+      sent: res.ok && json?.ok === true,
+      http_status: res.status,
+      response: json,
+      reason: res.ok && json?.ok === true ? undefined : "TELEGRAM_SEND_FAILED",
+    };
+  } catch (e: any) {
+    return { sent: false, reason: e?.message ?? String(e) };
+  }
+}
+
+async function getAccountSnapshot(): Promise<any> {
+  try {
+    const state = await postInfo({
+      type: "clearinghouseState",
+      user: MASTER_ACCOUNT,
+    });
+
+    const accountValue = Number(state?.marginSummary?.accountValue);
+    const totalMarginUsed = Number(state?.marginSummary?.totalMarginUsed);
+    const withdrawable = Number(state?.withdrawable);
+
+    return {
+      success: true,
+      account_value_usd: Number.isFinite(accountValue) ? accountValue : null,
+      margin_used_usd: Number.isFinite(totalMarginUsed) ? totalMarginUsed : null,
+      withdrawable_usd: Number.isFinite(withdrawable) ? withdrawable : null,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      error: e?.message ?? String(e),
+      account_value_usd: null,
+      margin_used_usd: null,
+      withdrawable_usd: null,
+    };
+  }
+}
+
+function buildEntryTelegramMessage(args: {
+  coin: string;
+  side: string;
+  score: number;
+  crossingId: any;
+  episodeId: any;
+  marginUsd: number;
+  leverage: number;
+  leverageType: string;
+  fillPrice: number;
+  fillSize: string;
+  fillNotional: number;
+  tpWire: string;
+  slWire: string;
+  takeProfitPct: number;
+  stopLossPct: number;
+  protectionOk: boolean;
+  protectionAttempts: number;
+  balance: any;
+}): string {
+  const a = args;
+  const protection = a.protectionOk
+    ? `✅ CONFIRMED (${a.protectionAttempts}/${CONFIG.TPSL_MAX_ATTEMPTS})`
+    : `🚨 FAILED (${a.protectionAttempts}/${CONFIG.TPSL_MAX_ATTEMPTS})`;
+
+  const bal = a.balance?.success
+    ? [
+        `💵 <b>ACCOUNT</b>`,
+        `Equity: $${Number(a.balance.account_value_usd ?? 0).toFixed(4)}`,
+        `Margin used: $${Number(a.balance.margin_used_usd ?? 0).toFixed(4)}`,
+        `Withdrawable: $${Number(a.balance.withdrawable_usd ?? 0).toFixed(4)}`,
+      ].join("\n")
+    : `💵 <b>ACCOUNT</b>\nBalance unavailable`;
+
+  return [
+    `🚀 <b>HYPERLIQUID ENTRY</b>`,
+    ``,
+    `🪙 <b>${escapeTelegramHtml(a.coin)}</b>`,
+    `${a.side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(a.side)}`,
+    `🔥 Signal: ${a.score.toFixed(2)}/100`,
+    `🆔 Crossing: ${escapeTelegramHtml(a.crossingId)}`,
+    `🔄 Episode: ${escapeTelegramHtml(a.episodeId)}`,
+    ``,
+    `💰 Margin: $${a.marginUsd.toFixed(2)}`,
+    `⚙️ Leverage: ${escapeTelegramHtml(a.leverageType)} ${a.leverage}x`,
+    `📊 Filled notional: $${a.fillNotional.toFixed(4)}`,
+    ``,
+    `🎯 <b>ENTRY</b>`,
+    `Fill: ${a.fillPrice}`,
+    `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
+    ``,
+    `🟢 TP: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
+    `🛡 TP/SL: ${protection}`,
+    ``,
+    bal,
+    ``,
+    `🕐 ${new Date().toISOString()}`,
+  ].join("\n");
+}
+
+
+function buildRejectedTelegramMessage(args: {
+  coin: string;
+  side: string;
+  score: number;
+  crossingId: any;
+  episodeId: any;
+  marginUsd: number;
+  leverage: number;
+  reason: string;
+  balance: any;
+}): string {
+  const a = args;
+  const bal = a.balance?.success
+    ? [
+        `💵 <b>ACCOUNT</b>`,
+        `Equity: $${Number(a.balance.account_value_usd ?? 0).toFixed(4)}`,
+        `Margin used: $${Number(a.balance.margin_used_usd ?? 0).toFixed(4)}`,
+        `Withdrawable: $${Number(a.balance.withdrawable_usd ?? 0).toFixed(4)}`,
+      ].join("\n")
+    : `💵 <b>ACCOUNT</b>\nBalance unavailable`;
+
+  return [
+    `❌ <b>HYPERLIQUID ORDER REJECTED</b>`,
+    ``,
+    `🪙 <b>${escapeTelegramHtml(a.coin)}</b>`,
+    `${a.side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(a.side)}`,
+    `🔥 Signal: ${a.score.toFixed(2)}/100`,
+    `🆔 Crossing: ${escapeTelegramHtml(a.crossingId)}`,
+    `🔄 Episode: ${escapeTelegramHtml(a.episodeId)}`,
+    ``,
+    `💰 Configured margin: $${a.marginUsd.toFixed(2)}`,
+    `⚙️ Leverage: ${a.leverage}x`,
+    `🚫 Reason: <b>${escapeTelegramHtml(a.reason)}</b>`,
+    ``,
+    bal,
+    ``,
+    `🕐 ${new Date().toISOString()}`,
+  ].join("\n");
+}
 
 async function ensureExecutionLedger(db: any): Promise<void> {
   if (!db) throw new Error("D1_NOT_BOUND_FOR_LIVE_EXECUTION");
@@ -688,8 +874,15 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
+  let lastNonce = 0;
+  function nextNonce(): number {
+    const now = Date.now();
+    lastNonce = Math.max(now, lastNonce + 1);
+    return lastNonce;
+  }
+
   async function sendSignedAction(action: Record<string, any>) {
-    const nonce = Date.now();
+    const nonce = nextNonce();
     const signed = await signHyperliquidAction(action, nonce, secret as `0x${string}`);
     const res = await fetch(EXCHANGE_URL, {
       method: "POST",
@@ -739,6 +932,9 @@ export async function buildHyperliquidExecutionCandidate(
       leverageResponse?.json?.status === "ok";
 
     if (!leverageAccepted) {
+      await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_REJECTED", {
+        last_error: "LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",
+      });
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_REJECTED",
@@ -765,12 +961,28 @@ export async function buildHyperliquidExecutionCandidate(
   try {
     entryResponse = await sendSignedAction(entryAction);
   } catch (e: any) {
+    const rejectReason = e?.message ?? String(e);
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_ERROR", {
-      last_error: e?.message ?? String(e),
+      last_error: rejectReason,
     });
+    const rejectBalance = await getAccountSnapshot();
+    const rejectTelegram = await sendTelegram(
+      env,
+      buildRejectedTelegramMessage({
+        coin, side, score,
+        crossingId: signal.crossing_id ?? null,
+        episodeId: signal.episode_id ?? null,
+        marginUsd: CONFIG.MARGIN_USD,
+        leverage: CONFIG.LEVERAGE,
+        reason: rejectReason,
+        balance: rejectBalance,
+      })
+    );
     return {
       ...result,
       status: "LIVE_ENTRY_TRANSPORT_ERROR",
+      account_balance: rejectBalance,
+      telegram: { sent: rejectTelegram.sent, reason: rejectTelegram.reason ?? null },
       reason: e?.message ?? String(e),
       exchange_request_sent: true,
       safety: {
@@ -788,13 +1000,37 @@ export async function buildHyperliquidExecutionCandidate(
   const entryError = entryStatus?.error ?? null;
 
   if (!fill || entryError) {
+    const rejectReason = entryError ?? "IOC_NOT_FILLED";
     await updateExecutionLedger(
       env?.DB,
       signal.crossing_id,
       entryError ? "ENTRY_REJECTED" : "ENTRY_NOT_FILLED",
-      { last_error: entryError ?? "IOC_NOT_FILLED" }
+      { last_error: rejectReason }
     );
+
+    const rejectBalance = await getAccountSnapshot();
+    const rejectTelegram = await sendTelegram(
+      env,
+      buildRejectedTelegramMessage({
+        coin, side, score,
+        crossingId: signal.crossing_id ?? null,
+        episodeId: signal.episode_id ?? null,
+        marginUsd: CONFIG.MARGIN_USD,
+        leverage: CONFIG.LEVERAGE,
+        reason: rejectReason,
+        balance: rejectBalance,
+      })
+    );
+
     return {
+      ...result,
+      account_balance: rejectBalance,
+      telegram: {
+        configured: Boolean(env?.TELEGRAM_BOT_TOKEN && env?.TELEGRAM_CHAT_ID),
+        sent: rejectTelegram.sent,
+        reason: rejectTelegram.reason ?? null,
+        http_status: rejectTelegram.http_status ?? null,
+      },
       ...result,
       status: entryError ? "LIVE_ENTRY_REJECTED" : "LIVE_ENTRY_NOT_FILLED",
       reason: entryError ?? "IOC_NOT_FILLED",
@@ -875,44 +1111,98 @@ export async function buildHyperliquidExecutionCandidate(
     grouping: "positionTpsl",
   };
 
-  let protectionResponse: any;
-  try {
-    protectionResponse = await sendSignedAction(protectionAction);
-  } catch (e: any) {
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "TPSL_ERROR", {
-      last_error: e?.message ?? String(e),
-    });
-    return {
-      ...result,
-      status: "LIVE_ENTRY_FILLED_TPSL_TRANSPORT_ERROR",
-      reason: e?.message ?? String(e),
-      exchange_request_sent: true,
-      live_entry: { filled: true, fill_price: fillPrice, fill_size: actualSizeWire, fill },
-      safety: {
-        live_trading: true,
-        signing_performed: true,
-        exchange_endpoint_called: true,
-        private_key_exposed: false,
-      },
-      timestamp: new Date().toISOString(),
-    };
-  }
+  let protectionResponse: any = null;
+  let protectionStatuses: any = null;
+  let protectionErrors: any[] = [];
+  let protectionAttempts = 0;
+  let protectionOk = false;
+  let protectionLastError: string | null = null;
 
-  const protectionStatuses = protectionResponse?.json?.response?.data?.statuses ?? null;
-  const protectionErrors = Array.isArray(protectionStatuses)
-    ? protectionStatuses.map((x: any) => x?.error ?? null).filter(Boolean)
-    : [];
+  // The position already exists here, so protection is retried independently.
+  // Retry only the TP/SL action; NEVER resend ENTRY.
+  for (let attempt = 1; attempt <= CONFIG.TPSL_MAX_ATTEMPTS; attempt++) {
+    protectionAttempts = attempt;
+
+    try {
+      protectionResponse = await sendSignedAction(protectionAction);
+      protectionStatuses =
+        protectionResponse?.json?.response?.data?.statuses ?? null;
+
+      protectionErrors = Array.isArray(protectionStatuses)
+        ? protectionStatuses
+            .map((x: any) => x?.error ?? null)
+            .filter(Boolean)
+        : [];
+
+      const httpOk =
+        protectionResponse?.httpStatus >= 200 &&
+        protectionResponse?.httpStatus < 300;
+      const exchangeOk = protectionResponse?.json?.status === "ok";
+      const twoStatuses =
+        Array.isArray(protectionStatuses) &&
+        protectionStatuses.length >= 2;
+
+      protectionOk =
+        httpOk &&
+        exchangeOk &&
+        twoStatuses &&
+        protectionErrors.length === 0;
+
+      if (protectionOk) break;
+
+      protectionLastError =
+        protectionErrors.length
+          ? protectionErrors.join(" | ")
+          : `TPSL_NOT_CONFIRMED_ATTEMPT_${attempt}`;
+    } catch (e: any) {
+      protectionLastError = e?.message ?? String(e);
+    }
+
+    if (attempt < CONFIG.TPSL_MAX_ATTEMPTS) {
+      await sleep(CONFIG.TPSL_RETRY_DELAY_MS);
+    }
+  }
 
   await updateExecutionLedger(
     env?.DB,
     signal.crossing_id,
-    protectionErrors.length ? "TPSL_REJECTED" : "PROTECTED",
-    { last_error: protectionErrors.length ? protectionErrors.join(" | ") : null }
+    protectionOk ? "PROTECTED" : "TPSL_FAILED_AFTER_RETRIES",
+    { last_error: protectionOk ? null : protectionLastError }
   );
+
+  // Read account state AFTER the filled entry and TP/SL attempts.
+  const accountBalance = await getAccountSnapshot();
+
+  // Telegram is best-effort only. A Telegram failure must never change
+  // exchange execution or cause an ENTRY retry.
+  const telegramMessage = buildEntryTelegramMessage({
+    coin,
+    side,
+    score,
+    crossingId: signal.crossing_id ?? null,
+    episodeId: signal.episode_id ?? null,
+    marginUsd: CONFIG.MARGIN_USD,
+    leverage: CONFIG.LEVERAGE,
+    leverageType: desiredLeverageType.toUpperCase(),
+    fillPrice,
+    fillSize: actualSizeWire,
+    fillNotional: Number((fillPrice * fillSize).toFixed(8)),
+    tpWire,
+    slWire,
+    takeProfitPct,
+    stopLossPct,
+    protectionOk,
+    protectionAttempts,
+    balance: accountBalance,
+  });
+  const telegram = await sendTelegram(env, telegramMessage);
+
 
   return {
     ...result,
-    status: protectionErrors.length ? "LIVE_ENTRY_FILLED_TPSL_REJECTED" : "LIVE_ENTRY_FILLED_TPSL_SUBMITTED",
+    status: protectionOk
+      ? "LIVE_ENTRY_FILLED_TPSL_CONFIRMED"
+      : "LIVE_ENTRY_FILLED_TPSL_FAILED_AFTER_RETRIES",
     exchange_request_sent: true,
     live_leverage: {
       required: !leverageAlreadyCorrect,
@@ -936,9 +1226,20 @@ export async function buildHyperliquidExecutionCandidate(
       stop_loss_pct: stopLossPct,
       stop_loss_trigger: slWire,
       grouping: "positionTpsl",
-      http_status: protectionResponse.httpStatus,
+      http_status: protectionResponse?.httpStatus ?? null,
       returned_statuses: protectionStatuses,
       errors: protectionErrors,
+      confirmed: protectionOk,
+      attempts: protectionAttempts,
+      max_attempts: CONFIG.TPSL_MAX_ATTEMPTS,
+      last_error: protectionLastError,
+    },
+    account_balance: accountBalance,
+    telegram: {
+      configured: Boolean(env?.TELEGRAM_BOT_TOKEN && env?.TELEGRAM_CHAT_ID),
+      sent: telegram.sent,
+      reason: telegram.reason ?? null,
+      http_status: telegram.http_status ?? null,
     },
     safety: {
       live_trading: true,
