@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.15 BE EXTEND 60M RESEARCH";
+const VERSION = "V1.9.16 PROGRESSIVE SL RESEARCH";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4248,6 +4248,7 @@ export default {
           tp_sl_matrix_by_side: "/tp-sl-matrix-by-side",
           time_exit_analysis: "/time-exit-analysis?side=ALL",
           be_extend_analysis: "/be-extend-analysis?side=ALL",
+          progressive_sl_analysis: "/progressive-sl-analysis?side=ALL",
           forward_long_shadow: "/forward-long-shadow",
           forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
           debug: "/debug-hyperliquid",
@@ -5992,6 +5993,295 @@ export default {
     // so after the configured 0.07% round-trip fee the research
     // result is approximately 0.00% net before slippage.
     // ============================================================
+
+    // ============================================================
+    // V1.9.16 — PROGRESSIVE SL / BREAK-EVEN MATRIX
+    // RESEARCH ONLY. Real execution is unchanged.
+    //
+    // Replays each completed >=65 crossing from entry through 30m.
+    // Baseline:
+    //   LONG  TP +0.50 / SL -0.15
+    //   SHORT TP +0.50 / SL -0.40
+    //
+    // Progressive variants raise the protected directional return
+    // as MFE reaches successive trigger levels.
+    //
+    // IMPORTANT: market_snapshots are minute samples, so a candle
+    // can cross multiple levels between samples. To avoid pretending
+    // we know intraminute ordering, each snapshot first advances the
+    // stop from the observed favorable return, then checks whether
+    // the observed return is <= the active stop. This is research,
+    // not tick-accurate execution simulation.
+    // ============================================================
+    if (url.pathname === "/progressive-sl-analysis") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+
+      const sideParam=(url.searchParams.get("side")??"ALL").toUpperCase();
+      if(!["ALL","LONG","SHORT"].includes(sideParam)){
+        return json({success:false,error:"INVALID_SIDE",allowed:["ALL","LONG","SHORT"]},400);
+      }
+
+      const FEE=0.07;
+      const MAX_MIN=30;
+      const cfgFor=(side:string)=>side==="SHORT"
+        ? {tp:0.50,sl:0.40}
+        : {tp:0.50,sl:0.15};
+
+      // Stops are directional gross-return percentages.
+      // Example +0.10 means lock +0.10% gross in the signal direction.
+      const variants=[
+        {
+          id:"BE_015",
+          name:"BE after +0.15%",
+          steps:[{trigger:0.15,stop:0.07}]
+        },
+        {
+          id:"BE_020",
+          name:"BE after +0.20%",
+          steps:[{trigger:0.20,stop:0.07}]
+        },
+        {
+          id:"PROG_A",
+          name:"Progressive A",
+          steps:[
+            {trigger:0.15,stop:0.07},
+            {trigger:0.25,stop:0.10},
+            {trigger:0.35,stop:0.20},
+            {trigger:0.45,stop:0.30}
+          ]
+        },
+        {
+          id:"PROG_B",
+          name:"Progressive B",
+          steps:[
+            {trigger:0.20,stop:0.07},
+            {trigger:0.30,stop:0.15},
+            {trigger:0.40,stop:0.25}
+          ]
+        },
+        {
+          id:"PROG_C",
+          name:"Progressive C",
+          steps:[
+            {trigger:0.25,stop:0.07},
+            {trigger:0.35,stop:0.15},
+            {trigger:0.45,stop:0.25}
+          ]
+        }
+      ];
+
+      const q:any=await env.DB.prepare(`
+        SELECT id,episode_id,coin,side,crossing_ts,crossing_datetime,
+               crossing_price,crossing_score,outcome_complete
+        FROM signal_65_crossings
+        WHERE outcome_complete=1
+          AND (?='ALL' OR side=?)
+        ORDER BY crossing_ts ASC
+      `).bind(sideParam,sideParam).all();
+
+      const crossings:any[]=q?.results??[];
+      const now=Date.now();
+
+      // Merge overlapping 30m windows by coin to keep D1 query count low.
+      const byCoin=new Map<string,{start:number,end:number}[]>();
+      for(const c of crossings){
+        const t=Number(c.crossing_ts);
+        if(!Number.isFinite(t)) continue;
+        const coin=String(c.coin);
+        if(!byCoin.has(coin)) byCoin.set(coin,[]);
+        byCoin.get(coin)!.push({start:t,end:t+MAX_MIN*60*1000});
+      }
+      const merged:{coin:string,start:number,end:number}[]=[];
+      for(const [coin,ws] of byCoin){
+        ws.sort((a,b)=>a.start-b.start);
+        let cur:any=null;
+        for(const w of ws){
+          if(!cur) cur={coin,start:w.start,end:w.end};
+          else if(w.start<=cur.end) cur.end=Math.max(cur.end,w.end);
+          else {merged.push(cur);cur={coin,start:w.start,end:w.end};}
+        }
+        if(cur) merged.push(cur);
+      }
+
+      const snapMap=new Map<string,any[]>();
+      let snapshotQueries=0,snapshotsLoaded=0;
+      for(const w of merged){
+        const r:any=await env.DB.prepare(`
+          SELECT coin,ts,price
+          FROM market_snapshots
+          WHERE coin=? AND ts>=? AND ts<=?
+          ORDER BY ts ASC
+        `).bind(w.coin,w.start,Math.min(now,w.end)).all();
+        snapshotQueries++;
+        const rows:any[]=r?.results??[];
+        snapshotsLoaded+=rows.length;
+        if(!snapMap.has(w.coin)) snapMap.set(w.coin,[]);
+        snapMap.get(w.coin)!.push(...rows);
+      }
+      for(const rows of snapMap.values())
+        rows.sort((a:any,b:any)=>Number(a.ts)-Number(b.ts));
+
+      const directionalReturn=(side:string,entry:number,px:number)=>
+        side==="SHORT" ? ((entry-px)/entry)*100 : ((px-entry)/entry)*100;
+
+      const replay=(side:string,entry:number,rows:any[],steps:any[]|null)=>{
+        const cfg=cfgFor(side);
+        let activeStop=-cfg.sl;
+        let maxFav=0;
+        let stopMoves=0;
+        let highestTrigger=0;
+        let lastPx=entry,lastTs:number|null=null;
+
+        for(const x of rows){
+          const px=Number(x.price),ts=Number(x.ts);
+          if(!Number.isFinite(px)||px<=0||!Number.isFinite(ts)) continue;
+          lastPx=px; lastTs=ts;
+          const r=directionalReturn(side,entry,px);
+          maxFav=Math.max(maxFav,r);
+
+          if(r>=cfg.tp){
+            return {result:"TP",gross:cfg.tp,exit_px:px,exit_ts:ts,
+                    max_favorable_pct:maxFav,active_stop_pct:activeStop,
+                    stop_moves:stopMoves,highest_trigger_pct:highestTrigger};
+          }
+
+          if(steps){
+            for(const st of steps){
+              if(maxFav>=st.trigger && st.stop>activeStop){
+                activeStop=st.stop;
+                stopMoves++;
+                highestTrigger=Math.max(highestTrigger,st.trigger);
+              }
+            }
+          }
+
+          if(r<=activeStop){
+            const progressive=activeStop>=0;
+            return {
+              result:progressive
+                ? (activeStop<=FEE+1e-9 ? "FEE_BE_STOP" : "PROFIT_LOCK_STOP")
+                : "SL",
+              gross:activeStop,
+              exit_px:px,exit_ts:ts,max_favorable_pct:maxFav,
+              active_stop_pct:activeStop,stop_moves:stopMoves,
+              highest_trigger_pct:highestTrigger
+            };
+          }
+        }
+
+        const gross=directionalReturn(side,entry,lastPx);
+        return {result:"TIME_30M",gross,exit_px:lastPx,exit_ts:lastTs,
+                max_favorable_pct:maxFav,active_stop_pct:activeStop,
+                stop_moves:stopMoves,highest_trigger_pct:highestTrigger};
+      };
+
+      const perTrade:any[]=[];
+      for(const c of crossings){
+        const start=Number(c.crossing_ts),entry=Number(c.crossing_price);
+        if(!Number.isFinite(start)||!Number.isFinite(entry)||entry<=0) continue;
+        const end=start+MAX_MIN*60*1000;
+        const rows=(snapMap.get(String(c.coin))??[])
+          .filter((x:any)=>Number(x.ts)>=start&&Number(x.ts)<=end);
+        if(!rows.length) continue;
+
+        const base=replay(String(c.side),entry,rows,null);
+        const vr:any={};
+        for(const v of variants) vr[v.id]=replay(String(c.side),entry,rows,v.steps);
+
+        perTrade.push({
+          crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,side:c.side,
+          crossing_score:c.crossing_score,entry_price:entry,
+          baseline:{
+            result:base.result,
+            gross_pct:round(base.gross,4),
+            net_pct:round(base.gross-FEE,4),
+            max_favorable_pct:round(base.max_favorable_pct,4)
+          },
+          variants:Object.fromEntries(variants.map(v=>{
+            const x=vr[v.id];
+            return [v.id,{
+              result:x.result,
+              gross_pct:round(x.gross,4),
+              net_pct:round(x.gross-FEE,4),
+              difference_vs_baseline_net_pct:round((x.gross-FEE)-(base.gross-FEE),4),
+              stop_moves:x.stop_moves,
+              highest_trigger_pct:round(x.highest_trigger_pct,4),
+              final_active_stop_pct:round(x.active_stop_pct,4)
+            }];
+          }))
+        });
+      }
+
+      const summarize=(variantId:string,side:string)=>{
+        const arr=perTrade.filter((t:any)=>side==="ALL"||t.side===side);
+        const base=arr.reduce((s:number,t:any)=>s+Number(t.baseline.net_pct),0);
+        const val=arr.reduce((s:number,t:any)=>s+Number(t.variants[variantId].net_pct),0);
+        const wins=arr.filter((t:any)=>Number(t.variants[variantId].net_pct)>0).length;
+        const losses=arr.filter((t:any)=>Number(t.variants[variantId].net_pct)<0).length;
+        const flat=arr.length-wins-losses;
+        return {
+          trades:arr.length,
+          baseline_net_sum_pct:round(base,4),
+          variant_net_sum_pct:round(val,4),
+          difference_pct:round(val-base,4),
+          avg_variant_net_pct:arr.length?round(val/arr.length,4):null,
+          positive_net:wins,negative_net:losses,flat_net:flat,
+          tp:arr.filter((t:any)=>t.variants[variantId].result==="TP").length,
+          original_sl:arr.filter((t:any)=>t.variants[variantId].result==="SL").length,
+          fee_be_stop:arr.filter((t:any)=>t.variants[variantId].result==="FEE_BE_STOP").length,
+          profit_lock_stop:arr.filter((t:any)=>t.variants[variantId].result==="PROFIT_LOCK_STOP").length,
+          time_30m:arr.filter((t:any)=>t.variants[variantId].result==="TIME_30M").length
+        };
+      };
+
+      const matrix=variants.map(v=>({
+        id:v.id,name:v.name,steps:v.steps,
+        all:summarize(v.id,"ALL"),
+        long:summarize(v.id,"LONG"),
+        short:summarize(v.id,"SHORT")
+      })).sort((a:any,b:any)=>b.all.variant_net_sum_pct-a.all.variant_net_sum_pct);
+
+      const baselineAll=perTrade.reduce((s:number,t:any)=>s+Number(t.baseline.net_pct),0);
+      const baselineLong=perTrade.filter((t:any)=>t.side==="LONG")
+        .reduce((s:number,t:any)=>s+Number(t.baseline.net_pct),0);
+      const baselineShort=perTrade.filter((t:any)=>t.side==="SHORT")
+        .reduce((s:number,t:any)=>s+Number(t.baseline.net_pct),0);
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"PROGRESSIVE_SL_RESEARCH",
+        trading:"REAL_TRADING_DISABLED",
+        side:sideParam,
+        methodology:{
+          horizon_minutes:MAX_MIN,
+          fee_pct_round_trip:FEE,
+          baseline:{
+            long:{tp_pct:0.50,sl_pct:0.15},
+            short:{tp_pct:0.50,sl_pct:0.40}
+          },
+          progressive_rule:"when observed MFE reaches a trigger, raise protected directional gross return to that step's stop",
+          fee_adjusted_be_pct:0.07,
+          limitation:"minute snapshots are not tick data; intraminute trigger/stop ordering can be missed"
+        },
+        performance:{
+          crossing_query:1,snapshot_queries:snapshotQueries,
+          total_d1_queries:1+snapshotQueries,
+          merged_data_windows:merged.length,snapshots_loaded:snapshotsLoaded
+        },
+        baseline:{
+          trades:perTrade.length,
+          all_net_sum_pct:round(baselineAll,4),
+          long_net_sum_pct:round(baselineLong,4),
+          short_net_sum_pct:round(baselineShort,4)
+        },
+        matrix,
+        trades:perTrade
+      });
+    }
+
     if (url.pathname === "/be-extend-analysis") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
