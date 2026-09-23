@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.13 HYPERLIQUID ACTIVE ASSET READ ONLY";
+const VERSION = "V1.9.14 TIME EXIT POST-30M ANALYSIS";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4246,6 +4246,7 @@ export default {
           crossing_65_analytics: "/crossing-65-analytics",
           tp_sl_matrix: "/tp-sl-matrix",
           tp_sl_matrix_by_side: "/tp-sl-matrix-by-side",
+          time_exit_analysis: "/time-exit-analysis?side=ALL",
           forward_long_shadow: "/forward-long-shadow",
           forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
           debug: "/debug-hyperliquid",
@@ -5953,6 +5954,245 @@ export default {
         crossings_used:crossings.length,combinations:matrix.length,
         current_config:{tp_pct:PAPER_TP_PCT,sl_pct:PAPER_SL_PCT},
         top_by_net_return:ranked.slice(0,10),matrix
+      });
+    }
+
+
+    // ============================================================
+    // V1.9.14 — TIME / MAX-HOLD POST-EXIT RESEARCH
+    // Research only. Does NOT change signal, TP/SL, execution or trading.
+    //
+    // Phase 1: replay the actual configured strategy for the first 30m:
+    //   LONG  TP +0.50% / SL -0.15%
+    //   SHORT TP +0.50% / SL -0.40%
+    // Only crossings that reach 30m without TP/SL become TIME_30M.
+    //
+    // Phase 2: keep the ORIGINAL entry and ORIGINAL TP/SL levels and
+    // observe minutes 30..60. Mark:
+    //   TIME_THEN_TP / TIME_THEN_SL / TIME_THEN_NEITHER / PENDING_POST_30M
+    // The real result remains TIME_30M; post-exit is counterfactual research.
+    // ============================================================
+    if (url.pathname === "/time-exit-analysis") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+
+      const sideParam=(url.searchParams.get("side")??"ALL").toUpperCase();
+      if(!["ALL","LONG","SHORT"].includes(sideParam)){
+        return json({success:false,error:"INVALID_SIDE",allowed:["ALL","LONG","SHORT"]},400);
+      }
+
+      const q:any=await env.DB.prepare(`
+        SELECT id,episode_id,coin,side,crossing_ts,crossing_datetime,
+               crossing_price,crossing_score,outcome_complete
+        FROM signal_65_crossings
+        WHERE outcome_complete=1
+          AND (?='ALL' OR side=?)
+        ORDER BY crossing_ts ASC
+      `).bind(sideParam,sideParam).all();
+
+      const crossings:any[]=q?.results??[];
+      const now=Date.now();
+
+      const configFor=(side:string)=> side==="SHORT"
+        ? {tp:0.50,sl:0.40}
+        : {tp:0.50,sl:0.15};
+
+      // Load only real crossing +60m windows, merged per coin.
+      const byCoin=new Map<string,{start:number,end:number}[]>();
+      for(const c of crossings){
+        const t=Number(c.crossing_ts);
+        if(!Number.isFinite(t)) continue;
+        const coin=String(c.coin);
+        if(!byCoin.has(coin)) byCoin.set(coin,[]);
+        byCoin.get(coin)!.push({start:t,end:t+60*60*1000});
+      }
+
+      const mergedWindows:{coin:string,start:number,end:number}[]=[];
+      for(const [coin,windows] of byCoin){
+        windows.sort((a,b)=>a.start-b.start);
+        let cur:any=null;
+        for(const w of windows){
+          if(!cur) cur={coin,start:w.start,end:w.end};
+          else if(w.start<=cur.end) cur.end=Math.max(cur.end,w.end);
+          else { mergedWindows.push(cur); cur={coin,start:w.start,end:w.end}; }
+        }
+        if(cur) mergedWindows.push(cur);
+      }
+
+      const snapshotsByCoin=new Map<string,any[]>();
+      let snapshotQueries=0,snapshotsLoaded=0;
+      for(const w of mergedWindows){
+        const r:any=await env.DB.prepare(`
+          SELECT coin,ts,price
+          FROM market_snapshots
+          WHERE coin=? AND ts>=? AND ts<=?
+          ORDER BY ts ASC
+        `).bind(w.coin,w.start,Math.min(now,w.end)).all();
+        snapshotQueries++;
+        const rows:any[]=r?.results??[];
+        snapshotsLoaded+=rows.length;
+        if(!snapshotsByCoin.has(w.coin)) snapshotsByCoin.set(w.coin,[]);
+        snapshotsByCoin.get(w.coin)!.push(...rows);
+      }
+      for(const rows of snapshotsByCoin.values())
+        rows.sort((a:any,b:any)=>Number(a.ts)-Number(b.ts));
+
+      const directionalReturn=(side:string,entry:number,px:number)=>
+        side==="SHORT"
+          ? ((entry-px)/entry)*100
+          : ((px-entry)/entry)*100;
+
+      const details:any[]=[];
+      for(const c of crossings){
+        const start=Number(c.crossing_ts);
+        const entry=Number(c.crossing_price);
+        if(!Number.isFinite(start)||!Number.isFinite(entry)||entry<=0) continue;
+
+        const cfg=configFor(String(c.side));
+        const end30=start+30*60*1000;
+        const end60=start+60*60*1000;
+        const all=snapshotsByCoin.get(String(c.coin))??[];
+        const first30=all.filter((x:any)=>Number(x.ts)>=start&&Number(x.ts)<=end30);
+
+        let firstBarrier:string|null=null;
+        let firstBarrierTs:number|null=null;
+        for(const x of first30){
+          const px=Number(x.price);
+          if(!Number.isFinite(px)||px<=0) continue;
+          const r=directionalReturn(String(c.side),entry,px);
+          if(r>=cfg.tp){ firstBarrier="TP"; firstBarrierTs=Number(x.ts); break; }
+          if(r<=-cfg.sl){ firstBarrier="SL"; firstBarrierTs=Number(x.ts); break; }
+        }
+
+        // This endpoint is specifically about trades that would really TIME out.
+        if(firstBarrier) continue;
+
+        const post=all.filter((x:any)=>Number(x.ts)>end30&&Number(x.ts)<=end60);
+        let postOutcome="PENDING_POST_30M";
+        let postBarrierTs:number|null=null;
+        let postBarrierPrice:number|null=null;
+        let postMfe:number|null=null;
+        let postMae:number|null=null;
+
+        for(const x of post){
+          const px=Number(x.price);
+          if(!Number.isFinite(px)||px<=0) continue;
+          const r=directionalReturn(String(c.side),entry,px);
+          postMfe=postMfe===null?r:Math.max(postMfe,r);
+          postMae=postMae===null?r:Math.min(postMae,r);
+
+          if(postBarrierTs===null){
+            if(r>=cfg.tp){
+              postOutcome="TIME_THEN_TP";
+              postBarrierTs=Number(x.ts);
+              postBarrierPrice=px;
+            }else if(r<=-cfg.sl){
+              postOutcome="TIME_THEN_SL";
+              postBarrierTs=Number(x.ts);
+              postBarrierPrice=px;
+            }
+          }
+        }
+
+        // Only call it NEITHER when the full extra 30m observation window exists.
+        if(postBarrierTs===null && now>=end60){
+          postOutcome="TIME_THEN_NEITHER";
+        }
+
+        const lastBeforeOrAt30=[...first30]
+          .filter((x:any)=>Number(x.ts)<=end30)
+          .sort((a:any,b:any)=>Number(b.ts)-Number(a.ts))[0]??null;
+        const timeExitPrice=Number(lastBeforeOrAt30?.price);
+        const timeExitGross=Number.isFinite(timeExitPrice)&&timeExitPrice>0
+          ? directionalReturn(String(c.side),entry,timeExitPrice)
+          : null;
+
+        details.push({
+          crossing_id:c.id,
+          episode_id:c.episode_id,
+          coin:c.coin,
+          side:c.side,
+          crossing_datetime:c.crossing_datetime,
+          crossing_score:c.crossing_score,
+          entry_price:entry,
+          configured_tp_pct:cfg.tp,
+          configured_sl_pct:cfg.sl,
+          real_result:"TIME_30M",
+          time_exit_price:Number.isFinite(timeExitPrice)?timeExitPrice:null,
+          time_exit_gross_pct:timeExitGross===null?null:round(timeExitGross,4),
+          post_exit_result:postOutcome,
+          minutes_after_exit_to_barrier:postBarrierTs===null
+            ? null
+            : round((postBarrierTs-end30)/60000,2),
+          post_barrier_price:postBarrierPrice,
+          post_exit_mfe_pct:postMfe===null?null:round(postMfe,4),
+          post_exit_mae_pct:postMae===null?null:round(postMae,4),
+          observation_complete:now>=end60
+        });
+      }
+
+      const count=(name:string)=>details.filter((x:any)=>x.post_exit_result===name).length;
+      const completedPost=details.filter((x:any)=>x.observation_complete);
+      const avgMinutes=(name:string)=>{
+        const a=details
+          .filter((x:any)=>x.post_exit_result===name)
+          .map((x:any)=>Number(x.minutes_after_exit_to_barrier))
+          .filter((v:number)=>Number.isFinite(v));
+        return a.length?round(a.reduce((s:number,v:number)=>s+v,0)/a.length,2):null;
+      };
+
+      const bySide=["LONG","SHORT"].map(side=>{
+        const a=details.filter((x:any)=>x.side===side);
+        return {
+          side,
+          time_exits:a.length,
+          time_then_tp:a.filter((x:any)=>x.post_exit_result==="TIME_THEN_TP").length,
+          time_then_sl:a.filter((x:any)=>x.post_exit_result==="TIME_THEN_SL").length,
+          time_then_neither:a.filter((x:any)=>x.post_exit_result==="TIME_THEN_NEITHER").length,
+          pending_post_30m:a.filter((x:any)=>x.post_exit_result==="PENDING_POST_30M").length
+        };
+      }).filter((x:any)=>x.time_exits>0);
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"TIME_EXIT_POST_30M_RESEARCH",
+        trading:"REAL_TRADING_DISABLED",
+        side:sideParam,
+        methodology:{
+          real_result_preserved:"TIME_30M",
+          first_window_minutes:30,
+          post_exit_observation_minutes:30,
+          total_window_minutes:60,
+          levels:"original entry-based TP/SL; never rebased at TIME exit",
+          long:{tp_pct:0.50,sl_pct:0.15},
+          short:{tp_pct:0.50,sl_pct:0.40},
+          labels:["TIME_THEN_TP","TIME_THEN_SL","TIME_THEN_NEITHER","PENDING_POST_30M"],
+          ordering:"first sampled post-exit barrier wins",
+          limitation:"minute market_snapshots can miss intraminute touches; research only"
+        },
+        performance:{
+          crossing_query:1,
+          snapshot_queries:snapshotQueries,
+          total_d1_queries:1+snapshotQueries,
+          merged_data_windows:mergedWindows.length,
+          snapshots_loaded:snapshotsLoaded,
+          calculation:"IN_MEMORY"
+        },
+        summary:{
+          crossings_checked:crossings.length,
+          time_exits:details.length,
+          completed_post_exit_windows:completedPost.length,
+          time_then_tp:count("TIME_THEN_TP"),
+          time_then_sl:count("TIME_THEN_SL"),
+          time_then_neither:count("TIME_THEN_NEITHER"),
+          pending_post_30m:count("PENDING_POST_30M"),
+          avg_minutes_after_exit_to_tp:avgMinutes("TIME_THEN_TP"),
+          avg_minutes_after_exit_to_sl:avgMinutes("TIME_THEN_SL")
+        },
+        by_side:bySide,
+        time_trades:details
       });
     }
 
