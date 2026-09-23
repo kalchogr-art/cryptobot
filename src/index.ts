@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.16 PROGRESSIVE SL RESEARCH";
+const VERSION = "V1.9.17 SHORT SL 0.15 + PROGRESSIVE RESEARCH";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4249,6 +4249,7 @@ export default {
           time_exit_analysis: "/time-exit-analysis?side=ALL",
           be_extend_analysis: "/be-extend-analysis?side=ALL",
           progressive_sl_analysis: "/progressive-sl-analysis?side=ALL",
+          short_sl015_analysis: "/short-sl015-analysis",
           forward_long_shadow: "/forward-long-shadow",
           forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
           debug: "/debug-hyperliquid",
@@ -6013,6 +6014,267 @@ export default {
     // the observed return is <= the active stop. This is research,
     // not tick-accurate execution simulation.
     // ============================================================
+
+    // ============================================================
+    // V1.9.17 — SHORT SL 0.15 + PROGRESSIVE RESEARCH
+    // RESEARCH ONLY. Real execution is unchanged.
+    //
+    // Compares SHORT-only:
+    //   A) current baseline: TP +0.50 / SL -0.40
+    //   B) tighter baseline: TP +0.50 / SL -0.15
+    //   C) tighter -0.15 baseline + progressive A/B/C
+    //
+    // Uses the same minute-snapshot methodology as V1.9.16.
+    // ============================================================
+    if (url.pathname === "/short-sl015-analysis") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+
+      const FEE=0.07;
+      const MAX_MIN=30;
+      const TP=0.50;
+
+      const variants=[
+        {
+          id:"SHORT_SL015",
+          name:"SHORT TP 0.50 / SL 0.15",
+          sl:0.15,
+          steps:null
+        },
+        {
+          id:"SHORT_SL015_PROG_A",
+          name:"SHORT SL 0.15 + Progressive A",
+          sl:0.15,
+          steps:[
+            {trigger:0.15,stop:0.07},
+            {trigger:0.25,stop:0.10},
+            {trigger:0.35,stop:0.20},
+            {trigger:0.45,stop:0.30}
+          ]
+        },
+        {
+          id:"SHORT_SL015_PROG_B",
+          name:"SHORT SL 0.15 + Progressive B",
+          sl:0.15,
+          steps:[
+            {trigger:0.20,stop:0.07},
+            {trigger:0.30,stop:0.15},
+            {trigger:0.40,stop:0.25}
+          ]
+        },
+        {
+          id:"SHORT_SL015_PROG_C",
+          name:"SHORT SL 0.15 + Progressive C",
+          sl:0.15,
+          steps:[
+            {trigger:0.25,stop:0.07},
+            {trigger:0.35,stop:0.15},
+            {trigger:0.45,stop:0.25}
+          ]
+        }
+      ];
+
+      const q:any=await env.DB.prepare(`
+        SELECT id,episode_id,coin,side,crossing_ts,crossing_datetime,
+               crossing_price,crossing_score,outcome_complete
+        FROM signal_65_crossings
+        WHERE outcome_complete=1 AND side='SHORT'
+        ORDER BY crossing_ts ASC
+      `).all();
+
+      const crossings:any[]=q?.results??[];
+      const now=Date.now();
+
+      const byCoin=new Map<string,{start:number,end:number}[]>();
+      for(const c of crossings){
+        const t=Number(c.crossing_ts);
+        if(!Number.isFinite(t)) continue;
+        const coin=String(c.coin);
+        if(!byCoin.has(coin)) byCoin.set(coin,[]);
+        byCoin.get(coin)!.push({start:t,end:t+MAX_MIN*60*1000});
+      }
+
+      const merged:{coin:string,start:number,end:number}[]=[];
+      for(const [coin,ws] of byCoin){
+        ws.sort((a,b)=>a.start-b.start);
+        let cur:any=null;
+        for(const w of ws){
+          if(!cur) cur={coin,start:w.start,end:w.end};
+          else if(w.start<=cur.end) cur.end=Math.max(cur.end,w.end);
+          else {merged.push(cur);cur={coin,start:w.start,end:w.end};}
+        }
+        if(cur) merged.push(cur);
+      }
+
+      const snapMap=new Map<string,any[]>();
+      let snapshotQueries=0,snapshotsLoaded=0;
+      for(const w of merged){
+        const r:any=await env.DB.prepare(`
+          SELECT coin,ts,price
+          FROM market_snapshots
+          WHERE coin=? AND ts>=? AND ts<=?
+          ORDER BY ts ASC
+        `).bind(w.coin,w.start,Math.min(now,w.end)).all();
+        snapshotQueries++;
+        const rows:any[]=r?.results??[];
+        snapshotsLoaded+=rows.length;
+        if(!snapMap.has(w.coin)) snapMap.set(w.coin,[]);
+        snapMap.get(w.coin)!.push(...rows);
+      }
+      for(const rows of snapMap.values())
+        rows.sort((a:any,b:any)=>Number(a.ts)-Number(b.ts));
+
+      const shortReturn=(entry:number,px:number)=>((entry-px)/entry)*100;
+
+      const replay=(entry:number,rows:any[],sl:number,steps:any[]|null)=>{
+        let activeStop=-sl;
+        let maxFav=0;
+        let stopMoves=0;
+        let highestTrigger=0;
+        let lastPx=entry,lastTs:number|null=null;
+
+        for(const x of rows){
+          const px=Number(x.price),ts=Number(x.ts);
+          if(!Number.isFinite(px)||px<=0||!Number.isFinite(ts)) continue;
+          lastPx=px; lastTs=ts;
+          const r=shortReturn(entry,px);
+          maxFav=Math.max(maxFav,r);
+
+          if(r>=TP){
+            return {result:"TP",gross:TP,exit_px:px,exit_ts:ts,
+              max_favorable_pct:maxFav,active_stop_pct:activeStop,
+              stop_moves:stopMoves,highest_trigger_pct:highestTrigger};
+          }
+
+          if(steps){
+            for(const st of steps){
+              if(maxFav>=st.trigger && st.stop>activeStop){
+                activeStop=st.stop;
+                stopMoves++;
+                highestTrigger=Math.max(highestTrigger,st.trigger);
+              }
+            }
+          }
+
+          if(r<=activeStop){
+            const progressive=activeStop>=0;
+            return {
+              result:progressive
+                ? (activeStop<=FEE+1e-9 ? "FEE_BE_STOP" : "PROFIT_LOCK_STOP")
+                : "SL",
+              gross:activeStop,exit_px:px,exit_ts:ts,
+              max_favorable_pct:maxFav,active_stop_pct:activeStop,
+              stop_moves:stopMoves,highest_trigger_pct:highestTrigger
+            };
+          }
+        }
+
+        const gross=shortReturn(entry,lastPx);
+        return {result:"TIME_30M",gross,exit_px:lastPx,exit_ts:lastTs,
+          max_favorable_pct:maxFav,active_stop_pct:activeStop,
+          stop_moves:stopMoves,highest_trigger_pct:highestTrigger};
+      };
+
+      const perTrade:any[]=[];
+      for(const c of crossings){
+        const start=Number(c.crossing_ts),entry=Number(c.crossing_price);
+        if(!Number.isFinite(start)||!Number.isFinite(entry)||entry<=0) continue;
+        const end=start+MAX_MIN*60*1000;
+        const rows=(snapMap.get(String(c.coin))??[])
+          .filter((x:any)=>Number(x.ts)>=start&&Number(x.ts)<=end);
+        if(!rows.length) continue;
+
+        const current=replay(entry,rows,0.40,null);
+        const vr:any={};
+        for(const v of variants) vr[v.id]=replay(entry,rows,v.sl,v.steps);
+
+        perTrade.push({
+          crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,
+          crossing_score:c.crossing_score,entry_price:entry,
+          current_short_sl040:{
+            result:current.result,
+            gross_pct:round(current.gross,4),
+            net_pct:round(current.gross-FEE,4),
+            max_favorable_pct:round(current.max_favorable_pct,4)
+          },
+          variants:Object.fromEntries(variants.map(v=>{
+            const x=vr[v.id];
+            return [v.id,{
+              result:x.result,
+              gross_pct:round(x.gross,4),
+              net_pct:round(x.gross-FEE,4),
+              difference_vs_current_sl040_net_pct:round(x.gross-current.gross,4),
+              stop_moves:x.stop_moves,
+              highest_trigger_pct:round(x.highest_trigger_pct,4),
+              final_active_stop_pct:round(x.active_stop_pct,4)
+            }];
+          }))
+        });
+      }
+
+      const currentNet=perTrade.reduce((s:number,t:any)=>s+Number(t.current_short_sl040.net_pct),0);
+
+      const summarize=(v:any)=>{
+        const arr=perTrade;
+        const val=arr.reduce((s:number,t:any)=>s+Number(t.variants[v.id].net_pct),0);
+        return {
+          id:v.id,
+          name:v.name,
+          sl_pct:v.sl,
+          steps:v.steps,
+          trades:arr.length,
+          current_sl040_net_sum_pct:round(currentNet,4),
+          variant_net_sum_pct:round(val,4),
+          difference_vs_current_sl040_pct:round(val-currentNet,4),
+          relative_change_vs_current_pct:currentNet!==0
+            ? round(((val/currentNet)-1)*100,2)
+            : null,
+          avg_net_pct:arr.length?round(val/arr.length,4):null,
+          positive_net:arr.filter((t:any)=>Number(t.variants[v.id].net_pct)>0).length,
+          negative_net:arr.filter((t:any)=>Number(t.variants[v.id].net_pct)<0).length,
+          flat_net:arr.filter((t:any)=>Number(t.variants[v.id].net_pct)===0).length,
+          tp:arr.filter((t:any)=>t.variants[v.id].result==="TP").length,
+          sl:arr.filter((t:any)=>t.variants[v.id].result==="SL").length,
+          fee_be_stop:arr.filter((t:any)=>t.variants[v.id].result==="FEE_BE_STOP").length,
+          profit_lock_stop:arr.filter((t:any)=>t.variants[v.id].result==="PROFIT_LOCK_STOP").length,
+          time_30m:arr.filter((t:any)=>t.variants[v.id].result==="TIME_30M").length
+        };
+      };
+
+      const matrix=variants.map(summarize)
+        .sort((a:any,b:any)=>b.variant_net_sum_pct-a.variant_net_sum_pct);
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"SHORT_SL_015_RESEARCH",
+        trading:"REAL_TRADING_DISABLED",
+        methodology:{
+          horizon_minutes:MAX_MIN,
+          fee_pct_round_trip:FEE,
+          tp_pct:TP,
+          current_short_sl_pct:0.40,
+          test_short_sl_pct:0.15,
+          limitation:"minute snapshots are not tick data; intraminute TP/SL/progressive ordering can be missed"
+        },
+        performance:{
+          crossing_query:1,
+          snapshot_queries:snapshotQueries,
+          total_d1_queries:1+snapshotQueries,
+          merged_data_windows:merged.length,
+          snapshots_loaded:snapshotsLoaded
+        },
+        current_short_sl040:{
+          trades:perTrade.length,
+          net_sum_pct:round(currentNet,4),
+          avg_net_pct:perTrade.length?round(currentNet/perTrade.length,4):null
+        },
+        matrix,
+        trades:perTrade
+      });
+    }
+
     if (url.pathname === "/progressive-sl-analysis") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
