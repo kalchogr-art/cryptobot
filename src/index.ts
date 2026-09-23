@@ -39,7 +39,7 @@ import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycl
 // /debug-hyperliquid
 // ============================================================
 
-const VERSION = "V1.9.14 TIME EXIT POST-30M ANALYSIS";
+const VERSION = "V1.9.15 BE EXTEND 60M RESEARCH";
 const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
 const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4247,6 +4247,7 @@ export default {
           tp_sl_matrix: "/tp-sl-matrix",
           tp_sl_matrix_by_side: "/tp-sl-matrix-by-side",
           time_exit_analysis: "/time-exit-analysis?side=ALL",
+          be_extend_analysis: "/be-extend-analysis?side=ALL",
           forward_long_shadow: "/forward-long-shadow",
           forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
           debug: "/debug-hyperliquid",
@@ -5972,6 +5973,267 @@ export default {
     //   TIME_THEN_TP / TIME_THEN_SL / TIME_THEN_NEITHER / PENDING_POST_30M
     // The real result remains TIME_30M; post-exit is counterfactual research.
     // ============================================================
+
+    // ============================================================
+    // V1.9.15 — BASELINE 30M vs FEE-ADJUSTED BREAK-EVEN EXTEND 60M
+    // RESEARCH ONLY — does not modify real execution.
+    //
+    // Strategy replay:
+    // 0..30m:
+    //   LONG  TP +0.50 / SL -0.15
+    //   SHORT TP +0.50 / SL -0.40
+    //
+    // If no barrier by 30m:
+    //   - losing/flat at 30m => close at 30m
+    //   - profitable at 30m => extend to 60m
+    //     with fee-adjusted break-even protection.
+    //
+    // Fee-adjusted BE target is +0.07% gross directional return,
+    // so after the configured 0.07% round-trip fee the research
+    // result is approximately 0.00% net before slippage.
+    // ============================================================
+    if (url.pathname === "/be-extend-analysis") {
+      if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+      await ensurePaperTables(env);
+
+      const sideParam=(url.searchParams.get("side")??"ALL").toUpperCase();
+      if(!["ALL","LONG","SHORT"].includes(sideParam)){
+        return json({success:false,error:"INVALID_SIDE",allowed:["ALL","LONG","SHORT"]},400);
+      }
+
+      const FEE_PCT=0.07;
+      const q:any=await env.DB.prepare(`
+        SELECT id,episode_id,coin,side,crossing_ts,crossing_datetime,
+               crossing_price,crossing_score,outcome_complete
+        FROM signal_65_crossings
+        WHERE outcome_complete=1
+          AND (?='ALL' OR side=?)
+        ORDER BY crossing_ts ASC
+      `).bind(sideParam,sideParam).all();
+
+      const crossings:any[]=q?.results??[];
+      const now=Date.now();
+      const cfgFor=(side:string)=>side==="SHORT"
+        ? {tp:0.50,sl:0.40}
+        : {tp:0.50,sl:0.15};
+
+      const byCoin=new Map<string,{start:number,end:number}[]>();
+      for(const c of crossings){
+        const t=Number(c.crossing_ts);
+        if(!Number.isFinite(t)) continue;
+        const coin=String(c.coin);
+        if(!byCoin.has(coin)) byCoin.set(coin,[]);
+        byCoin.get(coin)!.push({start:t,end:t+60*60*1000});
+      }
+
+      const merged:{coin:string,start:number,end:number}[]=[];
+      for(const [coin,ws] of byCoin){
+        ws.sort((a,b)=>a.start-b.start);
+        let cur:any=null;
+        for(const w of ws){
+          if(!cur) cur={coin,start:w.start,end:w.end};
+          else if(w.start<=cur.end) cur.end=Math.max(cur.end,w.end);
+          else {merged.push(cur);cur={coin,start:w.start,end:w.end};}
+        }
+        if(cur) merged.push(cur);
+      }
+
+      const snapMap=new Map<string,any[]>();
+      let snapshotQueries=0,snapshotsLoaded=0;
+      for(const w of merged){
+        const r:any=await env.DB.prepare(`
+          SELECT coin,ts,price
+          FROM market_snapshots
+          WHERE coin=? AND ts>=? AND ts<=?
+          ORDER BY ts ASC
+        `).bind(w.coin,w.start,Math.min(now,w.end)).all();
+        snapshotQueries++;
+        const rows:any[]=r?.results??[];
+        snapshotsLoaded+=rows.length;
+        if(!snapMap.has(w.coin)) snapMap.set(w.coin,[]);
+        snapMap.get(w.coin)!.push(...rows);
+      }
+      for(const rows of snapMap.values())
+        rows.sort((a:any,b:any)=>Number(a.ts)-Number(b.ts));
+
+      const ret=(side:string,entry:number,px:number)=>
+        side==="SHORT" ? ((entry-px)/entry)*100 : ((px-entry)/entry)*100;
+
+      const trades:any[]=[];
+      for(const c of crossings){
+        const start=Number(c.crossing_ts), entry=Number(c.crossing_price);
+        if(!Number.isFinite(start)||!Number.isFinite(entry)||entry<=0) continue;
+        const side=String(c.side), cfg=cfgFor(side);
+        const end30=start+30*60*1000, end60=start+60*60*1000;
+        const all=snapMap.get(String(c.coin))??[];
+        const w30=all.filter((x:any)=>Number(x.ts)>=start&&Number(x.ts)<=end30);
+
+        let barrier:string|null=null, barrierPx:number|null=null, barrierTs:number|null=null;
+        for(const x of w30){
+          const px=Number(x.price); if(!Number.isFinite(px)||px<=0) continue;
+          const r=ret(side,entry,px);
+          if(r>=cfg.tp){barrier="TP";barrierPx=px;barrierTs=Number(x.ts);break;}
+          if(r<=-cfg.sl){barrier="SL";barrierPx=px;barrierTs=Number(x.ts);break;}
+        }
+
+        if(barrier){
+          const gross=barrier==="TP"?cfg.tp:-cfg.sl;
+          trades.push({
+            crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,side,
+            crossing_score:c.crossing_score,
+            baseline_result:barrier,
+            baseline_gross_pct:round(gross,4),
+            baseline_net_pct:round(gross-FEE_PCT,4),
+            variant_result:barrier,
+            variant_gross_pct:round(gross,4),
+            variant_net_pct:round(gross-FEE_PCT,4),
+            extended:false
+          });
+          continue;
+        }
+
+        const last30=[...w30].sort((a:any,b:any)=>Number(b.ts)-Number(a.ts))[0]??null;
+        const px30=Number(last30?.price);
+        if(!Number.isFinite(px30)||px30<=0) continue;
+        const gross30=ret(side,entry,px30);
+        const baselineNet=gross30-FEE_PCT;
+
+        // Not profitable at 30m: variant behaves exactly like baseline.
+        if(gross30<=0){
+          trades.push({
+            crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,side,
+            crossing_score:c.crossing_score,
+            baseline_result:"TIME_30M",
+            baseline_gross_pct:round(gross30,4),
+            baseline_net_pct:round(baselineNet,4),
+            variant_result:"CLOSE_30M_NOT_PROFITABLE",
+            variant_gross_pct:round(gross30,4),
+            variant_net_pct:round(baselineNet,4),
+            extended:false
+          });
+          continue;
+        }
+
+        // Profitable at 30m: extend. Protection is fee-adjusted BE.
+        // It only makes sense if current gross profit is already above fee threshold.
+        // If profit is positive but <= fee, close now rather than install a stop
+        // beyond the current price.
+        if(gross30<=FEE_PCT){
+          trades.push({
+            crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,side,
+            crossing_score:c.crossing_score,
+            baseline_result:"TIME_30M",
+            baseline_gross_pct:round(gross30,4),
+            baseline_net_pct:round(baselineNet,4),
+            variant_result:"CLOSE_30M_BE_NOT_LOCKABLE",
+            variant_gross_pct:round(gross30,4),
+            variant_net_pct:round(baselineNet,4),
+            extended:false
+          });
+          continue;
+        }
+
+        const post=all.filter((x:any)=>Number(x.ts)>end30&&Number(x.ts)<=end60);
+        let vResult="PENDING_60M", vGross:number|null=null, vPx:number|null=null, vTs:number|null=null;
+        for(const x of post){
+          const px=Number(x.price); if(!Number.isFinite(px)||px<=0) continue;
+          const r=ret(side,entry,px);
+          if(r>=cfg.tp){
+            vResult="TP_AFTER_30M"; vGross=cfg.tp; vPx=px; vTs=Number(x.ts); break;
+          }
+          if(r<=FEE_PCT){
+            vResult="FEE_ADJUSTED_BE"; vGross=FEE_PCT; vPx=px; vTs=Number(x.ts); break;
+          }
+        }
+
+        if(vGross===null && now>=end60){
+          const last60=[...post].sort((a:any,b:any)=>Number(b.ts)-Number(a.ts))[0]??last30;
+          const px60=Number(last60?.price);
+          if(Number.isFinite(px60)&&px60>0){
+            vResult="TIME_60M";
+            vGross=ret(side,entry,px60);
+            vPx=px60;
+            vTs=Number(last60?.ts);
+          }
+        }
+
+        trades.push({
+          crossing_id:c.id,episode_id:c.episode_id,coin:c.coin,side,
+          crossing_score:c.crossing_score,
+          baseline_result:"TIME_30M",
+          baseline_gross_pct:round(gross30,4),
+          baseline_net_pct:round(baselineNet,4),
+          variant_result:vResult,
+          variant_gross_pct:vGross===null?null:round(vGross,4),
+          variant_net_pct:vGross===null?null:round(vGross-FEE_PCT,4),
+          extended:true,
+          gross_at_30m_pct:round(gross30,4),
+          fee_adjusted_be_gross_pct:FEE_PCT,
+          minutes_after_30m_to_exit:vTs===null?null:round((vTs-end30)/60000,2),
+          variant_exit_price:vPx
+        });
+      }
+
+      const resolved=trades.filter((x:any)=>Number.isFinite(Number(x.variant_net_pct)));
+      const baseNet=resolved.reduce((s:number,x:any)=>s+Number(x.baseline_net_pct),0);
+      const variantNet=resolved.reduce((s:number,x:any)=>s+Number(x.variant_net_pct),0);
+      const extended=trades.filter((x:any)=>x.extended);
+
+      const summarize=(arr:any[])=>{
+        const r=arr.filter((x:any)=>Number.isFinite(Number(x.variant_net_pct)));
+        const b=r.reduce((s:number,x:any)=>s+Number(x.baseline_net_pct),0);
+        const v=r.reduce((s:number,x:any)=>s+Number(x.variant_net_pct),0);
+        return {
+          trades:r.length,
+          extended:r.filter((x:any)=>x.extended).length,
+          baseline_net_sum_pct:round(b,4),
+          be_extend_net_sum_pct:round(v,4),
+          difference_pct:round(v-b,4),
+          tp_after_30m:r.filter((x:any)=>x.variant_result==="TP_AFTER_30M").length,
+          fee_adjusted_be:r.filter((x:any)=>x.variant_result==="FEE_ADJUSTED_BE").length,
+          time_60m:r.filter((x:any)=>x.variant_result==="TIME_60M").length
+        };
+      };
+
+      return json({
+        success:true,
+        worker:"cryptobot",
+        version:VERSION,
+        mode:"BASELINE_30M_VS_BE_EXTEND_60M_RESEARCH",
+        trading:"REAL_TRADING_DISABLED",
+        side:sideParam,
+        methodology:{
+          first_30m:{long:{tp_pct:0.50,sl_pct:0.15},short:{tp_pct:0.50,sl_pct:0.40}},
+          baseline:"close unresolved trade at 30m",
+          variant:"if gross directional return at 30m > 0.07%, extend to 60m; otherwise close at 30m",
+          protection:"fee-adjusted break-even at +0.07% gross directional return",
+          estimated_net_at_be_pct:0,
+          max_hold_minutes:60,
+          fee_pct_per_round_trip:FEE_PCT,
+          note:"research only; slippage/funding not modeled; minute snapshots can miss intraminute ordering"
+        },
+        performance:{
+          crossing_query:1,snapshot_queries:snapshotQueries,
+          total_d1_queries:1+snapshotQueries,
+          merged_data_windows:merged.length,snapshots_loaded:snapshotsLoaded
+        },
+        summary:{
+          resolved_trades:resolved.length,
+          extended_trades:extended.length,
+          baseline_net_sum_pct:round(baseNet,4),
+          be_extend_net_sum_pct:round(variantNet,4),
+          improvement_pct:round(variantNet-baseNet,4),
+          tp_after_30m:resolved.filter((x:any)=>x.variant_result==="TP_AFTER_30M").length,
+          fee_adjusted_be:resolved.filter((x:any)=>x.variant_result==="FEE_ADJUSTED_BE").length,
+          time_60m:resolved.filter((x:any)=>x.variant_result==="TIME_60M").length,
+          closed_30m_not_profitable:resolved.filter((x:any)=>x.variant_result==="CLOSE_30M_NOT_PROFITABLE").length,
+          closed_30m_be_not_lockable:resolved.filter((x:any)=>x.variant_result==="CLOSE_30M_BE_NOT_LOCKABLE").length
+        },
+        by_side:["LONG","SHORT"].map(s=>({side:s,...summarize(trades.filter((x:any)=>x.side===s))})),
+        trades
+      });
+    }
+
     if (url.pathname === "/time-exit-analysis") {
       if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
       await ensurePaperTables(env);
