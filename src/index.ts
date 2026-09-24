@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.20 MECHANICAL VS RAW TRACKER";
+            const VERSION = "V1.9.21 WS EXECUTION BRIDGE DRY RUN";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -8077,8 +8077,10 @@
 
 
                 // ============================================================
-                // V2.9 PROGRESSIVE WEBSOCKET MONITOR — DRY RUN ONLY
+                // V2.9.1 PROGRESSIVE WEBSOCKET → EXECUTION LEDGER BRIDGE — DRY RUN
                 // No signing, no /exchange, no order modification.
+                // Default /start now prefers the latest open execution ledger row
+                // and therefore uses the real entry_fill_price when one exists.
                 //
                 // /progressive-monitor/start
                 //   Defaults coin/side to latest >=65 crossing and uses the
@@ -8117,7 +8119,25 @@
                   let coin = String(url.searchParams.get("coin") ?? "").trim().toUpperCase();
                   let side = String(url.searchParams.get("side") ?? "").trim().toUpperCase();
                   const entryParam = Number(url.searchParams.get("entry"));
+                  const ledgerIdParam = Number(url.searchParams.get("ledger_id"));
+                  const manual = url.searchParams.get("manual") === "1";
 
+                  // Default V2.9.1 behavior: bridge to the newest open execution-ledger
+                  // row. This is still READ ONLY. It only gives the Durable Object the
+                  // exact ledger id + real fill price context to validate WS triggers.
+                  if (!manual && !coin && side !== "LONG" && side !== "SHORT" && env.DB) {
+                    const body: any = { mode: "LEDGER" };
+                    if (Number.isInteger(ledgerIdParam) && ledgerIdParam > 0) {
+                      body.ledgerId = ledgerIdParam;
+                    }
+                    return stub.fetch("https://progressive-monitor/start", {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify(body),
+                    });
+                  }
+
+                  // Manual WS test fallback is preserved for diagnostics.
                   if (!coin || (side !== "LONG" && side !== "SHORT")) {
                     if (!env.DB) {
                       return json({
