@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.1 WS EXECUTION BRIDGE DRY RUN";
+    const MODULE_VERSION = "V2.9.2 AUTO WS BRIDGE + D1 LOG";
 
     type Side = "LONG" | "SHORT";
 
@@ -156,6 +156,54 @@
           : entry * (1 - protectedPct / 100);
       }
 
+      private async ensureEventTable(): Promise<void> {
+        if (!this.env?.DB) return;
+        await this.env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS progressive_ws_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ledger_id INTEGER,
+            crossing_id TEXT,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stage INTEGER NOT NULL,
+            trigger_pct REAL NOT NULL,
+            target_stop_pct REAL NOT NULL,
+            target_stop_price REAL NOT NULL,
+            observed_price REAL NOT NULL,
+            directional_return_pct REAL NOT NULL,
+            ledger_status TEXT,
+            ledger_stage_before INTEGER,
+            ledger_active_stop_oid INTEGER,
+            validation TEXT NOT NULL,
+            detected_at INTEGER NOT NULL,
+            detected_datetime TEXT NOT NULL,
+            action TEXT NOT NULL,
+            exchange_request_sent INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(ledger_id, stage)
+          )
+        `).run();
+      }
+
+      private async persistTriggerEvent(event: TriggerEvent): Promise<void> {
+        if (!this.env?.DB || event.bridge.ledgerId == null) return;
+        await this.ensureEventTable();
+        await this.env.DB.prepare(`
+          INSERT OR IGNORE INTO progressive_ws_events (
+            ledger_id,crossing_id,coin,side,entry_price,stage,trigger_pct,target_stop_pct,
+            target_stop_price,observed_price,directional_return_pct,ledger_status,
+            ledger_stage_before,ledger_active_stop_oid,validation,detected_at,
+            detected_datetime,action,exchange_request_sent
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).bind(
+          event.bridge.ledgerId,event.bridge.crossingId,event.coin,event.side,event.entryPrice,
+          event.stage,event.triggerPct,event.targetStopPct,event.bridge.targetStopPrice,
+          event.observedPrice,event.directionalReturnPct,event.bridge.ledgerStatus,
+          event.bridge.ledgerStageBefore,event.bridge.ledgerActiveStopOid,event.bridge.validation,
+          event.detectedAt,event.detectedDatetime,event.action,0
+        ).run();
+      }
+
       async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
 
@@ -260,6 +308,20 @@
             module: MODULE_VERSION,
             mode: "DRY_RUN_READ_ONLY",
             status: await this.status(),
+          });
+        }
+
+        if (url.pathname === "/events") {
+          if (!this.env?.DB) return json({ success:false, error:"D1_NOT_BOUND" },503);
+          await this.ensureEventTable();
+          const q:any=await this.env.DB.prepare(`
+            SELECT * FROM progressive_ws_events
+            ORDER BY detected_at DESC, id DESC LIMIT 100
+          `).all();
+          return json({
+            success:true,module:MODULE_VERSION,mode:"DRY_RUN_READ_ONLY",
+            count:Array.isArray(q?.results)?q.results.length:0,
+            events:Array.isArray(q?.results)?q.results:[]
           });
         }
 
@@ -455,6 +517,8 @@
 
           this.events.push(event);
           if (this.events.length > 100) this.events = this.events.slice(-100);
+          try { await this.persistTriggerEvent(event); }
+          catch (e:any) { console.log("progressive_ws_events persist failed:", e?.message ?? String(e)); }
           this.config.stage += 1;
         }
 
