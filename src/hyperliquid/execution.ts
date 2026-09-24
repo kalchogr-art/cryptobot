@@ -8,7 +8,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.7.3
+// HYPERLIQUID SIGNAL EXECUTION V2.8
+// V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -42,18 +43,32 @@ const MASTER_ACCOUNT =
   "0xf1CF243f05024AE78aE2dFa31c2Bec1e1F6c9196";
 
 const CONFIG = {
-  LIVE_TRADING: true,
+  LIVE_TRADING: false,
 
   MIN_SIGNAL_SCORE: 65,
 
-  MARGIN_USD: 0.41,
-  LEVERAGE: 25,
+  MARGIN_USD: 1.04,
+  LEVERAGE: 10,
   IS_CROSS: true,
 
   LONG_TAKE_PROFIT_PCT: 0.50,
   LONG_STOP_LOSS_PCT: 0.15,
   SHORT_TAKE_PROFIT_PCT: 0.50,
-  SHORT_STOP_LOSS_PCT: 0.40,
+  SHORT_STOP_LOSS_PCT: 0.15,
+
+  // V2.8 progressive protection. Values are directional gross-return percentages.
+  // +0.07% gross is approximately fee-adjusted break-even before slippage.
+  LONG_PROGRESSIVE_STEPS: [
+    { trigger: 0.15, stop: 0.07 },
+    { trigger: 0.25, stop: 0.10 },
+    { trigger: 0.35, stop: 0.20 },
+    { trigger: 0.45, stop: 0.30 },
+  ],
+  SHORT_PROGRESSIVE_STEPS: [
+    { trigger: 0.25, stop: 0.07 },
+    { trigger: 0.35, stop: 0.15 },
+    { trigger: 0.45, stop: 0.25 },
+  ],
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
   TIF: "Ioc" as const,
@@ -534,6 +549,10 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       close_reason TEXT,
       exit_price REAL,
       realized_pnl REAL,
+      progressive_stage INTEGER DEFAULT 0,
+      progressive_stop_pct REAL,
+      progressive_stop_price REAL,
+      progressive_updated_at INTEGER,
       last_error TEXT
     )
   `).run();
@@ -549,7 +568,11 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN closed_at INTEGER",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN close_reason TEXT",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN exit_price REAL",
-    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN realized_pnl REAL"
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN realized_pnl REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stage INTEGER DEFAULT 0",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_updated_at INTEGER"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
   }
@@ -731,6 +754,201 @@ function lifecyclePnlFromFills(
   };
 }
 
+
+type ProgressiveStep = { trigger: number; stop: number };
+
+function progressiveStepsForSide(side: string): ProgressiveStep[] {
+  return side === "SHORT"
+    ? CONFIG.SHORT_PROGRESSIVE_STEPS
+    : CONFIG.LONG_PROGRESSIVE_STEPS;
+}
+
+function directionalReturnPct(side: string, entryPrice: number, marketPrice: number): number {
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(marketPrice) || marketPrice <= 0) {
+    return NaN;
+  }
+  return side === "SHORT"
+    ? ((entryPrice - marketPrice) / entryPrice) * 100
+    : ((marketPrice - entryPrice) / entryPrice) * 100;
+}
+
+function reachedProgressiveStep(side: string, directionalReturn: number): { stage: number; stop: number; trigger: number } | null {
+  if (!Number.isFinite(directionalReturn)) return null;
+  const steps = progressiveStepsForSide(side);
+  let reached: { stage: number; stop: number; trigger: number } | null = null;
+  for (let i = 0; i < steps.length; i++) {
+    if (directionalReturn + 1e-12 >= steps[i].trigger) {
+      reached = { stage: i + 1, stop: steps[i].stop, trigger: steps[i].trigger };
+    }
+  }
+  return reached;
+}
+
+function progressiveStopPrice(side: string, entryPrice: number, stopPct: number): number {
+  return side === "SHORT"
+    ? entryPrice * (1 - stopPct / 100)
+    : entryPrice * (1 + stopPct / 100);
+}
+
+function openOrderPx(o: any): number {
+  const candidates = [o?.triggerPx, o?.trigger_px, o?.limitPx, o?.limit_px, o?.px];
+  for (const x of candidates) {
+    const n = Number(x);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return NaN;
+}
+
+function isStopSidePrice(side: string, entryPrice: number, px: number): boolean {
+  if (!Number.isFinite(px) || !Number.isFinite(entryPrice)) return false;
+  // TP is favorable from entry; SL/progressive protection is on the opposite side
+  // of TP. Progressive profit-lock SL can cross entry, so when stage > 0 we
+  // identify the old SL by closeness to the ledger's last protected stop first.
+  return side === "SHORT" ? px >= entryPrice : px <= entryPrice;
+}
+
+async function advanceProgressiveProtection(
+  env: HyperliquidExecutionEnv,
+  row: any,
+  position: any,
+  secret: `0x${string}`
+): Promise<any> {
+  const coin = String(row.coin ?? "").toUpperCase();
+  const side = String(row.side ?? "").toUpperCase();
+  const entryPrice = Number(row.entry_fill_price);
+  if (!coin || !Number.isFinite(entryPrice) || entryPrice <= 0) {
+    return { advanced: false, reason: "INVALID_ENTRY" };
+  }
+
+  const raw = await postInfo({ type: "metaAndAssetCtxs" });
+  const universe = Array.isArray(raw?.[0]?.universe) ? raw[0].universe : [];
+  const contexts = Array.isArray(raw?.[1]) ? raw[1] : [];
+  const asset = universe.findIndex((x:any) => String(x?.name ?? "").toUpperCase() === coin);
+  if (asset < 0) return { advanced: false, reason: "ASSET_NOT_FOUND" };
+
+  const szDecimals = Number(universe[asset]?.szDecimals);
+  const marketPrice = Number(contexts?.[asset]?.midPx ?? contexts?.[asset]?.markPx);
+  const szi = Number(position?.szi);
+  if (!Number.isFinite(marketPrice) || marketPrice <= 0 || !Number.isFinite(szi) || szi === 0) {
+    return { advanced: false, reason: "MARKET_OR_POSITION_INVALID" };
+  }
+
+  const dirReturn = directionalReturnPct(side, entryPrice, marketPrice);
+  const target = reachedProgressiveStep(side, dirReturn);
+  const currentStage = Math.max(0, Number(row.progressive_stage ?? 0) || 0);
+  if (!target || target.stage <= currentStage) {
+    return {
+      advanced: false,
+      stage: currentStage,
+      directional_return_pct: Number.isFinite(dirReturn) ? roundTo(dirReturn, 4) : null,
+      market_price: marketPrice,
+    };
+  }
+
+  const stopRaw = progressiveStopPrice(side, entryPrice, target.stop);
+  const stopWire = priceToWire(stopRaw, szDecimals);
+  const stopPx = Number(stopWire);
+  const sizeWire = toWire(Math.abs(szi), szDecimals);
+  const closeIsBuy = side === "SHORT";
+
+  // Install the tighter stop FIRST. Only after Hyperliquid confirms it do we
+  // cancel the previous stop. This avoids an unprotected gap during replacement.
+  const newStopOrder = {
+    a: asset,
+    b: closeIsBuy,
+    p: stopWire,
+    s: sizeWire,
+    r: true,
+    t: { trigger: { isMarket: true, triggerPx: stopWire, tpsl: "sl" } },
+  };
+  const addRes = await sendLifecycleSignedAction(
+    { type: "order", orders: [newStopOrder], grouping: "na" },
+    secret
+  );
+  const addStatus = addRes?.json?.response?.data?.statuses?.[0];
+  const addOk =
+    addRes?.httpStatus >= 200 &&
+    addRes?.httpStatus < 300 &&
+    addRes?.json?.status === "ok" &&
+    !addStatus?.error;
+
+  if (!addOk) {
+    return {
+      advanced: false,
+      reason: "PROGRESSIVE_STOP_ADD_FAILED",
+      target_stage: target.stage,
+      target_stop_pct: target.stop,
+      target_stop_price: stopWire,
+      response: addRes?.json ?? null,
+    };
+  }
+
+  // Find old protection order(s), excluding the newly-created order when its oid
+  // is available. Prefer the price closest to the previously stored stop.
+  let cancelledOids: number[] = [];
+  try {
+    const open = await getOpenOrdersForCoin(coin);
+    const newOid = Number(addStatus?.resting?.oid ?? addStatus?.filled?.oid);
+    const previousStored = Number(row.progressive_stop_price);
+    const initialSlPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
+    const initialSl = side === "LONG"
+      ? entryPrice * (1 - initialSlPct / 100)
+      : entryPrice * (1 + initialSlPct / 100);
+    const oldTarget = Number.isFinite(previousStored) && previousStored > 0 ? previousStored : initialSl;
+
+    const candidates = open
+      .filter((o:any) => o?.oid != null && Number(o.oid) !== newOid)
+      .map((o:any) => ({ o, px: openOrderPx(o) }))
+      .filter((x:any) => Number.isFinite(x.px))
+      .sort((a:any,b:any) => Math.abs(a.px-oldTarget)-Math.abs(b.px-oldTarget));
+
+    const old = candidates[0];
+    if (old && Number.isFinite(old.px)) {
+      // Sanity: do not cancel the TP. The old stop should be materially closer
+      // to the expected old stop than to the fixed TP.
+      const tpPct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
+      const tp = side === "LONG"
+        ? entryPrice * (1 + tpPct/100)
+        : entryPrice * (1 - tpPct/100);
+      if (Math.abs(old.px-oldTarget) < Math.abs(old.px-tp)) {
+        const oid = Number(old.o.oid);
+        const cancelRes = await sendLifecycleSignedAction(
+          { type: "cancel", cancels: [{ a: asset, o: oid }] },
+          secret
+        );
+        if (cancelRes?.httpStatus >= 200 && cancelRes?.httpStatus < 300 && cancelRes?.json?.status === "ok") {
+          cancelledOids.push(oid);
+        }
+      }
+    }
+  } catch {}
+
+  await env.DB?.prepare(`
+    UPDATE hyperliquid_execution_ledger
+    SET progressive_stage=?, progressive_stop_pct=?, progressive_stop_price=?,
+        progressive_updated_at=?, updated_at=?
+    WHERE id=?
+  `).bind(
+    target.stage,
+    target.stop,
+    stopPx,
+    Date.now(),
+    Date.now(),
+    row.id
+  ).run();
+
+  return {
+    advanced: true,
+    stage: target.stage,
+    trigger_pct: target.trigger,
+    protected_gross_pct: target.stop,
+    stop_price: stopWire,
+    directional_return_pct: roundTo(dirReturn, 4),
+    market_price: marketPrice,
+    cancelled_old_stop_oids: cancelledOids,
+  };
+}
+
 let lifecycleLastNonce = 0;
 function nextLifecycleNonce(): number {
   const now = Date.now();
@@ -787,11 +1005,17 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       const slPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
       const tp = side === "LONG" ? entryPrice*(1+tpPct/100) : entryPrice*(1-tpPct/100);
       const sl = side === "LONG" ? entryPrice*(1-slPct/100) : entryPrice*(1+slPct/100);
+      const progressiveStop = Number(row.progressive_stop_price);
+      const progressiveStage = Number(row.progressive_stage ?? 0);
       let reason = "CLOSED_OTHER", title = "POSITION CLOSED", emoji = "⚪";
       if (Number.isFinite(exitPrice)) {
         const tpHit = side === "LONG" ? exitPrice >= tp*0.9999 : exitPrice <= tp*1.0001;
+        const progressiveHit =
+          progressiveStage > 0 && Number.isFinite(progressiveStop) &&
+          (side === "LONG" ? exitPrice <= progressiveStop*1.0005 : exitPrice >= progressiveStop*0.9995);
         const slHit = side === "LONG" ? exitPrice <= sl*1.0001 : exitPrice >= sl*0.9999;
         if (tpHit) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
+        else if (progressiveHit) { reason="PROGRESSIVE_SL_HIT"; title="PROGRESSIVE SL HIT"; emoji="🟡"; }
         else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
       }
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=? WHERE id=?`)
@@ -809,7 +1033,26 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       continue;
     }
 
-    if (heldMs < CONFIG.MAX_HOLD_MS) { out.push({coin,status:"OPEN",held_ms:heldMs}); continue; }
+    // V2.8: while the position is open, advance the live progressive SL.
+    // LONG uses Progressive A; SHORT uses Progressive C. Initial SL is 0.15% for both.
+    let progressive: any = null;
+    if (secretOk && String(row.status) === "PROTECTED") {
+      try {
+        progressive = await advanceProgressiveProtection(
+          env,
+          row,
+          position,
+          secretRaw as `0x${string}`
+        );
+      } catch (e:any) {
+        progressive = { advanced:false, reason:"PROGRESSIVE_EXCEPTION", error:e?.message ?? String(e) };
+      }
+    }
+
+    if (heldMs < CONFIG.MAX_HOLD_MS) {
+      out.push({coin,status:"OPEN",held_ms:heldMs,progressive});
+      continue;
+    }
     if (!secretOk) { out.push({coin,status:"MAX_HOLD_BLOCKED",reason:"PRIVATE_KEY_INVALID"}); continue; }
 
     // MAX HOLD: close the actual remaining position, not the original requested size.
@@ -1136,6 +1379,8 @@ export async function buildHyperliquidExecutionCandidate(
       estimated_notional_usd: Number(estimatedNotionalUsd.toFixed(8)),
       take_profit_pct: takeProfitPct,
       stop_loss_pct: stopLossPct,
+      progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
+      progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
       tpsl_price_source_live: "ACTUAL_FILL_PRICE",
       preview_fill_price: marketReferenceWire,
       preview_take_profit_trigger: previewTpWire,
@@ -1669,6 +1914,8 @@ export async function buildHyperliquidExecutionCandidate(
       take_profit_trigger: tpWire,
       stop_loss_pct: stopLossPct,
       stop_loss_trigger: slWire,
+      progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
+      progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
       grouping: "positionTpsl",
       http_status: protectionResponse?.httpStatus ?? null,
       returned_statuses: protectionStatuses,
