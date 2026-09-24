@@ -8,7 +8,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.8
+// HYPERLIQUID SIGNAL EXECUTION V2.8.1
+// V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
@@ -552,6 +553,7 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       progressive_stage INTEGER DEFAULT 0,
       progressive_stop_pct REAL,
       progressive_stop_price REAL,
+      progressive_stop_oid INTEGER,
       progressive_updated_at INTEGER,
       last_error TEXT
     )
@@ -572,6 +574,7 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stage INTEGER DEFAULT 0",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_pct REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_oid INTEGER",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_updated_at INTEGER"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
@@ -799,6 +802,19 @@ function openOrderPx(o: any): number {
   return NaN;
 }
 
+function responseOrderOid(status: any): number | null {
+  const candidates = [
+    status?.resting?.oid,
+    status?.filled?.oid,
+    status?.oid,
+  ];
+  for (const x of candidates) {
+    const n = Number(x);
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  return null;
+}
+
 function isStopSidePrice(side: string, entryPrice: number, px: number): boolean {
   if (!Number.isFinite(px) || !Number.isFinite(entryPrice)) return false;
   // TP is favorable from entry; SL/progressive protection is on the opposite side
@@ -883,55 +899,86 @@ async function advanceProgressiveProtection(
     };
   }
 
-  // Find old protection order(s), excluding the newly-created order when its oid
-  // is available. Prefer the price closest to the previously stored stop.
+  // V2.8.1: cancel the exact previously tracked SL OID.
+  // The new tighter SL is already confirmed at this point, so there is no
+  // unprotected gap. A price-based fallback is used only for legacy rows that
+  // predate exact OID tracking.
+  const newStopOid = responseOrderOid(addStatus);
   let cancelledOids: number[] = [];
-  try {
-    const open = await getOpenOrdersForCoin(coin);
-    const newOid = Number(addStatus?.resting?.oid ?? addStatus?.filled?.oid);
-    const previousStored = Number(row.progressive_stop_price);
-    const initialSlPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
-    const initialSl = side === "LONG"
-      ? entryPrice * (1 - initialSlPct / 100)
-      : entryPrice * (1 + initialSlPct / 100);
-    const oldTarget = Number.isFinite(previousStored) && previousStored > 0 ? previousStored : initialSl;
+  let oldStopOid: number | null = null;
+  let cancelMode = "NONE";
 
-    const candidates = open
-      .filter((o:any) => o?.oid != null && Number(o.oid) !== newOid)
-      .map((o:any) => ({ o, px: openOrderPx(o) }))
-      .filter((x:any) => Number.isFinite(x.px))
-      .sort((a:any,b:any) => Math.abs(a.px-oldTarget)-Math.abs(b.px-oldTarget));
-
-    const old = candidates[0];
-    if (old && Number.isFinite(old.px)) {
-      // Sanity: do not cancel the TP. The old stop should be materially closer
-      // to the expected old stop than to the fixed TP.
-      const tpPct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
+  const trackedOldOid = Number(row.progressive_stop_oid);
+  if (Number.isInteger(trackedOldOid) && trackedOldOid >= 0 && trackedOldOid !== newStopOid) {
+    oldStopOid = trackedOldOid;
+    cancelMode = "EXACT_TRACKED_OID";
+  } else if (currentStage === 0) {
+    // Legacy/initial bracket: the initial SL was created before V2.8.1 and its
+    // OID may not yet be in D1. Resolve it once by expected initial-SL price.
+    try {
+      const open = await getOpenOrdersForCoin(coin);
+      const initialSlPct = side === "LONG"
+        ? CONFIG.LONG_STOP_LOSS_PCT
+        : CONFIG.SHORT_STOP_LOSS_PCT;
+      const initialSl = side === "LONG"
+        ? entryPrice * (1 - initialSlPct / 100)
+        : entryPrice * (1 + initialSlPct / 100);
+      const tpPct = side === "LONG"
+        ? CONFIG.LONG_TAKE_PROFIT_PCT
+        : CONFIG.SHORT_TAKE_PROFIT_PCT;
       const tp = side === "LONG"
-        ? entryPrice * (1 + tpPct/100)
-        : entryPrice * (1 - tpPct/100);
-      if (Math.abs(old.px-oldTarget) < Math.abs(old.px-tp)) {
-        const oid = Number(old.o.oid);
-        const cancelRes = await sendLifecycleSignedAction(
-          { type: "cancel", cancels: [{ a: asset, o: oid }] },
-          secret
-        );
-        if (cancelRes?.httpStatus >= 200 && cancelRes?.httpStatus < 300 && cancelRes?.json?.status === "ok") {
-          cancelledOids.push(oid);
-        }
+        ? entryPrice * (1 + tpPct / 100)
+        : entryPrice * (1 - tpPct / 100);
+
+      const candidates = open
+        .filter((o:any) => o?.oid != null && Number(o.oid) !== newStopOid)
+        .map((o:any) => ({ o, px: openOrderPx(o) }))
+        .filter((x:any) => Number.isFinite(x.px))
+        .sort((a:any,b:any) => Math.abs(a.px-initialSl)-Math.abs(b.px-initialSl));
+
+      const old = candidates[0];
+      if (
+        old &&
+        Math.abs(old.px - initialSl) < Math.abs(old.px - tp)
+      ) {
+        oldStopOid = Number(old.o.oid);
+        cancelMode = "LEGACY_INITIAL_SL_PRICE_RESOLUTION";
       }
+    } catch {}
+  }
+
+  if (oldStopOid != null) {
+    try {
+      const cancelRes = await sendLifecycleSignedAction(
+        { type: "cancel", cancels: [{ a: asset, o: oldStopOid }] },
+        secret
+      );
+      if (
+        cancelRes?.httpStatus >= 200 &&
+        cancelRes?.httpStatus < 300 &&
+        cancelRes?.json?.status === "ok"
+      ) {
+        cancelledOids.push(oldStopOid);
+      } else {
+        // Fail closed: if old SL could not be cancelled, keep both protective
+        // reduce-only stops rather than risk deleting an unrelated order.
+        cancelMode += "_CANCEL_NOT_CONFIRMED";
+      }
+    } catch {
+      cancelMode += "_CANCEL_EXCEPTION";
     }
-  } catch {}
+  }
 
   await env.DB?.prepare(`
     UPDATE hyperliquid_execution_ledger
     SET progressive_stage=?, progressive_stop_pct=?, progressive_stop_price=?,
-        progressive_updated_at=?, updated_at=?
+        progressive_stop_oid=?, progressive_updated_at=?, updated_at=?
     WHERE id=?
   `).bind(
     target.stage,
     target.stop,
     stopPx,
+    newStopOid,
     Date.now(),
     Date.now(),
     row.id
@@ -943,8 +990,10 @@ async function advanceProgressiveProtection(
     trigger_pct: target.trigger,
     protected_gross_pct: target.stop,
     stop_price: stopWire,
+    active_stop_oid: newStopOid,
     directional_return_pct: roundTo(dirReturn, 4),
     market_price: marketPrice,
+    old_stop_cancel_mode: cancelMode,
     cancelled_old_stop_oids: cancelledOids,
   };
 }
