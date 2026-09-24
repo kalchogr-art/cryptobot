@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.21 WS EXECUTION BRIDGE DRY RUN";
+            const VERSION = "V1.9.22 AUTO WS BRIDGE + D1 LOG";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4166,7 +4166,39 @@
             }
 
 
-            export default {
+            async function autoSyncProgressiveWsMonitor(env: Env): Promise<any> {
+      if (!env.DB || !env.PROGRESSIVE_MONITOR) return { success:false, reason:"BINDING_MISSING" };
+      const stub = env.PROGRESSIVE_MONITOR.getByName("cryptobot-progressive-dry-run-v1");
+      const open:any = await env.DB.prepare(`
+        SELECT id, crossing_id, coin, side, status, entry_fill_price,
+               progressive_stage, progressive_stop_oid, entry_filled_at, updated_at
+        FROM hyperliquid_execution_ledger
+        WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
+          AND entry_fill_price IS NOT NULL AND entry_fill_price > 0
+        ORDER BY COALESCE(entry_filled_at, updated_at, id) DESC LIMIT 1
+      `).first();
+      let current:any=null;
+      try { current=await (await stub.fetch("https://progressive-monitor/status")).json(); } catch {}
+      const active=current?.status?.active===true;
+      const activeLedgerId=Number(current?.status?.ledger?.id);
+      if (!open) {
+        if (active) {
+          await stub.fetch("https://progressive-monitor/stop",{method:"POST"});
+          return {success:true,action:"AUTO_STOP_NO_OPEN_LEDGER"};
+        }
+        return {success:true,action:"IDLE_NO_OPEN_LEDGER"};
+      }
+      const openId=Number(open.id);
+      if (active && Number.isInteger(activeLedgerId) && activeLedgerId===openId)
+        return {success:true,action:"ALREADY_MONITORING",ledger_id:openId};
+      const res=await stub.fetch("https://progressive-monitor/start",{
+        method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({mode:"LEDGER",ledgerId:openId})
+      });
+      return {success:res.ok,action:active?"AUTO_SWITCH_LEDGER":"AUTO_START_LEDGER",ledger_id:openId};
+    }
+
+    export default {
               async fetch(request: Request, env: Env): Promise<Response> {
                 const url = new URL(request.url);
 
@@ -8650,6 +8682,11 @@
                 } catch (error: any) {
                   console.log("Hyperliquid lifecycle monitor failed:", error?.message ?? String(error));
                 }
+        try {
+          await autoSyncProgressiveWsMonitor(env);
+        } catch (error: any) {
+          console.log("Progressive WS auto-sync failed:", error?.message ?? String(error));
+        }
 
                 // V1.6.9: safe idempotent legacy cleanup. Once repaired to <=30m, a row
                 // no longer matches and will not be touched again.
