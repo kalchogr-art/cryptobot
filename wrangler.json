@@ -1,24 +1,38 @@
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cryptobot",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-09-15",
-  "workers_dev": true,
-  "observability": {
-    "enabled": true
-  },
-
-  "d1_databases": [
     {
-      "binding": "DB",
-      "database_name": "cryptobot-db",
-      "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+      "$schema": "node_modules/wrangler/config-schema.json",
+      "name": "cryptobot",
+      "main": "src/index.ts",
+      "compatibility_date": "2026-09-15",
+      "workers_dev": true,
+      "observability": {
+        "enabled": true
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "cryptobot-db",
+          "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+        }
+      ],
+      "triggers": {
+        "crons": [
+          "* * * * *"
+        ]
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "PROGRESSIVE_MONITOR",
+            "class_name": "ProgressiveMonitor"
+          }
+        ]
+      },
+      "migrations": [
+        {
+          "tag": "v1-progressive-monitor",
+          "new_sqlite_classes": [
+            "ProgressiveMonitor"
+          ]
+        }
+      ]
     }
-  ],
-
-  "triggers": {
-    "crons": [
-      "* * * * *"
-    ]
-  }
-}
