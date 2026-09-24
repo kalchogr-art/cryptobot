@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.8.1
+// HYPERLIQUID SIGNAL EXECUTION V2.8.1.
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
