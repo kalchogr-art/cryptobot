@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.30 RUNNER POTENTIAL ANALYTICS";
+            const VERSION = "V1.9.31 RUNNER REPLAY AUDIT";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -5958,6 +5958,116 @@
                     all:summarize(rows),
                     by_side:["LONG","SHORT"].map(side=>({side,...summarize(rows.filter(r=>String(r.side)===side))})),
                     by_score_bucket:buckets
+                  });
+                }
+
+                // V1.9.31 — READ-ONLY historical snapshot coverage audit for 50/50 runner replay.
+                // No live execution, TP, SL or progressive settings are changed.
+                if (url.pathname === "/runner-replay-audit") {
+                  if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+                  await ensurePaperTables(env);
+
+                  const cq:any=await env.DB.prepare(`
+                    SELECT id,coin,side,crossing_ts,crossing_datetime,crossing_score,
+                           return_30m_pct,mfe_pct,mae_pct,outcome_complete
+                    FROM signal_65_crossings
+                    WHERE outcome_complete=1
+                    ORDER BY crossing_ts ASC
+                  `).all();
+                  const crossings:any[]=cq?.results??[];
+
+                  // One joined read avoids one D1 query per crossing. We intentionally use
+                  // the stored minute snapshots only; no current/future market data is mixed in.
+                  const jq:any=await env.DB.prepare(`
+                    SELECT c.id AS crossing_id,c.coin,c.side,c.crossing_ts,c.crossing_score,
+                           m.ts AS snapshot_ts,m.price AS snapshot_price
+                    FROM signal_65_crossings c
+                    LEFT JOIN market_snapshots m
+                      ON m.coin=c.coin
+                     AND m.ts>=c.crossing_ts
+                     AND m.ts<=c.crossing_ts+1800000
+                    WHERE c.outcome_complete=1
+                    ORDER BY c.crossing_ts ASC,m.ts ASC
+                  `).all();
+                  const joined:any[]=jq?.results??[];
+                  const byId=new Map<string,any[]>();
+                  for(const r of joined){
+                    const k=String(r.crossing_id);
+                    if(!byId.has(k))byId.set(k,[]);
+                    if(r.snapshot_ts!==null&&r.snapshot_price!==null)byId.get(k)!.push(r);
+                  }
+
+                  const MAX_START_DELAY_MS=90_000;
+                  const MAX_END_EARLY_MS=90_000;
+                  const MAX_GAP_MS=120_000;
+                  const MIN_SNAPSHOTS=20;
+                  const details:any[]=[];
+                  let replayable=0,insufficient=0,noSnapshots=0;
+                  const reasons:Record<string,number>={};
+                  const addReason=(x:string)=>{reasons[x]=(reasons[x]??0)+1;};
+
+                  for(const c of crossings){
+                    const start=Number(c.crossing_ts);
+                    const end=start+1_800_000;
+                    const snaps=(byId.get(String(c.id))??[])
+                      .map((r:any)=>({ts:Number(r.snapshot_ts),price:Number(r.snapshot_price)}))
+                      .filter((r:any)=>Number.isFinite(r.ts)&&Number.isFinite(r.price)&&r.price>0)
+                      .sort((a:any,b:any)=>a.ts-b.ts);
+                    if(!snaps.length){
+                      noSnapshots++; insufficient++; addReason("NO_SNAPSHOTS");
+                      details.push({id:c.id,coin:c.coin,side:c.side,score:c.crossing_score,status:"INSUFFICIENT",reason:"NO_SNAPSHOTS",snapshots:0});
+                      continue;
+                    }
+                    let maxGap=0;
+                    for(let i=1;i<snaps.length;i++)maxGap=Math.max(maxGap,snaps[i].ts-snaps[i-1].ts);
+                    const startDelay=snaps[0].ts-start;
+                    const endEarly=end-snaps[snaps.length-1].ts;
+                    const rs:string[]=[];
+                    if(snaps.length<MIN_SNAPSHOTS)rs.push("TOO_FEW_SNAPSHOTS");
+                    if(startDelay>MAX_START_DELAY_MS)rs.push("LATE_FIRST_SNAPSHOT");
+                    if(endEarly>MAX_END_EARLY_MS)rs.push("EARLY_LAST_SNAPSHOT");
+                    if(maxGap>MAX_GAP_MS)rs.push("GAP_OVER_2M");
+                    const ok=rs.length===0;
+                    if(ok)replayable++; else {insufficient++; for(const x of rs)addReason(x);}
+                    details.push({
+                      id:c.id,coin:c.coin,side:c.side,score:c.crossing_score,
+                      status:ok?"REPLAYABLE":"INSUFFICIENT",reason:ok?null:rs.join("|"),
+                      snapshots:snaps.length,
+                      first_delay_seconds:round(startDelay/1000,2),
+                      last_before_30m_seconds:round(endEarly/1000,2),
+                      max_gap_seconds:round(maxGap/1000,2),
+                      first_snapshot_ts:snaps[0].ts,last_snapshot_ts:snaps[snaps.length-1].ts
+                    });
+                  }
+
+                  const pct=(n:number,d:number)=>d?round(n*100/d,2):null;
+                  const bySide=["LONG","SHORT"].map(side=>{
+                    const x=details.filter(r=>r.side===side);
+                    const ok=x.filter(r=>r.status==="REPLAYABLE").length;
+                    return {side,total:x.length,replayable:ok,replayable_pct:pct(ok,x.length),insufficient:x.length-ok};
+                  });
+                  const buckets=[
+                    {name:"65-69",min:65,max:70},{name:"70-74",min:70,max:75},
+                    {name:"75-79",min:75,max:80},{name:"80+",min:80,max:Infinity}
+                  ].map(b=>{
+                    const x=details.filter(r=>Number(r.score)>=b.min&&Number(r.score)<b.max);
+                    const ok=x.filter(r=>r.status==="REPLAYABLE").length;
+                    return {bucket:b.name,total:x.length,replayable:ok,replayable_pct:pct(ok,x.length),insufficient:x.length-ok};
+                  });
+
+                  return json({
+                    success:true,worker:"cryptobot",version:VERSION,
+                    mode:"RUNNER_REPLAY_AUDIT_READ_ONLY",live_strategy_changed:false,
+                    methodology:{
+                      cohort:">=65 completed crossings",window_minutes:30,source:"market_snapshots",
+                      replayable_rules:{min_snapshots:MIN_SNAPSHOTS,max_first_snapshot_delay_seconds:MAX_START_DELAY_MS/1000,max_last_snapshot_early_seconds:MAX_END_EARLY_MS/1000,max_gap_seconds:MAX_GAP_MS/1000},
+                      planned_replay:"50% close at +0.50%; remaining 50% progressive runner",
+                      limitation:"minute snapshots do not prove intraminute event ordering; this endpoint audits coverage only and does not yet estimate runner P/L"
+                    },
+                    summary:{total_completed:crossings.length,replayable,replayable_pct:pct(replayable,crossings.length),insufficient,no_snapshots:noSnapshots},
+                    insufficient_reasons:reasons,
+                    by_side:bySide,by_score_bucket:buckets,
+                    rows:details
                   });
                 }
 
