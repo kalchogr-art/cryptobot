@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.10.0 — LIVE 50/50 RUNNER
+// HYPERLIQUID SIGNAL EXECUTION V2.10.1 — DYNAMIC ASSET LEVERAGE
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
@@ -49,7 +49,7 @@ const CONFIG = {
   MIN_SIGNAL_SCORE: 65,
 
   MARGIN_USD: 1.04,
-  LEVERAGE: 10,
+  TARGET_LEVERAGE: 10,
   IS_CROSS: true,
 
   LONG_TAKE_PROFIT_PCT: 0.50,
@@ -133,7 +133,8 @@ function toWire(value: number, decimals = 8): string {
 function bestValidSize(
   targetSize: number,
   price: number,
-  szDecimals: number
+  szDecimals: number,
+  targetNotionalUsd: number
 ): number {
   const scale = 10 ** szDecimals;
   const minSize = Math.ceil((10 / price) * scale - 1e-12) / scale;
@@ -147,8 +148,8 @@ function bestValidSize(
   if (!candidates.length) return minSize;
 
   return candidates.reduce((best, current) =>
-    Math.abs(current * price - CONFIG.MARGIN_USD * CONFIG.LEVERAGE) <
-    Math.abs(best * price - CONFIG.MARGIN_USD * CONFIG.LEVERAGE)
+    Math.abs(current * price - targetNotionalUsd) <
+    Math.abs(best * price - targetNotionalUsd)
       ? current
       : best
   );
@@ -1302,7 +1303,26 @@ export async function buildHyperliquidExecutionCandidate(
     throw new Error("INVALID_SZ_DECIMALS");
   }
 
-  const positionUsdTarget = CONFIG.MARGIN_USD * CONFIG.LEVERAGE;
+  // V2.10.1 — dynamic per-asset leverage.
+  // Hyperliquid meta.universe exposes maxLeverage for each perp.
+  const rawAssetMaxLeverage = Number(universe[asset]?.maxLeverage);
+  if (!Number.isFinite(rawAssetMaxLeverage) || rawAssetMaxLeverage < 1) {
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "ASSET_MAX_LEVERAGE_UNAVAILABLE",
+      coin,
+      raw_max_leverage: universe[asset]?.maxLeverage ?? null,
+      live_trading: CONFIG.LIVE_TRADING,
+    };
+  }
+
+  const assetMaxLeverage = Math.max(1, Math.floor(rawAssetMaxLeverage));
+  const effectiveLeverage = Math.min(CONFIG.TARGET_LEVERAGE, assetMaxLeverage);
+  const leverageWasCapped = effectiveLeverage < CONFIG.TARGET_LEVERAGE;
+
+  // Keep margin fixed. If an asset supports less than 10x, notional is reduced.
+  const positionUsdTarget = CONFIG.MARGIN_USD * effectiveLeverage;
   const isLong = side === "LONG";
 
   // Market entry policy: use the current Hyperliquid market, not the old
@@ -1341,7 +1361,8 @@ export async function buildHyperliquidExecutionCandidate(
   const size = bestValidSize(
     positionUsdTarget / marketReference,
     marketReference,
-    szDecimals
+    szDecimals,
+    positionUsdTarget
   );
   const sizeWire = toWire(size, szDecimals);
   const estimatedNotionalUsd = marketReference * size;
@@ -1403,13 +1424,13 @@ export async function buildHyperliquidExecutionCandidate(
   const desiredLeverageType = CONFIG.IS_CROSS ? "cross" : "isolated";
   const leverageAlreadyCorrect =
     currentLeverageType === desiredLeverageType &&
-    currentLeverageValue === CONFIG.LEVERAGE;
+    currentLeverageValue === effectiveLeverage;
 
   const leverageAction = {
     type: "updateLeverage",
     asset,
     isCross: CONFIG.IS_CROSS,
-    leverage: CONFIG.LEVERAGE,
+    leverage: effectiveLeverage,
   };
 
   // In DRY RUN there is no real fill. For preview only, use the current
@@ -1483,9 +1504,12 @@ export async function buildHyperliquidExecutionCandidate(
       asset,
       sz_decimals: szDecimals,
       margin_usd: CONFIG.MARGIN_USD,
-      leverage: CONFIG.LEVERAGE,
+      leverage: effectiveLeverage,
       leverage_type: desiredLeverageType,
-      leverage_policy: "AUTO_ENSURE_BEFORE_ENTRY",
+      strategy_target_leverage: CONFIG.TARGET_LEVERAGE,
+      asset_max_leverage: assetMaxLeverage,
+      leverage_capped_by_asset: leverageWasCapped,
+      leverage_policy: "DYNAMIC_MIN_STRATEGY_TARGET_ASSET_MAX",
       current_exchange_leverage: {
         type: currentLeverageType || null,
         value: Number.isFinite(currentLeverageValue) ? currentLeverageValue : null,
@@ -1525,7 +1549,7 @@ export async function buildHyperliquidExecutionCandidate(
         : leverageAction,
       step_1_entry: entryAction,
       step_2_after_confirmed_fill: previewProtectionAction,
-      note: "LIVE guarantees configured leverage before ENTRY. DRY RUN does not change leverage. TP/SL are recalculated from actual fill price in LIVE mode.",
+      note: "LIVE applies min(strategy target, Hyperliquid asset maxLeverage) before ENTRY. Margin stays fixed; lower leverage means lower notional. TP/SL are recalculated from actual fill price.",
     },
 
     safety: {
@@ -1606,7 +1630,7 @@ export async function buildHyperliquidExecutionCandidate(
 
   // Compare like-for-like notionals. CONFIG.MARGIN_USD is collateral/margin,
   // while maxTradeSz is the maximum position size Hyperliquid currently allows.
-  const targetNotionalUsd = CONFIG.MARGIN_USD * CONFIG.LEVERAGE;
+  const targetNotionalUsd = CONFIG.MARGIN_USD * effectiveLeverage;
   const maxTradableNotionalUsd =
     Number.isFinite(maxTradeSz) && Number.isFinite(availabilityMarkPx)
       ? maxTradeSz * availabilityMarkPx
@@ -1615,7 +1639,7 @@ export async function buildHyperliquidExecutionCandidate(
   // Small headroom prevents requesting the absolute exchange maximum and
   // reduces partial IOC fills caused by price movement between check and order.
   const requiredNotionalWithHeadroom =
-    targetNotionalUsd + CONFIG.MIN_MARGIN_HEADROOM_USD * CONFIG.LEVERAGE;
+    targetNotionalUsd + CONFIG.MIN_MARGIN_HEADROOM_USD * effectiveLeverage;
 
   if (
     !tradingAvailability?.success ||
@@ -1642,7 +1666,7 @@ export async function buildHyperliquidExecutionCandidate(
         crossingId: signal.crossing_id,
         episodeId: signal.episode_id,
         marginUsd: CONFIG.MARGIN_USD,
-        leverage: CONFIG.LEVERAGE,
+        leverage: effectiveLeverage,
         reason,
         balance: {
           ...preEntryBalance,
@@ -1677,7 +1701,7 @@ export async function buildHyperliquidExecutionCandidate(
   if (existingPosition || existingOrders.length > 0) {
     const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN" : "EXISTING_OPEN_ORDERS_FOR_COIN";
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
-    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason,balance:preEntryBalance}));
+    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
     return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
   }
 
@@ -1717,7 +1741,7 @@ export async function buildHyperliquidExecutionCandidate(
       const levReason = e?.message ?? String(e);
       await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_ERROR", { last_error: levReason });
       const levBal = await getAccountSnapshot();
-      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:`LEVERAGE_ERROR: ${levReason}`,balance:levBal}));
+      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:effectiveLeverage,reason:`LEVERAGE_ERROR: ${levReason}`,balance:levBal}));
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_TRANSPORT_ERROR",
@@ -1742,7 +1766,7 @@ export async function buildHyperliquidExecutionCandidate(
     if (!leverageAccepted) {
       await updateExecutionLedger(env?.DB, signal.crossing_id, "LEVERAGE_REJECTED", { last_error: "LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED" });
       const levBal = await getAccountSnapshot();
-      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:"LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",balance:levBal}));
+      const levTg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:effectiveLeverage,reason:"LEVERAGE_NOT_CONFIRMED_ENTRY_BLOCKED",balance:levBal}));
       return {
         ...result,
         status: "LIVE_LEVERAGE_UPDATE_REJECTED",
@@ -1781,7 +1805,7 @@ export async function buildHyperliquidExecutionCandidate(
         crossingId: signal.crossing_id ?? null,
         episodeId: signal.episode_id ?? null,
         marginUsd: CONFIG.MARGIN_USD,
-        leverage: CONFIG.LEVERAGE,
+        leverage: effectiveLeverage,
         reason: rejectReason,
         balance: rejectBalance,
       })
@@ -1824,7 +1848,7 @@ export async function buildHyperliquidExecutionCandidate(
         crossingId: signal.crossing_id ?? null,
         episodeId: signal.episode_id ?? null,
         marginUsd: CONFIG.MARGIN_USD,
-        leverage: CONFIG.LEVERAGE,
+        leverage: effectiveLeverage,
         reason: rejectReason,
         balance: rejectBalance,
       })
@@ -1865,7 +1889,7 @@ export async function buildHyperliquidExecutionCandidate(
   if (!Number.isFinite(fillPrice) || fillPrice <= 0 || !Number.isFinite(fillSize) || fillSize <= 0) {
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILL_INVALID", { last_error: "INVALID_FILL_DATA_CRITICAL_POSITION_MAY_BE_OPEN" });
     const invalidBal = await getAccountSnapshot();
-    await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:CONFIG.LEVERAGE,reason:"CRITICAL: ENTRY REPORTED FILLED BUT FILL DATA INVALID — CHECK POSITION NOW",balance:invalidBal}));
+    await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:CONFIG.MARGIN_USD,leverage:effectiveLeverage,reason:"CRITICAL: ENTRY REPORTED FILLED BUT FILL DATA INVALID — CHECK POSITION NOW",balance:invalidBal}));
     return {
       ...result,
       status: "LIVE_ENTRY_FILLED_BUT_FILL_DATA_INVALID",
@@ -1997,7 +2021,7 @@ export async function buildHyperliquidExecutionCandidate(
     crossingId: signal.crossing_id ?? null,
     episodeId: signal.episode_id ?? null,
     marginUsd: CONFIG.MARGIN_USD,
-    leverage: CONFIG.LEVERAGE,
+    leverage: effectiveLeverage,
     leverageType: desiredLeverageType.toUpperCase(),
     fillPrice,
     fillSize: actualSizeWire,
@@ -2023,7 +2047,10 @@ export async function buildHyperliquidExecutionCandidate(
       required: !leverageAlreadyCorrect,
       updated: leverageAlreadyCorrect ? false : true,
       already_correct: leverageAlreadyCorrect,
-      target: { type: desiredLeverageType, value: CONFIG.LEVERAGE },
+      target: { type: desiredLeverageType, value: effectiveLeverage },
+      strategy_target: CONFIG.TARGET_LEVERAGE,
+      asset_max: assetMaxLeverage,
+      capped_by_asset: leverageWasCapped,
     },
     live_entry: {
       filled: true,
