@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.28 REAL PROGRESSIVE DASHBOARD";
+            const VERSION = "V1.9.29 CROSSING RESEARCH DIAGNOSTICS";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -175,8 +175,23 @@
               return hyperliquid({ type: "allMids" });
             }
 
+            // V1.9.29 — short-lived shared cache. All coins processed in the same
+            // cron burst reuse one metaAndAssetCtxs request instead of requesting
+            // the same world snapshot once per coin. Strategy math is unchanged.
+            let metaCtxCache: { value: any; expires: number } | null = null;
+            let metaCtxPending: Promise<any> | null = null;
+
             async function getMetaAndContexts() {
-              return hyperliquid({ type: "metaAndAssetCtxs" });
+              const now = Date.now();
+              if (metaCtxCache && now < metaCtxCache.expires) return metaCtxCache.value;
+              if (metaCtxPending) return metaCtxPending;
+              metaCtxPending = hyperliquid({ type: "metaAndAssetCtxs" })
+                .then((value:any) => {
+                  metaCtxCache = { value, expires: Date.now() + 1500 };
+                  return value;
+                })
+                .finally(() => { metaCtxPending = null; });
+              return metaCtxPending;
             }
 
             async function getAssetContext(coin: string) {
@@ -1579,6 +1594,40 @@
                 CREATE INDEX IF NOT EXISTS idx_cross60_64_coin_ts
                 ON signal_60_64_crossings (coin, crossing_ts DESC)
               `).run();
+
+              // V1.9.29 — research-only snapshot captured at the FIRST cohort crossing.
+              // These fields never block or modify a live execution.
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS crossing_diagnostics (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  cohort TEXT NOT NULL,
+                  crossing_id INTEGER NOT NULL,
+                  episode_id INTEGER,
+                  coin TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  crossing_ts INTEGER NOT NULL,
+                  score REAL NOT NULL,
+                  chart_signed REAL,
+                  chart_gap REAL,
+                  order_flow_signed REAL,
+                  oi_signed REAL,
+                  funding_signed REAL,
+                  news_signed REAL,
+                  market_signed REAL,
+                  spread_pct REAL,
+                  normal_range_1m_pct REAL,
+                  normal_range_5m_pct REAL,
+                  trend_15m TEXT,
+                  trend_1h TEXT,
+                  htf_15m_alignment TEXT,
+                  htf_1h_alignment TEXT,
+                  news_mode TEXT,
+                  snapshot_json TEXT,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE(cohort, crossing_id)
+                )
+              `).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_crossdiag_coin_ts ON crossing_diagnostics (coin, crossing_ts DESC)`).run();
             }
 
             function scoreBucket(score: number): string {
@@ -2163,6 +2212,59 @@
               };
             }
 
+            // V1.9.29 — observational diagnostics only. No entry filter is changed.
+            async function recordCrossingDiagnostic(
+              env: Env, cohort: string, crossingId: number, episodeId: number,
+              signal: any, finalSignal: any, side: string, score: number, crossingTs: number
+            ): Promise<void> {
+              if (!env.DB || !Number.isFinite(crossingId) || crossingId <= 0) return;
+              try {
+                const [c15, c1h] = await Promise.all([
+                  getCandles(signal.coin, "15m", 45),
+                  getCandles(signal.coin, "1h", 45),
+                ]);
+                const tf15 = calculateTimeframe(c15.candles, "15m");
+                const tf1h = calculateTimeframe(c1h.candles, "1h");
+                const align = (direction:any) => {
+                  const d=String(direction??"NEUTRAL");
+                  if(d==="NEUTRAL") return "NEUTRAL";
+                  if(side==="LONG") return d==="BULLISH"?"ALIGNED":"OPPOSED";
+                  return d==="BEARISH"?"ALIGNED":"OPPOSED";
+                };
+                const chartLong=Number(signal?.chart?.final?.long_score??0);
+                const chartShort=Number(signal?.chart?.final?.short_score??0);
+                const snapshot={
+                  cohort,crossing_id:crossingId,episode_id:episodeId,coin:signal.coin,side,score,
+                  market:signal?.market??null, chart:signal?.chart??null,
+                  order_flow:signal?.microstructure?.order_flow??null,
+                  spread_pct:signal?.microstructure?.spread_pct??null,
+                  derivatives:signal?.derivatives??null, history:signal?.history??null,
+                  news:finalSignal?.news_x??null, final:finalSignal?.final??null,
+                  timeframe_15m:tf15,timeframe_1h:tf1h
+                };
+                await env.DB.prepare(`INSERT OR IGNORE INTO crossing_diagnostics (
+                  cohort,crossing_id,episode_id,coin,side,crossing_ts,score,
+                  chart_signed,chart_gap,order_flow_signed,oi_signed,funding_signed,news_signed,market_signed,
+                  spread_pct,normal_range_1m_pct,normal_range_5m_pct,trend_15m,trend_1h,
+                  htf_15m_alignment,htf_1h_alignment,news_mode,snapshot_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+                  cohort,crossingId,episodeId,signal.coin,side,crossingTs,score,
+                  signal?.market?.components?.chart_signed??null,Math.abs(chartLong-chartShort),
+                  signal?.market?.components?.order_flow_persistent_signed??null,
+                  signal?.market?.components?.oi_change_signed??null,
+                  signal?.market?.components?.funding_premium_signed??null,
+                  finalSignal?.news_x?.signed_score??null,signal?.market?.signed_score??null,
+                  signal?.microstructure?.spread_pct??null,
+                  signal?.chart?.timeframe_1m?.volatility?.normal_range_pct??null,
+                  signal?.chart?.timeframe_5m?.volatility?.normal_range_pct??null,
+                  tf15.direction,tf1h.direction,align(tf15.direction),align(tf1h.direction),
+                  finalSignal?.final?.mode??null,JSON.stringify(snapshot)
+                ).run();
+              } catch (e:any) {
+                console.log("crossing diagnostic failed", cohort, crossingId, e?.message??String(e));
+              }
+            }
+
             // ============================================================
             // V1.8.5 — 60-64 CONTROL CROSSINGS
             // Separate research cohort. Does NOT qualify for paper entry.
@@ -2181,7 +2283,9 @@
               const r:any=await env.DB.prepare(`INSERT OR IGNORE INTO signal_60_64_crossings
                 (episode_id,coin,side,crossing_ts,crossing_datetime,crossing_price,crossing_score)
                 VALUES (?,?,?,?,?,?,?)`).bind(ep.id,signal.coin,side,now,new Date(now).toISOString(),price,score).run();
-              return {recorded:true,crossing_id:r?.meta?.last_row_id??null,episode_id:ep.id,coin:signal.coin,side,crossing_score:round(score),crossing_price:price};
+              const crossingId=Number(r?.meta?.last_row_id??0);
+              if(crossingId>0) await recordCrossingDiagnostic(env,"60_64",crossingId,Number(ep.id),signal,finalSignal,side,score,now);
+              return {recorded:true,crossing_id:crossingId||null,episode_id:ep.id,coin:signal.coin,side,crossing_score:round(score),crossing_price:price};
             }
 
             async function update6064CrossingOutcomes(env: Env, coin: string): Promise<void> {
@@ -2235,7 +2339,9 @@
                 signal.market?.components?.chart_signed??null,signal.market?.components?.order_flow_persistent_signed??null,
                 signal.market?.components?.oi_change_signed??null,signal.market?.components?.funding_premium_signed??null,
                 signal.market?.weights?.mode??null).run();
-              return { recorded:true, crossing_id:r?.meta?.last_row_id??null, episode_id:episode.id, coin:signal.coin, side, crossing_score:round(score), crossing_price:price, crossing_ts:now };
+              const crossingId=Number(r?.meta?.last_row_id??0);
+              if(crossingId>0) await recordCrossingDiagnostic(env,"65_PLUS",crossingId,Number(episode.id),signal,finalSignal,side,score,now);
+              return { recorded:true, crossing_id:crossingId||null, episode_id:episode.id, coin:signal.coin, side, crossing_score:round(score), crossing_price:price, crossing_ts:now };
             }
 
             async function update65CrossingOutcomes(env: Env, coin: string): Promise<void> {
@@ -2337,7 +2443,13 @@
                 };
               }
 
-              const finalGap = Math.abs(finalSigned);
+              // V1.9.29: the old `abs(finalSigned)` duplicated the >=65 score
+              // check and could never fail a 20-point gap threshold. Use the
+              // independently computed 1m/5m chart LONG-vs-SHORT separation.
+              // PAPER ONLY — live >=65 execution remains unchanged.
+              const chartLong = Number(signal?.chart?.final?.long_score ?? 0);
+              const chartShort = Number(signal?.chart?.final?.short_score ?? 0);
+              const finalGap = Math.abs(chartLong - chartShort);
 
               if (finalGap < PAPER_MIN_SCORE_GAP) {
                 return {
@@ -5809,6 +5921,36 @@
 
 
 
+                if (url.pathname === "/crossing-diagnostics") {
+                  if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+                  await ensurePaperTables(env);
+                  const limit=Math.max(1,Math.min(Number(url.searchParams.get("limit")??100),500));
+                  const cohort=String(url.searchParams.get("cohort")??"").toUpperCase();
+                  const q=cohort==="60_64"||cohort==="65_PLUS"
+                    ? await env.DB.prepare(`SELECT * FROM crossing_diagnostics WHERE cohort=? ORDER BY crossing_ts DESC LIMIT ?`).bind(cohort,limit).all()
+                    : await env.DB.prepare(`SELECT * FROM crossing_diagnostics ORDER BY crossing_ts DESC LIMIT ?`).bind(limit).all();
+                  return json({success:true,worker:"cryptobot",version:VERSION,mode:"CROSSING_DIAGNOSTICS_READ_ONLY",live_strategy_changed:false,total:q?.results?.length??0,rows:q?.results??[]});
+                }
+
+                if (url.pathname === "/research-dashboard") {
+                  if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+                  await ensurePaperTables(env);
+                  const a:any=await env.DB.prepare(`SELECT * FROM signal_60_64_crossings WHERE outcome_complete=1 ORDER BY crossing_ts DESC LIMIT 3000`).all();
+                  const b:any=await env.DB.prepare(`SELECT * FROM signal_65_crossings WHERE outcome_complete=1 ORDER BY crossing_ts DESC LIMIT 3000`).all();
+                  const d:any=await env.DB.prepare(`SELECT * FROM crossing_diagnostics ORDER BY crossing_ts DESC LIMIT 3000`).all();
+                  const l:any=await env.DB.prepare(`SELECT l.*,c.crossing_score score FROM hyperliquid_execution_ledger l LEFT JOIN signal_65_crossings c ON CAST(c.id AS TEXT)=CAST(l.crossing_id AS TEXT) WHERE l.entry_fill_price IS NOT NULL AND l.entry_fill_price>0 ORDER BY l.id DESC LIMIT 3000`).all();
+                  const r60:any[]=a?.results??[],r65:any[]=b?.results??[],diag:any[]=d?.results??[],real:any[]=l?.results??[];
+                  const avg=(rows:any[],k:string)=>rows.length?rows.reduce((s:number,x:any)=>s+Number(x[k]??0),0)/rows.length:0;
+                  const card=(title:string,rows:any[],cls:string)=>`<section class="card ${cls}"><h2>${title}</h2><div class="grid"><div><small>Completed</small><b>${rows.length}</b></div><div><small>Avg 30m</small><b>${avg(rows,"return_30m_pct").toFixed(3)}%</b></div><div><small>Avg MFE</small><b>${avg(rows,"mfe_pct").toFixed(3)}%</b></div><div><small>Avg MAE</small><b>${avg(rows,"mae_pct").toFixed(3)}%</b></div></div></section>`;
+                  const terminal=(x:any)=>!["CLAIMED","ENTRY_FILLED","PROTECTED","TPSL_FAILED_AFTER_RETRIES","MAX_HOLD_CLOSING"].includes(String(x.status??""));
+                  const closed=real.filter(terminal), realNet=closed.reduce((s:number,x:any)=>s+Number(x.realized_pnl??0),0);
+                  const diagStats=(cohort:string)=>{const z=diag.filter(x=>x.cohort===cohort);return {n:z.length,a15:z.filter(x=>x.htf_15m_alignment==="ALIGNED").length,o15:z.filter(x=>x.htf_15m_alignment==="OPPOSED").length,a1h:z.filter(x=>x.htf_1h_alignment==="ALIGNED").length,o1h:z.filter(x=>x.htf_1h_alignment==="OPPOSED").length,spread:avg(z,"spread_pct"),vol:avg(z,"normal_range_1m_pct")}};
+                  const x60=diagStats("60_64"),x65=diagStats("65_PLUS");
+                  const diagRow=(name:string,x:any)=>`<tr><td>${name}</td><td>${x.n}</td><td>${x.a15}/${x.o15}</td><td>${x.a1h}/${x.o1h}</td><td>${x.spread.toFixed(4)}%</td><td>${x.vol.toFixed(4)}%</td></tr>`;
+                  const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>CryptoBot Research</title><style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui}.wrap{max-width:1000px;margin:auto;padding:16px}h1{margin-bottom:4px}.sub,small{color:#8292aa}.cards{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}.card{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.c60{border-top:3px solid #ffcc66}.c65{border-top:3px solid #62dc9d}.grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.grid div{background:#0a1323;padding:9px;border-radius:9px}.grid small{display:block}.real{margin-top:12px}.tbl{overflow:auto;background:#111a2d;border:1px solid #26334d;border-radius:15px;margin-top:12px}table{width:100%;border-collapse:collapse;min-width:620px}th,td{padding:10px;border-bottom:1px solid #243149;text-align:left;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:700px){.cards{grid-template-columns:1fr}}</style></head><body><main class="wrap"><h1>🧪 60–64 CONTROL vs ≥65</h1><div class="sub">Research only · LIVE entry logic is unchanged · refresh 30s</div><div class="cards">${card("60–64 CONTROL",r60,"c60")}${card("≥65 CROSSINGS",r65,"c65")}</div><section class="card real"><h2>REAL Hyperliquid ≥65</h2><div class="grid"><div><small>Executed</small><b>${real.length}</b></div><div><small>Closed</small><b>${closed.length}</b></div><div><small>Actual realized P/L</small><b>$${realNet.toFixed(4)}</b></div><div><small>Open</small><b>${real.length-closed.length}</b></div></div></section><h3>Нови diagnostic snapshots</h3><div class="tbl"><table><thead><tr><th>Cohort</th><th>Snapshots</th><th>15m aligned/opposed</th><th>1h aligned/opposed</th><th>Avg spread</th><th>Avg 1m normal range</th></tr></thead><tbody>${diagRow("60–64",x60)}${diagRow("≥65",x65)}</tbody></table></div><div class="foot">V1.9.29 · 60–64 и ≥65 forward статистиката е от D1 crossing cohorts. REAL P/L е директно от hyperliquid_execution_ledger.realized_pnl. HTF/volatility/spread са observation-only и не филтрират LIVE сделки.</div></main></body></html>`;
+                  return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
+                }
+
                 if (url.pathname === "/forward-dashboard") {
                   // V1.9.28 — dashboard is now sourced from the REAL Hyperliquid
                   // execution ledger. Shadow forward tables are intentionally not
@@ -5891,7 +6033,7 @@
                   const dayBlocks=days.map((d:string,di:number)=>{const rows=groups[d],ds=stats(rows);const cards=rows.map((x:any)=>{const n=netPct(x);return`<div class="trade"><div class="top"><div><b>${x.coin}</b> ${sideBadge(x)}</div>${badge(x)}</div><div class="meta">${dt(rowTs(x))} · Score ${Number.isFinite(Number(x.score))?Number(x.score).toFixed(2):"—"} · Crossing #${x.crossing_id??"—"}</div><div class="prices"><div><small>ENTRY FILL</small><b>${fmt(x.entry_fill_price)}</b></div><div><small>EXIT</small><b>${fmt(x.exit_price)}</b></div><div><small>ACTIVE / FINAL SL</small><b>${fmt(activeStop(x))}</b></div><div><small>STAGE</small><b>${Number(x.progressive_stage??0)}/${maxStage(x)}</b></div><div><small>NET*</small><b class="${Number(n??0)>=0?"pos":"neg"}">${n==null?"—":pct(n)}</b></div></div></div>`;}).join("");const pretty=d==="unknown"?"Unknown":d.split("-").reverse().join(".");return`<details class="day" ${di===0?"open":""}><summary><div><b>📅 ${pretty}</b><span>${rows.length} real · ${ds.tp} TP · ${ds.psl} Prog SL · ${ds.isl} Initial SL · ${ds.time} TIME</span></div><strong class="${ds.net>=0?"pos":"neg"}">${pct(ds.net)}</strong></summary><div class="daybody">${cards}</div></details>`;}).join("");
                   const history=Object.keys(all.reduce((g:any,x:any)=>{const k=dayKey(rowTs(x));(g[k]??=[]).push(x);return g;},{})).sort().reverse().slice(0,14).map((d:string)=>{const rows=all.filter((x:any)=>dayKey(rowTs(x))===d),l=stats(rows,"LONG"),sh=stats(rows,"SHORT"),a=stats(rows);return`<tr><td>${d.split("-").reverse().join(".")}</td><td>${rows.length}</td><td class="${l.net>=0?"pos":"neg"}">${pct(l.net)}</td><td class="${sh.net>=0?"pos":"neg"}">${pct(sh.net)}</td><td class="${a.net>=0?"pos":"neg"}"><b>${pct(a.net)}</b></td></tr>`;}).join("");
                   const tab=(key:string,label:string)=>`<a class="${period===key?"active":""}" href="/forward-dashboard?period=${key}">${label}</a>`;
-                  const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15"><title>CryptoBot Real Progressive</title><style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1100px;margin:auto;padding:16px}h1{margin:0;font-size:24px}.sub,.meta,small{color:#8292aa}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.live{color:#64dda0;font-size:12px}.tabs{display:flex;gap:7px;overflow:auto;margin:17px 0}.tabs a{white-space:nowrap;text-decoration:none;color:#a8b5ca;background:#121b2e;border:1px solid #27344e;padding:9px 13px;border-radius:999px;font-size:13px}.tabs a.active{background:#263d69;color:white;border-color:#5578ba}.compare{display:grid;grid-template-columns:1fr 1fr;gap:11px}.panel{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.lp{border-top:3px solid #62dc9d}.sp{border-top:3px solid #ff8490}.ph{display:flex;justify-content:space-between}.ph h2{margin:0;font-size:18px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px}.metrics div,.prices div{background:#0a1323;border-radius:9px;padding:8px}.metrics small,.prices small{display:block;font-size:9px}.metrics b{font-size:14px}.stages{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.stages span{background:#17243b;color:#a9b8cf;border-radius:999px;padding:5px 8px;font-size:10px}.pos{color:#62dc9d}.neg{color:#ff7f8d}.sectiontitle{margin:21px 0 9px}.day{background:#10192b;border:1px solid #25324b;border-radius:14px;margin-bottom:9px;overflow:hidden}.day summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:13px;list-style:none}.day summary span{display:block;color:#7f90aa;font-size:11px;margin-top:3px}.daybody{padding:0 10px 10px}.trade{background:#0b1425;border-radius:11px;padding:11px;margin-top:7px}.top{display:flex;justify-content:space-between}.side,.badge{font-size:9px;font-weight:800;border-radius:999px;padding:4px 6px}.long,.win{background:#14382b;color:#6ce2a3}.short,.loss{background:#40202a;color:#ff8c98}.prog{background:#173849;color:#76d7ff}.open{background:#413716;color:#ffdb72}.time{background:#25314a;color:#b7c5dc}.prices{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:9px}.prices b{font-size:11px}.history{overflow:auto;background:#10192b;border:1px solid #25324b;border-radius:14px}table{width:100%;border-collapse:collapse;min-width:520px}th,td{padding:10px;text-align:left;border-bottom:1px solid #202c43;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:720px){.wrap{padding:11px}.head{display:block}.live{margin-top:4px}.compare{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.prices{grid-template-columns:repeat(2,1fr)}}</style></head><body><main class="wrap"><div class="head"><div><h1>📊 REAL Progressive LONG vs SHORT</h1><div class="sub">Real Hyperliquid ledger · ≥65 · Sofia time</div></div><div class="live">● LIVE DATA · refresh 15s</div></div><nav class="tabs">${tab("today","Днес")}${tab("yesterday","Вчера")}${tab("7d","7 дни")}${tab("all","Всички")}</nav><div class="compare">${panel("↑ LONG",LS,"lp","TP +0.50% · Initial SL −0.15% · Progressive A")}${panel("↓ SHORT",SS,"sp","TP +0.50% · Initial SL −0.15% · Progressive C")}</div><h3 class="sectiontitle">Реални сделки по дни</h3>${dayBlocks||'<div class="day"><summary>Няма реални сделки за периода.</summary></div>'}<h3 class="sectiontitle">Последни 14 дни</h3><div class="history"><table><thead><tr><th>Дата</th><th>Real trades</th><th>LONG net*</th><th>SHORT net*</th><th>Общо net*</th></tr></thead><tbody>${history||'<tr><td colspan="5">Няма данни</td></tr>'}</tbody></table></div><div class="foot">V1.9.28 · Данните са от hyperliquid_execution_ledger. *NET% е изчислен от реалните entry/exit цени минус 0.07% round-trip fee; Telegram realized P/L остава източникът за точния $ P/L. Progressive stage/stop са реално записаните D1 стойности.</div></main></body></html>`;
+                  const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15"><title>CryptoBot Real Progressive</title><style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1100px;margin:auto;padding:16px}h1{margin:0;font-size:24px}.sub,.meta,small{color:#8292aa}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.live{color:#64dda0;font-size:12px}.tabs{display:flex;gap:7px;overflow:auto;margin:17px 0}.tabs a{white-space:nowrap;text-decoration:none;color:#a8b5ca;background:#121b2e;border:1px solid #27344e;padding:9px 13px;border-radius:999px;font-size:13px}.tabs a.active{background:#263d69;color:white;border-color:#5578ba}.compare{display:grid;grid-template-columns:1fr 1fr;gap:11px}.panel{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.lp{border-top:3px solid #62dc9d}.sp{border-top:3px solid #ff8490}.ph{display:flex;justify-content:space-between}.ph h2{margin:0;font-size:18px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px}.metrics div,.prices div{background:#0a1323;border-radius:9px;padding:8px}.metrics small,.prices small{display:block;font-size:9px}.metrics b{font-size:14px}.stages{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.stages span{background:#17243b;color:#a9b8cf;border-radius:999px;padding:5px 8px;font-size:10px}.pos{color:#62dc9d}.neg{color:#ff7f8d}.sectiontitle{margin:21px 0 9px}.day{background:#10192b;border:1px solid #25324b;border-radius:14px;margin-bottom:9px;overflow:hidden}.day summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:13px;list-style:none}.day summary span{display:block;color:#7f90aa;font-size:11px;margin-top:3px}.daybody{padding:0 10px 10px}.trade{background:#0b1425;border-radius:11px;padding:11px;margin-top:7px}.top{display:flex;justify-content:space-between}.side,.badge{font-size:9px;font-weight:800;border-radius:999px;padding:4px 6px}.long,.win{background:#14382b;color:#6ce2a3}.short,.loss{background:#40202a;color:#ff8c98}.prog{background:#173849;color:#76d7ff}.open{background:#413716;color:#ffdb72}.time{background:#25314a;color:#b7c5dc}.prices{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:9px}.prices b{font-size:11px}.history{overflow:auto;background:#10192b;border:1px solid #25324b;border-radius:14px}table{width:100%;border-collapse:collapse;min-width:520px}th,td{padding:10px;text-align:left;border-bottom:1px solid #202c43;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:720px){.wrap{padding:11px}.head{display:block}.live{margin-top:4px}.compare{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.prices{grid-template-columns:repeat(2,1fr)}}</style></head><body><main class="wrap"><div class="head"><div><h1>📊 REAL Progressive LONG vs SHORT</h1><div class="sub">Real Hyperliquid ledger · ≥65 · Sofia time</div></div><div class="live">● LIVE DATA · refresh 15s</div></div><nav class="tabs">${tab("today","Днес")}${tab("yesterday","Вчера")}${tab("7d","7 дни")}${tab("all","Всички")}</nav><div class="compare">${panel("↑ LONG",LS,"lp","TP +0.50% · Initial SL −0.15% · Progressive A")}${panel("↓ SHORT",SS,"sp","TP +0.50% · Initial SL −0.15% · Progressive C")}</div><h3 class="sectiontitle">Реални сделки по дни</h3>${dayBlocks||'<div class="day"><summary>Няма реални сделки за периода.</summary></div>'}<h3 class="sectiontitle">Последни 14 дни</h3><div class="history"><table><thead><tr><th>Дата</th><th>Real trades</th><th>LONG net*</th><th>SHORT net*</th><th>Общо net*</th></tr></thead><tbody>${history||'<tr><td colspan="5">Няма данни</td></tr>'}</tbody></table></div><div class="foot">V1.9.29 · Данните са от hyperliquid_execution_ledger. *NET% е изчислен от реалните entry/exit цени минус 0.07% round-trip fee; Telegram realized P/L остава източникът за точния $ P/L. Progressive stage/stop са реално записаните D1 стойности.</div></main></body></html>`;
                   return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
                 }
 
