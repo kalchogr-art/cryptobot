@@ -2,7 +2,7 @@
             import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
             import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
             import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
-            import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle } from "./hyperliquid/execution";
+            import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle, executeProgressiveWsTrigger } from "./hyperliquid/execution";
             export { ProgressiveMonitor } from "./hyperliquid/progressive-monitor";
 
             // ============================================================
@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.24 AUTO DRY-RUN CROSSING WS";
+            const VERSION = "V1.9.25 WS LIVE PROGRESSIVE BRIDGE";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4277,6 +4277,20 @@
                       "access-control-allow-headers": "content-type",
                     },
                   });
+                }
+
+                if (request.method === "POST" && url.pathname === "/internal/progressive-execute") {
+                  try {
+                    const body:any=await request.json().catch(()=>({}));
+                    const ledgerId=Number(body?.ledgerId??body?.ledger_id);
+                    const targetStage=Number(body?.targetStage??body?.target_stage);
+                    if(!Number.isInteger(ledgerId)||ledgerId<=0||!Number.isInteger(targetStage)||targetStage<=0)
+                      return json({success:false,error:"INVALID_LEDGER_OR_STAGE"},400);
+                    const result=await executeProgressiveWsTrigger(env as any,ledgerId,targetStage);
+                    return json({success:result?.success===true,worker:"cryptobot",version:VERSION,module:"WS_LIVE_PROGRESSIVE_BRIDGE",...result},result?.success===true?200:409);
+                  } catch(error:any) {
+                    return json({success:false,worker:"cryptobot",version:VERSION,error:"PROGRESSIVE_EXECUTION_BRIDGE_FAILED",message:error?.message??String(error)},500);
+                  }
                 }
 
                 if (request.method !== "GET") {
