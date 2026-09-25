@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.25 WS LIVE PROGRESSIVE BRIDGE";
+            const VERSION = "V1.9.26 PROGRESSIVE BRIDGE DIAGNOSTIC";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4276,6 +4276,100 @@
                       "access-control-allow-methods": "GET, OPTIONS",
                       "access-control-allow-headers": "content-type",
                     },
+                  });
+                }
+
+                // V1.9.26 SAFE BRIDGE DIAGNOSTIC
+                // Tests Worker -> SELF -> Worker routing only.
+                // It NEVER calls executeProgressiveWsTrigger, never reads the private key,
+                // never signs, and never calls Hyperliquid /exchange.
+                if (request.method === "GET" && url.pathname === "/progressive-bridge-diagnostic") {
+                  if (!env.SELF) {
+                    return json({
+                      success:false,
+                      worker:"cryptobot",
+                      version:VERSION,
+                      diagnostic:"PROGRESSIVE_BRIDGE_DIAGNOSTIC",
+                      error:"SELF_BINDING_MISSING",
+                      safety:{
+                        execution_function_called:false,
+                        private_key_read:false,
+                        signing_performed:false,
+                        exchange_endpoint_called:false,
+                        order_sent:false,
+                        order_modified:false,
+                        order_cancelled:false
+                      }
+                    },503);
+                  }
+
+                  try {
+                    const probe=await env.SELF.fetch("https://cryptobot.internal/internal/progressive-bridge-probe",{
+                      method:"GET",
+                      headers:{"x-cryptobot-internal-probe":"v1.9.26"}
+                    });
+                    const probeJson:any=await probe.json().catch(()=>null);
+                    const ok=probe.ok && probeJson?.probe==="SELF_ROUTE_OK";
+                    return json({
+                      success:ok,
+                      worker:"cryptobot",
+                      version:VERSION,
+                      diagnostic:"PROGRESSIVE_BRIDGE_DIAGNOSTIC",
+                      self_binding:true,
+                      self_route:{
+                        http_status:probe.status,
+                        ok,
+                        response:probeJson
+                      },
+                      execution_module:{
+                        wired:true,
+                        live_execution_invoked:false,
+                        expected_live_gate:"LIVE_TRADING_DISABLED"
+                      },
+                      safety:{
+                        execution_function_called:false,
+                        private_key_read:false,
+                        signing_performed:false,
+                        exchange_endpoint_called:false,
+                        order_sent:false,
+                        order_modified:false,
+                        order_cancelled:false
+                      }
+                    },ok?200:502);
+                  } catch(error:any) {
+                    return json({
+                      success:false,
+                      worker:"cryptobot",
+                      version:VERSION,
+                      diagnostic:"PROGRESSIVE_BRIDGE_DIAGNOSTIC",
+                      error:"SELF_ROUTE_FAILED",
+                      message:error?.message??String(error),
+                      safety:{
+                        execution_function_called:false,
+                        private_key_read:false,
+                        signing_performed:false,
+                        exchange_endpoint_called:false,
+                        order_sent:false,
+                        order_modified:false,
+                        order_cancelled:false
+                      }
+                    },502);
+                  }
+                }
+
+                // Internal probe target. Harmless routing acknowledgement only.
+                if (
+                  request.method === "GET" &&
+                  url.pathname === "/internal/progressive-bridge-probe" &&
+                  request.headers.get("x-cryptobot-internal-probe") === "v1.9.26"
+                ) {
+                  return json({
+                    success:true,
+                    probe:"SELF_ROUTE_OK",
+                    worker:"cryptobot",
+                    version:VERSION,
+                    execution_function_called:false,
+                    exchange_request_sent:false
                   });
                 }
 
