@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.4 LIVE EXECUTION BRIDGE";
+    const MODULE_VERSION = "V2.9.5 SERIALIZED LIVE EXECUTION BRIDGE";
 
     type Side = "LONG" | "SHORT";
 
@@ -104,6 +104,11 @@
       private ws: WebSocket | null = null;
       private config: MonitorConfig | null = null;
       private events: TriggerEvent[] = [];
+
+      // V2.9.5: serialize all WS price messages inside this Durable Object.
+      // Previously multiple async message handlers could overlap before D1
+      // persisted progressive_stage, creating duplicate live SL orders.
+      private messageQueue: Promise<void> = Promise.resolve();
 
       constructor(ctx: any, env: any) {
         this.ctx = ctx;
@@ -397,7 +402,12 @@
         });
 
         ws.addEventListener("message", (event: MessageEvent) => {
-          this.onMessage(event.data).catch(() => {});
+          const raw = event.data;
+          this.messageQueue = this.messageQueue
+            .then(() => this.onMessage(raw))
+            .catch((error: any) => {
+              console.log("progressive WS message failed:", error?.message ?? String(error));
+            });
         });
 
         ws.addEventListener("close", () => {
@@ -446,6 +456,29 @@
         this.config.lastMessageAt = now;
         this.config.messageCount += 1;
         this.config.connectionState = "OPEN";
+
+        // V2.9.5: a ledger-backed monitor must stop after the real position
+        // lifecycle closes its ledger row. This prevents stale post-close
+        // stages/events from being recorded.
+        if (this.config.ledgerId != null) {
+          const liveLedger = await this.ledgerRowById(this.config.ledgerId);
+          const openStatuses = new Set([
+            "ENTRY_FILLED",
+            "PROTECTED",
+            "TPSL_FAILED_AFTER_RETRIES",
+            "MAX_HOLD_CLOSING",
+          ]);
+          if (!liveLedger || !openStatuses.has(String(liveLedger.status ?? ""))) {
+            this.config.active = false;
+            this.config.connectionState = liveLedger
+              ? `STOPPED_LEDGER_${String(liveLedger.status ?? "CLOSED")}`
+              : "STOPPED_LEDGER_ROW_MISSING";
+            await this.persist();
+            try { this.ws?.close(1000, "ledger closed"); } catch {}
+            this.ws = null;
+            return;
+          }
+        }
 
         if (!this.config.entryPrice) {
           this.config.entryPrice = price;
@@ -541,6 +574,20 @@
           if (this.events.length > 100) this.events = this.events.slice(-100);
           try { await this.persistTriggerEvent(event); }
           catch (e:any) { console.log("progressive_ws_events persist failed:", e?.message ?? String(e)); }
+
+          // V2.9.5:
+          // - DRY-RUN/manual crossings keep the old simulation behavior.
+          // - Ledger-backed LIVE mode advances the local stage only after the
+          //   execution bridge confirms success (including idempotent
+          //   ALREADY_AT_OR_ABOVE_TARGET_STAGE).
+          // - On an execution failure, stop this loop and retry on a later WS
+          //   message instead of falsely marking the stage as protected.
+          if (event.bridge.ledgerId != null) {
+            const ex: any = (event as any).execution;
+            const bridgeSuccess = ex?.success === true;
+            if (!bridgeSuccess) break;
+          }
+
           this.config.stage += 1;
         }
 
