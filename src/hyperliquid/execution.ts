@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.8.1.те
+// HYPERLIQUID SIGNAL EXECUTION V2.8.1
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
@@ -1015,6 +1015,34 @@ async function sendLifecycleSignedAction(action: Record<string, any>, secret: `0
   const text = await res.text();
   let json: any = null; try { json = text ? JSON.parse(text) : null; } catch {}
   return { httpStatus: res.status, json, text };
+}
+
+export async function executeProgressiveWsTrigger(
+  env: HyperliquidExecutionEnv | undefined,
+  ledgerId: number,
+  targetStage: number
+): Promise<any> {
+  if (!env?.DB) return { success:false, executed:false, reason:"D1_NOT_BOUND" };
+  await ensureExecutionLedger(env.DB);
+  if (!CONFIG.LIVE_TRADING) return { success:true, executed:false, reason:"LIVE_TRADING_DISABLED", ledger_id:ledgerId, target_stage:targetStage };
+  const secretRaw=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  if (!privateKeyFormatOk(secretRaw)) return { success:false, executed:false, reason:"PRIVATE_KEY_INVALID" };
+  const row:any=await env.DB.prepare(`
+    SELECT * FROM hyperliquid_execution_ledger
+    WHERE id=? AND status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
+      AND entry_fill_price IS NOT NULL AND entry_fill_price > 0 LIMIT 1
+  `).bind(ledgerId).first();
+  if (!row) return { success:false, executed:false, reason:"OPEN_LEDGER_ROW_NOT_FOUND", ledger_id:ledgerId };
+  const currentStage=Math.max(0,Number(row.progressive_stage??0)||0);
+  if (!Number.isInteger(targetStage)||targetStage<=currentStage)
+    return {success:true,executed:false,reason:"ALREADY_AT_OR_ABOVE_TARGET_STAGE",ledger_id:ledgerId,current_stage:currentStage,target_stage:targetStage};
+  let position:any=null;
+  try { position=await getOpenPositionForCoin(String(row.coin??"").toUpperCase()); }
+  catch(err:any){ return {success:false,executed:false,reason:"POSITION_LOOKUP_FAILED",error:err?.message??String(err)}; }
+  if(!position) return {success:false,executed:false,reason:"POSITION_NOT_OPEN",ledger_id:ledgerId};
+  const result=await advanceProgressiveProtection(env,row,position,secretRaw as `0x${string}`);
+  const reachedStage=Number(result?.stage??currentStage);
+  return {success:result?.advanced===true||reachedStage>=targetStage,executed:result?.advanced===true,ledger_id:ledgerId,requested_target_stage:targetStage,result};
 }
 
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
