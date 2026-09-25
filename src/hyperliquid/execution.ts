@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.8.1
+// HYPERLIQUID SIGNAL EXECUTION V2.10.0 — LIVE 50/50 RUNNER
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
@@ -53,6 +53,7 @@ const CONFIG = {
   IS_CROSS: true,
 
   LONG_TAKE_PROFIT_PCT: 0.50,
+  PARTIAL_TP_FRACTION: 0.50,
   LONG_STOP_LOSS_PCT: 0.15,
   SHORT_TAKE_PROFIT_PCT: 0.50,
   SHORT_STOP_LOSS_PCT: 0.15,
@@ -64,11 +65,21 @@ const CONFIG = {
     { trigger: 0.25, stop: 0.10 },
     { trigger: 0.35, stop: 0.20 },
     { trigger: 0.45, stop: 0.30 },
+    { trigger: 0.75, stop: 0.50 },
+    { trigger: 1.00, stop: 0.75 },
+    { trigger: 1.50, stop: 1.00 },
+    { trigger: 2.00, stop: 1.50 },
+    { trigger: 3.00, stop: 2.00 },
   ],
   SHORT_PROGRESSIVE_STEPS: [
     { trigger: 0.25, stop: 0.07 },
     { trigger: 0.35, stop: 0.15 },
     { trigger: 0.45, stop: 0.25 },
+    { trigger: 0.75, stop: 0.50 },
+    { trigger: 1.00, stop: 0.75 },
+    { trigger: 1.50, stop: 1.00 },
+    { trigger: 2.00, stop: 1.50 },
+    { trigger: 3.00, stop: 2.00 },
   ],
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
@@ -477,7 +488,7 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 TP: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🟢 PARTIAL TP 50%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
     `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🛡 TP/SL: ${protection}`,
     ``,
@@ -555,6 +566,13 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       progressive_stop_price REAL,
       progressive_stop_oid INTEGER,
       progressive_updated_at INTEGER,
+      partial_tp_filled_at INTEGER,
+      partial_tp_price REAL,
+      partial_tp_size REAL,
+      partial_tp_realized_pnl REAL,
+      runner_active INTEGER DEFAULT 0,
+      runner_size REAL,
+      runner_max_return_pct REAL,
       last_error TEXT
     )
   `).run();
@@ -575,7 +593,14 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_pct REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_price REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_oid INTEGER",
-    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_updated_at INTEGER"
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_updated_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN partial_tp_filled_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN partial_tp_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN partial_tp_size REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN partial_tp_realized_pnl REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_active INTEGER DEFAULT 0",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_size REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_max_return_pct REAL"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
   }
@@ -738,7 +763,8 @@ function lifecyclePnlFromFills(
     return sum + (Number.isFinite(fee) ? Math.abs(fee) : 0);
   }, 0);
 
-  let grossPnl = Number(exchangeClosedPnl);
+  const closedPnlValues = relevant.map((f:any) => Number(f?.closedPnl)).filter((v:number) => Number.isFinite(v) && Math.abs(v) > 1e-15);
+  let grossPnl = closedPnlValues.length ? closedPnlValues.reduce((s:number,v:number)=>s+v,0) : Number(exchangeClosedPnl);
   if (!Number.isFinite(grossPnl) && Number.isFinite(entryPrice) && Number.isFinite(exitPrice) && Number.isFinite(size)) {
     grossPnl =
       side === "SHORT"
@@ -1091,11 +1117,12 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
           progressiveStage > 0 && Number.isFinite(progressiveStop) &&
           (side === "LONG" ? exitPrice <= progressiveStop*1.0005 : exitPrice >= progressiveStop*0.9995);
         const slHit = side === "LONG" ? exitPrice <= sl*1.0001 : exitPrice >= sl*0.9999;
-        if (tpHit) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
+        if (Number(row.partial_tp_filled_at) && progressiveHit) { reason="RUNNER_PROGRESSIVE_SL_HIT"; title="RUNNER PROGRESSIVE SL HIT"; emoji="🟡"; }
+        else if (tpHit && !Number(row.partial_tp_filled_at)) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
         else if (progressiveHit) { reason="PROGRESSIVE_SL_HIT"; title="PROGRESSIVE SL HIT"; emoji="🟡"; }
         else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
       }
-      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=? WHERE id=?`)
+      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
         .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
       await sendTelegram(env,lifecycleTelegram({
         emoji,title,coin,side,entryPrice,
@@ -1110,8 +1137,27 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       continue;
     }
 
-    // V2.8: while the position is open, advance the live progressive SL.
-    // LONG uses Progressive A; SHORT uses Progressive C. Initial SL is 0.15% for both.
+    // V2.10 — confirm 50% partial TP from the actual remaining position and fills.
+    const liveSzi = Math.abs(Number(position?.szi));
+    const expectedRunnerSize = entrySize * (1 - CONFIG.PARTIAL_TP_FRACTION);
+    if (!Number(row.partial_tp_filled_at) && Number.isFinite(liveSzi) && liveSzi > 0 && liveSzi <= expectedRunnerSize * 1.08 && liveSzi < entrySize * 0.80) {
+      const fills = await getRecentFillsForCoin(coin);
+      const closes = fills.filter((f:any)=>Number(f?.time??0)>=filledAt && Number.isFinite(Number(f?.closedPnl)) && Math.abs(Number(f?.closedPnl))>1e-15).sort((a:any,b:any)=>Number(a?.time??0)-Number(b?.time??0));
+      const partial = closes[0] ?? null;
+      const partialPx=Number(partial?.px), partialSz=Number(partial?.sz), partialPnl=Number(partial?.closedPnl), partialAt=Number(partial?.time??Date.now());
+      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,runner_active=1,runner_size=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
+        .bind(partialAt,Number.isFinite(partialPx)?partialPx:null,Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi),Number.isFinite(partialPnl)?partialPnl:null,liveSzi,Date.now(),row.id).run();
+      row.partial_tp_filled_at=partialAt; row.partial_tp_price=Number.isFinite(partialPx)?partialPx:null; row.partial_tp_size=Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi); row.partial_tp_realized_pnl=Number.isFinite(partialPnl)?partialPnl:null; row.runner_active=1; row.runner_size=liveSzi;
+      await sendTelegram(env,[`🟢 <b>PARTIAL TP 50%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Partial TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Runner remaining: ${liveSzi}`,`🛡 Progressive runner active`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
+    }
+    if (Number(row.partial_tp_filled_at)) {
+      try {
+        const rawCtx=await postInfo({type:"metaAndAssetCtxs"}); const uni=Array.isArray(rawCtx?.[0]?.universe)?rawCtx[0].universe:[]; const ctxs=Array.isArray(rawCtx?.[1])?rawCtx[1]:[]; const ai=uni.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin); const mp=Number(ctxs?.[ai]?.midPx??ctxs?.[ai]?.markPx); const rr=directionalReturnPct(side,entryPrice,mp);
+        if(Number.isFinite(rr)) await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET runner_max_return_pct=MAX(COALESCE(runner_max_return_pct,0),?),runner_size=?,runner_active=1 WHERE id=?`).bind(rr,liveSzi,row.id).run();
+      } catch {}
+    }
+
+    // V2.10: progressive engine continues beyond partial TP through runner stages.
     let progressive: any = null;
     if (secretOk && String(row.status) === "PROTECTED") {
       try {
@@ -1173,7 +1219,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       Number.isFinite(exchangeClosedPnl) ? exchangeClosedPnl : null
     );
 
-    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=?,realized_pnl=? WHERE id=?`)
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
       .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
 
     await sendTelegram(env,lifecycleTelegram({
@@ -1846,6 +1892,9 @@ export async function buildHyperliquidExecutionCandidate(
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
+  const partialTpSizeRaw = Math.floor((fillSize * CONFIG.PARTIAL_TP_FRACTION) * (10 ** szDecimals) + 1e-12) / (10 ** szDecimals);
+  const partialTpSize = partialTpSizeRaw > 0 ? partialTpSizeRaw : fillSize;
+  const partialTpSizeWire = toWire(partialTpSize, szDecimals);
   const tpRaw = isLong
     ? fillPrice * (1 + takeProfitPct / 100)
     : fillPrice * (1 - takeProfitPct / 100);
@@ -1859,7 +1908,7 @@ export async function buildHyperliquidExecutionCandidate(
     a: asset,
     b: closeIsBuy,
     p: tpWire,
-    s: actualSizeWire,
+    s: partialTpSizeWire,
     r: true,
     t: { trigger: { isMarket: true, triggerPx: tpWire, tpsl: "tp" } },
   };
@@ -1874,7 +1923,7 @@ export async function buildHyperliquidExecutionCandidate(
   const protectionAction = {
     type: "order",
     orders: [tpOrder, slOrder],
-    grouping: "positionTpsl",
+    grouping: "na",
   };
 
   let protectionResponse: any = null;
@@ -1993,7 +2042,11 @@ export async function buildHyperliquidExecutionCandidate(
       stop_loss_trigger: slWire,
       progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
       progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
-      grouping: "positionTpsl",
+      partial_tp_fraction: CONFIG.PARTIAL_TP_FRACTION,
+      partial_tp_size: partialTpSizeWire,
+      runner_fraction: 1 - CONFIG.PARTIAL_TP_FRACTION,
+      runner_mode: "PROGRESSIVE_RUNNER_TO_STOP_OR_30M",
+      grouping: "na",
       http_status: protectionResponse?.httpStatus ?? null,
       returned_statuses: protectionStatuses,
       errors: protectionErrors,
