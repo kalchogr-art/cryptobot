@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.29 CROSSING RESEARCH DIAGNOSTICS";
+            const VERSION = "V1.9.30 RUNNER POTENTIAL ANALYTICS";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -5920,6 +5920,46 @@
                 }
 
 
+
+                // V1.9.30 — READ-ONLY runner potential from completed >=65 crossings.
+                // Uses already stored 30m MFE. It does NOT change live TP/SL or execution.
+                if (url.pathname === "/runner-potential") {
+                  if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
+                  await ensurePaperTables(env);
+                  const q:any=await env.DB.prepare(`
+                    SELECT id,coin,side,crossing_ts,crossing_datetime,crossing_score,
+                           return_30m_pct,mfe_pct,mae_pct,first_barrier
+                    FROM signal_65_crossings
+                    WHERE outcome_complete=1 AND mfe_pct IS NOT NULL
+                    ORDER BY crossing_ts ASC
+                  `).all();
+                  const rows:any[]=q?.results??[];
+                  const levels=[0.50,0.75,1.00,1.50,2.00,3.00];
+                  const reached=(r:any,l:number)=>Number(r.mfe_pct)>=l;
+                  const pct=(n:number,d:number)=>d?round(n*100/d,2):null;
+                  const summarize=(set:any[])=>{
+                    const base=set.length;
+                    const counts=levels.map(level=>({level_pct:level,count:set.filter(r=>reached(r,level)).length,of_all_pct:pct(set.filter(r=>reached(r,level)).length,base)}));
+                    const from05=set.filter(r=>reached(r,0.50));
+                    const continuation=levels.filter(x=>x>0.50).map(level=>{
+                      const n=from05.filter(r=>reached(r,level)).length;
+                      return {from_0_50_to_pct:level,count:n,of_0_50_reachers_pct:pct(n,from05.length)};
+                    });
+                    return {completed:base,reached_0_50:from05.length,reached_0_50_pct:pct(from05.length,base),levels:counts,continuation_after_0_50:continuation};
+                  };
+                  const buckets=[
+                    {name:"65-69",min:65,max:70},{name:"70-74",min:70,max:75},
+                    {name:"75-79",min:75,max:80},{name:"80+",min:80,max:Infinity}
+                  ].map(b=>({bucket:b.name,...summarize(rows.filter(r=>Number(r.crossing_score)>=b.min&&Number(r.crossing_score)<b.max))}));
+                  return json({
+                    success:true,worker:"cryptobot",version:VERSION,
+                    mode:"RUNNER_POTENTIAL_READ_ONLY",live_strategy_changed:false,
+                    methodology:{source:"signal_65_crossings.mfe_pct",window_minutes:30,levels_pct:levels,meaning:"maximum favorable excursion after >=65 crossing; shows how far signals travelled, not guaranteed executable runner P/L",limitation:"stored market snapshots can miss intraminute extremes and MFE does not encode the path/order of adverse moves"},
+                    all:summarize(rows),
+                    by_side:["LONG","SHORT"].map(side=>({side,...summarize(rows.filter(r=>String(r.side)===side))})),
+                    by_score_bucket:buckets
+                  });
+                }
 
                 if (url.pathname === "/crossing-diagnostics") {
                   if(!env.DB)return json({success:false,error:"D1_NOT_BOUND"},503);
