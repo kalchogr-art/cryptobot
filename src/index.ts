@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.26 PROGRESSIVE BRIDGE DIAGNOSTIC";
+            const VERSION = "V1.9.28 REAL PROGRESSIVE DASHBOARD";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4228,6 +4228,35 @@
       const side=String(crossing.side??"").toUpperCase();
       const entry=Number(crossing.crossing_price);
 
+      // V1.9.27 — never start AUTO_DRY_RUN_CROSSING for a crossing that has
+      // already had a REAL execution-ledger row. This covers both an open
+      // trade and a trade that closed before the next monitor reconciliation.
+      // It prevents the exact Crossing #114 case: real SL closed, then the
+      // same crossing was incorrectly replayed as a dry-run monitor.
+      const priorRealLedger:any = Number.isInteger(crossingId) && crossingId > 0
+        ? await env.DB.prepare(`
+            SELECT id, status, crossing_id
+            FROM hyperliquid_execution_ledger
+            WHERE CAST(crossing_id AS TEXT) = ?
+            ORDER BY id DESC
+            LIMIT 1
+          `).bind(String(crossingId)).first()
+        : null;
+
+      if (priorRealLedger) {
+        if (active) {
+          await stub.fetch("https://progressive-monitor/stop",{method:"POST"});
+        }
+        return {
+          success:true,
+          action:"SKIP_DRY_RUN_CROSSING_ALREADY_REAL_EXECUTED",
+          crossing_id:crossingId,
+          execution_ledger_id:Number(priorRealLedger.id),
+          execution_ledger_status:String(priorRealLedger.status??"UNKNOWN"),
+          monitor_stopped:active
+        };
+      }
+
       if (
         !Number.isInteger(crossingId) ||
         !coin ||
@@ -5781,87 +5810,91 @@
 
 
                 if (url.pathname === "/forward-dashboard") {
-                  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS forward_short_shadow (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, crossing_id INTEGER UNIQUE, coin TEXT NOT NULL, side TEXT NOT NULL,
-                    crossing_ts INTEGER NOT NULL, crossing_datetime TEXT, entry_price REAL NOT NULL, score REAL,
-                    tp_pct REAL NOT NULL DEFAULT 0.50, sl_pct REAL NOT NULL DEFAULT 0.40, tp_price REAL, sl_price REAL,
-                    status TEXT NOT NULL DEFAULT 'OPEN', exit_type TEXT, exit_ts INTEGER, exit_datetime TEXT, exit_price REAL,
-                    gross_return_pct REAL, fee_pct REAL NOT NULL DEFAULT 0.07, net_return_pct REAL,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                  )`).run();
+                  // V1.9.28 — dashboard is now sourced from the REAL Hyperliquid
+                  // execution ledger. Shadow forward tables are intentionally not
+                  // used here, so LONG/SHORT statistics reflect actual lifecycle data.
+                  const q:any=await env.DB.prepare(`
+                    SELECT l.*,
+                           c.crossing_score AS score,
+                           c.crossing_datetime AS signal_datetime
+                    FROM hyperliquid_execution_ledger l
+                    LEFT JOIN signal_65_crossings c
+                      ON CAST(c.id AS TEXT)=CAST(l.crossing_id AS TEXT)
+                    WHERE l.entry_fill_price IS NOT NULL
+                      AND l.entry_fill_price > 0
+                    ORDER BY COALESCE(l.entry_filled_at,l.crossing_ts,l.claimed_at,l.id) DESC
+                    LIMIT 3000
+                  `).all();
+                  const all:any[]=q?.results??[];
 
-                  const lq:any=await env.DB.prepare(`SELECT * FROM forward_long_shadow ORDER BY crossing_ts DESC LIMIT 3000`).all();
-                  const sq:any=await env.DB.prepare(`SELECT * FROM forward_short_shadow ORDER BY crossing_ts DESC LIMIT 3000`).all();
-                  const all:any[]=[...(lq?.results??[]),...(sq?.results??[])].sort((a:any,b:any)=>Number(b.crossing_ts)-Number(a.crossing_ts));
-
+                  const OPEN_STATUSES=new Set(["CLAIMED","ENTRY_FILLED","PROTECTED","TPSL_FAILED_AFTER_RETRIES","MAX_HOLD_CLOSING"]);
                   const dayKey=(ts:any)=>{
-                    const d=new Date(Number(ts));
+                    const n=Number(ts); if(!Number.isFinite(n)||n<=0)return "unknown";
+                    const d=new Date(n);
                     const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Sofia",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(d);
-                    const o:any={}; for(const p of parts) o[p.type]=p.value;
+                    const o:any={}; for(const p of parts)o[p.type]=p.value;
                     return `${o.year}-${o.month}-${o.day}`;
                   };
-                  const now=Date.now(), today=dayKey(now), yesterday=dayKey(now-86400000);
+                  const now=Date.now(),today=dayKey(now),yesterday=dayKey(now-86400000);
                   const period=(url.searchParams.get("period")||"today").toLowerCase();
+                  const rowTs=(x:any)=>Number(x.entry_filled_at??x.crossing_ts??x.claimed_at??0);
                   const selected=all.filter((x:any)=>{
-                    const k=dayKey(x.crossing_ts);
-                    if(period==="all") return true;
-                    if(period==="7d") return Number(x.crossing_ts)>=now-7*86400000;
-                    if(period==="yesterday") return k===yesterday;
+                    const ts=rowTs(x),k=dayKey(ts);
+                    if(period==="all")return true;
+                    if(period==="7d")return ts>=now-7*86400000;
+                    if(period==="yesterday")return k===yesterday;
                     return k===today;
                   });
 
-                  const stats=(rows:any[],side?:string)=>{
-                    const r=side?rows.filter(x=>x.side===side):rows;
-                    const c=r.filter(x=>x.status==="CLOSED"),tp=c.filter(x=>x.exit_type==="TP").length,sl=c.filter(x=>x.exit_type==="SL").length;
-                    const net=c.reduce((s:number,x:any)=>s+Number(x.net_return_pct??0),0);
-                    return {total:r.length,open:r.filter(x=>x.status==="OPEN").length,closed:c.length,tp,sl,time:c.filter(x=>x.exit_type==="TIME_30M").length,
-                      wr:c.length?tp/c.length*100:0,net,avg:c.length?net/c.length:0};
+                  const closeKind=(x:any)=>{
+                    if(OPEN_STATUSES.has(String(x.status??"")))return "OPEN";
+                    const r=String(x.close_reason??x.status??"").toUpperCase();
+                    if(r.includes("PROGRESSIVE"))return "PROGRESSIVE_SL";
+                    if(r.includes("TP"))return "TP";
+                    if(r.includes("SL"))return "INITIAL_SL";
+                    if(r.includes("MAX_HOLD")||r.includes("TIME"))return "TIME";
+                    return "CLOSED";
                   };
-                  const LS=stats(selected,"LONG"), SS=stats(selected,"SHORT"), AS=stats(selected);
-
-                  const groups:any={};
-                  for(const x of selected){const k=dayKey(x.crossing_ts);(groups[k]??=[]).push(x);}
-                  const days=Object.keys(groups).sort().reverse();
-
-                  const fmt=(v:any)=>{const n=Number(v);if(!Number.isFinite(n))return"—";return (Math.abs(n)>=100?n.toFixed(2):Math.abs(n)>=1?n.toFixed(4):n.toFixed(6)).replace(/0+$/,"").replace(/\.$/,"")};
+                  const grossPct=(x:any)=>{
+                    const e=Number(x.entry_fill_price),z=Number(x.exit_price);
+                    if(!Number.isFinite(e)||e<=0||!Number.isFinite(z)||z<=0)return null;
+                    return String(x.side)==="SHORT"?((e-z)/e)*100:((z-e)/e)*100;
+                  };
+                  const netPct=(x:any)=>{const g=grossPct(x);return g==null?null:g-0.07;};
+                  const stats=(rows:any[],side?:string)=>{
+                    const r=side?rows.filter((x:any)=>x.side===side):rows;
+                    const closed=r.filter((x:any)=>closeKind(x)!=="OPEN");
+                    const resolved=closed.filter((x:any)=>netPct(x)!=null);
+                    const net=resolved.reduce((s:number,x:any)=>s+Number(netPct(x)),0);
+                    const positive=resolved.filter((x:any)=>Number(netPct(x))>0).length;
+                    return {total:r.length,open:r.filter((x:any)=>closeKind(x)==="OPEN").length,closed:closed.length,
+                      tp:closed.filter((x:any)=>closeKind(x)==="TP").length,
+                      psl:closed.filter((x:any)=>closeKind(x)==="PROGRESSIVE_SL").length,
+                      isl:closed.filter((x:any)=>closeKind(x)==="INITIAL_SL").length,
+                      time:closed.filter((x:any)=>closeKind(x)==="TIME").length,
+                      stage1:r.filter((x:any)=>Number(x.progressive_stage??0)>=1).length,
+                      stage2:r.filter((x:any)=>Number(x.progressive_stage??0)>=2).length,
+                      stage3:r.filter((x:any)=>Number(x.progressive_stage??0)>=3).length,
+                      stage4:r.filter((x:any)=>Number(x.progressive_stage??0)>=4).length,
+                      wr:resolved.length?positive/resolved.length*100:0,net,avg:resolved.length?net/resolved.length:0,resolved:resolved.length};
+                  };
+                  const LS=stats(selected,"LONG"),SS=stats(selected,"SHORT");
+                  const groups:any={};for(const x of selected){const k=dayKey(rowTs(x));(groups[k]??=[]).push(x);}const days=Object.keys(groups).sort().reverse();
+                  const fmt=(v:any)=>{const n=Number(v);if(!Number.isFinite(n))return"—";return(Math.abs(n)>=100?n.toFixed(2):Math.abs(n)>=1?n.toFixed(4):n.toFixed(6)).replace(/0+$/,"" ).replace(/\.$/,"")};
                   const pct=(v:any)=>{const n=Number(v);return Number.isFinite(n)?`${n>0?"+":""}${n.toFixed(2)}%`:"—"};
-                  const dt=(v:any)=>{try{return new Intl.DateTimeFormat("bg-BG",{timeZone:"Europe/Sofia",hour:"2-digit",minute:"2-digit"}).format(new Date(v))}catch{return"—"}};
-                  const badge=(x:any)=>x.status==="OPEN"?'<span class="badge open">● OPEN</span>':x.exit_type==="TP"?'<span class="badge win">✓ TP</span>':x.exit_type==="SL"?'<span class="badge loss">✕ SL</span>':'<span class="badge time">◷ TIME</span>';
-                  const side=(x:any)=>x.side==="LONG"?'<span class="side long">↑ LONG</span>':'<span class="side short">↓ SHORT</span>';
-                  const duration=(x:any)=>x.exit_ts?`${Math.max(0,Math.round((Number(x.exit_ts)-Number(x.crossing_ts))/60000))}m`:"OPEN";
-
-                  const panel=(name:string,s:any,cls:string,rule:string)=>`<section class="panel ${cls}">
-                    <div class="ph"><div><h2>${name}</h2><small>${rule}</small></div><b class="${s.net>=0?"pos":"neg"}">${pct(s.net)}</b></div>
-                    <div class="metrics"><div><small>Сделки</small><b>${s.total}</b></div><div><small>TP / SL</small><b>${s.tp} / ${s.sl}</b></div><div><small>Win rate</small><b>${s.wr.toFixed(1)}%</b></div><div><small>Avg net</small><b class="${s.avg>=0?"pos":"neg"}">${pct(s.avg)}</b></div><div><small>P/L $1000</small><b class="${s.net>=0?"pos":"neg"}">$${(s.net*10).toFixed(2)}</b></div></div>
-                  </section>`;
-
-                  const dayBlocks=days.map((d:string,di:number)=>{
-                    const rows=groups[d], ds=stats(rows);
-                    const cards=rows.map((x:any)=>`<div class="trade">
-                      <div class="top"><div><b>${x.coin}</b> ${side(x)}</div>${badge(x)}</div>
-                      <div class="meta">${dt(x.crossing_datetime)} · Score ${Number(x.score??0).toFixed(2)} · ${duration(x)}</div>
-                      <div class="prices"><div><small>ENTRY</small><b>${fmt(x.entry_price)}</b></div><div><small>TP</small><b class="pos">${fmt(x.tp_price)}</b></div><div><small>SL</small><b class="neg">${fmt(x.sl_price)}</b></div><div><small>NET</small><b class="${Number(x.net_return_pct??0)>=0?"pos":"neg"}">${x.status==="OPEN"?"—":pct(x.net_return_pct)}</b></div></div>
-                    </div>`).join("");
-                    const pretty=d.split("-").reverse().join(".");
-                    return `<details class="day" ${di===0?"open":""}><summary><div><b>📅 ${pretty}</b><span>${rows.length} сделки · ${ds.tp} TP / ${ds.sl} SL</span></div><strong class="${ds.net>=0?"pos":"neg"}">${pct(ds.net)}</strong></summary><div class="daybody">${cards}</div></details>`;
-                  }).join("");
-
-                  const history=Object.keys(all.reduce((g:any,x:any)=>{const k=dayKey(x.crossing_ts);(g[k]??=[]).push(x);return g;},{})).sort().reverse().slice(0,14).map((d:string)=>{
-                    const rows=all.filter(x=>dayKey(x.crossing_ts)===d), l=stats(rows,"LONG"), s=stats(rows,"SHORT"), a=stats(rows);
-                    return `<tr><td>${d.split("-").reverse().join(".")}</td><td>${rows.length}</td><td class="${l.net>=0?"pos":"neg"}">${pct(l.net)}</td><td class="${s.net>=0?"pos":"neg"}">${pct(s.net)}</td><td class="${a.net>=0?"pos":"neg"}"><b>${pct(a.net)}</b></td></tr>`;
-                  }).join("");
-
+                  const dt=(v:any)=>{try{return new Intl.DateTimeFormat("bg-BG",{timeZone:"Europe/Sofia",hour:"2-digit",minute:"2-digit"}).format(new Date(Number(v)))}catch{return"—"}};
+                  const sideBadge=(x:any)=>x.side==="LONG"?'<span class="side long">↑ LONG</span>':'<span class="side short">↓ SHORT</span>';
+                  const badge=(x:any)=>{const k=closeKind(x);if(k==="OPEN")return'<span class="badge open">● OPEN</span>';if(k==="TP")return'<span class="badge win">✓ TP</span>';if(k==="PROGRESSIVE_SL")return'<span class="badge prog">◆ PROG SL</span>';if(k==="INITIAL_SL")return'<span class="badge loss">✕ INITIAL SL</span>';if(k==="TIME")return'<span class="badge time">◷ TIME</span>';return'<span class="badge time">CLOSED</span>';};
+                  const activeStop=(x:any)=>Number(x.progressive_stage??0)>0&&Number.isFinite(Number(x.progressive_stop_price))?x.progressive_stop_price:(Number(x.entry_fill_price)*(x.side==="SHORT"?1.0015:0.9985));
+                  const maxStage=(x:any)=>x.side==="SHORT"?3:4;
+                  const panel=(name:string,s:any,cls:string,rule:string)=>`<section class="panel ${cls}"><div class="ph"><div><h2>${name}</h2><small>${rule}</small></div><b class="${s.net>=0?"pos":"neg"}">${pct(s.net)}</b></div><div class="metrics"><div><small>Реални сделки</small><b>${s.total}</b></div><div><small>TP / Prog SL</small><b>${s.tp} / ${s.psl}</b></div><div><small>Initial SL / TIME</small><b>${s.isl} / ${s.time}</b></div><div><small>Positive net</small><b>${s.wr.toFixed(1)}%</b></div><div><small>Avg net*</small><b class="${s.avg>=0?"pos":"neg"}">${pct(s.avg)}</b></div><div><small>P/L $1000*</small><b class="${s.net>=0?"pos":"neg"}">$${(s.net*10).toFixed(2)}</b></div></div><div class="stages"><span>S1 ${s.stage1}</span><span>S2 ${s.stage2}</span><span>S3 ${s.stage3}</span>${cls==="lp"?`<span>S4 ${s.stage4}</span>`:""}<span>OPEN ${s.open}</span></div></section>`;
+                  const dayBlocks=days.map((d:string,di:number)=>{const rows=groups[d],ds=stats(rows);const cards=rows.map((x:any)=>{const n=netPct(x);return`<div class="trade"><div class="top"><div><b>${x.coin}</b> ${sideBadge(x)}</div>${badge(x)}</div><div class="meta">${dt(rowTs(x))} · Score ${Number.isFinite(Number(x.score))?Number(x.score).toFixed(2):"—"} · Crossing #${x.crossing_id??"—"}</div><div class="prices"><div><small>ENTRY FILL</small><b>${fmt(x.entry_fill_price)}</b></div><div><small>EXIT</small><b>${fmt(x.exit_price)}</b></div><div><small>ACTIVE / FINAL SL</small><b>${fmt(activeStop(x))}</b></div><div><small>STAGE</small><b>${Number(x.progressive_stage??0)}/${maxStage(x)}</b></div><div><small>NET*</small><b class="${Number(n??0)>=0?"pos":"neg"}">${n==null?"—":pct(n)}</b></div></div></div>`;}).join("");const pretty=d==="unknown"?"Unknown":d.split("-").reverse().join(".");return`<details class="day" ${di===0?"open":""}><summary><div><b>📅 ${pretty}</b><span>${rows.length} real · ${ds.tp} TP · ${ds.psl} Prog SL · ${ds.isl} Initial SL · ${ds.time} TIME</span></div><strong class="${ds.net>=0?"pos":"neg"}">${pct(ds.net)}</strong></summary><div class="daybody">${cards}</div></details>`;}).join("");
+                  const history=Object.keys(all.reduce((g:any,x:any)=>{const k=dayKey(rowTs(x));(g[k]??=[]).push(x);return g;},{})).sort().reverse().slice(0,14).map((d:string)=>{const rows=all.filter((x:any)=>dayKey(rowTs(x))===d),l=stats(rows,"LONG"),sh=stats(rows,"SHORT"),a=stats(rows);return`<tr><td>${d.split("-").reverse().join(".")}</td><td>${rows.length}</td><td class="${l.net>=0?"pos":"neg"}">${pct(l.net)}</td><td class="${sh.net>=0?"pos":"neg"}">${pct(sh.net)}</td><td class="${a.net>=0?"pos":"neg"}"><b>${pct(a.net)}</b></td></tr>`;}).join("");
                   const tab=(key:string,label:string)=>`<a class="${period===key?"active":""}" href="/forward-dashboard?period=${key}">${label}</a>`;
-                  const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>CryptoBot Forward</title>
-                  <style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1050px;margin:auto;padding:16px}h1{margin:0;font-size:24px}.sub,.meta,small{color:#8292aa}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.live{color:#64dda0;font-size:12px}.tabs{display:flex;gap:7px;overflow:auto;margin:17px 0}.tabs a{white-space:nowrap;text-decoration:none;color:#a8b5ca;background:#121b2e;border:1px solid #27344e;padding:9px 13px;border-radius:999px;font-size:13px}.tabs a.active{background:#263d69;color:white;border-color:#5578ba}.compare{display:grid;grid-template-columns:1fr 1fr;gap:11px}.panel{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.lp{border-top:3px solid #62dc9d}.sp{border-top:3px solid #ff8490}.ph{display:flex;justify-content:space-between}.ph h2{margin:0;font-size:18px}.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:12px}.metrics div,.prices div{background:#0a1323;border-radius:9px;padding:8px}.metrics small,.prices small{display:block;font-size:9px}.metrics b{font-size:14px}.pos{color:#62dc9d}.neg{color:#ff7f8d}.sectiontitle{margin:21px 0 9px}.day{background:#10192b;border:1px solid #25324b;border-radius:14px;margin-bottom:9px;overflow:hidden}.day summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:13px;list-style:none}.day summary span{display:block;color:#7f90aa;font-size:11px;margin-top:3px}.daybody{padding:0 10px 10px}.trade{background:#0b1425;border-radius:11px;padding:11px;margin-top:7px}.top{display:flex;justify-content:space-between}.side,.badge{font-size:9px;font-weight:800;border-radius:999px;padding:4px 6px}.long,.win{background:#14382b;color:#6ce2a3}.short,.loss{background:#40202a;color:#ff8c98}.open{background:#413716;color:#ffdb72}.time{background:#25314a;color:#b7c5dc}.prices{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}.prices b{font-size:11px}.history{overflow:auto;background:#10192b;border:1px solid #25324b;border-radius:14px}table{width:100%;border-collapse:collapse;min-width:520px}th,td{padding:10px;text-align:left;border-bottom:1px solid #202c43;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:720px){.wrap{padding:11px}.head{display:block}.live{margin-top:4px}.compare{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(3,1fr)}.prices{grid-template-columns:repeat(2,1fr)}}</style></head>
-                  <body><main class="wrap"><div class="head"><div><h1>📊 Forward LONG vs SHORT</h1><div class="sub">≥65 · Sofia time · fee 0.07%</div></div><div class="live">● PAPER · refresh 30s</div></div>
-                  <nav class="tabs">${tab("today","Днес")}${tab("yesterday","Вчера")}${tab("7d","7 дни")}${tab("all","Всички")}</nav>
-                  <div class="compare">${panel("↑ LONG",LS,"lp","TP +0.50% · SL −0.15%")}${panel("↓ SHORT",SS,"sp","TP +0.50% · SL −0.40%")}</div>
-                  <h3 class="sectiontitle">Сделки по дни</h3>${dayBlocks||'<div class="day"><summary>Няма сделки за периода.</summary></div>'}
-                  <h3 class="sectiontitle">Последни 14 дни</h3><div class="history"><table><thead><tr><th>Дата</th><th>Сделки</th><th>LONG</th><th>SHORT</th><th>Общо net</th></tr></thead><tbody>${history||'<tr><td colspan="5">Няма данни</td></tr>'}</tbody></table></div>
-                  <div class="foot">V1.9.1 · Дните са по Europe/Sofia. При 7 дни/Всички всеки ден се разгъва отделно.</div></main></body></html>`;
+                  const html=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15"><title>CryptoBot Real Progressive</title><style>*{box-sizing:border-box}body{margin:0;background:#09101e;color:#eef3fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1100px;margin:auto;padding:16px}h1{margin:0;font-size:24px}.sub,.meta,small{color:#8292aa}.head{display:flex;justify-content:space-between;align-items:end;gap:10px}.live{color:#64dda0;font-size:12px}.tabs{display:flex;gap:7px;overflow:auto;margin:17px 0}.tabs a{white-space:nowrap;text-decoration:none;color:#a8b5ca;background:#121b2e;border:1px solid #27344e;padding:9px 13px;border-radius:999px;font-size:13px}.tabs a.active{background:#263d69;color:white;border-color:#5578ba}.compare{display:grid;grid-template-columns:1fr 1fr;gap:11px}.panel{background:#111a2d;border:1px solid #26334d;border-radius:15px;padding:14px}.lp{border-top:3px solid #62dc9d}.sp{border-top:3px solid #ff8490}.ph{display:flex;justify-content:space-between}.ph h2{margin:0;font-size:18px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px}.metrics div,.prices div{background:#0a1323;border-radius:9px;padding:8px}.metrics small,.prices small{display:block;font-size:9px}.metrics b{font-size:14px}.stages{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.stages span{background:#17243b;color:#a9b8cf;border-radius:999px;padding:5px 8px;font-size:10px}.pos{color:#62dc9d}.neg{color:#ff7f8d}.sectiontitle{margin:21px 0 9px}.day{background:#10192b;border:1px solid #25324b;border-radius:14px;margin-bottom:9px;overflow:hidden}.day summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:13px;list-style:none}.day summary span{display:block;color:#7f90aa;font-size:11px;margin-top:3px}.daybody{padding:0 10px 10px}.trade{background:#0b1425;border-radius:11px;padding:11px;margin-top:7px}.top{display:flex;justify-content:space-between}.side,.badge{font-size:9px;font-weight:800;border-radius:999px;padding:4px 6px}.long,.win{background:#14382b;color:#6ce2a3}.short,.loss{background:#40202a;color:#ff8c98}.prog{background:#173849;color:#76d7ff}.open{background:#413716;color:#ffdb72}.time{background:#25314a;color:#b7c5dc}.prices{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:9px}.prices b{font-size:11px}.history{overflow:auto;background:#10192b;border:1px solid #25324b;border-radius:14px}table{width:100%;border-collapse:collapse;min-width:520px}th,td{padding:10px;text-align:left;border-bottom:1px solid #202c43;font-size:12px}th{color:#8292aa}.foot{color:#65758e;font-size:11px;margin-top:12px}@media(max-width:720px){.wrap{padding:11px}.head{display:block}.live{margin-top:4px}.compare{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.prices{grid-template-columns:repeat(2,1fr)}}</style></head><body><main class="wrap"><div class="head"><div><h1>📊 REAL Progressive LONG vs SHORT</h1><div class="sub">Real Hyperliquid ledger · ≥65 · Sofia time</div></div><div class="live">● LIVE DATA · refresh 15s</div></div><nav class="tabs">${tab("today","Днес")}${tab("yesterday","Вчера")}${tab("7d","7 дни")}${tab("all","Всички")}</nav><div class="compare">${panel("↑ LONG",LS,"lp","TP +0.50% · Initial SL −0.15% · Progressive A")}${panel("↓ SHORT",SS,"sp","TP +0.50% · Initial SL −0.15% · Progressive C")}</div><h3 class="sectiontitle">Реални сделки по дни</h3>${dayBlocks||'<div class="day"><summary>Няма реални сделки за периода.</summary></div>'}<h3 class="sectiontitle">Последни 14 дни</h3><div class="history"><table><thead><tr><th>Дата</th><th>Real trades</th><th>LONG net*</th><th>SHORT net*</th><th>Общо net*</th></tr></thead><tbody>${history||'<tr><td colspan="5">Няма данни</td></tr>'}</tbody></table></div><div class="foot">V1.9.28 · Данните са от hyperliquid_execution_ledger. *NET% е изчислен от реалните entry/exit цени минус 0.07% round-trip fee; Telegram realized P/L остава източникът за точния $ P/L. Progressive stage/stop са реално записаните D1 стойности.</div></main></body></html>`;
                   return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}});
                 }
+
 
                 if (url.pathname === "/forward-long-shadow-dashboard") {
                   await env.DB.prepare(`
