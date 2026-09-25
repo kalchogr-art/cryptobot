@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.5 SERIALIZED LIVE EXECUTION BRIDGE";
+    const MODULE_VERSION = "V2.9.6 EXECUTION STAGE SYNC";
 
     type Side = "LONG" | "SHORT";
 
@@ -139,6 +139,26 @@
         }
       }
 
+      // V2.9.7: any historical execution ledger row for a crossing means
+      // that crossing belongs to the REAL execution lifecycle. It must never
+      // fall back to AUTO_DRY_RUN_CROSSING after TP/SL/TIME/progressive close.
+      private async ledgerRowByCrossingId(crossingId: string | null): Promise<any | null> {
+        if (!this.env?.DB || crossingId == null || String(crossingId).trim() === "") return null;
+        try {
+          return await this.env.DB.prepare(`
+            SELECT id, crossing_id, coin, side, status, entry_fill_price, entry_fill_size,
+                   progressive_stage, progressive_stop_pct, progressive_stop_price,
+                   progressive_stop_oid, entry_filled_at, updated_at
+            FROM hyperliquid_execution_ledger
+            WHERE CAST(crossing_id AS TEXT)=?
+            ORDER BY id DESC
+            LIMIT 1
+          `).bind(String(crossingId)).first();
+        } catch {
+          return null;
+        }
+      }
+
       private async ledgerRowById(id: number | null): Promise<any | null> {
         if (!this.env?.DB || !Number.isInteger(id) || Number(id) <= 0) return null;
         try {
@@ -248,6 +268,48 @@
                 ],
                 safety: "READ_ONLY_NO_EXCHANGE_ACTION",
               }, 404);
+            }
+          }
+
+          // V2.9.7 crossing guard:
+          // If this start request is a crossing fallback, first check whether
+          // the crossing has EVER had a real execution ledger row.
+          // - OPEN real ledger -> attach to that exact ledger instead of dry-run.
+          // - CLOSED/terminal real ledger -> reject fallback completely.
+          // - No ledger ever -> AUTO_DRY_RUN_CROSSING remains allowed.
+          const requestedCrossingId =
+            body?.crossingId != null ? String(body.crossingId) :
+            (body?.crossing_id != null ? String(body.crossing_id) : null);
+
+          if (!ledger && requestedCrossingId != null) {
+            const historicalLedger = await this.ledgerRowByCrossingId(requestedCrossingId);
+            if (historicalLedger) {
+              const openStatuses = new Set([
+                "ENTRY_FILLED",
+                "PROTECTED",
+                "TPSL_FAILED_AFTER_RETRIES",
+                "MAX_HOLD_CLOSING",
+              ]);
+
+              if (openStatuses.has(String(historicalLedger.status ?? ""))) {
+                ledger = historicalLedger;
+              } else {
+                await this.closeSocket("REAL_LEDGER_ALREADY_TERMINAL");
+                if (this.config) {
+                  this.config.active = false;
+                  this.config.connectionState = `BLOCKED_REAL_LEDGER_${String(historicalLedger.status ?? "TERMINAL")}`;
+                  await this.persist();
+                }
+                return json({
+                  success: false,
+                  module: MODULE_VERSION,
+                  error: "AUTO_DRY_RUN_BLOCKED_REAL_LEDGER_EXISTS",
+                  crossing_id: requestedCrossingId,
+                  ledger_id: Number(historicalLedger.id),
+                  ledger_status: String(historicalLedger.status ?? "UNKNOWN"),
+                  message: "Crossing already belongs to a real execution lifecycle; dry-run fallback is forbidden.",
+                }, 409);
+              }
             }
           }
 
@@ -586,9 +648,36 @@
             const ex: any = (event as any).execution;
             const bridgeSuccess = ex?.success === true;
             if (!bridgeSuccess) break;
-          }
 
-          this.config.stage += 1;
+            // V2.9.6: execution.ts may legitimately jump over one or more
+            // progressive stages when market price has already crossed them.
+            // Synchronize the Durable Object to the authoritative execution/D1
+            // stage instead of blindly doing stage += 1.
+            const executionStage = Number(
+              ex?.response?.result?.stage ??
+              ex?.response?.current_stage ??
+              ex?.response?.target_stage ??
+              event.bridge.targetStage
+            );
+
+            if (Number.isFinite(executionStage) && executionStage > this.config.stage) {
+              this.config.stage = executionStage;
+            } else {
+              this.config.stage = Math.max(this.config.stage, event.bridge.targetStage);
+            }
+
+            // Re-read D1 after execution so the next loop iteration uses the
+            // authoritative active stop OID/stage and cannot spam an already
+            // completed lower stage.
+            const syncedLedger = await this.ledgerRowById(event.bridge.ledgerId);
+            if (syncedLedger) {
+              const dbStage = Math.max(0, Number(syncedLedger.progressive_stage ?? 0) || 0);
+              if (dbStage > this.config.stage) this.config.stage = dbStage;
+            }
+          } else {
+            // Dry-run/manual monitor retains sequential simulation behavior.
+            this.config.stage += 1;
+          }
         }
 
         await this.persist();
