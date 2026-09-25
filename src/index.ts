@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.23 EVENTS ROUTE FIX";
+            const VERSION = "V1.9.24 AUTO DRY-RUN CROSSING WS";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4169,6 +4169,8 @@
             async function autoSyncProgressiveWsMonitor(env: Env): Promise<any> {
       if (!env.DB || !env.PROGRESSIVE_MONITOR) return { success:false, reason:"BINDING_MISSING" };
       const stub = env.PROGRESSIVE_MONITOR.getByName("cryptobot-progressive-dry-run-v1");
+
+      // Priority 1: real/open execution ledger with actual fill price.
       const open:any = await env.DB.prepare(`
         SELECT id, crossing_id, coin, side, status, entry_fill_price,
                progressive_stage, progressive_stop_oid, entry_filled_at, updated_at
@@ -4177,25 +4179,90 @@
           AND entry_fill_price IS NOT NULL AND entry_fill_price > 0
         ORDER BY COALESCE(entry_filled_at, updated_at, id) DESC LIMIT 1
       `).first();
+
       let current:any=null;
       try { current=await (await stub.fetch("https://progressive-monitor/status")).json(); } catch {}
       const active=current?.status?.active===true;
       const activeLedgerId=Number(current?.status?.ledger?.id);
-      if (!open) {
+      const activeCrossingId=Number(current?.status?.ledger?.crossing_id);
+
+      if (open) {
+        const openId=Number(open.id);
+        if (active && Number.isInteger(activeLedgerId) && activeLedgerId===openId)
+          return {success:true,action:"ALREADY_MONITORING_LEDGER",ledger_id:openId};
+
+        const res=await stub.fetch("https://progressive-monitor/start",{
+          method:"POST",
+          headers:{"content-type":"application/json"},
+          body:JSON.stringify({mode:"LEDGER",ledgerId:openId})
+        });
+        return {
+          success:res.ok,
+          action:active?"AUTO_SWITCH_LEDGER":"AUTO_START_LEDGER",
+          ledger_id:openId
+        };
+      }
+
+      // Priority 2: DRY-RUN fallback. When no filled ledger exists, monitor the
+      // newest fresh >=65 crossing directly. No signing or exchange action.
+      const now=Date.now();
+      const DRY_RUN_MAX_AGE_MS=30*60*1000;
+      const crossing:any = await env.DB.prepare(`
+        SELECT id, episode_id, coin, side, crossing_ts, crossing_price, crossing_score
+        FROM signal_65_crossings
+        WHERE crossing_ts >= ?
+        ORDER BY crossing_ts DESC, id DESC
+        LIMIT 1
+      `).bind(now-DRY_RUN_MAX_AGE_MS).first();
+
+      if (!crossing) {
         if (active) {
           await stub.fetch("https://progressive-monitor/stop",{method:"POST"});
-          return {success:true,action:"AUTO_STOP_NO_OPEN_LEDGER"};
+          return {success:true,action:"AUTO_STOP_NO_OPEN_LEDGER_OR_FRESH_CROSSING"};
         }
-        return {success:true,action:"IDLE_NO_OPEN_LEDGER"};
+        return {success:true,action:"IDLE_NO_OPEN_LEDGER_OR_FRESH_CROSSING"};
       }
-      const openId=Number(open.id);
-      if (active && Number.isInteger(activeLedgerId) && activeLedgerId===openId)
-        return {success:true,action:"ALREADY_MONITORING",ledger_id:openId};
+
+      const crossingId=Number(crossing.id);
+      const coin=String(crossing.coin??"").toUpperCase();
+      const side=String(crossing.side??"").toUpperCase();
+      const entry=Number(crossing.crossing_price);
+
+      if (
+        !Number.isInteger(crossingId) ||
+        !coin ||
+        (side!=="LONG" && side!=="SHORT") ||
+        !Number.isFinite(entry) ||
+        entry<=0
+      ) {
+        return {success:false,action:"INVALID_DRY_RUN_CROSSING",crossing_id:crossingId};
+      }
+
+      if (active && Number.isInteger(activeCrossingId) && activeCrossingId===crossingId)
+        return {success:true,action:"ALREADY_MONITORING_DRY_RUN_CROSSING",crossing_id:crossingId};
+
       const res=await stub.fetch("https://progressive-monitor/start",{
-        method:"POST",headers:{"content-type":"application/json"},
-        body:JSON.stringify({mode:"LEDGER",ledgerId:openId})
+        method:"POST",
+        headers:{"content-type":"application/json"},
+        body:JSON.stringify({
+          mode:"MANUAL",
+          coin,
+          side,
+          entry,
+          crossingId,
+          bridgeMode:"AUTO_DRY_RUN_CROSSING"
+        })
       });
-      return {success:res.ok,action:active?"AUTO_SWITCH_LEDGER":"AUTO_START_LEDGER",ledger_id:openId};
+
+      return {
+        success:res.ok,
+        action:active?"AUTO_SWITCH_DRY_RUN_CROSSING":"AUTO_START_DRY_RUN_CROSSING",
+        crossing_id:crossingId,
+        coin,
+        side,
+        entry_price:entry,
+        trading:"REAL_TRADING_DISABLED"
+      };
     }
 
     export default {
