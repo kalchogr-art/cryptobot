@@ -26,6 +26,13 @@
     ]
   },
 
+  "services": [
+    {
+      "binding": "SELF",
+      "service": "cryptobot"
+    }
+  ],
+
   "exports": {
     "ProgressiveMonitor": {
       "type": "durable-object",
