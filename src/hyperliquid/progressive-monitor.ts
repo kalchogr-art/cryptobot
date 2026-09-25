@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.2 AUTO WS BRIDGE + D1 LOG";
+    const MODULE_VERSION = "V2.9.3 AUTO DRY-RUN CROSSING WS";
 
     type Side = "LONG" | "SHORT";
 
@@ -183,10 +183,15 @@
             UNIQUE(ledger_id, stage)
           )
         `).run();
+        await this.env.DB.prepare(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_progressive_ws_crossing_stage
+          ON progressive_ws_events (crossing_id, stage)
+          WHERE crossing_id IS NOT NULL
+        `).run();
       }
 
       private async persistTriggerEvent(event: TriggerEvent): Promise<void> {
-        if (!this.env?.DB || event.bridge.ledgerId == null) return;
+        if (!this.env?.DB) return;
         await this.ensureEventTable();
         await this.env.DB.prepare(`
           INSERT OR IGNORE INTO progressive_ws_events (
@@ -273,7 +278,7 @@
             reconnectCount: 0,
             connectionState: "CONNECTING",
             ledgerId: ledger ? Number(ledger.id) : null,
-            crossingId: ledger?.crossing_id != null ? String(ledger.crossing_id) : null,
+            crossingId: ledger?.crossing_id != null ? String(ledger.crossing_id) : (body?.crossingId != null ? String(body.crossingId) : (body?.crossing_id != null ? String(body.crossing_id) : null)),
             ledgerStatus: ledger?.status != null ? String(ledger.status) : null,
             ledgerProgressiveStageAtStart: ledgerStage,
             ledgerProgressiveStopOidAtStart: ledgerOid,
@@ -478,7 +483,7 @@
           const ledgerOidRaw = Number(ledgerNow?.progressive_stop_oid);
           const ledgerOidNow = Number.isInteger(ledgerOidRaw) && ledgerOidRaw >= 0 ? ledgerOidRaw : null;
 
-          let validation = "MANUAL_TEST_NO_LEDGER";
+          let validation = this.config.crossingId != null ? "DRY_RUN_CROSSING_READY" : "MANUAL_TEST_NO_LEDGER";
           if (this.config.ledgerId != null) {
             if (!ledgerNow) validation = "LEDGER_ROW_MISSING";
             else if (String(ledgerNow.coin ?? "").toUpperCase() !== this.config.coin) validation = "LEDGER_COIN_MISMATCH";
@@ -539,7 +544,7 @@
             : null,
           entry_price: c?.entryPrice ?? null,
           entry_source: c?.entrySource ?? null,
-          bridge_mode: c?.ledgerId != null ? "EXECUTION_LEDGER_DRY_RUN" : "MANUAL_WS_TEST",
+          bridge_mode: c?.ledgerId != null ? "EXECUTION_LEDGER_DRY_RUN" : (c?.crossingId != null ? "AUTO_DRY_RUN_CROSSING" : "MANUAL_WS_TEST"),
           ledger: {
             id: c?.ledgerId ?? null,
             crossing_id: c?.crossingId ?? null,
