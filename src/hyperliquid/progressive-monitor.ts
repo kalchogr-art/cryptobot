@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.6 EXECUTION STAGE SYNC";
+    const MODULE_VERSION = "V2.10.0 LIVE 50/50 RUNNER STAGE SYNC";
 
     type Side = "LONG" | "SHORT";
 
@@ -68,12 +68,22 @@
       { trigger: 0.25, stop: 0.10 },
       { trigger: 0.35, stop: 0.20 },
       { trigger: 0.45, stop: 0.30 },
+      { trigger: 0.75, stop: 0.50 },
+      { trigger: 1.00, stop: 0.75 },
+      { trigger: 1.50, stop: 1.00 },
+      { trigger: 2.00, stop: 1.50 },
+      { trigger: 3.00, stop: 2.00 },
     ];
 
     const SHORT_C = [
       { trigger: 0.25, stop: 0.07 },
       { trigger: 0.35, stop: 0.15 },
       { trigger: 0.45, stop: 0.25 },
+      { trigger: 0.75, stop: 0.50 },
+      { trigger: 1.00, stop: 0.75 },
+      { trigger: 1.50, stop: 1.00 },
+      { trigger: 2.00, stop: 1.50 },
+      { trigger: 3.00, stop: 2.00 },
     ];
 
     function json(data: any, status = 200): Response {
