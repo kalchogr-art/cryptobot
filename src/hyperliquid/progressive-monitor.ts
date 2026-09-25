@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.9.3 AUTO DRY-RUN CROSSING WS";
+    const MODULE_VERSION = "V2.9.4 LIVE EXECUTION BRIDGE";
 
     type Side = "LONG" | "SHORT";
 
@@ -519,6 +519,23 @@
               validation,
             },
           };
+
+          // Only ledger-backed, exactly validated triggers may call execution.
+          // Crossing-only DRY RUN stays completely read-only.
+          if (event.bridge.ledgerId != null && event.bridge.validation === "BRIDGE_READY_FOR_EXECUTION_FUNCTION" && this.env?.SELF) {
+            try {
+              const execRes=await this.env.SELF.fetch("https://cryptobot.internal/internal/progressive-execute",{
+                method:"POST",headers:{"content-type":"application/json"},
+                body:JSON.stringify({ledgerId:event.bridge.ledgerId,targetStage:event.bridge.targetStage})
+              });
+              const execJson:any=await execRes.json().catch(()=>null);
+              (event as any).execution={attempted:true,http_status:execRes.status,success:execRes.ok&&execJson?.success===true,response:execJson};
+            } catch(error:any) {
+              (event as any).execution={attempted:true,success:false,error:error?.message??String(error)};
+            }
+          } else {
+            (event as any).execution={attempted:false,reason:event.bridge.ledgerId==null?"DRY_RUN_CROSSING_NO_LEDGER":(this.env?.SELF?"BRIDGE_VALIDATION_NOT_READY":"SELF_BINDING_MISSING")};
+          }
 
           this.events.push(event);
           if (this.events.length > 100) this.events = this.events.slice(-100);
