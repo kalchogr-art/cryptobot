@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.9.22 AUTO WS BRIDGE + D1 LOG";
+            const VERSION = "V1.9.23 EVENTS ROUTE FIX";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -8125,6 +8125,7 @@
                 if (
                   url.pathname === "/progressive-monitor/start" ||
                   url.pathname === "/progressive-monitor/status" ||
+                  url.pathname === "/progressive-monitor/events" ||
                   url.pathname === "/progressive-monitor/stop"
                 ) {
                   if (!env.PROGRESSIVE_MONITOR) {
@@ -8140,6 +8141,10 @@
 
                   if (url.pathname === "/progressive-monitor/status") {
                     return stub.fetch("https://progressive-monitor/status");
+                  }
+
+                  if (url.pathname === "/progressive-monitor/events") {
+                    return stub.fetch("https://progressive-monitor/events");
                   }
 
                   if (url.pathname === "/progressive-monitor/stop") {
