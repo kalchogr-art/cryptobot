@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.3 INITIAL SL ENTRY REPLAY SHADOW";
+            const VERSION = "V1.10.4 15M + SL TRACKING ENDPOINTS";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2766,6 +2766,117 @@
               };
             }
 
+
+            async function real15mAlignmentAnalysis(env: Env): Promise<any> {
+              if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              await ensurePaperTables(env);
+
+              const q:any=await env.DB.prepare(`
+                SELECT
+                  l.id AS ledger_id,l.crossing_id,l.coin,l.side,l.status,l.close_reason,
+                  l.entry_fill_price,l.entry_filled_at,l.closed_at,l.realized_pnl,
+                  d.score,d.trend_15m,d.htf_15m_alignment,d.trend_1h,d.htf_1h_alignment,
+                  d.normal_range_1m_pct,d.normal_range_5m_pct,d.spread_pct
+                FROM hyperliquid_execution_ledger l
+                LEFT JOIN crossing_diagnostics d
+                  ON d.cohort='65_PLUS'
+                 AND CAST(d.crossing_id AS TEXT)=CAST(l.crossing_id AS TEXT)
+                WHERE l.entry_fill_price IS NOT NULL AND l.entry_fill_price>0
+                ORDER BY COALESCE(l.entry_filled_at,l.id) DESC
+                LIMIT 3000
+              `).all();
+
+              const rows:any[]=q?.results??[];
+              const closed=rows.filter(x=>!["CLAIMED","ENTRY_FILLED","PROTECTED","TPSL_FAILED_AFTER_RETRIES","MAX_HOLD_CLOSING"].includes(String(x.status??"")));
+              const with15=closed.filter(x=>["ALIGNED","OPPOSED","NEUTRAL"].includes(String(x.htf_15m_alignment??"")));
+              const bucket=(name:string)=>{
+                const a=with15.filter(x=>String(x.htf_15m_alignment)===name);
+                const count=(reason:string)=>a.filter(x=>String(x.close_reason??"")===reason).length;
+                const early=a.filter(x=>String(x.close_reason??"")==="SL_HIT" && Number(x.closed_at)>0 && Number(x.entry_filled_at)>0 &&
+                  (Number(x.closed_at)-Number(x.entry_filled_at))<=5*60000).length;
+                const pnl=a.map(x=>Number(x.realized_pnl)).filter(Number.isFinite);
+                return {
+                  alignment:name,trades:a.length,
+                  initial_sl:count("SL_HIT"),
+                  early_initial_sl_le_5m:early,
+                  progressive_sl:a.filter(x=>["PROGRESSIVE_SL_HIT","RUNNER_PROGRESSIVE_SL_HIT"].includes(String(x.close_reason??""))).length,
+                  tp:count("TP_HIT"),
+                  time:a.filter(x=>String(x.close_reason??"").includes("TIME")||String(x.close_reason??"").includes("MAX_HOLD")).length,
+                  realized_pnl_usd:pnl.length?round(pnl.reduce((p,c)=>p+c,0),4):0,
+                  avg_realized_pnl_usd:pnl.length?round(pnl.reduce((p,c)=>p+c,0)/pnl.length,4):null
+                };
+              };
+              return {
+                success:true,worker:"cryptobot",version:VERSION,
+                mode:"REAL_15M_ALIGNMENT_ANALYSIS_READ_ONLY",
+                trading:"REAL_TRADING_UNCHANGED",
+                methodology:{
+                  cohort:"REAL executed >=65 ledger trades joined to crossing_diagnostics at signal crossing",
+                  context:"15m trend captured at crossing time",
+                  groups:["ALIGNED","OPPOSED","NEUTRAL"],
+                  purpose:"compare early Initial SL / Progressive SL / TP / TIME and realized P/L by 15m alignment",
+                  limitation:"older real trades without crossing_diagnostics are reported as missing_15m_context"
+                },
+                summary:{
+                  real_closed:closed.length,
+                  with_15m_context:with15.length,
+                  missing_15m_context:closed.length-with15.length,
+                  groups:[bucket("ALIGNED"),bucket("OPPOSED"),bucket("NEUTRAL")]
+                },
+                trades:closed.map(x=>({
+                  ledger_id:x.ledger_id,crossing_id:x.crossing_id,coin:x.coin,side:x.side,
+                  close_reason:x.close_reason,entry_filled_at:x.entry_filled_at,closed_at:x.closed_at,
+                  held_minutes:Number(x.closed_at)>0&&Number(x.entry_filled_at)>0?round((Number(x.closed_at)-Number(x.entry_filled_at))/60000,3):null,
+                  realized_pnl:x.realized_pnl,trend_15m:x.trend_15m,alignment_15m:x.htf_15m_alignment,
+                  trend_1h:x.trend_1h,alignment_1h:x.htf_1h_alignment
+                }))
+              };
+            }
+
+            async function researchTrackingStatus(env: Env): Promise<any> {
+              const a15=await real15mAlignmentAnalysis(env);
+              let sl:any=null;
+              try { sl=await initialSlForwardShadowReport(env); } catch(e:any) {
+                sl={success:false,error:e?.message??String(e)};
+              }
+              return {
+                success:true,worker:"cryptobot",version:VERSION,
+                mode:"RESEARCH_TRACKING_STATUS",
+                trading:"REAL_TRADING_UNCHANGED",
+                tracking:[
+                  {
+                    id:"INITIAL_SL_ENTRY_REPLAY",
+                    status:"ACTIVE",
+                    endpoint:"/live-sl-recovery-analysis",
+                    tests:["SL 0.15","SL 0.20","SL 0.25","SL 0.30","SL 0.40"],
+                    source:"market_snapshots",
+                    note:"minute replay; keep as historical comparison"
+                  },
+                  {
+                    id:"15M_ALIGNMENT",
+                    status:"ACTIVE",
+                    endpoint:"/15m-alignment-analysis",
+                    source:"crossing_diagnostics + real execution ledger",
+                    groups:["ALIGNED","OPPOSED","NEUTRAL"],
+                    note:"observation only; does not filter live entries"
+                  },
+                  {
+                    id:"WS_TICK_SL_SHADOW",
+                    status:"NEXT_PATCH_PROGRESSIVE_MONITOR",
+                    endpoint:"/progressive-monitor/status",
+                    tests:["SL 0.15","SL 0.20","SL 0.25","SL 0.30","SL 0.40"],
+                    source:"Hyperliquid activeAssetCtx markPx",
+                    note:"tick-accurate shadow must continue after real Initial SL until entry+30m; no real order changes"
+                  }
+                ],
+                current:{
+                  sl_shadow_summary:sl?.entry_based_counterfactual?.summary??null,
+                  alignment_15m_summary:a15?.summary??null
+                },
+                next:"Patch progressive-monitor so WS shadow survives real SL close and finalizes at entry+30m."
+              };
+            }
+
             async function getOpenPaperTrade(
               env: Env,
               coin: string
@@ -4985,8 +5096,10 @@
                       forward_long_shadow: "/forward-long-shadow",
                       forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
                       initial_sl_forward_shadow: "/live-sl-recovery-analysis",
+                      alignment_15m_analysis: "/15m-alignment-analysis",
                       order_wire_audit: "/order-wire-audit?limit=500",
                       debug: "/debug-hyperliquid",
+                      research_tracking_keep_last: "/research-tracking",
                     },
 
                     next_version:
@@ -9104,6 +9217,18 @@
                   });
                 }
 
+
+                // 15M ALIGNMENT — REAL LEDGER, READ ONLY
+                if (url.pathname === "/15m-alignment-analysis") {
+                  try { return json(await real15mAlignmentAnalysis(env)); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"15M_ALIGNMENT_ANALYSIS_FAILED",message:error?.message??String(error)},500); }
+                }
+
+                // RESEARCH TRACKING — keep active/next experiments visible in one place
+                if (url.pathname === "/research-tracking") {
+                  try { return json(await researchTrackingStatus(env)); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"RESEARCH_TRACKING_FAILED",message:error?.message??String(error)},500); }
+                }
 
                 // INITIAL SL FORWARD SHADOW — READ ONLY
                 if (url.pathname === "/live-sl-recovery-analysis") {
