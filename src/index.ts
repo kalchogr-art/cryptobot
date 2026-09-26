@@ -40,11 +40,11 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.5 WS SHADOW + 15M TRACKING";
+            const VERSION = "V1.11.0 SWING RESEARCH";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
-            const ALLOWED_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h"] as const;
+            const ALLOWED_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"] as const;
 
             const INTERVAL_MS: Record<string, number> = {
               "1m": 60_000,
@@ -53,6 +53,7 @@
               "15m": 900_000,
               "30m": 1_800_000,
               "1h": 3_600_000,
+              "4h": 14_400_000,
             };
 
             type AnyObj = Record<string, any>;
@@ -2833,6 +2834,146 @@
               };
             }
 
+
+            // ============================================================
+            // V1.11.0 SWING RESEARCH — PAPER/SHADOW ONLY, NO EXCHANGE ACTION
+            // 15m / 30m / 1h / 4h context, 24h forward observation.
+            // FAST LIVE execution is intentionally untouched.
+            // ============================================================
+            const SWING_ENTRY_SCORE = 65;
+            const SWING_SCAN_MS = 15 * 60_000;
+            const SWING_DEDUPE_MS = 4 * 60 * 60_000;
+            const SWING_HORIZONS_H = [1,2,4,8,12,24] as const;
+
+            async function ensureSwingResearchTables(env: Env): Promise<void> {
+              if (!env.DB) return;
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS swing_research_signals (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  coin TEXT NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'TRACKING',
+                  entry_ts INTEGER NOT NULL, entry_datetime TEXT NOT NULL, entry_price REAL NOT NULL,
+                  swing_score REAL NOT NULL, agreement_count INTEGER NOT NULL,
+                  score_15m REAL, score_30m REAL, score_1h REAL, score_4h REAL,
+                  dir_15m TEXT, dir_30m TEXT, dir_1h TEXT, dir_4h TEXT,
+                  return_1h_pct REAL, return_2h_pct REAL, return_4h_pct REAL,
+                  return_8h_pct REAL, return_12h_pct REAL, return_24h_pct REAL,
+                  mfe_pct REAL NOT NULL DEFAULT 0, mae_pct REAL NOT NULL DEFAULT 0,
+                  max_price REAL, min_price REAL, last_price REAL, last_update_ts INTEGER,
+                  outcome_complete INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+              `).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_coin_ts ON swing_research_signals(coin,entry_ts DESC)`).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_status ON swing_research_signals(status,entry_ts ASC)`).run();
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS swing_research_state (
+                  key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL
+                )
+              `).run();
+            }
+
+            function swingTfSigned(tf:any): number {
+              return Number(tf?.directional_raw ?? 0);
+            }
+
+            async function buildSwingCandidate(coin:string): Promise<any> {
+              const [c15,c30,c1h,c4h,mids] = await Promise.all([
+                getCandles(coin,"15m",45), getCandles(coin,"30m",45),
+                getCandles(coin,"1h",45), getCandles(coin,"4h",45), getAllMids()
+              ]);
+              const t15=calculateTimeframe(c15.candles,"15m");
+              const t30=calculateTimeframe(c30.candles,"30m");
+              const t1=calculateTimeframe(c1h.candles,"1h");
+              const t4=calculateTimeframe(c4h.candles,"4h");
+              const frames=[t15,t30,t1,t4];
+              const signed=[swingTfSigned(t15),swingTfSigned(t30),swingTfSigned(t1),swingTfSigned(t4)];
+              const weighted=signed[0]*0.15+signed[1]*0.20+signed[2]*0.30+signed[3]*0.35;
+              const side=weighted>0?"LONG":weighted<0?"SHORT":"NEUTRAL";
+              const agreement=side==="NEUTRAL"?0:frames.filter((x:any)=>x.direction===(side==="LONG"?"BULLISH":"BEARISH")).length;
+              const score=round(Math.abs(weighted),2);
+              return {
+                coin,price:num(mids?.[coin]),side,score,agreement,
+                qualifies:score>=SWING_ENTRY_SCORE && agreement>=3,
+                timeframes:{"15m":t15,"30m":t30,"1h":t1,"4h":t4},
+                weights:{"15m":0.15,"30m":0.20,"1h":0.30,"4h":0.35}
+              };
+            }
+
+            async function recordSwingCandidate(env:Env,c:any):Promise<any>{
+              if(!env.DB||!c?.qualifies||!c?.price||c.side==="NEUTRAL") return {recorded:false,reason:c?.qualifies?"INVALID_PRICE_OR_SIDE":"NOT_QUALIFIED"};
+              await ensureSwingResearchTables(env);
+              const now=Date.now();
+              const prior:any=await env.DB.prepare(`SELECT id,entry_ts FROM swing_research_signals WHERE coin=? AND side=? AND entry_ts>=? ORDER BY entry_ts DESC LIMIT 1`)
+                .bind(c.coin,c.side,now-SWING_DEDUPE_MS).first();
+              if(prior) return {recorded:false,reason:"4H_DEDUPE",existing_id:prior.id};
+              const tf=c.timeframes;
+              const r:any=await env.DB.prepare(`
+                INSERT INTO swing_research_signals(
+                  coin,side,entry_ts,entry_datetime,entry_price,swing_score,agreement_count,
+                  score_15m,score_30m,score_1h,score_4h,dir_15m,dir_30m,dir_1h,dir_4h,
+                  max_price,min_price,last_price,last_update_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id
+              `).bind(c.coin,c.side,now,new Date(now).toISOString(),c.price,c.score,c.agreement,
+                swingTfSigned(tf["15m"]),swingTfSigned(tf["30m"]),swingTfSigned(tf["1h"]),swingTfSigned(tf["4h"]),
+                tf["15m"].direction,tf["30m"].direction,tf["1h"].direction,tf["4h"].direction,
+                c.price,c.price,c.price,now).first();
+              return {recorded:true,id:r?.id??null,coin:c.coin,side:c.side,score:c.score,price:c.price};
+            }
+
+            async function updateSwingOutcomes(env:Env):Promise<void>{
+              if(!env.DB) return;
+              await ensureSwingResearchTables(env);
+              const q:any=await env.DB.prepare(`SELECT * FROM swing_research_signals WHERE outcome_complete=0 ORDER BY entry_ts ASC LIMIT 250`).all();
+              const rows:any[]=q?.results??[];
+              const now=Date.now();
+              for(const x of rows){
+                const end=Math.min(now,Number(x.entry_ts)+24*60*60_000);
+                const snaps:any=await env.DB.prepare(`SELECT ts,price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT 2000`)
+                  .bind(x.coin,x.entry_ts,end).all();
+                const a:any[]=snaps?.results??[];
+                if(!a.length) continue;
+                let mfe=-Infinity,mae=Infinity,maxP=Number(x.entry_price),minP=Number(x.entry_price);
+                for(const z of a){ const p=Number(z.price); if(!Number.isFinite(p)||p<=0) continue; const d=directionalReturnPct(x.side,Number(x.entry_price),p); mfe=Math.max(mfe,d); mae=Math.min(mae,d); maxP=Math.max(maxP,p); minP=Math.min(minP,p); }
+                const vals:any={};
+                for(const h of SWING_HORIZONS_H){
+                  const target=Number(x.entry_ts)+h*60*60_000;
+                  if(now<target) { vals[h]=null; continue; }
+                  let best:any=null,dist=Infinity;
+                  for(const z of a){ const d=Math.abs(Number(z.ts)-target); if(d<=120000&&d<dist){best=z;dist=d;} }
+                  vals[h]=best?round(directionalReturnPct(x.side,Number(x.entry_price),Number(best.price)),4):null;
+                }
+                const done=now>=Number(x.entry_ts)+24*60*60_000;
+                await env.DB.prepare(`UPDATE swing_research_signals SET return_1h_pct=?,return_2h_pct=?,return_4h_pct=?,return_8h_pct=?,return_12h_pct=?,return_24h_pct=?,mfe_pct=?,mae_pct=?,max_price=?,min_price=?,last_price=?,last_update_ts=?,status=?,outcome_complete=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+                  .bind(vals[1],vals[2],vals[4],vals[8],vals[12],vals[24],Number.isFinite(mfe)?round(mfe,4):0,Number.isFinite(mae)?round(mae,4):0,maxP,minP,Number(a[a.length-1].price),now,done?"COMPLETE":"TRACKING",done?1:0,x.id).run();
+              }
+            }
+
+            async function runSwingResearch(env:Env,force=false):Promise<any>{
+              if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              await ensureSwingResearchTables(env);
+              await updateSwingOutcomes(env);
+              const now=Date.now();
+              const st:any=await env.DB.prepare(`SELECT value FROM swing_research_state WHERE key='last_scan_ts'`).first();
+              const last=Number(st?.value??0);
+              if(!force && now-last<SWING_SCAN_MS) return {success:true,scanned:false,reason:"15M_SCAN_INTERVAL",next_in_ms:SWING_SCAN_MS-(now-last)};
+              const settled=await Promise.allSettled(TRACKED_COINS.map(async coin=>{const c=await buildSwingCandidate(coin);const rec=await recordSwingCandidate(env,c);return {coin,candidate:{side:c.side,score:c.score,agreement:c.agreement,qualifies:c.qualifies},record:rec};}));
+              await env.DB.prepare(`INSERT INTO swing_research_state(key,value,updated_at) VALUES('last_scan_ts',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).bind(String(now),now).run();
+              return {success:true,scanned:true,mode:"SWING_RESEARCH_ONLY",trading:"NO_SWING_ORDERS",results:settled.map((r:any)=>r.status==="fulfilled"?r.value:{error:String(r.reason)})};
+            }
+
+            async function swingResearchStatus(env:Env):Promise<any>{
+              if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              await ensureSwingResearchTables(env); await updateSwingOutcomes(env);
+              const q:any=await env.DB.prepare(`SELECT * FROM swing_research_signals ORDER BY entry_ts DESC LIMIT 200`).all();
+              const rows:any[]=q?.results??[];
+              const complete=rows.filter(x=>Number(x.outcome_complete)===1);
+              const avg=(key:string)=>{const v=complete.map(x=>Number(x[key])).filter(Number.isFinite);return v.length?round(v.reduce((a,b)=>a+b,0)/v.length,4):null;};
+              return {success:true,worker:"cryptobot",version:VERSION,mode:"SWING_RESEARCH_ONLY",trading:"FAST_LIVE_UNCHANGED__SWING_NO_ORDERS",
+                methodology:{timeframes:["15m","30m","1h","4h"],weights:{"15m":0.15,"30m":0.20,"1h":0.30,"4h":0.35},entry_score:SWING_ENTRY_SCORE,min_direction_agreement:"3 of 4",dedupe_hours:4,horizon_hours:[1,2,4,8,12,24],source:"Hyperliquid closed candles + existing market_snapshots forward tracking",note:"research only; no exchange action"},
+                summary:{signals:rows.length,tracking:rows.length-complete.length,complete:complete.length,avg_return_1h_pct:avg("return_1h_pct"),avg_return_2h_pct:avg("return_2h_pct"),avg_return_4h_pct:avg("return_4h_pct"),avg_return_8h_pct:avg("return_8h_pct"),avg_return_12h_pct:avg("return_12h_pct"),avg_return_24h_pct:avg("return_24h_pct"),avg_mfe_pct:avg("mfe_pct"),avg_mae_pct:avg("mae_pct")},signals:rows};
+            }
+
             async function researchTrackingStatus(env: Env): Promise<any> {
               const a15=await real15mAlignmentAnalysis(env);
               let sl:any=null;
@@ -2867,13 +3008,19 @@
                     tests:["SL 0.15","SL 0.20","SL 0.25","SL 0.30","SL 0.40"],
                     source:"Hyperliquid activeAssetCtx markPx",
                     note:"tick shadow starts at real entry and continues after real close until entry+30m; no real order changes"
+                  },
+                  {
+                    id:"SWING_RESEARCH",status:"ACTIVE",endpoint:"/swing-research",
+                    timeframes:["15m","30m","1h","4h"],horizons:["1h","2h","4h","8h","12h","24h"],
+                    source:"Hyperliquid closed candles + market_snapshots",
+                    note:"paper/shadow only; FAST LIVE and real execution unchanged"
                   }
                 ],
                 current:{
                   sl_shadow_summary:sl?.entry_based_counterfactual?.summary??null,
                   alignment_15m_summary:a15?.summary??null
                 },
-                next:"Collect WS tick shadow + 15m context; do not change live SL until sample is large enough."
+                next:"Collect WS tick shadow + 15m context + SWING research; do not change FAST LIVE from research-only data prematurely."
               };
             }
 
@@ -5100,6 +5247,8 @@
                       order_wire_audit: "/order-wire-audit?limit=500",
                       debug: "/debug-hyperliquid",
                       progressive_ws_shadow: "/progressive-monitor/shadow-status",
+                      swing_research: "/swing-research",
+                      swing_scan_manual: "/swing-scan?force=1",
                       research_tracking_keep_last: "/research-tracking",
                     },
 
@@ -9230,6 +9379,16 @@
                   catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"15M_ALIGNMENT_ANALYSIS_FAILED",message:error?.message??String(error)},500); }
                 }
 
+                // SWING RESEARCH — paper/shadow only; no exchange action
+                if (url.pathname === "/swing-research") {
+                  try { return json(await swingResearchStatus(env)); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"SWING_RESEARCH_FAILED",message:error?.message??String(error)},500); }
+                }
+                if (url.pathname === "/swing-scan") {
+                  try { return json(await runSwingResearch(env,url.searchParams.get("force")==="1")); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"SWING_SCAN_FAILED",message:error?.message??String(error)},500); }
+                }
+
                 // RESEARCH TRACKING — keep active/next experiments visible in one place
                 if (url.pathname === "/research-tracking") {
                   try { return json(await researchTrackingStatus(env)); }
@@ -9739,6 +9898,10 @@
                 }
 
                 await ensureSnapshotTable(env);
+
+                // V1.11.0 SWING RESEARCH: scans at most once per 15m; research only.
+                try { await runSwingResearch(env, false); }
+                catch (error:any) { console.log("Swing research failed:", error?.message ?? String(error)); }
 
                 // V1.9.9: reconcile real Hyperliquid positions before processing new signals.
                 // Sends TP/SL close notifications and enforces MAX HOLD 30m.
