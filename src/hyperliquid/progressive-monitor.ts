@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.10.0 LIVE 50/50 RUNNER STAGE SYNC";
+    const MODULE_VERSION = "V2.11.0 LIVE RUNNER + WS TICK SL SHADOW";
 
     type Side = "LONG" | "SHORT";
 
@@ -114,6 +114,9 @@
       private ws: WebSocket | null = null;
       private config: MonitorConfig | null = null;
       private events: TriggerEvent[] = [];
+      // V2.11.0 research-only detached WS streams. They continue after a real
+      // trade closes so each ledger can be observed until entry+30m.
+      private shadowSockets: Map<number, WebSocket> = new Map();
 
       // V2.9.5: serialize all WS price messages inside this Durable Object.
       // Previously multiple async message handlers could overlap before D1
@@ -136,7 +139,7 @@
           return await this.env.DB.prepare(`
             SELECT id, crossing_id, coin, side, status, entry_fill_price, entry_fill_size,
                    progressive_stage, progressive_stop_pct, progressive_stop_price,
-                   progressive_stop_oid, entry_filled_at, updated_at
+                   progressive_stop_oid, entry_filled_at, closed_at, close_reason, realized_pnl, updated_at
             FROM hyperliquid_execution_ledger
             WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
               AND entry_fill_price IS NOT NULL
@@ -158,7 +161,7 @@
           return await this.env.DB.prepare(`
             SELECT id, crossing_id, coin, side, status, entry_fill_price, entry_fill_size,
                    progressive_stage, progressive_stop_pct, progressive_stop_price,
-                   progressive_stop_oid, entry_filled_at, updated_at
+                   progressive_stop_oid, entry_filled_at, closed_at, close_reason, realized_pnl, updated_at
             FROM hyperliquid_execution_ledger
             WHERE CAST(crossing_id AS TEXT)=?
             ORDER BY id DESC
@@ -175,7 +178,7 @@
           return await this.env.DB.prepare(`
             SELECT id, crossing_id, coin, side, status, entry_fill_price, entry_fill_size,
                    progressive_stage, progressive_stop_pct, progressive_stop_price,
-                   progressive_stop_oid, entry_filled_at, updated_at
+                   progressive_stop_oid, entry_filled_at, closed_at, close_reason, realized_pnl, updated_at
             FROM hyperliquid_execution_ledger
             WHERE id=?
             LIMIT 1
@@ -183,6 +186,217 @@
         } catch {
           return null;
         }
+      }
+
+
+      private async ensureWsShadowTable(): Promise<void> {
+        if (!this.env?.DB) return;
+        await this.env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS ws_tick_sl_shadow (
+            ledger_id INTEGER PRIMARY KEY,
+            crossing_id TEXT,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_ts INTEGER NOT NULL,
+            horizon_ts INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            tick_count INTEGER NOT NULL DEFAULT 0,
+            first_tick_ts INTEGER,
+            last_tick_ts INTEGER,
+            last_price REAL,
+            mfe_pct REAL,
+            mae_pct REAL,
+            hit_sl015_ts INTEGER,
+            hit_sl020_ts INTEGER,
+            hit_sl025_ts INTEGER,
+            hit_sl030_ts INTEGER,
+            hit_sl040_ts INTEGER,
+            hit_plus015_ts INTEGER,
+            hit_plus025_ts INTEGER,
+            hit_plus035_ts INTEGER,
+            hit_plus050_ts INTEGER,
+            real_close_ts INTEGER,
+            real_close_reason TEXT,
+            completed_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        `).run();
+      }
+
+      private async seedWsShadow(ledger:any): Promise<void> {
+        if (!this.env?.DB || !ledger) return;
+        const ledgerId=Number(ledger.id);
+        const entry=finitePositive(ledger.entry_fill_price);
+        const entryTs=Number(ledger.entry_filled_at);
+        const side=String(ledger.side??"").toUpperCase();
+        if(!Number.isInteger(ledgerId)||ledgerId<=0||!entry||!Number.isFinite(entryTs)||entryTs<=0) return;
+        if(side!=="LONG"&&side!=="SHORT") return;
+        await this.ensureWsShadowTable();
+        const now=Date.now();
+        await this.env.DB.prepare(`
+          INSERT OR IGNORE INTO ws_tick_sl_shadow (
+            ledger_id,crossing_id,coin,side,entry_price,entry_ts,horizon_ts,
+            active,created_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,1,?,?)
+        `).bind(
+          ledgerId,ledger.crossing_id!=null?String(ledger.crossing_id):null,
+          String(ledger.coin).toUpperCase(),side,entry,entryTs,entryTs+30*60000,now,now
+        ).run();
+      }
+
+      private async updateWsShadowTick(ledgerId:number, price:number, ts:number): Promise<void> {
+        if(!this.env?.DB||!Number.isInteger(ledgerId)||ledgerId<=0||!Number.isFinite(price)||price<=0) return;
+        await this.ensureWsShadowTable();
+        const row:any=await this.env.DB.prepare(`SELECT * FROM ws_tick_sl_shadow WHERE ledger_id=? LIMIT 1`).bind(ledgerId).first();
+        if(!row||Number(row.active)!==1) return;
+        const horizon=Number(row.horizon_ts);
+        if(ts>horizon){
+          await this.env.DB.prepare(`
+            UPDATE ws_tick_sl_shadow SET active=0,completed_at=?,updated_at=? WHERE ledger_id=?
+          `).bind(ts,ts,ledgerId).run();
+          return;
+        }
+        const ret=directionalReturnPct(String(row.side).toUpperCase() as Side,Number(row.entry_price),price);
+        const setOnce=(col:string,condition:boolean)=>condition&&row[col]==null?ts:null;
+        const sl015=setOnce("hit_sl015_ts",ret<=-0.15);
+        const sl020=setOnce("hit_sl020_ts",ret<=-0.20);
+        const sl025=setOnce("hit_sl025_ts",ret<=-0.25);
+        const sl030=setOnce("hit_sl030_ts",ret<=-0.30);
+        const sl040=setOnce("hit_sl040_ts",ret<=-0.40);
+        const p015=setOnce("hit_plus015_ts",ret>=0.15);
+        const p025=setOnce("hit_plus025_ts",ret>=0.25);
+        const p035=setOnce("hit_plus035_ts",ret>=0.35);
+        const p050=setOnce("hit_plus050_ts",ret>=0.50);
+        const mfe=row.mfe_pct==null?ret:Math.max(Number(row.mfe_pct),ret);
+        const mae=row.mae_pct==null?ret:Math.min(Number(row.mae_pct),ret);
+        await this.env.DB.prepare(`
+          UPDATE ws_tick_sl_shadow SET
+            tick_count=tick_count+1,
+            first_tick_ts=COALESCE(first_tick_ts,?),
+            last_tick_ts=?,last_price=?,mfe_pct=?,mae_pct=?,
+            hit_sl015_ts=COALESCE(hit_sl015_ts,?),
+            hit_sl020_ts=COALESCE(hit_sl020_ts,?),
+            hit_sl025_ts=COALESCE(hit_sl025_ts,?),
+            hit_sl030_ts=COALESCE(hit_sl030_ts,?),
+            hit_sl040_ts=COALESCE(hit_sl040_ts,?),
+            hit_plus015_ts=COALESCE(hit_plus015_ts,?),
+            hit_plus025_ts=COALESCE(hit_plus025_ts,?),
+            hit_plus035_ts=COALESCE(hit_plus035_ts,?),
+            hit_plus050_ts=COALESCE(hit_plus050_ts,?),
+            updated_at=?
+          WHERE ledger_id=?
+        `).bind(ts,ts,price,mfe,mae,sl015,sl020,sl025,sl030,sl040,p015,p025,p035,p050,ts,ledgerId).run();
+      }
+
+      private async markWsShadowRealClose(ledger:any):Promise<void>{
+        if(!this.env?.DB||!ledger) return;
+        await this.seedWsShadow(ledger);
+        await this.env.DB.prepare(`
+          UPDATE ws_tick_sl_shadow
+          SET real_close_ts=COALESCE(real_close_ts,?),
+              real_close_reason=COALESCE(real_close_reason,?),
+              updated_at=?
+          WHERE ledger_id=?
+        `).bind(
+          Number(ledger.closed_at)||Date.now(),
+          ledger.close_reason!=null?String(ledger.close_reason):String(ledger.status??"CLOSED"),
+          Date.now(),Number(ledger.id)
+        ).run();
+      }
+
+      private async startDetachedShadow(ledger:any):Promise<void>{
+        if(!ledger) return;
+        const ledgerId=Number(ledger.id);
+        if(!Number.isInteger(ledgerId)||ledgerId<=0||this.shadowSockets.has(ledgerId)) return;
+        await this.markWsShadowRealClose(ledger);
+        const row:any=await this.env.DB?.prepare(`SELECT * FROM ws_tick_sl_shadow WHERE ledger_id=?`).bind(ledgerId).first();
+        if(!row||Number(row.active)!==1) return;
+        if(Date.now()>=Number(row.horizon_ts)){
+          await this.env.DB.prepare(`UPDATE ws_tick_sl_shadow SET active=0,completed_at=?,updated_at=? WHERE ledger_id=?`)
+            .bind(Date.now(),Date.now(),ledgerId).run();
+          return;
+        }
+        const upstream=new WebSocket(HL_WS);
+        this.shadowSockets.set(ledgerId,upstream);
+        upstream.addEventListener("open",()=>{
+          upstream.send(JSON.stringify({method:"subscribe",subscription:{type:"activeAssetCtx",coin:String(row.coin).toUpperCase()}}));
+        });
+        upstream.addEventListener("message",(ev:MessageEvent)=>{
+          this.messageQueue=this.messageQueue.then(async()=>{
+            let msg:any; try{msg=typeof ev.data==="string"?JSON.parse(ev.data):null}catch{return}
+            if(msg?.channel!=="activeAssetCtx") return;
+            const px=finitePositive(msg?.data?.ctx?.markPx??msg?.data?.ctx?.midPx);
+            if(!px) return;
+            const now=Date.now();
+            await this.updateWsShadowTick(ledgerId,px,now);
+            if(now>=Number(row.horizon_ts)){
+              try{upstream.close(1000,"shadow complete")}catch{}
+              this.shadowSockets.delete(ledgerId);
+            }
+          }).catch(()=>{});
+        });
+        const reconnect=()=>{
+          this.shadowSockets.delete(ledgerId);
+          this.ctx.storage.setAlarm(Date.now()+2000).catch(()=>{});
+        };
+        upstream.addEventListener("close",reconnect);
+        upstream.addEventListener("error",reconnect);
+      }
+
+      private async resumeActiveShadows():Promise<void>{
+        if(!this.env?.DB) return;
+        await this.ensureWsShadowTable();
+        const now=Date.now();
+        await this.env.DB.prepare(`
+          UPDATE ws_tick_sl_shadow SET active=0,completed_at=COALESCE(completed_at,?),updated_at=?
+          WHERE active=1 AND horizon_ts<=?
+        `).bind(now,now,now).run();
+        const q:any=await this.env.DB.prepare(`
+          SELECT s.*,l.status,l.closed_at,l.close_reason
+          FROM ws_tick_sl_shadow s
+          LEFT JOIN hyperliquid_execution_ledger l ON l.id=s.ledger_id
+          WHERE s.active=1 AND s.real_close_ts IS NOT NULL AND s.horizon_ts>?
+          ORDER BY s.ledger_id
+        `).bind(now).all();
+        for(const row of q?.results??[]) await this.startDetachedShadow(row);
+      }
+
+      private async wsShadowReport():Promise<any>{
+        if(!this.env?.DB) return {success:false,error:"D1_NOT_BOUND"};
+        await this.ensureWsShadowTable();
+        const q:any=await this.env.DB.prepare(`SELECT * FROM ws_tick_sl_shadow ORDER BY ledger_id DESC LIMIT 500`).all();
+        const rows:any[]=q?.results??[];
+        const levels=[0.15,0.20,0.25,0.30,0.40];
+        const summary=levels.map(sl=>{
+          const key="hit_sl"+String(Math.round(sl*100)).padStart(3,"0")+"_ts";
+          let tpFirst=0,slFirst=0,time=0,pending=0;
+          for(const r of rows){
+            const st=Number(r[key])||null, tp=Number(r.hit_plus050_ts)||null;
+            if(st&&(!tp||st<tp)) slFirst++;
+            else if(tp&&(!st||tp<st)) tpFirst++;
+            else if(Number(r.active)===1) pending++;
+            else time++;
+          }
+          return {sl_pct:sl,trades:rows.length,tp_first:tpFirst,sl_first:slFirst,time_no_barrier:time,pending};
+        });
+        return {
+          success:true,module:MODULE_VERSION,mode:"WS_TICK_SL_SHADOW_READ_ONLY",
+          trading:"REAL_TRADING_UNCHANGED",
+          methodology:{
+            source:"Hyperliquid activeAssetCtx markPx websocket",
+            horizon_minutes:30,
+            tested_sl_pct:levels,
+            tp_reference_pct:0.50,
+            starts_at:"real entry; same WS ticks while live, detached WS continues after real close",
+            ordering:"first observed WS mark touch wins",
+            note:"research only; no exchange action"
+          },
+          summary,
+          active_detached_ws:[...this.shadowSockets.keys()],
+          shadows:rows
+        };
       }
 
       private progressiveStopPrice(side: Side, entry: number, protectedPct: number): number {
@@ -246,6 +460,10 @@
 
       async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
+
+        if (url.pathname === "/shadow-status") {
+          return json(await this.wsShadowReport());
+        }
 
         if (url.pathname === "/start") {
           const body: any = request.method === "POST"
@@ -361,6 +579,7 @@
             ledgerProgressiveStopOidAtStart: ledgerOid,
           };
           this.events = [];
+          if (ledger) await this.seedWsShadow(ledger);
 
           await this.persist();
           await this.connect();
@@ -428,6 +647,7 @@
       }
 
       async alarm(): Promise<void> {
+        await this.resumeActiveShadows();
         if (!this.config?.active) return;
 
         const stale =
@@ -528,7 +748,12 @@
         this.config.lastMessageAt = now;
         this.config.messageCount += 1;
         this.config.connectionState = "OPEN";
+        if (this.config.ledgerId != null) {
+          await this.updateWsShadowTick(this.config.ledgerId, price, now);
+        }
 
+        // V2.11.0: real progressive execution stops when ledger closes, but
+        // research shadow detaches and continues independently to entry+30m.
         // V2.9.5: a ledger-backed monitor must stop after the real position
         // lifecycle closes its ledger row. This prevents stale post-close
         // stages/events from being recorded.
@@ -541,12 +766,13 @@
             "MAX_HOLD_CLOSING",
           ]);
           if (!liveLedger || !openStatuses.has(String(liveLedger.status ?? ""))) {
+            if (liveLedger) await this.startDetachedShadow(liveLedger);
             this.config.active = false;
             this.config.connectionState = liveLedger
-              ? `STOPPED_LEDGER_${String(liveLedger.status ?? "CLOSED")}`
+              ? `STOPPED_LEDGER_${String(liveLedger.status ?? "CLOSED")}_SHADOW_CONTINUES`
               : "STOPPED_LEDGER_ROW_MISSING";
             await this.persist();
-            try { this.ws?.close(1000, "ledger closed"); } catch {}
+            try { this.ws?.close(1000, "ledger closed; shadow detached"); } catch {}
             this.ws = null;
             return;
           }
@@ -731,6 +957,13 @@
             ? new Date(c.startedAt).toISOString()
             : null,
           trigger_events: this.events,
+          ws_tick_sl_shadow: {
+            enabled: true,
+            endpoint: "/shadow-status",
+            levels_pct: [0.15,0.20,0.25,0.30,0.40],
+            horizon_minutes: 30,
+            detached_active_ledger_ids: [...this.shadowSockets.keys()],
+          },
           websocket: HL_WS,
         };
       }
