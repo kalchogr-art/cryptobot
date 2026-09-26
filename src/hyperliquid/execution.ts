@@ -8,9 +8,11 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.10.3 — PRICE WIRE FIX + ORDER WIRE AUDIT
+// HYPERLIQUID SIGNAL EXECUTION V2.10.5 — SYMMETRIC BE + SL020 + RUNNER LOCK
+// V2.10.5: LONG/SHORT initial SL 0.20%; +0.25% -> BE; confirmed 50% TP -> +0.25%; +0.75% -> +0.50%
+// V2.10.5: progressive replacement keeps new SL live before cancelling the previous SL
 // V2.8.1: exact active SL OID tracking for progressive replacement
-// V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
+// V2.8 historical base: LIVE progressive protection; V2.10.5 now overrides initial SL to 0.20% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -56,17 +58,19 @@ const CONFIG = {
 
   LONG_TAKE_PROFIT_PCT: 0.50,
   PARTIAL_TP_FRACTION: 0.50,
-  LONG_STOP_LOSS_PCT: 0.15,
+  LONG_STOP_LOSS_PCT: 0.20,
   SHORT_TAKE_PROFIT_PCT: 0.50,
-  SHORT_STOP_LOSS_PCT: 0.15,
+  SHORT_STOP_LOSS_PCT: 0.20,
 
-  // V2.8 progressive protection. Values are directional gross-return percentages.
-  // +0.07% gross is approximately fee-adjusted break-even before slippage.
+  // V2.10.5 symmetric LONG/SHORT protection:
+  // 1) Initial SL = -0.20%.
+  // 2) +0.25% -> SL at ENTRY (break-even).
+  // 3) +0.50% is the existing 50% partial TP. Only AFTER that fill is confirmed
+  //    may Stage 2 replace the runner SL with +0.25%.
+  // 4) +0.75% -> runner SL +0.50%, then continue the wider runner ladder.
   LONG_PROGRESSIVE_STEPS: [
-    { trigger: 0.15, stop: 0.07 },
-    { trigger: 0.25, stop: 0.10 },
-    { trigger: 0.35, stop: 0.20 },
-    { trigger: 0.45, stop: 0.30 },
+    { trigger: 0.25, stop: 0.00 },
+    { trigger: 0.50, stop: 0.25 },
     { trigger: 0.75, stop: 0.50 },
     { trigger: 1.00, stop: 0.75 },
     { trigger: 1.50, stop: 1.00 },
@@ -74,9 +78,8 @@ const CONFIG = {
     { trigger: 3.00, stop: 2.00 },
   ],
   SHORT_PROGRESSIVE_STEPS: [
-    { trigger: 0.25, stop: 0.07 },
-    { trigger: 0.35, stop: 0.15 },
-    { trigger: 0.45, stop: 0.25 },
+    { trigger: 0.25, stop: 0.00 },
+    { trigger: 0.50, stop: 0.25 },
     { trigger: 0.75, stop: 0.50 },
     { trigger: 1.00, stop: 0.75 },
     { trigger: 1.50, stop: 1.00 },
@@ -384,7 +387,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.10.3 PRICE WIRE FIX + ORDER WIRE AUDIT",
+    version: "V2.10.5 SYMMETRIC BE + SL020 + RUNNER LOCK",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -1008,8 +1011,16 @@ async function advanceProgressiveProtection(
   }
 
   const dirReturn = directionalReturnPct(side, entryPrice, marketPrice);
-  const target = reachedProgressiveStep(side, dirReturn);
+  let target = reachedProgressiveStep(side, dirReturn);
   const currentStage = Math.max(0, Number(row.progressive_stage ?? 0) || 0);
+
+  // Once the exchange confirms the 50% TP fill, Stage 2 (+0.25% runner lock)
+  // is mandatory even if price has already pulled back below +0.50% before the
+  // lifecycle poll runs. A higher currently-reached stage still wins.
+  if (Number(row.partial_tp_filled_at) && currentStage < 2 && (!target || target.stage < 2)) {
+    target = { stage: 2, trigger: 0.50, stop: 0.25 };
+  }
+
   if (!target || target.stage <= currentStage) {
     return {
       advanced: false,
@@ -1194,6 +1205,17 @@ export async function executeProgressiveWsTrigger(
   const currentStage=Math.max(0,Number(row.progressive_stage??0)||0);
   if (!Number.isInteger(targetStage)||targetStage<=currentStage)
     return {success:true,executed:false,reason:"ALREADY_AT_OR_ABOVE_TARGET_STAGE",ledger_id:ledgerId,current_stage:currentStage,target_stage:targetStage};
+
+  // V2.10.5: LONG and SHORT Stage 2 (+0.50 -> runner SL +0.25) must never be armed
+  // merely because markPx touched +0.50. The exchange must first confirm that
+  // the existing 50% TP actually reduced the position. This also guarantees
+  // that the replacement SL is sized to the remaining runner, not full size.
+  if (targetStage >= 2 && !Number(row.partial_tp_filled_at)) {
+    return {
+      success:false, executed:false, reason:"WAITING_CONFIRMED_PARTIAL_TP",
+      ledger_id:ledgerId, current_stage:currentStage, target_stage:targetStage
+    };
+  }
   let position:any=null;
   try { position=await getOpenPositionForCoin(String(row.coin??"").toUpperCase()); }
   catch(err:any){ return {success:false,executed:false,reason:"POSITION_LOOKUP_FAILED",error:err?.message??String(err)}; }
@@ -2149,6 +2171,25 @@ export async function buildHyperliquidExecutionCandidate(
     protectionOk ? "PROTECTED" : "TPSL_FAILED_AFTER_RETRIES",
     { last_error: protectionOk ? null : protectionLastError }
   );
+
+  // V2.10.5: persist the exact INITIAL SL OID as soon as the bracket is
+  // confirmed. Stage 1 can then cancel that exact order after the replacement
+  // stop is live, instead of relying on legacy price matching. This prevents
+  // the stale Initial-SL + Progressive-SL pair observed in live trading.
+  if (protectionOk && env?.DB && signal.crossing_id != null && Array.isArray(protectionStatuses)) {
+    const initialSlOid = responseOrderOid(protectionStatuses[1]);
+    if (initialSlOid != null) {
+      try {
+        await env.DB.prepare(`
+          UPDATE hyperliquid_execution_ledger
+          SET progressive_stop_oid=?, progressive_stop_price=?, progressive_updated_at=?, updated_at=?
+          WHERE crossing_id=? AND COALESCE(progressive_stage,0)=0
+        `).bind(
+          initialSlOid, Number(slWire), Date.now(), Date.now(), String(signal.crossing_id)
+        ).run();
+      } catch {}
+    }
+  }
 
   // Read account state AFTER the filled entry and TP/SL attempts.
   const accountBalance = await getAccountSnapshot();
