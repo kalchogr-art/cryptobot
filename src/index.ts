@@ -2,7 +2,7 @@
             import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
             import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
             import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
-            import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle, executeProgressiveWsTrigger } from "./hyperliquid/execution";
+            import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle, executeProgressiveWsTrigger, getHyperliquidOrderWireAudit } from "./hyperliquid/execution";
             export { ProgressiveMonitor } from "./hyperliquid/progressive-monitor";
 
             // ============================================================
@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.0 LIVE 50/50 RUNNER DASHBOARD";
+            const VERSION = "V1.10.1 PRICE WIRE AUDIT";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -4606,6 +4606,7 @@
                       short_sl015_analysis: "/short-sl015-analysis",
                       forward_long_shadow: "/forward-long-shadow",
                       forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
+                      order_wire_audit: "/order-wire-audit?limit=500",
                       debug: "/debug-hyperliquid",
                     },
 
@@ -8722,6 +8723,34 @@
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify(body),
                   });
+                }
+
+
+                // HYPERLIQUID ORDER WIRE AUDIT — READ ONLY
+                // Audits open + historical Hyperliquid orders and flags decade-scale
+                // price outliers caused by the pre-V2.10.3 integer trailing-zero bug.
+                if (url.pathname === "/order-wire-audit") {
+                  try {
+                    const limit = Math.max(
+                      1,
+                      Math.min(2000, Number(url.searchParams.get("limit") ?? "500") || 500)
+                    );
+                    const audit = await getHyperliquidOrderWireAudit(limit);
+                    return json({
+                      worker: "cryptobot",
+                      version: VERSION,
+                      ...audit,
+                    });
+                  } catch (error: any) {
+                    return json({
+                      success: false,
+                      worker: "cryptobot",
+                      version: VERSION,
+                      read_only: true,
+                      error: "ORDER_WIRE_AUDIT_FAILED",
+                      message: error?.message ?? String(error),
+                    }, 500);
+                  }
                 }
 
 
