@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.11.0 SWING RESEARCH";
+            const VERSION = "V1.11.1 FAST + SWING PULLBACK RETEST SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2962,6 +2962,171 @@
               return {success:true,scanned:true,mode:"SWING_RESEARCH_ONLY",trading:"NO_SWING_ORDERS",results:settled.map((r:any)=>r.status==="fulfilled"?r.value:{error:String(r.reason)})};
             }
 
+
+            // ============================================================
+            // V1.11.1 FAST + SWING PULLBACK / ENTRY-RETEST SHADOW
+            // RESEARCH ONLY. Replays existing minute market_snapshots so it can
+            // backfill already-open research signals (including SWING #1).
+            // No live order, TP, SL, progressive stage or execution change.
+            // ============================================================
+            const FAST_PULLBACK_LEVELS = [0.15,0.25,0.35,0.50] as const;
+            const SWING_PULLBACK_LEVELS = [0.25,0.50,0.75,1.00,1.50,2.00,3.00,5.00] as const;
+
+            async function ensurePullbackRetestTable(env:Env):Promise<void>{
+              if(!env.DB) return;
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS pullback_retest_shadow (
+                  source TEXT NOT NULL,
+                  source_id INTEGER NOT NULL,
+                  coin TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  entry_ts INTEGER NOT NULL,
+                  entry_price REAL NOT NULL,
+                  horizon_ts INTEGER NOT NULL,
+                  milestone_pct REAL NOT NULL,
+                  milestone_hit INTEGER NOT NULL DEFAULT 0,
+                  milestone_hit_ts INTEGER,
+                  milestone_hit_price REAL,
+                  best_run_pct REAL NOT NULL DEFAULT 0,
+                  best_run_ts INTEGER,
+                  deepest_pullback_pct REAL,
+                  deepest_pullback_price REAL,
+                  deepest_pullback_ts INTEGER,
+                  pullback_from_best_pct REAL,
+                  entry_retest INTEGER NOT NULL DEFAULT 0,
+                  entry_retest_ts INTEGER,
+                  entry_retest_price REAL,
+                  entry_crossed_against INTEGER NOT NULL DEFAULT 0,
+                  post_retest_best_run_pct REAL,
+                  post_retest_best_run_ts INTEGER,
+                  recovered_milestone_after_retest INTEGER NOT NULL DEFAULT 0,
+                  completed INTEGER NOT NULL DEFAULT 0,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY(source,source_id,milestone_pct)
+                )
+              `).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_pullback_source ON pullback_retest_shadow(source,source_id)`).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_pullback_coin ON pullback_retest_shadow(coin,entry_ts DESC)`).run();
+            }
+
+            function pullbackLevelKey(x:number):string { return x.toFixed(2); }
+
+            async function replayPullbackOne(
+              env:Env, source:string, sourceId:number, coin:string, side:string,
+              entryTs:number, entryPrice:number, horizonTs:number, levels:readonly number[]
+            ):Promise<void>{
+              if(!env.DB || !entryPrice || !Number.isFinite(entryPrice)) return;
+              const end=Math.min(Date.now(),horizonTs);
+              const r:any=await env.DB.prepare(`
+                SELECT ts,price FROM market_snapshots
+                WHERE coin=? AND ts>=? AND ts<=?
+                ORDER BY ts ASC LIMIT 5000
+              `).bind(coin,entryTs,end).all();
+              const snaps:any[]=r?.results??[];
+              if(!snaps.length) return;
+              const pts=snaps.map(z=>({ts:Number(z.ts),price:Number(z.price),ret:directionalReturnPct(side,entryPrice,Number(z.price))}))
+                .filter(z=>Number.isFinite(z.price)&&z.price>0&&Number.isFinite(z.ret));
+              if(!pts.length) return;
+              for(const level of levels){
+                const hitIndex=pts.findIndex(z=>z.ret>=level);
+                let hit=0,hitTs:any=null,hitPrice:any=null,bestRun=0,bestRunTs:any=null;
+                let deepest:any=null,deepestPrice:any=null,deepestTs:any=null,pullbackFromBest:any=null;
+                let entryRetest=0,retestTs:any=null,retestPrice:any=null,crossedAgainst=0;
+                let postRetestBest:any=null,postRetestBestTs:any=null,recovered=0;
+                if(hitIndex>=0){
+                  hit=1; hitTs=pts[hitIndex].ts; hitPrice=pts[hitIndex].price;
+                  let peak=-Infinity,peakTs:any=null;
+                  for(let i=0;i<=hitIndex;i++){ if(pts[i].ret>peak){peak=pts[i].ret;peakTs=pts[i].ts;} }
+                  bestRun=peak; bestRunTs=peakTs;
+                  let runningPeak=peak;
+                  let maxSequentialPullback=0;
+                  for(let i=hitIndex;i<pts.length;i++){
+                    const z=pts[i];
+                    if(z.ret>runningPeak) runningPeak=z.ret;
+                    maxSequentialPullback=Math.max(maxSequentialPullback,runningPeak-z.ret);
+                    if(z.ret>bestRun){bestRun=z.ret;bestRunTs=z.ts;}
+                    if(deepest===null || z.ret<deepest){deepest=z.ret;deepestPrice=z.price;deepestTs=z.ts;}
+                    if(!entryRetest && z.ret<=0){entryRetest=1;retestTs=z.ts;retestPrice=z.price;}
+                    if(z.ret<0) crossedAgainst=1;
+                  }
+                  pullbackFromBest=maxSequentialPullback;
+                  if(entryRetest){
+                    for(const z of pts){
+                      if(z.ts<Number(retestTs)) continue;
+                      if(postRetestBest===null || z.ret>postRetestBest){postRetestBest=z.ret;postRetestBestTs=z.ts;}
+                    }
+                    recovered=postRetestBest!==null && postRetestBest>=level ? 1:0;
+                  }
+                } else {
+                  for(const z of pts){ if(z.ret>bestRun){bestRun=z.ret;bestRunTs=z.ts;} }
+                }
+                await env.DB.prepare(`
+                  INSERT INTO pullback_retest_shadow(
+                    source,source_id,coin,side,entry_ts,entry_price,horizon_ts,milestone_pct,
+                    milestone_hit,milestone_hit_ts,milestone_hit_price,best_run_pct,best_run_ts,
+                    deepest_pullback_pct,deepest_pullback_price,deepest_pullback_ts,pullback_from_best_pct,
+                    entry_retest,entry_retest_ts,entry_retest_price,entry_crossed_against,
+                    post_retest_best_run_pct,post_retest_best_run_ts,recovered_milestone_after_retest,completed,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                  ON CONFLICT(source,source_id,milestone_pct) DO UPDATE SET
+                    milestone_hit=excluded.milestone_hit,milestone_hit_ts=excluded.milestone_hit_ts,
+                    milestone_hit_price=excluded.milestone_hit_price,best_run_pct=excluded.best_run_pct,
+                    best_run_ts=excluded.best_run_ts,deepest_pullback_pct=excluded.deepest_pullback_pct,
+                    deepest_pullback_price=excluded.deepest_pullback_price,deepest_pullback_ts=excluded.deepest_pullback_ts,
+                    pullback_from_best_pct=excluded.pullback_from_best_pct,entry_retest=excluded.entry_retest,
+                    entry_retest_ts=excluded.entry_retest_ts,entry_retest_price=excluded.entry_retest_price,
+                    entry_crossed_against=excluded.entry_crossed_against,post_retest_best_run_pct=excluded.post_retest_best_run_pct,
+                    post_retest_best_run_ts=excluded.post_retest_best_run_ts,recovered_milestone_after_retest=excluded.recovered_milestone_after_retest,
+                    completed=excluded.completed,updated_at=CURRENT_TIMESTAMP
+                `).bind(source,sourceId,coin,side,entryTs,entryPrice,horizonTs,level,
+                  hit,hitTs,hitPrice,round(bestRun,4),bestRunTs,
+                  deepest===null?null:round(deepest,4),deepestPrice,deepestTs,pullbackFromBest===null?null:round(pullbackFromBest,4),
+                  entryRetest,retestTs,retestPrice,crossedAgainst,
+                  postRetestBest===null?null:round(postRetestBest,4),postRetestBestTs,recovered,Date.now()>=horizonTs?1:0).run();
+              }
+            }
+
+            async function updatePullbackRetestShadow(env:Env):Promise<void>{
+              if(!env.DB) return;
+              await ensurePullbackRetestTable(env);
+              const now=Date.now();
+              const fast:any=await env.DB.prepare(`
+                SELECT id,coin,side,crossing_ts entry_ts,crossing_price entry_price
+                FROM signal_65_crossings
+                WHERE crossing_ts>=? ORDER BY crossing_ts DESC LIMIT 300
+              `).bind(now-30*60_000).all();
+              for(const x of (fast?.results??[])){
+                await replayPullbackOne(env,"FAST",Number(x.id),x.coin,x.side,Number(x.entry_ts),Number(x.entry_price),Number(x.entry_ts)+30*60_000,FAST_PULLBACK_LEVELS);
+              }
+              await ensureSwingResearchTables(env);
+              const swing:any=await env.DB.prepare(`
+                SELECT id,coin,side,entry_ts,entry_price FROM swing_research_signals
+                WHERE entry_ts>=? ORDER BY entry_ts DESC LIMIT 300
+              `).bind(now-24*60*60_000).all();
+              for(const x of (swing?.results??[])){
+                await replayPullbackOne(env,"SWING",Number(x.id),x.coin,x.side,Number(x.entry_ts),Number(x.entry_price),Number(x.entry_ts)+24*60*60_000,SWING_PULLBACK_LEVELS);
+              }
+            }
+
+            async function pullbackRetestStatus(env:Env,sourceFilter?:string):Promise<any>{
+              if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              await updatePullbackRetestShadow(env);
+              const src=(sourceFilter??"").toUpperCase();
+              const where=src==="FAST"||src==="SWING"?"WHERE source=?":"";
+              const q:any=src==="FAST"||src==="SWING"
+                ? await env.DB.prepare(`SELECT * FROM pullback_retest_shadow ${where} ORDER BY entry_ts DESC,source_id DESC,milestone_pct ASC LIMIT 1000`).bind(src).all()
+                : await env.DB.prepare(`SELECT * FROM pullback_retest_shadow ORDER BY entry_ts DESC,source_id DESC,milestone_pct ASC LIMIT 1000`).all();
+              const rows:any[]=q?.results??[];
+              const hit=rows.filter(x=>Number(x.milestone_hit)===1);
+              const retest=hit.filter(x=>Number(x.entry_retest)===1);
+              const recovered=retest.filter(x=>Number(x.recovered_milestone_after_retest)===1);
+              return {success:true,worker:"cryptobot",version:VERSION,mode:"PULLBACK_ENTRY_RETEST_SHADOW",trading:"REAL_TRADING_UNCHANGED",
+                methodology:{FAST:{horizon:"30m",levels_pct:FAST_PULLBACK_LEVELS},SWING:{horizon:"24h",levels_pct:SWING_PULLBACK_LEVELS},
+                  meaning:"After first reaching each favorable milestone, track deepest later directional return, whether original Entry is retested/crossed, and whether the same milestone is recovered after the retest.",
+                  source:"market_snapshots",limitation:"Minute snapshots can miss intraminute touches; WS tick shadow remains the higher-resolution source for FAST."},
+                summary:{rows:rows.length,milestones_hit:hit.length,entry_retests_after_hit:retest.length,recovered_same_milestone_after_retest:recovered.length},rows};
+            }
+
             async function swingResearchStatus(env:Env):Promise<any>{
               if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
               await ensureSwingResearchTables(env); await updateSwingOutcomes(env);
@@ -3014,13 +3179,20 @@
                     timeframes:["15m","30m","1h","4h"],horizons:["1h","2h","4h","8h","12h","24h"],
                     source:"Hyperliquid closed candles + market_snapshots",
                     note:"paper/shadow only; FAST LIVE and real execution unchanged"
+                  },
+                  {
+                    id:"PULLBACK_ENTRY_RETEST",status:"ACTIVE",endpoint:"/pullback-retest-shadow",
+                    filters:["?source=FAST","?source=SWING"],
+                    fast_levels_pct:[0.15,0.25,0.35,0.50],swing_levels_pct:[0.25,0.50,0.75,1.00,1.50,2.00,3.00,5.00],
+                    source:"market_snapshots",
+                    note:"research-only: after a favorable run, tracks pullback depth, Entry retest/cross, and recovery after retest"
                   }
                 ],
                 current:{
                   sl_shadow_summary:sl?.entry_based_counterfactual?.summary??null,
                   alignment_15m_summary:a15?.summary??null
                 },
-                next:"Collect WS tick shadow + 15m context + SWING research; do not change FAST LIVE from research-only data prematurely."
+                next:"Collect WS tick shadow + pullback/Entry-retest paths + 15m context + SWING research; do not change FAST LIVE from research-only data prematurely."
               };
             }
 
@@ -9389,6 +9561,12 @@
                   catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"SWING_SCAN_FAILED",message:error?.message??String(error)},500); }
                 }
 
+                // FAST + SWING PULLBACK / ENTRY RETEST SHADOW — READ ONLY
+                if (url.pathname === "/pullback-retest-shadow") {
+                  try { return json(await pullbackRetestStatus(env,url.searchParams.get("source")??undefined)); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"PULLBACK_RETEST_SHADOW_FAILED",message:error?.message??String(error)},500); }
+                }
+
                 // RESEARCH TRACKING — keep active/next experiments visible in one place
                 if (url.pathname === "/research-tracking") {
                   try { return json(await researchTrackingStatus(env)); }
@@ -9902,6 +10080,9 @@
                 // V1.11.0 SWING RESEARCH: scans at most once per 15m; research only.
                 try { await runSwingResearch(env, false); }
                 catch (error:any) { console.log("Swing research failed:", error?.message ?? String(error)); }
+                // V1.11.1 research-only FAST + SWING pullback/retest path tracker.
+                try { await updatePullbackRetestShadow(env); }
+                catch (error:any) { console.log("Pullback/retest shadow failed:", error?.message ?? String(error)); }
 
                 // V1.9.9: reconcile real Hyperliquid positions before processing new signals.
                 // Sends TP/SL close notifications and enforces MAX HOLD 30m.
