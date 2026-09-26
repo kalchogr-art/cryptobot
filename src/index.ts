@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.1 PRICE WIRE AUDIT";
+            const VERSION = "V1.10.2 INITIAL SL FORWARD SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2388,6 +2388,234 @@
               };
             }
 
+
+            // ============================================================
+            // V1.10.2 — INITIAL SL FORWARD SHADOW
+            // RESEARCH ONLY. Starts after a REAL initial SL close and follows
+            // the original entry for another 30 minutes using market_snapshots.
+            // It never opens, modifies or closes a Hyperliquid order.
+            // ============================================================
+            async function ensureInitialSlForwardShadowTable(env: Env): Promise<void> {
+              if (!env.DB) return;
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS initial_sl_forward_shadow (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ledger_id INTEGER NOT NULL UNIQUE,
+                  crossing_id TEXT,
+                  episode_id TEXT,
+                  coin TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  entry_price REAL NOT NULL,
+                  entry_ts INTEGER NOT NULL,
+                  sl_exit_price REAL,
+                  sl_exit_ts INTEGER NOT NULL,
+                  sl_exit_minutes REAL,
+                  configured_initial_sl_pct REAL,
+                  return_1m_pct REAL,
+                  return_3m_pct REAL,
+                  return_5m_pct REAL,
+                  return_10m_pct REAL,
+                  return_15m_pct REAL,
+                  return_30m_pct REAL,
+                  post_sl_mfe_pct REAL,
+                  post_sl_mae_pct REAL,
+                  hit_plus_015 INTEGER NOT NULL DEFAULT 0,
+                  hit_plus_025 INTEGER NOT NULL DEFAULT 0,
+                  hit_plus_035 INTEGER NOT NULL DEFAULT 0,
+                  hit_plus_050 INTEGER NOT NULL DEFAULT 0,
+                  would_survive_sl020 INTEGER,
+                  would_survive_sl025 INTEGER,
+                  would_survive_sl030 INTEGER,
+                  would_survive_sl040 INTEGER,
+                  completed INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+              `).run();
+              await env.DB.prepare(`
+                CREATE INDEX IF NOT EXISTS idx_initial_sl_forward_shadow_completed
+                ON initial_sl_forward_shadow (completed, sl_exit_ts DESC)
+              `).run();
+            }
+
+            async function seedInitialSlForwardShadows(env: Env): Promise<number> {
+              if (!env.DB) return 0;
+              await ensureInitialSlForwardShadowTable(env);
+
+              // Seed only confirmed REAL initial-SL lifecycle rows.
+              // Historical rows are included automatically after deployment.
+              const q:any = await env.DB.prepare(`
+                SELECT id,crossing_id,episode_id,coin,side,entry_fill_price,
+                       entry_filled_at,claimed_at,updated_at,closed_at,exit_price
+                FROM hyperliquid_execution_ledger
+                WHERE close_reason='SL_HIT'
+                  AND entry_fill_price IS NOT NULL
+                  AND entry_fill_price > 0
+                  AND closed_at IS NOT NULL
+                ORDER BY closed_at ASC
+                LIMIT 500
+              `).all();
+
+              let inserted=0;
+              for(const row of q?.results??[]){
+                const entry=Number(row.entry_fill_price);
+                const entryTs=Number(row.entry_filled_at??row.claimed_at??row.updated_at);
+                const exitTs=Number(row.closed_at);
+                if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(entryTs)||!Number.isFinite(exitTs)) continue;
+                const side=String(row.side??"").toUpperCase();
+                const configuredSl=0.15; // Current live V2.10.x initial SL on both sides.
+                const r:any=await env.DB.prepare(`
+                  INSERT OR IGNORE INTO initial_sl_forward_shadow (
+                    ledger_id,crossing_id,episode_id,coin,side,entry_price,entry_ts,
+                    sl_exit_price,sl_exit_ts,sl_exit_minutes,configured_initial_sl_pct
+                  ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                `).bind(
+                  Number(row.id),String(row.crossing_id??""),String(row.episode_id??""),
+                  String(row.coin??"").toUpperCase(),side,entry,entryTs,
+                  Number.isFinite(Number(row.exit_price))?Number(row.exit_price):null,
+                  exitTs,round((exitTs-entryTs)/60000,3),configuredSl
+                ).run();
+                if(Number(r?.meta?.changes??0)>0) inserted++;
+              }
+              return inserted;
+            }
+
+            async function updateInitialSlForwardShadows(env: Env): Promise<void> {
+              if (!env.DB) return;
+              await ensureInitialSlForwardShadowTable(env);
+              await seedInitialSlForwardShadows(env);
+
+              const now=Date.now();
+              const q:any=await env.DB.prepare(`
+                SELECT * FROM initial_sl_forward_shadow
+                WHERE completed=0
+                ORDER BY sl_exit_ts ASC
+                LIMIT 200
+              `).all();
+
+              for(const row of q?.results??[]){
+                const coin=String(row.coin);
+                const side=String(row.side);
+                const entry=Number(row.entry_price);
+                const start=Number(row.sl_exit_ts);
+                if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(start)) continue;
+                const end=Math.min(now,start+30*60000);
+
+                const pts:any=await env.DB.prepare(`
+                  SELECT ts,price FROM market_snapshots
+                  WHERE coin=? AND ts>=? AND ts<=?
+                  ORDER BY ts ASC
+                `).bind(coin,start,end).all();
+
+                let mfe=Number.NEGATIVE_INFINITY;
+                let mae=Number.POSITIVE_INFINITY;
+                let hit015=0,hit025=0,hit035=0,hit050=0;
+                let minDirectional=Number.POSITIVE_INFINITY;
+
+                for(const p of pts?.results??[]){
+                  const px=Number(p.price);
+                  if(!Number.isFinite(px)||px<=0) continue;
+                  const ret=directionalReturnPct(side,entry,px);
+                  mfe=Math.max(mfe,ret);
+                  mae=Math.min(mae,ret);
+                  minDirectional=Math.min(minDirectional,ret);
+                  if(ret>=0.15) hit015=1;
+                  if(ret>=0.25) hit025=1;
+                  if(ret>=0.35) hit035=1;
+                  if(ret>=0.50) hit050=1;
+                }
+
+                const vals:any={
+                  return_1m_pct:row.return_1m_pct??null,
+                  return_3m_pct:row.return_3m_pct??null,
+                  return_5m_pct:row.return_5m_pct??null,
+                  return_10m_pct:row.return_10m_pct??null,
+                  return_15m_pct:row.return_15m_pct??null,
+                  return_30m_pct:row.return_30m_pct??null,
+                };
+                for(const [m,f] of [[1,"return_1m_pct"],[3,"return_3m_pct"],[5,"return_5m_pct"],[10,"return_10m_pct"],[15,"return_15m_pct"],[30,"return_30m_pct"]] as const){
+                  if(vals[f]!==null||now<start+m*60000) continue;
+                  const snap=await nearestSnapshotPrice(env,coin,start+m*60000);
+                  if(snap) vals[f]=round(directionalReturnPct(side,entry,snap.price),4);
+                }
+
+                // "Would survive" means no sampled price after the actual SL
+                // reached that wider loss threshold during the 30m shadow.
+                const survive=(sl:number)=>Number.isFinite(minDirectional)?(minDirectional>-sl?1:0):null;
+                const complete=now>=start+30*60000 ? 1 : 0;
+
+                await env.DB.prepare(`
+                  UPDATE initial_sl_forward_shadow SET
+                    return_1m_pct=?,return_3m_pct=?,return_5m_pct=?,return_10m_pct=?,
+                    return_15m_pct=?,return_30m_pct=?,
+                    post_sl_mfe_pct=?,post_sl_mae_pct=?,
+                    hit_plus_015=?,hit_plus_025=?,hit_plus_035=?,hit_plus_050=?,
+                    would_survive_sl020=?,would_survive_sl025=?,would_survive_sl030=?,would_survive_sl040=?,
+                    completed=?,updated_at=CURRENT_TIMESTAMP
+                  WHERE id=?
+                `).bind(
+                  vals.return_1m_pct,vals.return_3m_pct,vals.return_5m_pct,vals.return_10m_pct,
+                  vals.return_15m_pct,vals.return_30m_pct,
+                  Number.isFinite(mfe)?round(mfe,4):null,Number.isFinite(mae)?round(mae,4):null,
+                  hit015,hit025,hit035,hit050,
+                  survive(0.20),survive(0.25),survive(0.30),survive(0.40),
+                  complete,Number(row.id)
+                ).run();
+              }
+            }
+
+            async function initialSlForwardShadowReport(env: Env): Promise<any> {
+              if (!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              await updateInitialSlForwardShadows(env);
+              const rows:any=await env.DB.prepare(`
+                SELECT * FROM initial_sl_forward_shadow
+                ORDER BY sl_exit_ts DESC
+                LIMIT 500
+              `).all();
+              const a:any[]=rows?.results??[];
+              const completed=a.filter(x=>Number(x.completed)===1);
+              const sum=(fn:(x:any)=>boolean)=>completed.filter(fn).length;
+              const avg=(field:string)=>{
+                const v=completed.map(x=>Number(x[field])).filter(Number.isFinite);
+                return v.length?round(v.reduce((p,c)=>p+c,0)/v.length,4):null;
+              };
+              return {
+                success:true,
+                worker:"cryptobot",
+                version:VERSION,
+                mode:"INITIAL_SL_FORWARD_SHADOW_30M",
+                trading:"REAL_TRADING_UNCHANGED",
+                methodology:{
+                  cohort:"REAL hyperliquid_execution_ledger rows with close_reason=SL_HIT only",
+                  shadow_start:"actual initial SL close timestamp",
+                  reference:"original real entry price",
+                  horizon_minutes:30,
+                  checkpoints_minutes:[1,3,5,10,15,30],
+                  recovery_levels_pct:[0.15,0.25,0.35,0.50],
+                  wider_sl_tests_pct:[0.20,0.25,0.30,0.40],
+                  source:"existing market_snapshots",
+                  limitation:"minute snapshots can miss intraminute extremes; research only; no real orders"
+                },
+                summary:{
+                  shadows:a.length,
+                  completed:completed.length,
+                  open:a.length-completed.length,
+                  recovered_plus_015:sum(x=>Number(x.hit_plus_015)===1),
+                  recovered_plus_025:sum(x=>Number(x.hit_plus_025)===1),
+                  recovered_plus_035:sum(x=>Number(x.hit_plus_035)===1),
+                  recovered_plus_050:sum(x=>Number(x.hit_plus_050)===1),
+                  survived_sl020:sum(x=>Number(x.would_survive_sl020)===1),
+                  survived_sl025:sum(x=>Number(x.would_survive_sl025)===1),
+                  survived_sl030:sum(x=>Number(x.would_survive_sl030)===1),
+                  survived_sl040:sum(x=>Number(x.would_survive_sl040)===1),
+                  avg_post_sl_mfe_pct:avg("post_sl_mfe_pct"),
+                  avg_post_sl_mae_pct:avg("post_sl_mae_pct"),
+                  avg_return_30m_pct:avg("return_30m_pct")
+                },
+                trades:a
+              };
+            }
+
             async function getOpenPaperTrade(
               env: Env,
               coin: string
@@ -4606,6 +4834,7 @@
                       short_sl015_analysis: "/short-sl015-analysis",
                       forward_long_shadow: "/forward-long-shadow",
                       forward_long_shadow_dashboard: "/forward-long-shadow-dashboard",
+                      initial_sl_forward_shadow: "/live-sl-recovery-analysis",
                       order_wire_audit: "/order-wire-audit?limit=500",
                       debug: "/debug-hyperliquid",
                     },
@@ -8726,6 +8955,20 @@
                 }
 
 
+                // INITIAL SL FORWARD SHADOW — READ ONLY
+                if (url.pathname === "/live-sl-recovery-analysis") {
+                  try {
+                    return json(await initialSlForwardShadowReport(env));
+                  } catch (error:any) {
+                    return json({
+                      success:false,worker:"cryptobot",version:VERSION,
+                      mode:"INITIAL_SL_FORWARD_SHADOW_30M",
+                      error:"INITIAL_SL_FORWARD_SHADOW_FAILED",
+                      message:error?.message??String(error)
+                    },500);
+                  }
+                }
+
                 // HYPERLIQUID ORDER WIRE AUDIT — READ ONLY
                 // Audits open + historical Hyperliquid orders and flags decade-scale
                 // price outliers caused by the pre-V2.10.3 integer trailing-zero bug.
@@ -9222,6 +9465,12 @@
                   await monitorHyperliquidExecutionLifecycle(env);
                 } catch (error: any) {
                   console.log("Hyperliquid lifecycle monitor failed:", error?.message ?? String(error));
+                }
+                // V1.10.2: research-only continuation after REAL Initial SL.
+                try {
+                  await updateInitialSlForwardShadows(env);
+                } catch (error: any) {
+                  console.log("Initial SL forward shadow failed:", error?.message ?? String(error));
                 }
         try {
           await autoSyncProgressiveWsMonitor(env);
