@@ -12,7 +12,7 @@
     // ============================================================
 
     const HL_WS = "wss://api.hyperliquid.xyz/ws";
-    const MODULE_VERSION = "V2.11.0 LIVE RUNNER + WS TICK SL SHADOW";
+    const MODULE_VERSION = "V2.11.2 SYMMETRIC BE + SL020 + RUNNER LOCK + WS SHADOW";
 
     type Side = "LONG" | "SHORT";
 
@@ -63,11 +63,11 @@
       };
     };
 
+    // V2.11.2 symmetric LONG/SHORT live ladder. Stage 2 is exchange-gated in execution.ts:
+    // it cannot arm until the 50% TP fill has been confirmed in D1.
     const LONG_A = [
-      { trigger: 0.15, stop: 0.07 },
-      { trigger: 0.25, stop: 0.10 },
-      { trigger: 0.35, stop: 0.20 },
-      { trigger: 0.45, stop: 0.30 },
+      { trigger: 0.25, stop: 0.00 },
+      { trigger: 0.50, stop: 0.25 },
       { trigger: 0.75, stop: 0.50 },
       { trigger: 1.00, stop: 0.75 },
       { trigger: 1.50, stop: 1.00 },
@@ -76,9 +76,8 @@
     ];
 
     const SHORT_C = [
-      { trigger: 0.25, stop: 0.07 },
-      { trigger: 0.35, stop: 0.15 },
-      { trigger: 0.45, stop: 0.25 },
+      { trigger: 0.25, stop: 0.00 },
+      { trigger: 0.50, stop: 0.25 },
       { trigger: 0.75, stop: 0.50 },
       { trigger: 1.00, stop: 0.75 },
       { trigger: 1.50, stop: 1.00 },
