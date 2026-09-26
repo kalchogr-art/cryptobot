@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.2 INITIAL SL FORWARD SHADOW";
+            const VERSION = "V1.10.3 INITIAL SL ENTRY REPLAY SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2564,6 +2564,153 @@
               }
             }
 
+
+            type InitialSlReplayResult = {
+              sl_pct:number;
+              result:"TP"|"SL"|"TIME"|"PENDING";
+              barrier_ts:number|null;
+              minutes_to_barrier:number|null;
+              exit_return_pct:number|null;
+              reached_progressive_before_exit:boolean;
+              max_favorable_before_exit_pct:number|null;
+              max_adverse_before_exit_pct:number|null;
+            };
+
+            async function replayInitialSlFromEntry(
+              env: Env,
+              row: any,
+              slPct: number,
+              now: number
+            ): Promise<InitialSlReplayResult> {
+              const entry=Number(row.entry_price);
+              const start=Number(row.entry_ts);
+              const side=String(row.side??"").toUpperCase();
+              const horizon=start+30*60000;
+              const until=Math.min(now,horizon);
+
+              const q:any=await env.DB.prepare(`
+                SELECT ts,price
+                FROM market_snapshots
+                WHERE coin=? AND ts>=? AND ts<=?
+                ORDER BY ts ASC
+              `).bind(String(row.coin),start,until).all();
+
+              let result:"TP"|"SL"|"TIME"|"PENDING"=now>=horizon?"TIME":"PENDING";
+              let barrierTs:number|null=null;
+              let exitRet:number|null=null;
+              let mfe=Number.NEGATIVE_INFINITY;
+              let mae=Number.POSITIVE_INFINITY;
+              let reachedProgressive=false;
+              const progressiveTrigger=side==="SHORT"?0.25:0.15;
+
+              for(const p of q?.results??[]){
+                const px=Number(p.price), ts=Number(p.ts);
+                if(!Number.isFinite(px)||px<=0||!Number.isFinite(ts)) continue;
+                const ret=directionalReturnPct(side,entry,px);
+                mfe=Math.max(mfe,ret);
+                mae=Math.min(mae,ret);
+                if(ret>=progressiveTrigger) reachedProgressive=true;
+
+                // First sampled barrier wins. Because samples are minute-level,
+                // intraminute ordering remains unknowable and is explicitly research-only.
+                if(ret>=0.50){
+                  result="TP"; barrierTs=ts; exitRet=ret; break;
+                }
+                if(ret<=-slPct){
+                  result="SL"; barrierTs=ts; exitRet=ret; break;
+                }
+              }
+
+              if(result==="TIME"){
+                const snap=await nearestSnapshotPrice(env,String(row.coin),horizon);
+                if(snap) exitRet=directionalReturnPct(side,entry,snap.price);
+              }
+
+              return {
+                sl_pct:slPct,
+                result,
+                barrier_ts:barrierTs,
+                minutes_to_barrier:barrierTs===null?null:round((barrierTs-start)/60000,3),
+                exit_return_pct:exitRet===null?null:round(exitRet,4),
+                reached_progressive_before_exit:reachedProgressive,
+                max_favorable_before_exit_pct:Number.isFinite(mfe)?round(mfe,4):null,
+                max_adverse_before_exit_pct:Number.isFinite(mae)?round(mae,4):null
+              };
+            }
+
+            async function buildInitialSlEntryReplay(env: Env, rows:any[]):Promise<any>{
+              const now=Date.now();
+              const levels=[0.15,0.20,0.25,0.30,0.40];
+              const completedRows=rows.filter(x=>Number(x.completed)===1);
+              const perTrade:any[]=[];
+              const aggregate:any={};
+
+              for(const sl of levels){
+                aggregate[sl.toFixed(2)]={
+                  sl_pct:sl,trades:0,tp:0,sl:0,time:0,pending:0,
+                  progressive_reached_before_exit:0,
+                  avg_exit_return_pct:null,
+                  _returns:[] as number[]
+                };
+              }
+
+              for(const row of rows){
+                const variants:any={};
+                for(const sl of levels){
+                  const r=await replayInitialSlFromEntry(env,row,sl,now);
+                  variants[sl.toFixed(2)]=r;
+                  const a=aggregate[sl.toFixed(2)];
+                  a.trades++;
+                  if(r.result==="TP") a.tp++;
+                  else if(r.result==="SL") a.sl++;
+                  else if(r.result==="TIME") a.time++;
+                  else a.pending++;
+                  if(r.reached_progressive_before_exit) a.progressive_reached_before_exit++;
+                  if(r.exit_return_pct!==null) a._returns.push(r.exit_return_pct);
+                }
+                perTrade.push({
+                  crossing_id:row.crossing_id,
+                  episode_id:row.episode_id,
+                  coin:row.coin,
+                  side:row.side,
+                  entry_price:row.entry_price,
+                  entry_ts:row.entry_ts,
+                  real_initial_sl_exit_ts:row.sl_exit_ts,
+                  real_initial_sl_minutes:row.sl_exit_minutes,
+                  replay_complete:Number(row.completed)===1,
+                  variants
+                });
+              }
+
+              const summary=levels.map(sl=>{
+                const a=aggregate[sl.toFixed(2)];
+                const returns:number[]=a._returns;
+                delete a._returns;
+                a.avg_exit_return_pct=returns.length
+                  ? round(returns.reduce((p,c)=>p+c,0)/returns.length,4)
+                  : null;
+                return a;
+              });
+
+              return {
+                methodology:{
+                  start:"REAL entry timestamp",
+                  horizon_minutes:30,
+                  tp_pct:0.50,
+                  tested_initial_sl_pct:levels,
+                  first_sampled_barrier_wins:true,
+                  progressive_reference:{
+                    LONG_first_trigger_pct:0.15,
+                    SHORT_first_trigger_pct:0.25
+                  },
+                  source:"market_snapshots",
+                  limitation:"minute snapshots can miss intraminute touches/order; counterfactual research only"
+                },
+                summary,
+                trades:perTrade
+              };
+            }
+
             async function initialSlForwardShadowReport(env: Env): Promise<any> {
               if (!env.DB) return {success:false,error:"D1_NOT_BOUND"};
               await updateInitialSlForwardShadows(env);
@@ -2579,11 +2726,12 @@
                 const v=completed.map(x=>Number(x[field])).filter(Number.isFinite);
                 return v.length?round(v.reduce((p,c)=>p+c,0)/v.length,4):null;
               };
+              const entryReplay=await buildInitialSlEntryReplay(env,a);
               return {
                 success:true,
                 worker:"cryptobot",
                 version:VERSION,
-                mode:"INITIAL_SL_FORWARD_SHADOW_30M",
+                mode:"INITIAL_SL_FORWARD_SHADOW_30M_PLUS_ENTRY_REPLAY",
                 trading:"REAL_TRADING_UNCHANGED",
                 methodology:{
                   cohort:"REAL hyperliquid_execution_ledger rows with close_reason=SL_HIT only",
@@ -2593,6 +2741,7 @@
                   checkpoints_minutes:[1,3,5,10,15,30],
                   recovery_levels_pct:[0.15,0.25,0.35,0.50],
                   wider_sl_tests_pct:[0.20,0.25,0.30,0.40],
+                  wider_sl_legacy_note:"would_survive_* fields are post-SL recovery diagnostics only; use entry_based_counterfactual for SL comparison",
                   source:"existing market_snapshots",
                   limitation:"minute snapshots can miss intraminute extremes; research only; no real orders"
                 },
@@ -2612,6 +2761,7 @@
                   avg_post_sl_mae_pct:avg("post_sl_mae_pct"),
                   avg_return_30m_pct:avg("return_30m_pct")
                 },
+                entry_based_counterfactual:entryReplay,
                 trades:a
               };
             }
@@ -8962,7 +9112,7 @@
                   } catch (error:any) {
                     return json({
                       success:false,worker:"cryptobot",version:VERSION,
-                      mode:"INITIAL_SL_FORWARD_SHADOW_30M",
+                      mode:"INITIAL_SL_FORWARD_SHADOW_30M_PLUS_ENTRY_REPLAY",
                       error:"INITIAL_SL_FORWARD_SHADOW_FAILED",
                       message:error?.message??String(error)
                     },500);
