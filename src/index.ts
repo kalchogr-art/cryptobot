@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.11.1 FAST + SWING PULLBACK RETEST SHADOW";
+            const VERSION = "V1.11.2 INVERSE DIRECTION SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -3127,6 +3127,123 @@
                 summary:{rows:rows.length,milestones_hit:hit.length,entry_retests_after_hit:retest.length,recovered_same_milestone_after_retest:recovered.length},rows};
             }
 
+
+            // ============================================================
+            // V1.11.2 INVERSE DIRECTION SHADOW — RESEARCH ONLY
+            // For every FAST >=65 crossing, replay the exact same entry time
+            // and entry price in BOTH the signal direction and the opposite
+            // direction. No exchange action and no live-strategy changes.
+            // Minute snapshots are used so intraminute touches can be missed.
+            // ============================================================
+            const INVERSE_TP_PCT = 0.50;
+            const INVERSE_SL_PCT = 0.15;
+            const INVERSE_HORIZON_MS = 30 * 60_000;
+
+            function oppositeSide(side:string):"LONG"|"SHORT" {
+              return String(side).toUpperCase()==="LONG" ? "SHORT" : "LONG";
+            }
+
+            function replayDirectionPath(side:string,entryPrice:number,entryTs:number,pts:any[]):any {
+              let mfe=-Infinity,mae=Infinity,firstBarrier="TIME",firstBarrierTs:any=null,firstBarrierPrice:any=null;
+              let exitRet:any=null,ret30:any=null,last:any=null;
+              for(const z of pts){
+                const p=Number(z.price),ts=Number(z.ts);
+                if(!Number.isFinite(p)||p<=0||!Number.isFinite(ts)) continue;
+                const r=directionalReturnPct(side,entryPrice,p);
+                if(!Number.isFinite(r)) continue;
+                last={ts,price:p,ret:r};
+                mfe=Math.max(mfe,r); mae=Math.min(mae,r);
+                if(firstBarrier==="TIME"){
+                  if(r>=INVERSE_TP_PCT){ firstBarrier="TP"; firstBarrierTs=ts; firstBarrierPrice=p; exitRet=INVERSE_TP_PCT; }
+                  else if(r<=-INVERSE_SL_PCT){ firstBarrier="SL"; firstBarrierTs=ts; firstBarrierPrice=p; exitRet=-INVERSE_SL_PCT; }
+                }
+              }
+              if(last){ ret30=round(last.ret,4); }
+              if(firstBarrier==="TIME") exitRet=ret30;
+              return {
+                side,first_barrier:firstBarrier,first_barrier_ts:firstBarrierTs,first_barrier_price:firstBarrierPrice,
+                sampled_exit_return_pct:exitRet===null?null:round(exitRet,4),
+                return_30m_pct:ret30,
+                mfe_pct:Number.isFinite(mfe)?round(mfe,4):null,
+                mae_pct:Number.isFinite(mae)?round(mae,4):null,
+                samples:pts.length
+              };
+            }
+
+            async function inverseDirectionShadow(env:Env,limit=300):Promise<any>{
+              if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
+              const safeLimit=Math.max(1,Math.min(1000,Math.floor(limit||300)));
+              const q:any=await env.DB.prepare(`
+                SELECT id,coin,side,crossing_ts,crossing_price,crossing_score,outcome_complete
+                FROM signal_65_crossings
+                WHERE crossing_price IS NOT NULL AND crossing_price>0
+                ORDER BY crossing_ts DESC LIMIT ?
+              `).bind(safeLimit).all();
+              const rows:any[]=q?.results??[];
+              const trades:any[]=[];
+              const now=Date.now();
+              for(const x of rows){
+                const entryTs=Number(x.crossing_ts),entryPrice=Number(x.crossing_price);
+                const end=Math.min(now,entryTs+INVERSE_HORIZON_MS);
+                const sr:any=await env.DB.prepare(`
+                  SELECT ts,price FROM market_snapshots
+                  WHERE coin=? AND ts>=? AND ts<=?
+                  ORDER BY ts ASC LIMIT 1000
+                `).bind(x.coin,entryTs,end).all();
+                const pts:any[]=(sr?.results??[]).filter((z:any)=>Number.isFinite(Number(z.ts))&&Number.isFinite(Number(z.price))&&Number(z.price)>0);
+                if(!pts.length) continue;
+                const originalSide=String(x.side).toUpperCase();
+                const inverseSide=oppositeSide(originalSide);
+                const original=replayDirectionPath(originalSide,entryPrice,entryTs,pts);
+                const inverse=replayDirectionPath(inverseSide,entryPrice,entryTs,pts);
+                trades.push({
+                  crossing_id:x.id,coin:x.coin,signal_score:x.crossing_score,entry_ts:entryTs,entry_price:entryPrice,
+                  signal_side:originalSide,inverse_side:inverseSide,
+                  complete:now>=entryTs+INVERSE_HORIZON_MS,
+                  original,inverse,
+                  sampled_difference_pct:(original.sampled_exit_return_pct!==null&&inverse.sampled_exit_return_pct!==null)
+                    ?round(Number(inverse.sampled_exit_return_pct)-Number(original.sampled_exit_return_pct),4):null
+                });
+              }
+              const complete=trades.filter(t=>t.complete);
+              const summarize=(key:"original"|"inverse")=>{
+                const a=complete.map(t=>t[key]);
+                const avg=(field:string)=>{const v=a.map(z=>Number(z?.[field])).filter(Number.isFinite);return v.length?round(v.reduce((p,c)=>p+c,0)/v.length,4):null;};
+                return {
+                  trades:a.length,
+                  tp_first:a.filter(z=>z.first_barrier==="TP").length,
+                  sl_first:a.filter(z=>z.first_barrier==="SL").length,
+                  time:a.filter(z=>z.first_barrier==="TIME").length,
+                  avg_sampled_exit_return_pct:avg("sampled_exit_return_pct"),
+                  avg_mfe_pct:avg("mfe_pct"),avg_mae_pct:avg("mae_pct"),avg_return_30m_pct:avg("return_30m_pct")
+                };
+              };
+              const bySignalSide=(signalSide:string)=>{
+                const a=complete.filter(t=>t.signal_side===signalSide);
+                const pack=(key:"original"|"inverse")=>({
+                  trades:a.length,tp_first:a.filter(t=>t[key].first_barrier==="TP").length,
+                  sl_first:a.filter(t=>t[key].first_barrier==="SL").length,time:a.filter(t=>t[key].first_barrier==="TIME").length,
+                  avg_sampled_exit_return_pct:(()=>{const v=a.map(t=>Number(t[key].sampled_exit_return_pct)).filter(Number.isFinite);return v.length?round(v.reduce((p,c)=>p+c,0)/v.length,4):null;})()
+                });
+                return {signal_side:signalSide,original:pack("original"),inverse:pack("inverse")};
+              };
+              return {
+                success:true,worker:"cryptobot",version:VERSION,mode:"INVERSE_DIRECTION_SHADOW_READ_ONLY",
+                trading:"REAL_TRADING_UNCHANGED__NO_INVERSE_ORDERS",
+                methodology:{
+                  cohort:"FAST >=65 signal_65_crossings",
+                  entry:"same crossing timestamp and crossing price for original and inverse",
+                  original:"signal direction",inverse:"exact opposite direction",
+                  horizon_minutes:30,tp_pct:INVERSE_TP_PCT,sl_pct:INVERSE_SL_PCT,
+                  barrier_rule:"first sampled TP +0.50% versus sampled SL -0.15%; otherwise TIME at last available sample",
+                  source:"market_snapshots",
+                  limitation:"Minute snapshots can miss intraminute TP/SL touches. This is research evidence, not an executable/live P&L reconstruction; fees, slippage, partial TP and progressive runner are intentionally excluded from the simple direction comparison."
+                },
+                summary:{complete:complete.length,tracking:trades.length-complete.length,original:summarize("original"),inverse:summarize("inverse"),by_signal_side:[bySignalSide("LONG"),bySignalSide("SHORT")]},
+                trades
+              };
+            }
+
             async function swingResearchStatus(env:Env):Promise<any>{
               if(!env.DB) return {success:false,error:"D1_NOT_BOUND"};
               await ensureSwingResearchTables(env); await updateSwingOutcomes(env);
@@ -3181,6 +3298,12 @@
                     note:"paper/shadow only; FAST LIVE and real execution unchanged"
                   },
                   {
+                    id:"INVERSE_DIRECTION_SHADOW",status:"ACTIVE",endpoint:"/inverse-direction-shadow",
+                    tests:["SIGNAL DIRECTION","EXACT OPPOSITE DIRECTION"],
+                    horizon:"30m",tp_pct:0.50,sl_pct:0.15,source:"market_snapshots",
+                    note:"research only; same entry time/price, opposite side; no inverse real orders"
+                  },
+                  {
                     id:"PULLBACK_ENTRY_RETEST",status:"ACTIVE",endpoint:"/pullback-retest-shadow",
                     filters:["?source=FAST","?source=SWING"],
                     fast_levels_pct:[0.15,0.25,0.35,0.50],swing_levels_pct:[0.25,0.50,0.75,1.00,1.50,2.00,3.00,5.00],
@@ -3192,7 +3315,7 @@
                   sl_shadow_summary:sl?.entry_based_counterfactual?.summary??null,
                   alignment_15m_summary:a15?.summary??null
                 },
-                next:"Collect WS tick shadow + pullback/Entry-retest paths + 15m context + SWING research; do not change FAST LIVE from research-only data prematurely."
+                next:"Collect WS tick shadow + inverse-direction comparison + pullback/Entry-retest paths + 15m context + SWING research; do not change FAST LIVE from research-only data prematurely."
               };
             }
 
@@ -5421,6 +5544,8 @@
                       progressive_ws_shadow: "/progressive-monitor/shadow-status",
                       swing_research: "/swing-research",
                       swing_scan_manual: "/swing-scan?force=1",
+                      inverse_direction_shadow: "/inverse-direction-shadow?limit=300",
+                      pullback_retest_shadow: "/pullback-retest-shadow",
                       research_tracking_keep_last: "/research-tracking",
                     },
 
@@ -9559,6 +9684,12 @@
                 if (url.pathname === "/swing-scan") {
                   try { return json(await runSwingResearch(env,url.searchParams.get("force")==="1")); }
                   catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"SWING_SCAN_FAILED",message:error?.message??String(error)},500); }
+                }
+
+                // INVERSE DIRECTION SHADOW — READ ONLY, NO REAL INVERSE ORDERS
+                if (url.pathname === "/inverse-direction-shadow") {
+                  try { return json(await inverseDirectionShadow(env,Number(url.searchParams.get("limit")??300))); }
+                  catch(error:any){ return json({success:false,worker:"cryptobot",version:VERSION,error:"INVERSE_DIRECTION_SHADOW_FAILED",message:error?.message??String(error)},500); }
                 }
 
                 // FAST + SWING PULLBACK / ENTRY RETEST SHADOW — READ ONLY
