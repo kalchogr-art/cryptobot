@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.10.2 — FIXED NOTIONAL / DYNAMIC MARGIN
+// HYPERLIQUID SIGNAL EXECUTION V2.10.3 — PRICE WIRE FIX + ORDER WIRE AUDIT
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8: LIVE progressive protection — LONG=A, SHORT=C; initial SL 0.15% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
@@ -129,7 +129,17 @@ function roundTo(value: number, decimals: number): number {
 
 function toWire(value: number, decimals = 8): string {
   if (!Number.isFinite(value) || value <= 0) throw new Error("INVALID_WIRE_NUMBER");
-  return value.toFixed(decimals).replace(/\.?0+$/, "");
+
+  // V2.10.3 CRITICAL PRICE-WIRE FIX:
+  // Trim zeroes only from the fractional part. Integer trailing zeroes are
+  // significant and MUST survive (84620 must remain "84620", never "8462").
+  const fixed = value.toFixed(decimals);
+  const dot = fixed.indexOf(".");
+  if (dot < 0) return fixed;
+
+  const integerPart = fixed.slice(0, dot);
+  const fractionalPart = fixed.slice(dot + 1).replace(/0+$/, "");
+  return fractionalPart ? `${integerPart}.${fractionalPart}` : integerPart;
 }
 
 function bestValidSize(
@@ -275,6 +285,125 @@ async function postInfo(body: Record<string, any>): Promise<any> {
   const text = await res.text();
   if (!res.ok) throw new Error(`INFO_HTTP_${res.status}: ${text.slice(0, 300)}`);
   return JSON.parse(text);
+}
+
+
+export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
+  const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
+
+  const settled = await Promise.allSettled([
+    postInfo({ type: "frontendOpenOrders", user: MASTER_ACCOUNT }),
+    postInfo({ type: "historicalOrders", user: MASTER_ACCOUNT }),
+  ]);
+
+  const openOrders =
+    settled[0].status === "fulfilled" && Array.isArray(settled[0].value)
+      ? settled[0].value
+      : [];
+  const historicalAll =
+    settled[1].status === "fulfilled" && Array.isArray(settled[1].value)
+      ? settled[1].value
+      : [];
+  const historicalOrders = historicalAll.slice(-safeLimit);
+
+  type AuditRow = {
+    source: string;
+    coin: string | null;
+    oid: string | number | null;
+    status: string | null;
+    timestamp: number | null;
+    order_type: string | null;
+    trigger_px: number | null;
+    limit_px: number | null;
+    suspicious: boolean;
+    reason: string | null;
+    raw: any;
+  };
+
+  const normalize = (row: any, source: string): AuditRow => {
+    const order = row?.order ?? row ?? {};
+    const trigger = Number(order?.triggerPx ?? order?.trigger_px);
+    const limit = Number(order?.limitPx ?? order?.limit_px);
+    const orderType =
+      order?.orderType ?? order?.order_type ?? order?.tpsl ?? order?.type ?? null;
+
+    return {
+      source,
+      coin: order?.coin != null ? String(order.coin) : null,
+      oid: order?.oid ?? null,
+      status: row?.status != null
+        ? String(row.status)
+        : (order?.status != null ? String(order.status) : null),
+      timestamp: Number.isFinite(Number(row?.statusTimestamp ?? order?.timestamp))
+        ? Number(row?.statusTimestamp ?? order?.timestamp)
+        : null,
+      order_type: orderType != null ? String(orderType) : null,
+      trigger_px: Number.isFinite(trigger) && trigger > 0 ? trigger : null,
+      limit_px: Number.isFinite(limit) && limit > 0 ? limit : null,
+      suspicious: false,
+      reason: null,
+      raw: row,
+    };
+  };
+
+  const rows: AuditRow[] = [
+    ...openOrders.map((x: any) => normalize(x, "OPEN")),
+    ...historicalOrders.map((x: any) => normalize(x, "HISTORICAL")),
+  ];
+
+  // Detect decade-scale outliers per coin. This is the signature produced by
+  // the old integer-zero stripping bug (e.g. BTC ~84620 accidentally sent as 8462).
+  const pricesByCoin = new Map<string, number[]>();
+  for (const r of rows) {
+    if (!r.coin) continue;
+    const p = r.trigger_px ?? r.limit_px;
+    if (!Number.isFinite(p) || Number(p) <= 0) continue;
+    const arr = pricesByCoin.get(r.coin) ?? [];
+    arr.push(Number(p));
+    pricesByCoin.set(r.coin, arr);
+  }
+
+  for (const r of rows) {
+    if (!r.coin) continue;
+    const p = r.trigger_px ?? r.limit_px;
+    if (!Number.isFinite(p) || Number(p) <= 0) continue;
+    const vals = (pricesByCoin.get(r.coin) ?? [])
+      .filter(v => Number.isFinite(v) && v > 0)
+      .sort((a, b) => a - b);
+    if (vals.length < 2) continue;
+    const median = vals[Math.floor(vals.length / 2)];
+    const ratio = Number(p) / median;
+    if (ratio < 0.2 || ratio > 5) {
+      r.suspicious = true;
+      r.reason = `DECADE_PRICE_OUTLIER ratio=${ratio.toFixed(6)}`;
+    }
+  }
+
+  const suspicious = rows.filter(r => r.suspicious);
+
+  return {
+    success: true,
+    read_only: true,
+    version: "V2.10.3 PRICE WIRE FIX + ORDER WIRE AUDIT",
+    account: MASTER_ACCOUNT,
+    wire_fix: {
+      fixed: true,
+      example_before: '84620 -> "8462"',
+      example_after: '84620 -> "84620"',
+    },
+    sources: {
+      frontend_open_orders: settled[0].status === "fulfilled" ? "OK" : "ERROR",
+      historical_orders: settled[1].status === "fulfilled" ? "OK" : "ERROR",
+    },
+    counts: {
+      open: openOrders.length,
+      historical_scanned: historicalOrders.length,
+      total: rows.length,
+      suspicious: suspicious.length,
+    },
+    suspicious,
+    orders: rows,
+  };
 }
 
 
