@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.10.4 15M + SL TRACKING ENDPOINTS";
+            const VERSION = "V1.10.5 WS SHADOW + 15M TRACKING";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2862,18 +2862,18 @@
                   },
                   {
                     id:"WS_TICK_SL_SHADOW",
-                    status:"NEXT_PATCH_PROGRESSIVE_MONITOR",
-                    endpoint:"/progressive-monitor/status",
+                    status:"ACTIVE",
+                    endpoint:"/progressive-monitor/shadow-status",
                     tests:["SL 0.15","SL 0.20","SL 0.25","SL 0.30","SL 0.40"],
                     source:"Hyperliquid activeAssetCtx markPx",
-                    note:"tick-accurate shadow must continue after real Initial SL until entry+30m; no real order changes"
+                    note:"tick shadow starts at real entry and continues after real close until entry+30m; no real order changes"
                   }
                 ],
                 current:{
                   sl_shadow_summary:sl?.entry_based_counterfactual?.summary??null,
                   alignment_15m_summary:a15?.summary??null
                 },
-                next:"Patch progressive-monitor so WS shadow survives real SL close and finalizes at entry+30m."
+                next:"Collect WS tick shadow + 15m context; do not change live SL until sample is large enough."
               };
             }
 
@@ -5099,6 +5099,7 @@
                       alignment_15m_analysis: "/15m-alignment-analysis",
                       order_wire_audit: "/order-wire-audit?limit=500",
                       debug: "/debug-hyperliquid",
+                      progressive_ws_shadow: "/progressive-monitor/shadow-status",
                       research_tracking_keep_last: "/research-tracking",
                     },
 
@@ -9126,6 +9127,7 @@
                   url.pathname === "/progressive-monitor/start" ||
                   url.pathname === "/progressive-monitor/status" ||
                   url.pathname === "/progressive-monitor/events" ||
+                  url.pathname === "/progressive-monitor/shadow-status" ||
                   url.pathname === "/progressive-monitor/stop"
                 ) {
                   if (!env.PROGRESSIVE_MONITOR) {
@@ -9145,6 +9147,10 @@
 
                   if (url.pathname === "/progressive-monitor/events") {
                     return stub.fetch("https://progressive-monitor/events");
+                  }
+
+                  if (url.pathname === "/progressive-monitor/shadow-status") {
+                    return stub.fetch("https://progressive-monitor/shadow-status");
                   }
 
                   if (url.pathname === "/progressive-monitor/stop") {
