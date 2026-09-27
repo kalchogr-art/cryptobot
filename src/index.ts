@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.11.2 INVERSE DIRECTION SHADOW";
+            const VERSION = "V1.11.3 SWING EXIT MODEL SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -2844,6 +2844,20 @@
             const SWING_SCAN_MS = 15 * 60_000;
             const SWING_DEDUPE_MS = 4 * 60 * 60_000;
             const SWING_HORIZONS_H = [1,2,4,8,12,24] as const;
+            const SWING_EXIT_MODELS = [
+              {id:"A_TP075_SL050",tp:0.75,sl:0.50},
+              {id:"B_TP100_SL050",tp:1.00,sl:0.50},
+              {id:"C_TP100_SL075",tp:1.00,sl:0.75},
+              {id:"D_TP150_SL075",tp:1.50,sl:0.75},
+              {id:"E_TP200_SL100",tp:2.00,sl:1.00},
+            ] as const;
+            const SWING_PROGRESSIVE_STEPS = [
+              {trigger:0.50,stop:0.00},
+              {trigger:1.00,stop:0.50},
+              {trigger:1.50,stop:1.00},
+              {trigger:2.00,stop:1.50},
+            ] as const;
+            const SWING_PROGRESSIVE_INITIAL_SL = 0.75;
 
             async function ensureSwingResearchTables(env: Env): Promise<void> {
               if (!env.DB) return;
@@ -2866,6 +2880,20 @@
               `).run();
               await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_coin_ts ON swing_research_signals(coin,entry_ts DESC)`).run();
               await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_status ON swing_research_signals(status,entry_ts ASC)`).run();
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS swing_exit_model_shadow (
+                  signal_id INTEGER NOT NULL, model_id TEXT NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+                  entry_ts INTEGER NOT NULL, entry_price REAL NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'TRACKING', exit_reason TEXT,
+                  exit_ts INTEGER, exit_price REAL, exit_return_pct REAL,
+                  mfe_pct REAL NOT NULL DEFAULT 0, mae_pct REAL NOT NULL DEFAULT 0,
+                  progressive_stage INTEGER NOT NULL DEFAULT 0, active_stop_pct REAL,
+                  last_update_ts INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY(signal_id,model_id)
+                )
+              `).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_exit_model ON swing_exit_model_shadow(model_id,status,entry_ts)`).run();
               await env.DB.prepare(`
                 CREATE TABLE IF NOT EXISTS swing_research_state (
                   key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL
@@ -2921,6 +2949,43 @@
               return {recorded:true,id:r?.id??null,coin:c.coin,side:c.side,score:c.score,price:c.price};
             }
 
+            function replaySwingExitModel(x:any,a:any[],modelId:string,tp:number|null,sl:number|null,progressive=false):any{
+              const entry=Number(x.entry_price), endTs=Number(x.entry_ts)+24*60*60_000;
+              let stage=0, activeStop=progressive?-SWING_PROGRESSIVE_INITIAL_SL:(sl!=null?-sl:null);
+              let mfe=-Infinity,mae=Infinity,last:any=null;
+              for(const z of a){
+                const ts=Number(z.ts), p=Number(z.price); if(!Number.isFinite(p)||p<=0||ts>endTs) continue;
+                last=z; const r=directionalReturnPct(x.side,entry,p); mfe=Math.max(mfe,r); mae=Math.min(mae,r);
+                if(progressive){
+                  // Snapshot-order simulation: advance protection first when a sampled price reaches a milestone.
+                  // Intraminute ordering cannot be reconstructed from minute snapshots.
+                  while(stage<SWING_PROGRESSIVE_STEPS.length && r>=SWING_PROGRESSIVE_STEPS[stage].trigger){
+                    activeStop=SWING_PROGRESSIVE_STEPS[stage].stop; stage++;
+                  }
+                  if(activeStop!=null && r<=activeStop){
+                    return {status:"CLOSED",reason:stage===0?"SL":"PROGRESSIVE_SL",exit_ts:ts,exit_price:p,exit_return_pct:round(r,4),mfe:round(mfe,4),mae:round(mae,4),stage,active_stop_pct:activeStop};
+                  }
+                } else {
+                  if(tp!=null && r>=tp) return {status:"CLOSED",reason:"TP",exit_ts:ts,exit_price:p,exit_return_pct:round(r,4),mfe:round(mfe,4),mae:round(mae,4),stage:0,active_stop_pct:activeStop};
+                  if(sl!=null && r<=-sl) return {status:"CLOSED",reason:"SL",exit_ts:ts,exit_price:p,exit_return_pct:round(r,4),mfe:round(mfe,4),mae:round(mae,4),stage:0,active_stop_pct:activeStop};
+                }
+              }
+              const complete=Date.now()>=endTs;
+              const lr=last?directionalReturnPct(x.side,entry,Number(last.price)):0;
+              return {status:complete?"CLOSED":"TRACKING",reason:complete?"TIME":null,exit_ts:complete&&last?Number(last.ts):null,exit_price:complete&&last?Number(last.price):null,exit_return_pct:complete?round(lr,4):null,mfe:Number.isFinite(mfe)?round(mfe,4):0,mae:Number.isFinite(mae)?round(mae,4):0,stage,active_stop_pct:activeStop};
+            }
+
+            async function updateSwingExitModels(env:Env,x:any,a:any[]):Promise<void>{
+              const defs:any[]=[...SWING_EXIT_MODELS.map(m=>({id:m.id,tp:m.tp,sl:m.sl,progressive:false})),{id:"P_PROGRESSIVE",tp:null,sl:null,progressive:true}];
+              for(const d of defs){
+                const r=replaySwingExitModel(x,a,d.id,d.tp,d.sl,d.progressive);
+                await env.DB.prepare(`INSERT INTO swing_exit_model_shadow(signal_id,model_id,coin,side,entry_ts,entry_price,status,exit_reason,exit_ts,exit_price,exit_return_pct,mfe_pct,mae_pct,progressive_stage,active_stop_pct,last_update_ts,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                  ON CONFLICT(signal_id,model_id) DO UPDATE SET status=excluded.status,exit_reason=excluded.exit_reason,exit_ts=excluded.exit_ts,exit_price=excluded.exit_price,exit_return_pct=excluded.exit_return_pct,mfe_pct=excluded.mfe_pct,mae_pct=excluded.mae_pct,progressive_stage=excluded.progressive_stage,active_stop_pct=excluded.active_stop_pct,last_update_ts=excluded.last_update_ts,updated_at=CURRENT_TIMESTAMP`)
+                  .bind(x.id,d.id,x.coin,x.side,x.entry_ts,x.entry_price,r.status,r.reason,r.exit_ts,r.exit_price,r.exit_return_pct,r.mfe,r.mae,r.stage,r.active_stop_pct,Date.now()).run();
+              }
+            }
+
             async function updateSwingOutcomes(env:Env):Promise<void>{
               if(!env.DB) return;
               await ensureSwingResearchTables(env);
@@ -2943,6 +3008,7 @@
                   for(const z of a){ const d=Math.abs(Number(z.ts)-target); if(d<=120000&&d<dist){best=z;dist=d;} }
                   vals[h]=best?round(directionalReturnPct(x.side,Number(x.entry_price),Number(best.price)),4):null;
                 }
+                await updateSwingExitModels(env,x,a);
                 const done=now>=Number(x.entry_ts)+24*60*60_000;
                 await env.DB.prepare(`UPDATE swing_research_signals SET return_1h_pct=?,return_2h_pct=?,return_4h_pct=?,return_8h_pct=?,return_12h_pct=?,return_24h_pct=?,mfe_pct=?,mae_pct=?,max_price=?,min_price=?,last_price=?,last_update_ts=?,status=?,outcome_complete=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
                   .bind(vals[1],vals[2],vals[4],vals[8],vals[12],vals[24],Number.isFinite(mfe)?round(mfe,4):0,Number.isFinite(mae)?round(mae,4):0,maxP,minP,Number(a[a.length-1].price),now,done?"COMPLETE":"TRACKING",done?1:0,x.id).run();
@@ -3251,8 +3317,13 @@
               const rows:any[]=q?.results??[];
               const complete=rows.filter(x=>Number(x.outcome_complete)===1);
               const avg=(key:string)=>{const v=complete.map(x=>Number(x[key])).filter(Number.isFinite);return v.length?round(v.reduce((a,b)=>a+b,0)/v.length,4):null;};
+              const mq:any=await env.DB.prepare(`SELECT model_id,status,exit_reason,exit_return_pct,coin,side,signal_id,progressive_stage,active_stop_pct FROM swing_exit_model_shadow ORDER BY signal_id DESC,model_id ASC`).all();
+              const mr:any[]=mq?.results??[];
+              const modelIds=[...SWING_EXIT_MODELS.map(x=>x.id),"P_PROGRESSIVE"];
+              const exit_models=modelIds.map(id=>{const a=mr.filter(x=>x.model_id===id),closed=a.filter(x=>x.status==="CLOSED"),vals=closed.map(x=>Number(x.exit_return_pct)).filter(Number.isFinite);return {model_id:id,signals:a.length,tracking:a.length-closed.length,closed:closed.length,tp:closed.filter(x=>x.exit_reason==="TP").length,sl:closed.filter(x=>x.exit_reason==="SL").length,progressive_sl:closed.filter(x=>x.exit_reason==="PROGRESSIVE_SL").length,time:closed.filter(x=>x.exit_reason==="TIME").length,avg_exit_return_pct:vals.length?round(vals.reduce((u,v)=>u+v,0)/vals.length,4):null,positive:vals.filter(v=>v>0).length,negative:vals.filter(v=>v<0).length};});
               return {success:true,worker:"cryptobot",version:VERSION,mode:"SWING_RESEARCH_ONLY",trading:"FAST_LIVE_UNCHANGED__SWING_NO_ORDERS",
-                methodology:{timeframes:["15m","30m","1h","4h"],weights:{"15m":0.15,"30m":0.20,"1h":0.30,"4h":0.35},entry_score:SWING_ENTRY_SCORE,min_direction_agreement:"3 of 4",dedupe_hours:4,horizon_hours:[1,2,4,8,12,24],source:"Hyperliquid closed candles + existing market_snapshots forward tracking",note:"research only; no exchange action"},
+                methodology:{timeframes:["15m","30m","1h","4h"],weights:{"15m":0.15,"30m":0.20,"1h":0.30,"4h":0.35},entry_score:SWING_ENTRY_SCORE,min_direction_agreement:"3 of 4",dedupe_hours:4,horizon_hours:[1,2,4,8,12,24],source:"Hyperliquid closed candles + existing market_snapshots forward tracking",exit_model_shadow:{fixed:SWING_EXIT_MODELS,progressive:{initial_sl_pct:SWING_PROGRESSIVE_INITIAL_SL,steps:SWING_PROGRESSIVE_STEPS,max_hold_hours:24},barrier_rule:"first sampled touch in market_snapshots; minute sampling can miss intraminute ordering"},note:"research only; no exchange action; FAST LIVE unchanged"},
+                exit_models,
                 summary:{signals:rows.length,tracking:rows.length-complete.length,complete:complete.length,avg_return_1h_pct:avg("return_1h_pct"),avg_return_2h_pct:avg("return_2h_pct"),avg_return_4h_pct:avg("return_4h_pct"),avg_return_8h_pct:avg("return_8h_pct"),avg_return_12h_pct:avg("return_12h_pct"),avg_return_24h_pct:avg("return_24h_pct"),avg_mfe_pct:avg("mfe_pct"),avg_mae_pct:avg("mae_pct")},signals:rows};
             }
 
