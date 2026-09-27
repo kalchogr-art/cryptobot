@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.11.4 PULLBACK LIMIT ENTRY V1";
+            const VERSION = "V1.11.5 PULLBACK RECONFIRM SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -5101,6 +5101,175 @@
             }
 
 
+            // ============================================================
+            // V1.11.5 — PULLBACK + RECONFIRM ENTRY SHADOW
+            // Research only. LIVE execution remains the V1.11.4 ±0.20% LIMIT model.
+            // For every NEW FAST >=65 crossing we test six independent scenarios:
+            // wait 1m / 5m × pullback 0.20 / 0.30 / 0.50%.
+            // At the checkpoint a virtual MARKET entry is accepted only when:
+            // 1) the requested pullback was observed inside the wait window;
+            // 2) current FAST direction is unchanged; and
+            // 3) current FAST score is still >=65.
+            // After a virtual entry we observe static TP +0.50%, SL -0.20%, MAX HOLD 60m.
+            // No order is signed/sent by this module.
+            // ============================================================
+            async function updatePullbackReconfirmShadow(
+              env: Env,
+              signal: any,
+              finalSignal: any,
+              newCrossing?: any
+            ): Promise<void> {
+              if (!env.DB) return;
+              await env.DB.prepare(`
+                CREATE TABLE IF NOT EXISTS pullback_reconfirm_shadow (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  crossing_id INTEGER NOT NULL,
+                  coin TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  crossing_ts INTEGER NOT NULL,
+                  crossing_price REAL NOT NULL,
+                  crossing_score REAL NOT NULL,
+                  wait_minutes INTEGER NOT NULL,
+                  pullback_pct REAL NOT NULL,
+                  checkpoint_ts INTEGER NOT NULL,
+                  pullback_touched INTEGER NOT NULL DEFAULT 0,
+                  pullback_touch_ts INTEGER,
+                  pullback_touch_price REAL,
+                  recheck_ts INTEGER,
+                  recheck_price REAL,
+                  recheck_score REAL,
+                  recheck_side TEXT,
+                  reconfirmed INTEGER,
+                  entry_ts INTEGER,
+                  entry_price REAL,
+                  status TEXT NOT NULL DEFAULT 'WAITING',
+                  first_barrier TEXT,
+                  first_barrier_ts INTEGER,
+                  exit_ts INTEGER,
+                  exit_price REAL,
+                  gross_return_pct REAL,
+                  return_1m_pct REAL,
+                  return_5m_pct REAL,
+                  return_15m_pct REAL,
+                  return_30m_pct REAL,
+                  return_60m_pct REAL,
+                  mfe_pct REAL,
+                  mae_pct REAL,
+                  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE(crossing_id, wait_minutes, pullback_pct)
+                )
+              `).run();
+              await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_pullback_reconfirm_coin_status ON pullback_reconfirm_shadow(coin,status,checkpoint_ts)`).run();
+
+              // Seed ONLY the crossing created by this live signal cycle. No historical backfill.
+              if (newCrossing?.recorded === true && Number(newCrossing?.crossing_id) > 0) {
+                for (const waitMinutes of [1,5]) {
+                  for (const pullbackPct of [0.20,0.30,0.50]) {
+                    await env.DB.prepare(`
+                      INSERT OR IGNORE INTO pullback_reconfirm_shadow
+                      (crossing_id,coin,side,crossing_ts,crossing_price,crossing_score,wait_minutes,pullback_pct,checkpoint_ts,status)
+                      VALUES(?,?,?,?,?,?,?,?,?,'WAITING')
+                    `).bind(
+                      Number(newCrossing.crossing_id), String(newCrossing.coin), String(newCrossing.side),
+                      Number(newCrossing.crossing_ts), Number(newCrossing.crossing_price), Number(newCrossing.crossing_score),
+                      waitMinutes, pullbackPct, Number(newCrossing.crossing_ts)+waitMinutes*60_000
+                    ).run();
+                  }
+                }
+              }
+
+              const coin=String(signal?.coin??'').toUpperCase();
+              if(!coin) return;
+              const now=Date.now();
+              const signed=Number(finalSignal?.final?.signed_score ?? signal?.market?.signed_score ?? 0);
+              const currentScore=Math.abs(signed);
+              const currentSide=signed>=0?'LONG':'SHORT';
+              const currentPrice=Number(signal?.price);
+
+              // Resolve checkpoints using the CURRENT live score/direction at first scan >= checkpoint.
+              const waiting:any=await env.DB.prepare(`
+                SELECT * FROM pullback_reconfirm_shadow
+                WHERE coin=? AND status='WAITING' AND checkpoint_ts<=?
+                ORDER BY checkpoint_ts ASC
+              `).bind(coin,now).all();
+              for(const row of (waiting?.results??[])){
+                const crossingPrice=Number(row.crossing_price), side=String(row.side);
+                const target=side==='LONG'
+                  ? crossingPrice*(1-Number(row.pullback_pct)/100)
+                  : crossingPrice*(1+Number(row.pullback_pct)/100);
+                const snaps:any=await env.DB.prepare(`
+                  SELECT ts,price FROM market_snapshots
+                  WHERE coin=? AND ts>=? AND ts<=?
+                  ORDER BY ts ASC
+                `).bind(coin,Number(row.crossing_ts),Number(row.checkpoint_ts)).all();
+                let touch:any=null;
+                for(const x of (snaps?.results??[])){
+                  const px=Number(x.price);
+                  if((side==='LONG'&&px<=target)||(side==='SHORT'&&px>=target)){touch=x;break;}
+                }
+                const touched=!!touch;
+                const sameSide=currentSide===side;
+                const reconfirmed=touched && sameSide && currentScore>=65;
+                await env.DB.prepare(`
+                  UPDATE pullback_reconfirm_shadow SET
+                    pullback_touched=?,pullback_touch_ts=?,pullback_touch_price=?,
+                    recheck_ts=?,recheck_price=?,recheck_score=?,recheck_side=?,reconfirmed=?,
+                    entry_ts=?,entry_price=?,status=?,updated_at=CURRENT_TIMESTAMP
+                  WHERE id=?
+                `).bind(
+                  touched?1:0,touch?Number(touch.ts):null,touch?Number(touch.price):null,
+                  now,Number.isFinite(currentPrice)?currentPrice:null,round(currentScore),currentSide,reconfirmed?1:0,
+                  reconfirmed?now:null,reconfirmed&&Number.isFinite(currentPrice)?currentPrice:null,
+                  reconfirmed?'OPEN':'NO_ENTRY',row.id
+                ).run();
+              }
+
+              // Follow virtual entries for 60m. This is measurement only.
+              const open:any=await env.DB.prepare(`
+                SELECT * FROM pullback_reconfirm_shadow WHERE coin=? AND status='OPEN' ORDER BY entry_ts ASC
+              `).bind(coin).all();
+              for(const row of (open?.results??[])){
+                const entry=Number(row.entry_price), entryTs=Number(row.entry_ts), side=String(row.side);
+                if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(entryTs)) continue;
+                const end=Math.min(now,entryTs+60*60_000);
+                const pts:any=await env.DB.prepare(`SELECT ts,price FROM market_snapshots WHERE coin=? AND ts>=? AND ts<=? ORDER BY ts ASC`).bind(coin,entryTs,end).all();
+                const arr:any[]=pts?.results??[];
+                let mfe=0,mae=0,barrier:string|null=null,barrierTs:number|null=null,exitPrice:number|null=null;
+                const tp=side==='LONG'?entry*1.005:entry*0.995;
+                const sl=side==='LONG'?entry*0.998:entry*1.002;
+                for(const x of arr){
+                  const px=Number(x.price); if(!Number.isFinite(px)) continue;
+                  const ret=directionalReturnPct(side,entry,px); mfe=Math.max(mfe,ret); mae=Math.min(mae,ret);
+                  if(!barrier){
+                    if((side==='LONG'&&px>=tp)||(side==='SHORT'&&px<=tp)){barrier='TP';barrierTs=Number(x.ts);exitPrice=tp;}
+                    else if((side==='LONG'&&px<=sl)||(side==='SHORT'&&px>=sl)){barrier='SL';barrierTs=Number(x.ts);exitPrice=sl;}
+                  }
+                }
+                const returns:any={};
+                for(const m of [1,5,15,30,60]){
+                  if(now<entryTs+m*60_000){returns[m]=null;continue;}
+                  const q:any=await env.DB.prepare(`SELECT price FROM market_snapshots WHERE coin=? ORDER BY ABS(ts-?) ASC LIMIT 1`).bind(coin,entryTs+m*60_000).first();
+                  returns[m]=q&&Number.isFinite(Number(q.price))?round(directionalReturnPct(side,entry,Number(q.price))):null;
+                }
+                if(barrier){
+                  const gross=barrier==='TP'?0.50:-0.20;
+                  await env.DB.prepare(`UPDATE pullback_reconfirm_shadow SET status='CLOSED',first_barrier=?,first_barrier_ts=?,exit_ts=?,exit_price=?,gross_return_pct=?,return_1m_pct=?,return_5m_pct=?,return_15m_pct=?,return_30m_pct=?,return_60m_pct=?,mfe_pct=?,mae_pct=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+                    .bind(barrier,barrierTs,barrierTs,exitPrice,gross,returns[1],returns[5],returns[15],returns[30],returns[60],round(mfe),round(mae),row.id).run();
+                } else if(now>=entryTs+60*60_000){
+                  const last=arr.length?arr[arr.length-1]:null;
+                  if(last){
+                    const gross=directionalReturnPct(side,entry,Number(last.price));
+                    await env.DB.prepare(`UPDATE pullback_reconfirm_shadow SET status='CLOSED',first_barrier='TIME_60M',exit_ts=?,exit_price=?,gross_return_pct=?,return_1m_pct=?,return_5m_pct=?,return_15m_pct=?,return_30m_pct=?,return_60m_pct=?,mfe_pct=?,mae_pct=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+                      .bind(Number(last.ts),Number(last.price),round(gross),returns[1],returns[5],returns[15],returns[30],returns[60],round(mfe),round(mae),row.id).run();
+                  }
+                } else {
+                  await env.DB.prepare(`UPDATE pullback_reconfirm_shadow SET return_1m_pct=?,return_5m_pct=?,return_15m_pct=?,return_30m_pct=?,return_60m_pct=?,mfe_pct=?,mae_pct=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+                    .bind(returns[1],returns[5],returns[15],returns[30],returns[60],round(mfe),round(mae),row.id).run();
+                }
+              }
+            }
+
             async function updateForwardLongShadow(env:any):Promise<void>{
               await env.DB.prepare(`
                 CREATE TABLE IF NOT EXISTS forward_long_shadow (
@@ -9822,6 +9991,39 @@
                 }
 
 
+                // PULLBACK + RECONFIRM SHADOW — research only
+                if (url.pathname === "/pullback-reconfirm-shadow") {
+                  if (!env.DB) return json({success:false,error:"D1_NOT_BOUND"},503);
+                  await env.DB.prepare(`
+                    CREATE TABLE IF NOT EXISTS pullback_reconfirm_shadow (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT, crossing_id INTEGER NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+                      crossing_ts INTEGER NOT NULL, crossing_price REAL NOT NULL, crossing_score REAL NOT NULL,
+                      wait_minutes INTEGER NOT NULL, pullback_pct REAL NOT NULL, checkpoint_ts INTEGER NOT NULL,
+                      pullback_touched INTEGER NOT NULL DEFAULT 0, pullback_touch_ts INTEGER, pullback_touch_price REAL,
+                      recheck_ts INTEGER, recheck_price REAL, recheck_score REAL, recheck_side TEXT, reconfirmed INTEGER,
+                      entry_ts INTEGER, entry_price REAL, status TEXT NOT NULL DEFAULT 'WAITING', first_barrier TEXT,
+                      first_barrier_ts INTEGER, exit_ts INTEGER, exit_price REAL, gross_return_pct REAL,
+                      return_1m_pct REAL, return_5m_pct REAL, return_15m_pct REAL, return_30m_pct REAL, return_60m_pct REAL,
+                      mfe_pct REAL, mae_pct REAL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE(crossing_id,wait_minutes,pullback_pct)
+                    )
+                  `).run();
+                  const summary:any=await env.DB.prepare(`
+                    SELECT wait_minutes,pullback_pct,COUNT(*) signals,
+                      SUM(CASE WHEN pullback_touched=1 THEN 1 ELSE 0 END) pullback_touched,
+                      SUM(CASE WHEN reconfirmed=1 THEN 1 ELSE 0 END) entries,
+                      SUM(CASE WHEN first_barrier='TP' THEN 1 ELSE 0 END) tp,
+                      SUM(CASE WHEN first_barrier='SL' THEN 1 ELSE 0 END) sl,
+                      SUM(CASE WHEN first_barrier='TIME_60M' THEN 1 ELSE 0 END) time_60m,
+                      ROUND(AVG(CASE WHEN status='CLOSED' THEN gross_return_pct END),4) avg_gross_pct
+                    FROM pullback_reconfirm_shadow GROUP BY wait_minutes,pullback_pct ORDER BY wait_minutes,pullback_pct
+                  `).all();
+                  const recent:any=await env.DB.prepare(`SELECT * FROM pullback_reconfirm_shadow ORDER BY crossing_ts DESC,wait_minutes,pullback_pct LIMIT 120`).all();
+                  return json({success:true,worker:"cryptobot",version:VERSION,mode:"PULLBACK_RECONFIRM_SHADOW",live_strategy_changed:false,
+                    methodology:{wait_minutes:[1,5],pullback_pct:[0.20,0.30,0.50],reconfirm:"same side AND FAST score >=65 at checkpoint",virtual_entry:"current market price at checkpoint",tp_pct:0.50,sl_pct:0.20,max_hold_minutes:60,note:"research only; current LIVE ±0.20% limit execution unchanged"},
+                    summary:summary?.results??[],recent:recent?.results??[]});
+                }
+
                 // HYPERLIQUID EXECUTION V1 — READ ONLY
                 // Shows the latest >=65 crossing as the exact DRY-RUN bracket that the
                 // execution module would build. Never signs and never calls /exchange
@@ -10395,6 +10597,9 @@
                     await update6064CrossingOutcomes(env, coin);
                     const crossing65 = await record65Crossing(env, signal, finalSignal);
                     const crossing6064 = await record6064Crossing(env, signal, finalSignal);
+
+                    // V1.11.5 research-only pullback + FAST>=65 reconfirmation shadow.
+                    await updatePullbackReconfirmShadow(env, signal, finalSignal, crossing65);
 
                     // HYPERLIQUID EXECUTION POLICY:
                     // - ONE TRADE PER COIN PER SIGNAL EPISODE.
