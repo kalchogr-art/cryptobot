@@ -8,7 +8,9 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.11.1 — PULLBACK LIMIT ENTRY + MAX HOLD 60M
+// HYPERLIQUID SIGNAL EXECUTION V2.11.2 — SUPERSEDE STALE PENDING LIMIT
+// V2.11.2: a NEW valid crossing for the same coin supersedes older unfilled LIMIT_PULLBACK_V1 entry orders
+// V2.11.2: exact old entry OID is cancelled and marked ENTRY_LIMIT_SUPERSEDED before the new LIMIT is placed
 // V2.11.0: FAST >=65 places a resting LIMIT 0.20% better than signal; no market entry
 // V2.11.0: after LIMIT fill, existing SL0.20/BE/partial-TP/runner ladder starts from actual fill
 // V2.8.1: exact active SL OID tracking for progressive replacement
@@ -1948,13 +1950,69 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
-  const existingPosition = await getOpenPositionForCoin(coin);
-  const existingOrders = await getOpenOrdersForCoin(coin);
-  if (existingPosition || existingOrders.length > 0) {
-    const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN" : "EXISTING_OPEN_ORDERS_FOR_COIN";
+  // V2.11.2 — NEW CROSSING SUPERSEDES AN OLDER UNFILLED PULLBACK LIMIT FOR THE SAME COIN.
+  // A real open position still blocks the new signal. We only cancel exact entry OIDs that
+  // belong to D1 rows in ENTRY_LIMIT_OPEN / LIMIT_PULLBACK_V1. Protective or unknown orders
+  // are never cancelled by this path.
+  let existingPosition = await getOpenPositionForCoin(coin);
+  let existingOrders = await getOpenOrdersForCoin(coin);
+
+  if (existingPosition) {
+    const reason = "EXISTING_POSITION_FOR_COIN";
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
     const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
-    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
+    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
+  }
+
+  const supersededLimits:any[] = [];
+  if (existingOrders.length > 0 && env?.DB) {
+    const pendingQ:any = await env.DB.prepare(`
+      SELECT * FROM hyperliquid_execution_ledger
+      WHERE coin=?
+        AND status='ENTRY_LIMIT_OPEN'
+        AND strategy_version='LIMIT_PULLBACK_V1'
+        AND crossing_id<>?
+      ORDER BY id ASC
+    `).bind(coin, String(signal.crossing_id)).all();
+    const pendingRows:any[] = Array.isArray(pendingQ?.results) ? pendingQ.results : [];
+    const openOidSet = new Set(existingOrders.map((o:any)=>Number(o?.oid)).filter((x:number)=>Number.isFinite(x)));
+
+    for (const oldRow of pendingRows) {
+      const oldOid = Number(oldRow?.entry_oid);
+      if (!Number.isFinite(oldOid) || !openOidSet.has(oldOid)) continue;
+
+      const cancelResponse = await sendLifecycleSignedAction(
+        { type:'cancel', cancels:[{ a:asset, o:oldOid }] },
+        secret as `0x${string}`
+      );
+
+      // Fail closed: verify that the exact old entry OID disappeared before superseding it.
+      const verifyOrders = await getOpenOrdersForCoin(coin);
+      const stillOpen = verifyOrders.some((o:any)=>Number(o?.oid)===oldOid);
+      if (stillOpen) {
+        const reason = `OLD_PENDING_LIMIT_CANCEL_NOT_CONFIRMED:${oldOid}`;
+        await updateExecutionLedger(env.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
+        const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
+        return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_OLD_LIMIT_CANCEL_FAILED",reason,old_crossing_id:oldRow.crossing_id,old_entry_oid:oldOid,cancel_response:cancelResponse,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:true};
+      }
+
+      await updateExecutionLedger(env.DB, oldRow.crossing_id, "ENTRY_LIMIT_SUPERSEDED", {
+        last_error: `SUPERSEDED_BY_NEW_CROSSING:${String(signal.crossing_id)}`
+      });
+      supersededLimits.push({crossing_id:oldRow.crossing_id,oid:oldOid,side:oldRow.side});
+      existingOrders = verifyOrders;
+    }
+  }
+
+  // Re-check exchange state after cancellation. If any position appeared meanwhile, or any
+  // unknown/open order remains, do not place the new entry.
+  existingPosition = await getOpenPositionForCoin(coin);
+  existingOrders = await getOpenOrdersForCoin(coin);
+  if (existingPosition || existingOrders.length > 0) {
+    const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN_AFTER_SUPERSEDE_CHECK" : "UNRELATED_OR_UNTRACKED_OPEN_ORDERS_FOR_COIN";
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
+    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
+    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,superseded_limits:supersededLimits,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:supersededLimits.length>0};
   }
 
   let lastNonce = 0;
@@ -2099,6 +2157,7 @@ export async function buildHyperliquidExecutionCandidate(
       reason:"WAITING_PULLBACK_LIMIT_FILL",
       exchange_request_sent:true,
       live_entry:{filled:false,resting:true,oid:resting.oid,target_price:entryTargetPrice,pullback_pct:CONFIG.ENTRY_PULLBACK_PCT,http_status:entryResponse.httpStatus,response_json:entryResponse.json},
+      superseded_limits:supersededLimits,
       timestamp:new Date().toISOString(),
     };
   }
