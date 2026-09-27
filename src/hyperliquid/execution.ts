@@ -8,11 +8,11 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.10.5 — SYMMETRIC BE + SL020 + RUNNER LOCK
-// V2.10.5: LONG/SHORT initial SL 0.20%; +0.25% -> BE; confirmed 50% TP -> +0.25%; +0.75% -> +0.50%
-// V2.10.5: progressive replacement keeps new SL live before cancelling the previous SL
+// HYPERLIQUID SIGNAL EXECUTION V2.10.6 — PARTIAL TP RUNNER DETECTION FIX
+// V2.10.6: fixes rounded partial-TP runner detection; keeps symmetric SL0.20/BE/runner ladder
+// V2.10.6: confirmed partial fill immediately activates runner protection at +0.25%
 // V2.8.1: exact active SL OID tracking for progressive replacement
-// V2.8 historical base: LIVE progressive protection; V2.10.5 now overrides initial SL to 0.20% both sides
+// V2.8 historical base: LIVE progressive protection; initial SL remains 0.20% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -387,7 +387,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.10.5 SYMMETRIC BE + SL020 + RUNNER LOCK",
+    version: "V2.10.6 PARTIAL TP RUNNER DETECTION FIX",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -1293,11 +1293,27 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
 
     // V2.10 — confirm 50% partial TP from the actual remaining position and fills.
     const liveSzi = Math.abs(Number(position?.szi));
-    const expectedRunnerSize = entrySize * (1 - CONFIG.PARTIAL_TP_FRACTION);
-    if (!Number(row.partial_tp_filled_at) && Number.isFinite(liveSzi) && liveSzi > 0 && liveSzi <= expectedRunnerSize * 1.08 && liveSzi < entrySize * 0.80) {
+    const reducedSize = entrySize - liveSzi;
+
+    // V2.10.6 — partial-TP detection must respect Hyperliquid size granularity.
+    // Example: UNI entry 1.1 with szDecimals=1 cannot close exactly 0.55; the
+    // bracket floors the 50% TP to 0.5 and the real runner is therefore 0.6.
+    // The old expectedRunnerSize*1.08 check capped the runner at 0.594 and missed
+    // this perfectly valid fill. Detect the actual position reduction instead;
+    // the fill lookup below confirms the close and supplies its exact size/price.
+    if (
+      !Number(row.partial_tp_filled_at) &&
+      Number.isFinite(liveSzi) && liveSzi > 0 &&
+      Number.isFinite(reducedSize) && reducedSize > 0 &&
+      liveSzi < entrySize * 0.80
+    ) {
       const fills = await getRecentFillsForCoin(coin);
       const closes = fills.filter((f:any)=>Number(f?.time??0)>=filledAt && Number.isFinite(Number(f?.closedPnl)) && Math.abs(Number(f?.closedPnl))>1e-15).sort((a:any,b:any)=>Number(a?.time??0)-Number(b?.time??0));
       const partial = closes[0] ?? null;
+      if (!partial) {
+        out.push({coin,status:"PARTIAL_SIZE_REDUCTION_WAITING_FOR_FILL_CONFIRMATION",live_size:liveSzi,reduced_size:reducedSize});
+        continue;
+      }
       const partialPx=Number(partial?.px), partialSz=Number(partial?.sz), partialPnl=Number(partial?.closedPnl), partialAt=Number(partial?.time??Date.now());
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,runner_active=1,runner_size=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
         .bind(partialAt,Number.isFinite(partialPx)?partialPx:null,Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi),Number.isFinite(partialPnl)?partialPnl:null,liveSzi,Date.now(),row.id).run();
