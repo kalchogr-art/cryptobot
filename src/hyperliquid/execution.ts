@@ -8,9 +8,9 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.10.6 — PARTIAL TP RUNNER DETECTION FIX
-// V2.10.6: fixes rounded partial-TP runner detection; keeps symmetric SL0.20/BE/runner ladder
-// V2.10.6: confirmed partial fill immediately activates runner protection at +0.25%
+// HYPERLIQUID SIGNAL EXECUTION V2.11.1 — PULLBACK LIMIT ENTRY + MAX HOLD 60M
+// V2.11.0: FAST >=65 places a resting LIMIT 0.20% better than signal; no market entry
+// V2.11.0: after LIMIT fill, existing SL0.20/BE/partial-TP/runner ladder starts from actual fill
 // V2.8.1: exact active SL OID tracking for progressive replacement
 // V2.8 historical base: LIVE progressive protection; initial SL remains 0.20% both sides
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
@@ -88,7 +88,9 @@ const CONFIG = {
   ],
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
-  TIF: "Ioc" as const,
+  ENTRY_PULLBACK_PCT: 0.20,
+  ENTRY_LIMIT_TTL_MS: 30 * 60 * 1000,
+  ENTRY_TIF: "Gtc" as const,
 
   // A real entry is allowed only immediately after a newly-created crossing.
   // Old crossings may still be previewed by the read-only endpoint, but can
@@ -100,7 +102,7 @@ const CONFIG = {
   TPSL_RETRY_DELAY_MS: 500,
 
   // Position lifecycle safety.
-  MAX_HOLD_MS: 30 * 60 * 1000,
+  MAX_HOLD_MS: 60 * 60 * 1000,
   MIN_MARGIN_HEADROOM_USD: 0.01,
 };
 
@@ -387,7 +389,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.10.6 PARTIAL TP RUNNER DETECTION FIX",
+    version: "V2.11.1 PULLBACK LIMIT ENTRY + MAX HOLD 60M",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -708,7 +710,9 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       runner_active INTEGER DEFAULT 0,
       runner_size REAL,
       runner_max_return_pct REAL,
-      last_error TEXT
+      last_error TEXT,
+      strategy_version TEXT,
+      entry_target_price REAL
     )
   `).run();
 
@@ -735,7 +739,9 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN partial_tp_realized_pnl REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_active INTEGER DEFAULT 0",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_size REAL",
-    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_max_return_pct REAL"
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_max_return_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN strategy_version TEXT",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN entry_target_price REAL"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
   }
@@ -761,8 +767,8 @@ async function claimExecutionOnce(
   const insert: any = await db.prepare(`
     INSERT OR IGNORE INTO hyperliquid_execution_ledger (
       crossing_id, episode_id, coin, side, crossing_ts,
-      status, claimed_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?)
+      status, claimed_at, updated_at, strategy_version
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'LIMIT_PULLBACK_V1')
   `).bind(
     crossingId,
     episodeId,
@@ -1225,16 +1231,113 @@ export async function executeProgressiveWsTrigger(
   return {success:result?.advanced===true||reachedStage>=targetStage,executed:result?.advanced===true,ledger_id:ledgerId,requested_target_stage:targetStage,result};
 }
 
+async function reconcilePendingLimitEntries(env: HyperliquidExecutionEnv, secretRaw: string): Promise<any[]> {
+  if (!env?.DB) return [];
+  const q:any = await env.DB.prepare(`
+    SELECT * FROM hyperliquid_execution_ledger
+    WHERE status='ENTRY_LIMIT_OPEN' AND strategy_version='LIMIT_PULLBACK_V1'
+    ORDER BY id ASC LIMIT 100
+  `).all();
+  const rows:any[] = Array.isArray(q?.results) ? q.results : [];
+  const out:any[] = [];
+  const secretOk = privateKeyFormatOk(secretRaw);
+
+  for (const row of rows) {
+    const coin=String(row.coin??'').toUpperCase();
+    const side=String(row.side??'').toUpperCase();
+    const oid=Number(row.entry_oid);
+    const age=Date.now()-Number(row.crossing_ts??row.claimed_at??Date.now());
+    let open:any[]=[];
+    try { open=await getOpenOrdersForCoin(coin); } catch(e:any){ out.push({coin,status:'LIMIT_CHECK_ERROR',error:e?.message??String(e)}); continue; }
+    const stillOpen=Number.isFinite(oid) && open.some((o:any)=>Number(o?.oid)===oid);
+
+    if (stillOpen && age >= CONFIG.ENTRY_LIMIT_TTL_MS) {
+      if (!secretOk) { out.push({coin,status:'LIMIT_EXPIRED_CANCEL_BLOCKED',reason:'PRIVATE_KEY_INVALID'}); continue; }
+      try {
+        const raw=await postInfo({type:'metaAndAssetCtxs'});
+        const universe=Array.isArray(raw?.[0]?.universe)?raw[0].universe:[];
+        const asset=universe.findIndex((x:any)=>String(x?.name??'').toUpperCase()===coin);
+        if(asset>=0){
+          await sendLifecycleSignedAction({type:'cancel',cancels:[{a:asset,o:oid}]},secretRaw as `0x${string}`);
+          await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_LIMIT_EXPIRED',{last_error:null});
+          out.push({coin,status:'ENTRY_LIMIT_EXPIRED',oid});
+        }
+      } catch(e:any){ out.push({coin,status:'LIMIT_CANCEL_ERROR',error:e?.message??String(e)}); }
+      continue;
+    }
+    if (stillOpen) { out.push({coin,status:'ENTRY_LIMIT_OPEN',oid,age_ms:age}); continue; }
+
+    // Order is no longer resting. Confirm a real position/fill before arming protection.
+    let position:any=null;
+    try { position=await getOpenPositionForCoin(coin); } catch {}
+    if(!position){
+      // Could have been externally cancelled/rejected. Never invent a fill.
+      await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_LIMIT_CLOSED_UNFILLED',{last_error:'LIMIT_NO_LONGER_OPEN_AND_NO_POSITION'});
+      out.push({coin,status:'ENTRY_LIMIT_CLOSED_UNFILLED',oid});
+      continue;
+    }
+
+    const fills=await getRecentFillsForCoin(coin);
+    const matched=fills.find((f:any)=>Number(f?.oid)===oid) ?? fills.find((f:any)=>Number(f?.time??0)>=Number(row.claimed_at??0));
+    const fillPrice=Number(matched?.px ?? matched?.avgPx ?? position?.entryPx);
+    const fillSize=Math.abs(Number(matched?.sz ?? position?.szi));
+    if(!Number.isFinite(fillPrice)||fillPrice<=0||!Number.isFinite(fillSize)||fillSize<=0){
+      out.push({coin,status:'LIMIT_FILL_DATA_INVALID',oid}); continue;
+    }
+
+    await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_FILLED',{entry_fill_price:fillPrice,entry_fill_size:fillSize,entry_oid:oid,last_error:null});
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=?,updated_at=? WHERE id=?`).bind(Number(matched?.time??Date.now()),Date.now(),row.id).run();
+
+    if(!secretOk){ out.push({coin,status:'ENTRY_FILLED_PROTECTION_BLOCKED',reason:'PRIVATE_KEY_INVALID'}); continue; }
+    try {
+      const raw=await postInfo({type:'metaAndAssetCtxs'});
+      const universe=Array.isArray(raw?.[0]?.universe)?raw[0].universe:[];
+      const asset=universe.findIndex((x:any)=>String(x?.name??'').toUpperCase()===coin);
+      if(asset<0) throw new Error('ASSET_NOT_FOUND');
+      const szDecimals=Number(universe[asset]?.szDecimals);
+      const isLong=side==='LONG';
+      const tpPct=isLong?CONFIG.LONG_TAKE_PROFIT_PCT:CONFIG.SHORT_TAKE_PROFIT_PCT;
+      const slPct=isLong?CONFIG.LONG_STOP_LOSS_PCT:CONFIG.SHORT_STOP_LOSS_PCT;
+      const actualSizeWire=toWire(fillSize,szDecimals);
+      const partialRaw=Math.floor((fillSize*CONFIG.PARTIAL_TP_FRACTION)*(10**szDecimals)+1e-12)/(10**szDecimals);
+      const partialWire=toWire(partialRaw>0?partialRaw:fillSize,szDecimals);
+      const tpWire=priceToWire(isLong?fillPrice*(1+tpPct/100):fillPrice*(1-tpPct/100),szDecimals);
+      const slWire=priceToWire(isLong?fillPrice*(1-slPct/100):fillPrice*(1+slPct/100),szDecimals);
+      const closeIsBuy=!isLong;
+      const action={type:'order',orders:[
+        {a:asset,b:closeIsBuy,p:tpWire,s:partialWire,r:true,t:{trigger:{isMarket:true,triggerPx:tpWire,tpsl:'tp'}}},
+        {a:asset,b:closeIsBuy,p:slWire,s:actualSizeWire,r:true,t:{trigger:{isMarket:true,triggerPx:slWire,tpsl:'sl'}}}
+      ],grouping:'na'};
+      const pr=await sendLifecycleSignedAction(action,secretRaw as `0x${string}`);
+      const sts=pr?.json?.response?.data?.statuses??null;
+      const errs=Array.isArray(sts)?sts.map((x:any)=>x?.error??null).filter(Boolean):['NO_STATUSES'];
+      const ok=pr?.httpStatus>=200&&pr?.httpStatus<300&&pr?.json?.status==='ok'&&Array.isArray(sts)&&sts.length>=2&&errs.length===0;
+      await updateExecutionLedger(env.DB,row.crossing_id,ok?'PROTECTED':'TPSL_FAILED_AFTER_RETRIES',{last_error:ok?null:errs.join(' | ')});
+      if(ok){
+        const slOid=responseOrderOid(sts[1]);
+        if(slOid!=null) await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET progressive_stop_oid=?,progressive_stop_price=?,progressive_updated_at=?,updated_at=? WHERE id=?`).bind(slOid,Number(slWire),Date.now(),Date.now(),row.id).run();
+      }
+      await sendTelegram(env,[`🎯 <b>PULLBACK LIMIT FILLED</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side==='LONG'?'📈':'📉'} ${side}`,`Signal price: ${row.entry_target_price?Number(row.entry_target_price)/(isLong?0.998:1.002):'n/a'}`,`Limit target: ${row.entry_target_price??'n/a'}`,`Fill: ${fillPrice}`,`SL: ${slWire} (-0.20%)`,`Partial TP 50%: ${tpWire} (+0.50%)`,`Protection: ${ok?'✅ CONFIRMED':'🚨 FAILED'}`,`🆔 Crossing: ${row.crossing_id}`,``,`🕐 ${new Date().toISOString()}`].join('\n'));
+      out.push({coin,status:ok?'LIMIT_FILLED_PROTECTED':'LIMIT_FILLED_TPSL_FAILED',fill_price:fillPrice,fill_size:fillSize,oid});
+    } catch(e:any){
+      await updateExecutionLedger(env.DB,row.crossing_id,'TPSL_FAILED_AFTER_RETRIES',{last_error:e?.message??String(e)});
+      out.push({coin,status:'LIMIT_FILLED_PROTECTION_ERROR',error:e?.message??String(e)});
+    }
+  }
+  return out;
+}
+
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
   if (!env?.DB) return { success: false, reason: "D1_NOT_BOUND" };
   await ensureExecutionLedger(env.DB);
+  const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  const pending_limits = await reconcilePendingLimitEntries(env, secretRaw);
   const rows: any = await env.DB.prepare(`
     SELECT * FROM hyperliquid_execution_ledger
     WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
     ORDER BY id ASC LIMIT 100
   `).all();
   const items = Array.isArray(rows?.results) ? rows.results : [];
-  const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   const secretOk = privateKeyFormatOk(secretRaw);
   const out: any[] = [];
 
@@ -1389,7 +1492,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       Number.isFinite(exchangeClosedPnl) ? exchangeClosedPnl : null
     );
 
-    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_60M',exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
       .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
 
     await sendTelegram(env,lifecycleTelegram({
@@ -1402,7 +1505,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }));
     out.push({coin,status:"MAX_HOLD_EXIT",exit_price:exitPrice,net_pnl:pnl.netPnl});
   }
-  return { success:true, checked:items.length, results:out };
+  return { success:true, pending_limits, checked:items.length, results:out };
 }
 
 export async function buildHyperliquidExecutionCandidate(
@@ -1500,79 +1603,47 @@ export async function buildHyperliquidExecutionCandidate(
     positionUsdTarget / effectiveLeverage;
   const isLong = side === "LONG";
 
-  // Market entry policy: use the current Hyperliquid market, not the old
-  // crossing price. A market order is represented as a marketable IOC limit.
+  // V2.11.1 PULLBACK LIMIT ENTRY + MAX HOLD 60M:
+  // FAST >=65 is a setup, not an immediate market buy/sell.
+  // LONG rests 0.20% BELOW the signal price; SHORT rests 0.20% ABOVE it.
+  // Protection starts only after the exchange confirms the limit fill.
   const markPx = Number(contexts?.[asset]?.markPx);
   const midPx = Number(contexts?.[asset]?.midPx);
   const currentMarketPrice =
-    Number.isFinite(midPx) && midPx > 0
-      ? midPx
-      : Number.isFinite(markPx) && markPx > 0
-        ? markPx
-        : NaN;
+    Number.isFinite(midPx) && midPx > 0 ? midPx :
+    Number.isFinite(markPx) && markPx > 0 ? markPx : NaN;
 
   if (!Number.isFinite(currentMarketPrice) || currentMarketPrice <= 0) {
-    return {
-      eligible: false,
-      status: "SKIPPED",
-      reason: "CURRENT_MARKET_PRICE_UNAVAILABLE",
-      coin,
-      live_trading: CONFIG.LIVE_TRADING,
-    };
+    return { eligible:false,status:"SKIPPED",reason:"CURRENT_MARKET_PRICE_UNAVAILABLE",coin,live_trading:CONFIG.LIVE_TRADING };
   }
 
-  const marketReferenceWire = priceToWire(currentMarketPrice, szDecimals);
-  const marketReference = Number(marketReferenceWire);
+  const entryTargetRaw = isLong
+    ? entryPrice * (1 - CONFIG.ENTRY_PULLBACK_PCT / 100)
+    : entryPrice * (1 + CONFIG.ENTRY_PULLBACK_PCT / 100);
+  const entryTargetWire = priceToWire(entryTargetRaw, szDecimals);
+  const entryTargetPrice = Number(entryTargetWire);
 
-  // LONG pays up to +slippage; SHORT sells down to -slippage.
-  // IOC means fill immediately inside this protection band or cancel.
-  const iocLimitRaw = isLong
-    ? currentMarketPrice * (1 + CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100)
-    : currentMarketPrice * (1 - CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100);
-  const iocLimitWire = priceToWire(iocLimitRaw, szDecimals);
-  const iocLimitPrice = Number(iocLimitWire);
-
-  // Size from the current market reference, not the stale signal price.
   const size = bestValidSize(
-    positionUsdTarget / marketReference,
-    marketReference,
+    positionUsdTarget / entryTargetPrice,
+    entryTargetPrice,
     szDecimals,
     positionUsdTarget
   );
   const sizeWire = toWire(size, szDecimals);
-  const estimatedNotionalUsd = marketReference * size;
+  const estimatedNotionalUsd = entryTargetPrice * size;
 
   if (estimatedNotionalUsd < 10) {
-    return {
-      eligible: false,
-      status: "SKIPPED",
-      reason: "CALCULATED_NOTIONAL_BELOW_10",
-      actual_notional_usd: estimatedNotionalUsd,
-      live_trading: CONFIG.LIVE_TRADING,
-    };
+    return { eligible:false,status:"SKIPPED",reason:"CALCULATED_NOTIONAL_BELOW_10",actual_notional_usd:estimatedNotionalUsd,live_trading:CONFIG.LIVE_TRADING };
   }
 
-  const takeProfitPct = isLong
-    ? CONFIG.LONG_TAKE_PROFIT_PCT
-    : CONFIG.SHORT_TAKE_PROFIT_PCT;
-  const stopLossPct = isLong
-    ? CONFIG.LONG_STOP_LOSS_PCT
-    : CONFIG.SHORT_STOP_LOSS_PCT;
+  const takeProfitPct = isLong ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
+  const stopLossPct = isLong ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
 
   const entryOrder = {
-    a: asset,
-    b: isLong,
-    p: iocLimitWire,
-    s: sizeWire,
-    r: false,
-    t: { limit: { tif: CONFIG.TIF } },
+    a: asset, b: isLong, p: entryTargetWire, s: sizeWire, r: false,
+    t: { limit: { tif: CONFIG.ENTRY_TIF } },
   };
-
-  const entryAction = {
-    type: "order",
-    orders: [entryOrder],
-    grouping: "na",
-  };
+  const entryAction = { type:"order", orders:[entryOrder], grouping:"na" };
 
   // Read current per-asset leverage. Hyperliquid leverage is configured per coin.
   // This call is read-only and is safe in DRY RUN.
@@ -1611,7 +1682,7 @@ export async function buildHyperliquidExecutionCandidate(
   // In DRY RUN there is no real fill. For preview only, use the current
   // market reference as the estimated fill. LIVE TP/SL are recalculated from
   // the actual Hyperliquid fill price returned by /exchange.
-  const previewFillPrice = marketReference;
+  const previewFillPrice = entryTargetPrice;
   const previewTpRaw = isLong
     ? previewFillPrice * (1 + takeProfitPct / 100)
     : previewFillPrice * (1 - takeProfitPct / 100);
@@ -1696,11 +1767,13 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_already_correct: leverageAlreadyCorrect,
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
-      entry_mode: "MARKETABLE_IOC",
-      entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
-      market_reference_price: marketReferenceWire,
-      max_entry_slippage_pct: CONFIG.MAX_ENTRY_SLIPPAGE_PCT,
-      ioc_limit_price: iocLimitWire,
+      entry_mode: "PULLBACK_LIMIT_GTC",
+      entry_price_source: "SIGNAL_PRICE_MINUS_PLUS_0_20PCT",
+      entry_pullback_pct: CONFIG.ENTRY_PULLBACK_PCT,
+      entry_target_price: entryTargetPrice,
+      market_reference_price: currentMarketPrice,
+      max_entry_slippage_pct: null,
+      limit_entry_price: entryTargetWire,
       size: sizeWire,
       estimated_notional_usd: Number(estimatedNotionalUsd.toFixed(8)),
       take_profit_pct: takeProfitPct,
@@ -1708,7 +1781,7 @@ export async function buildHyperliquidExecutionCandidate(
       progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
       progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
       tpsl_price_source_live: "ACTUAL_FILL_PRICE",
-      preview_fill_price: marketReferenceWire,
+      preview_fill_price: entryTargetWire,
       preview_take_profit_trigger: previewTpWire,
       preview_stop_loss_trigger: previewSlWire,
       trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
@@ -2008,10 +2081,30 @@ export async function buildHyperliquidExecutionCandidate(
   const entryStatuses = entryResponse?.json?.response?.data?.statuses ?? null;
   const entryStatus = Array.isArray(entryStatuses) ? entryStatuses[0] : null;
   const fill = entryStatus?.filled ?? null;
+  const resting = entryStatus?.resting ?? null;
   const entryError = entryStatus?.error ?? null;
 
+  if (!fill && resting?.oid != null && !entryError) {
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_LIMIT_OPEN", {
+      entry_oid: resting.oid,
+      last_error: null,
+    });
+    try {
+      await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET strategy_version='LIMIT_PULLBACK_V1',entry_target_price=?,updated_at=? WHERE crossing_id=?`)
+        .bind(entryTargetPrice, Date.now(), String(signal.crossing_id)).run();
+    } catch {}
+    return {
+      ...result,
+      status:"LIVE_LIMIT_ENTRY_OPEN",
+      reason:"WAITING_PULLBACK_LIMIT_FILL",
+      exchange_request_sent:true,
+      live_entry:{filled:false,resting:true,oid:resting.oid,target_price:entryTargetPrice,pullback_pct:CONFIG.ENTRY_PULLBACK_PCT,http_status:entryResponse.httpStatus,response_json:entryResponse.json},
+      timestamp:new Date().toISOString(),
+    };
+  }
+
   if (!fill || entryError) {
-    const rejectReason = entryError ?? "IOC_NOT_FILLED";
+    const rejectReason = entryError ?? "LIMIT_NOT_ACCEPTED";
     await updateExecutionLedger(
       env?.DB,
       signal.crossing_id,
@@ -2044,7 +2137,7 @@ export async function buildHyperliquidExecutionCandidate(
       },
       ...result,
       status: entryError ? "LIVE_ENTRY_REJECTED" : "LIVE_ENTRY_NOT_FILLED",
-      reason: entryError ?? "IOC_NOT_FILLED",
+      reason: entryError ?? "LIMIT_NOT_ACCEPTED",
       exchange_request_sent: true,
       live_entry: {
         http_status: entryResponse.httpStatus,
@@ -2090,8 +2183,8 @@ export async function buildHyperliquidExecutionCandidate(
     last_error: null,
   });
   try {
-    await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=? WHERE crossing_id=?`)
-      .bind(Date.now(), String(signal.crossing_id)).run();
+    await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=?,strategy_version='LIMIT_PULLBACK_V1',entry_target_price=? WHERE crossing_id=?`)
+      .bind(Date.now(), entryTargetPrice, String(signal.crossing_id)).run();
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
