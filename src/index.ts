@@ -40,7 +40,7 @@
             // /debug-hyperliquid
             // ============================================================
 
-            const VERSION = "V1.11.6 PULLBACK WINDOW RECONFIRM SHADOW";
+            const VERSION = "V1.11.7 PRE-MOVE DETECTOR SHADOW";
             const HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info";
 
             const TRACKED_COINS = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "LINK", "SUI", "HYPE", "ADA", "LTC", "BCH", "AAVE", "UNI", "NEAR", "OP", "ARB", "WIF", "TRX"] as const;
@@ -1383,6 +1383,129 @@
             }
 
 
+
+
+
+// ============================================================
+// V1.11.7 PRE-MOVE DETECTOR — RESEARCH/SHADOW ONLY
+// Goal: detect pressure building BEFORE the existing FAST >=65 crossing.
+// IMPORTANT: this module never calls Hyperliquid execution and does not alter
+// LIMIT_PULLBACK_V1. It is deliberately isolated until real micro-live testing.
+// ============================================================
+const PREMOVE = {
+  BUILDING_SCORE: 50,
+  ARMED_SCORE: 70,
+  TRIGGER_SCORE: 70,
+  MAX_1M_MOVE_PCT: 0.15,
+  MAX_3M_MOVE_PCT: 0.25,
+  MIN_TRIGGER_1M_MOVE_PCT: 0.015,
+  MAX_COMPRESSION_RANGE_PCT: 0.30,
+};
+
+function pmPct(a:number,b:number){ return Number.isFinite(a)&&Number.isFinite(b)&&b!==0 ? (a/b-1)*100 : 0; }
+function pmSignedNorm(v:number, scale:number){ return clampSigned((v/scale)*100); }
+
+async function ensurePreMoveTables(env:Env){
+  if(!env.DB) return;
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS pre_move_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    coin TEXT NOT NULL, ts INTEGER NOT NULL, datetime TEXT NOT NULL,
+    side TEXT NOT NULL, state TEXT NOT NULL, pre_move_score REAL NOT NULL,
+    price REAL NOT NULL, fast_score REAL,
+    order_flow REAL, order_flow_velocity REAL, order_flow_acceleration REAL,
+    obi_shift_score REAL, oi_velocity_pct REAL, oi_acceleration_pct REAL,
+    compression_range_pct REAL, move_1m_pct REAL, move_3m_pct REAL,
+    late_move_guard INTEGER NOT NULL DEFAULT 0,
+    trigger_reason TEXT, fast65_seen INTEGER NOT NULL DEFAULT 0,
+    captured_before_fast_pct REAL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(coin, ts)
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_premove_coin_ts ON pre_move_observations(coin,ts DESC)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_premove_state_ts ON pre_move_observations(state,ts DESC)`).run();
+}
+
+async function updatePreMoveDetector(env:Env, signal:any, finalSignal:any){
+  if(!env.DB) return {state:'DISABLED',reason:'D1_NOT_BOUND'};
+  await ensurePreMoveTables(env);
+  const coin=String(signal.coin), now=Number(signal.timestamp??Date.now()), price=Number(signal.price);
+  const fastSigned=Number(finalSignal?.final?.signed_score??signal.market?.signed_score??0);
+  const rows:any[]=(await env.DB.prepare(`SELECT ts,price,order_flow_signed,open_interest FROM market_snapshots WHERE coin=? AND ts<=? ORDER BY ts DESC LIMIT 6`).bind(coin,now).all()).results??[];
+  if(rows.length<4) return {state:'COLLECTING',samples:rows.length};
+  const r=[...rows].reverse();
+  const cur=r[r.length-1], p1=r[r.length-2], p2=r[r.length-3], p3=r[r.length-4];
+  const of0=Number(cur.order_flow_signed??0), of1=Number(p1.order_flow_signed??0), of2=Number(p2.order_flow_signed??0);
+  const flowVel=of0-of1, prevFlowVel=of1-of2, flowAccel=flowVel-prevFlowVel;
+  // OBI shift is the immediate L2 imbalance shift. market_snapshots stores the same
+  // signed top-book composite as order_flow_signed, so this remains independently visible.
+  const obiShift=flowVel;
+  const oi0=Number(cur.open_interest), oi1=Number(p1.open_interest), oi2=Number(p2.open_interest);
+  const oiVel=(Number.isFinite(oi0)&&Number.isFinite(oi1)&&oi1!==0)?pmPct(oi0,oi1):0;
+  const prevOiVel=(Number.isFinite(oi1)&&Number.isFinite(oi2)&&oi2!==0)?pmPct(oi1,oi2):0;
+  const oiAccel=oiVel-prevOiVel;
+  const move1=pmPct(price,Number(p1.price));
+  const move3=pmPct(price,Number(p3.price));
+  const recentPrices=r.slice(-4).map(x=>Number(x.price)).filter(Number.isFinite);
+  const hi=Math.max(...recentPrices), lo=Math.min(...recentPrices);
+  const compression=lo>0?(hi/lo-1)*100:999;
+
+  // Determine candidate direction from PRESSURE, not from existing FAST direction.
+  // 30% order-flow acceleration + 20% OBI shift + 20% OI acceleration
+  // + 15% compression + 15% early price acceleration.
+  const flowSigned=pmSignedNorm(flowAccel,20);
+  const obiSigned=pmSignedNorm(obiShift,20);
+  // Rising OI amplifies the direction implied by flow/OBI; falling OI weakens it.
+  const pressureDir=Math.sign(flowSigned*0.6+obiSigned*0.4)||Math.sign(of0)||1;
+  const oiSigned=clampSigned(pressureDir*pmSignedNorm(Math.max(-0.15,Math.min(0.15,oiAccel)),0.08));
+  const compressionScore=clamp((PREMOVE.MAX_COMPRESSION_RANGE_PCT-compression)/PREMOVE.MAX_COMPRESSION_RANGE_PCT*100);
+  const earlySigned=pmSignedNorm(move1,0.12);
+  const rawSigned=flowSigned*0.30+obiSigned*0.20+oiSigned*0.20+pressureDir*compressionScore*0.15+earlySigned*0.15;
+  const side=rawSigned>=0?'LONG':'SHORT';
+  const dir=side==='LONG'?1:-1;
+  const score=Math.abs(rawSigned);
+  const directional1=move1*dir, directional3=move3*dir;
+  const lateGuard=Math.abs(move1)>=PREMOVE.MAX_1M_MOVE_PCT || Math.abs(move3)>=PREMOVE.MAX_3M_MOVE_PCT;
+  const pressureAligned=(flowVel*dir)>0 && (of0*dir)>0;
+  const earlyPriceConfirmed=directional1>=PREMOVE.MIN_TRIGGER_1M_MOVE_PCT;
+  let state='IDLE', reason='SCORE_BELOW_BUILDING';
+  if(score>=PREMOVE.BUILDING_SCORE){ state='BUILDING'; reason='PRESSURE_BUILDING'; }
+  if(score>=PREMOVE.ARMED_SCORE && !lateGuard){ state='ARMED'; reason='PRESSURE_ARMED_PRICE_NOT_LATE'; }
+  if(score>=PREMOVE.TRIGGER_SCORE && !lateGuard && pressureAligned && earlyPriceConfirmed){ state='TRIGGERED'; reason='PRESSURE_PLUS_EARLY_PRICE_CONFIRMATION'; }
+  if(lateGuard && score>=PREMOVE.BUILDING_SCORE){ state='LATE_BLOCKED'; reason='LATE_MOVE_GUARD'; }
+
+  const fast65=Math.abs(fastSigned)>=65?1:0;
+  // If PRE-MOVE triggers before FAST, later endpoint can calculate how much price moved
+  // before the first >=65 crossing. Never fabricate it at trigger time.
+  await env.DB.prepare(`INSERT OR IGNORE INTO pre_move_observations(
+    coin,ts,datetime,side,state,pre_move_score,price,fast_score,
+    order_flow,order_flow_velocity,order_flow_acceleration,obi_shift_score,
+    oi_velocity_pct,oi_acceleration_pct,compression_range_pct,move_1m_pct,move_3m_pct,
+    late_move_guard,trigger_reason,fast65_seen
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    coin,now,new Date(now).toISOString(),side,state,round(score,2),price,round(Math.abs(fastSigned),2),
+    round(of0,2),round(flowVel,2),round(flowAccel,2),round(obiSigned,2),
+    round(oiVel,5),round(oiAccel,5),round(compression,4),round(move1,4),round(move3,4),
+    lateGuard?1:0,reason,fast65
+  ).run();
+
+  // Backfill captured_before_fast_pct exactly once when the OLD FAST first reaches >=65.
+  if(fast65){
+    const prior:any=await env.DB.prepare(`SELECT id,side,price FROM pre_move_observations WHERE coin=? AND state='TRIGGERED' AND ts<? AND captured_before_fast_pct IS NULL ORDER BY ts DESC LIMIT 1`).bind(coin,now).first();
+    if(prior){
+      const d=String(prior.side)==='LONG'?pmPct(price,Number(prior.price)):pmPct(Number(prior.price),price);
+      await env.DB.prepare(`UPDATE pre_move_observations SET captured_before_fast_pct=? WHERE id=?`).bind(round(d,4),prior.id).run();
+    }
+  }
+  return {state,side,pre_move_score:round(score,2),fast_score:round(Math.abs(fastSigned),2),late_move_guard:lateGuard,move_1m_pct:round(move1,4),move_3m_pct:round(move3,4),order_flow_acceleration:round(flowAccel,2),oi_acceleration_pct:round(oiAccel,5),compression_range_pct:round(compression,4),reason};
+}
+
+async function getPreMoveStatus(env:Env){
+  if(!env.DB) return {success:false,error:'D1_NOT_BOUND'};
+  await ensurePreMoveTables(env);
+  const summary:any=(await env.DB.prepare(`SELECT state,COUNT(*) n,ROUND(AVG(pre_move_score),2) avg_score,ROUND(AVG(captured_before_fast_pct),4) avg_captured_before_fast_pct FROM pre_move_observations GROUP BY state ORDER BY n DESC`).all()).results??[];
+  const triggers:any=(await env.DB.prepare(`SELECT coin,datetime,side,state,pre_move_score,price,fast_score,move_1m_pct,move_3m_pct,order_flow_velocity,order_flow_acceleration,oi_acceleration_pct,compression_range_pct,late_move_guard,captured_before_fast_pct FROM pre_move_observations WHERE state IN ('TRIGGERED','ARMED','LATE_BLOCKED') ORDER BY ts DESC LIMIT 100`).all()).results??[];
+  return {success:true,worker:'cryptobot',version:VERSION,mode:'PRE_MOVE_SHADOW',live_strategy_changed:false,weights:{order_flow_acceleration:0.30,obi_shift:0.20,oi_acceleration:0.20,price_compression:0.15,early_price_acceleration:0.15},guards:{max_1m_move_pct:PREMOVE.MAX_1M_MOVE_PCT,max_3m_move_pct:PREMOVE.MAX_3M_MOVE_PCT},states:['IDLE','BUILDING','ARMED','TRIGGERED','LATE_BLOCKED'],summary,triggers};
+}
 
             // ============================================================
             // V1.5 PAPER TRADING ENGINE
@@ -10124,6 +10247,10 @@
                     summary:summary?.results??[],recent:recent?.results??[]});
                 }
 
+                if (url.pathname === "/pre-move") {
+                  return json(await getPreMoveStatus(env));
+                }
+
                 if (url.pathname === "/hyperliquid-execution") {
                   try {
                     if (!env.DB) {
@@ -10665,6 +10792,9 @@
                       final,
                     };
 
+                    // V1.11.7 PRE-MOVE detector. Research only; no exchange call.
+                    const preMove = await updatePreMoveDetector(env, signal, finalSignal);
+
                     // V1.6: update 1m/5m/15m/30m outcomes for
                     // previously opened independent signal episodes.
                     await updateEpisodeOutcomes(
@@ -10754,6 +10884,7 @@
                       active_news_items: news?.active_items ?? 0,
                       final_score: final?.signed_score ?? 0,
                       final_mode: final?.mode ?? null,
+                      pre_move: preMove,
                       observation,
                       episode,
                       crossing65,
