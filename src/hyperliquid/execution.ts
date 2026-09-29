@@ -8,13 +8,10 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.11.2 — SUPERSEDE STALE PENDING LIMIT
-// V2.11.2: a NEW valid crossing for the same coin supersedes older unfilled LIMIT_PULLBACK_V1 entry orders
-// V2.11.2: exact old entry OID is cancelled and marked ENTRY_LIMIT_SUPERSEDED before the new LIMIT is placed
-// V2.11.0: FAST >=65 places a resting LIMIT 0.20% better than signal; no market entry
-// V2.11.0: after LIMIT fill, existing SL0.20/BE/partial-TP/runner ladder starts from actual fill
-// V2.8.1: exact active SL OID tracking for progressive replacement
-// V2.8 historical base: LIVE progressive protection; initial SL remains 0.20% both sides
+// HYPERLIQUID SIGNAL EXECUTION V2.12.0 — A+B FIXED TP020 SL010
+// V2.12.0: direct MARKETABLE IOC entry for A/B setup signals
+// V2.12.0: fixed full-position TP +0.20% and SL -0.10%
+// V2.12.0: NO final TP, NO break-even, NO progressive runner
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -50,7 +47,7 @@ const MASTER_ACCOUNT =
 const CONFIG = {
   LIVE_TRADING: true,
 
-  MIN_SIGNAL_SCORE: 65,
+  MIN_SIGNAL_SCORE: 0,
 
   // Strategy reference: $1.04 × 10x = $10.40 target notional.
   // V2.10.2 keeps this notional fixed when an asset supports <10x.
@@ -58,16 +55,16 @@ const CONFIG = {
   TARGET_LEVERAGE: 10,
   IS_CROSS: true,
 
-  LONG_TAKE_PROFIT_PCT: 0.50,
-  PARTIAL_TP_FRACTION: 0.50,
-  LONG_STOP_LOSS_PCT: 0.20,
-  SHORT_TAKE_PROFIT_PCT: 0.50,
-  SHORT_STOP_LOSS_PCT: 0.20,
+  LONG_TAKE_PROFIT_PCT: 0.20,
+  PARTIAL_TP_FRACTION: 1.00,
+  LONG_STOP_LOSS_PCT: 0.10,
+  SHORT_TAKE_PROFIT_PCT: 0.20,
+  SHORT_STOP_LOSS_PCT: 0.10,
 
   // V2.10.5 symmetric LONG/SHORT protection:
   // 1) Initial SL = -0.20%.
   // 2) +0.25% -> SL at ENTRY (break-even).
-  // 3) +0.50% is the existing 50% partial TP. Only AFTER that fill is confirmed
+  // 3) +0.50% is the existing 50% final TP. Only AFTER that fill is confirmed
   //    may Stage 2 replace the runner SL with +0.25%.
   // 4) +0.75% -> runner SL +0.50%, then continue the wider runner ladder.
   LONG_PROGRESSIVE_STEPS: [
@@ -90,9 +87,7 @@ const CONFIG = {
   ],
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
-  ENTRY_PULLBACK_PCT: 0.20,
-  ENTRY_LIMIT_TTL_MS: 30 * 60 * 1000,
-  ENTRY_TIF: "Gtc" as const,
+  TIF: "Ioc" as const,
 
   // A real entry is allowed only immediately after a newly-created crossing.
   // Old crossings may still be previewed by the read-only endpoint, but can
@@ -104,7 +99,7 @@ const CONFIG = {
   TPSL_RETRY_DELAY_MS: 500,
 
   // Position lifecycle safety.
-  MAX_HOLD_MS: 60 * 60 * 1000,
+  MAX_HOLD_MS: 30 * 60 * 1000,
   MIN_MARGIN_HEADROOM_USD: 0.01,
 };
 
@@ -123,6 +118,7 @@ export type HyperliquidExecutionSignal = {
   crossing_id?: number | string | null;
   episode_id?: number | string | null;
   crossing_ts?: number | null;
+  setup_name?: "A" | "B1" | "B2" | "B3" | string | null;
 
   // READ_ONLY_STATUS is used by /hyperliquid-execution and is permanently
   // forbidden from sending live exchange actions even if LIVE_TRADING=true.
@@ -391,7 +387,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.11.1 PULLBACK LIMIT ENTRY + MAX HOLD 60M",
+    version: "V2.12.0 A+B FIXED TP020 SL010",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -712,9 +708,9 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       runner_active INTEGER DEFAULT 0,
       runner_size REAL,
       runner_max_return_pct REAL,
-      last_error TEXT,
       strategy_version TEXT,
-      entry_target_price REAL
+      setup_name TEXT,
+      last_error TEXT
     )
   `).run();
 
@@ -743,7 +739,7 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_size REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_max_return_pct REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN strategy_version TEXT",
-    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN entry_target_price REAL"
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN setup_name TEXT"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
   }
@@ -769,8 +765,8 @@ async function claimExecutionOnce(
   const insert: any = await db.prepare(`
     INSERT OR IGNORE INTO hyperliquid_execution_ledger (
       crossing_id, episode_id, coin, side, crossing_ts,
-      status, claimed_at, updated_at, strategy_version
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'LIMIT_PULLBACK_V1')
+      status, claimed_at, updated_at, strategy_version, setup_name
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'AB_FIXED_TPSL_V1', ?)
   `).bind(
     crossingId,
     episodeId,
@@ -778,7 +774,8 @@ async function claimExecutionOnce(
     side,
     crossingTs,
     now,
-    now
+    now,
+    String(signal.setup_name ?? '') || null
   ).run();
 
   const changes = Number(insert?.meta?.changes ?? 0);
@@ -1233,113 +1230,16 @@ export async function executeProgressiveWsTrigger(
   return {success:result?.advanced===true||reachedStage>=targetStage,executed:result?.advanced===true,ledger_id:ledgerId,requested_target_stage:targetStage,result};
 }
 
-async function reconcilePendingLimitEntries(env: HyperliquidExecutionEnv, secretRaw: string): Promise<any[]> {
-  if (!env?.DB) return [];
-  const q:any = await env.DB.prepare(`
-    SELECT * FROM hyperliquid_execution_ledger
-    WHERE status='ENTRY_LIMIT_OPEN' AND strategy_version='LIMIT_PULLBACK_V1'
-    ORDER BY id ASC LIMIT 100
-  `).all();
-  const rows:any[] = Array.isArray(q?.results) ? q.results : [];
-  const out:any[] = [];
-  const secretOk = privateKeyFormatOk(secretRaw);
-
-  for (const row of rows) {
-    const coin=String(row.coin??'').toUpperCase();
-    const side=String(row.side??'').toUpperCase();
-    const oid=Number(row.entry_oid);
-    const age=Date.now()-Number(row.crossing_ts??row.claimed_at??Date.now());
-    let open:any[]=[];
-    try { open=await getOpenOrdersForCoin(coin); } catch(e:any){ out.push({coin,status:'LIMIT_CHECK_ERROR',error:e?.message??String(e)}); continue; }
-    const stillOpen=Number.isFinite(oid) && open.some((o:any)=>Number(o?.oid)===oid);
-
-    if (stillOpen && age >= CONFIG.ENTRY_LIMIT_TTL_MS) {
-      if (!secretOk) { out.push({coin,status:'LIMIT_EXPIRED_CANCEL_BLOCKED',reason:'PRIVATE_KEY_INVALID'}); continue; }
-      try {
-        const raw=await postInfo({type:'metaAndAssetCtxs'});
-        const universe=Array.isArray(raw?.[0]?.universe)?raw[0].universe:[];
-        const asset=universe.findIndex((x:any)=>String(x?.name??'').toUpperCase()===coin);
-        if(asset>=0){
-          await sendLifecycleSignedAction({type:'cancel',cancels:[{a:asset,o:oid}]},secretRaw as `0x${string}`);
-          await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_LIMIT_EXPIRED',{last_error:null});
-          out.push({coin,status:'ENTRY_LIMIT_EXPIRED',oid});
-        }
-      } catch(e:any){ out.push({coin,status:'LIMIT_CANCEL_ERROR',error:e?.message??String(e)}); }
-      continue;
-    }
-    if (stillOpen) { out.push({coin,status:'ENTRY_LIMIT_OPEN',oid,age_ms:age}); continue; }
-
-    // Order is no longer resting. Confirm a real position/fill before arming protection.
-    let position:any=null;
-    try { position=await getOpenPositionForCoin(coin); } catch {}
-    if(!position){
-      // Could have been externally cancelled/rejected. Never invent a fill.
-      await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_LIMIT_CLOSED_UNFILLED',{last_error:'LIMIT_NO_LONGER_OPEN_AND_NO_POSITION'});
-      out.push({coin,status:'ENTRY_LIMIT_CLOSED_UNFILLED',oid});
-      continue;
-    }
-
-    const fills=await getRecentFillsForCoin(coin);
-    const matched=fills.find((f:any)=>Number(f?.oid)===oid) ?? fills.find((f:any)=>Number(f?.time??0)>=Number(row.claimed_at??0));
-    const fillPrice=Number(matched?.px ?? matched?.avgPx ?? position?.entryPx);
-    const fillSize=Math.abs(Number(matched?.sz ?? position?.szi));
-    if(!Number.isFinite(fillPrice)||fillPrice<=0||!Number.isFinite(fillSize)||fillSize<=0){
-      out.push({coin,status:'LIMIT_FILL_DATA_INVALID',oid}); continue;
-    }
-
-    await updateExecutionLedger(env.DB,row.crossing_id,'ENTRY_FILLED',{entry_fill_price:fillPrice,entry_fill_size:fillSize,entry_oid:oid,last_error:null});
-    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=?,updated_at=? WHERE id=?`).bind(Number(matched?.time??Date.now()),Date.now(),row.id).run();
-
-    if(!secretOk){ out.push({coin,status:'ENTRY_FILLED_PROTECTION_BLOCKED',reason:'PRIVATE_KEY_INVALID'}); continue; }
-    try {
-      const raw=await postInfo({type:'metaAndAssetCtxs'});
-      const universe=Array.isArray(raw?.[0]?.universe)?raw[0].universe:[];
-      const asset=universe.findIndex((x:any)=>String(x?.name??'').toUpperCase()===coin);
-      if(asset<0) throw new Error('ASSET_NOT_FOUND');
-      const szDecimals=Number(universe[asset]?.szDecimals);
-      const isLong=side==='LONG';
-      const tpPct=isLong?CONFIG.LONG_TAKE_PROFIT_PCT:CONFIG.SHORT_TAKE_PROFIT_PCT;
-      const slPct=isLong?CONFIG.LONG_STOP_LOSS_PCT:CONFIG.SHORT_STOP_LOSS_PCT;
-      const actualSizeWire=toWire(fillSize,szDecimals);
-      const partialRaw=Math.floor((fillSize*CONFIG.PARTIAL_TP_FRACTION)*(10**szDecimals)+1e-12)/(10**szDecimals);
-      const partialWire=toWire(partialRaw>0?partialRaw:fillSize,szDecimals);
-      const tpWire=priceToWire(isLong?fillPrice*(1+tpPct/100):fillPrice*(1-tpPct/100),szDecimals);
-      const slWire=priceToWire(isLong?fillPrice*(1-slPct/100):fillPrice*(1+slPct/100),szDecimals);
-      const closeIsBuy=!isLong;
-      const action={type:'order',orders:[
-        {a:asset,b:closeIsBuy,p:tpWire,s:partialWire,r:true,t:{trigger:{isMarket:true,triggerPx:tpWire,tpsl:'tp'}}},
-        {a:asset,b:closeIsBuy,p:slWire,s:actualSizeWire,r:true,t:{trigger:{isMarket:true,triggerPx:slWire,tpsl:'sl'}}}
-      ],grouping:'na'};
-      const pr=await sendLifecycleSignedAction(action,secretRaw as `0x${string}`);
-      const sts=pr?.json?.response?.data?.statuses??null;
-      const errs=Array.isArray(sts)?sts.map((x:any)=>x?.error??null).filter(Boolean):['NO_STATUSES'];
-      const ok=pr?.httpStatus>=200&&pr?.httpStatus<300&&pr?.json?.status==='ok'&&Array.isArray(sts)&&sts.length>=2&&errs.length===0;
-      await updateExecutionLedger(env.DB,row.crossing_id,ok?'PROTECTED':'TPSL_FAILED_AFTER_RETRIES',{last_error:ok?null:errs.join(' | ')});
-      if(ok){
-        const slOid=responseOrderOid(sts[1]);
-        if(slOid!=null) await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET progressive_stop_oid=?,progressive_stop_price=?,progressive_updated_at=?,updated_at=? WHERE id=?`).bind(slOid,Number(slWire),Date.now(),Date.now(),row.id).run();
-      }
-      await sendTelegram(env,[`🎯 <b>PULLBACK LIMIT FILLED</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side==='LONG'?'📈':'📉'} ${side}`,`Signal price: ${row.entry_target_price?Number(row.entry_target_price)/(isLong?0.998:1.002):'n/a'}`,`Limit target: ${row.entry_target_price??'n/a'}`,`Fill: ${fillPrice}`,`SL: ${slWire} (-0.20%)`,`Partial TP 50%: ${tpWire} (+0.50%)`,`Protection: ${ok?'✅ CONFIRMED':'🚨 FAILED'}`,`🆔 Crossing: ${row.crossing_id}`,``,`🕐 ${new Date().toISOString()}`].join('\n'));
-      out.push({coin,status:ok?'LIMIT_FILLED_PROTECTED':'LIMIT_FILLED_TPSL_FAILED',fill_price:fillPrice,fill_size:fillSize,oid});
-    } catch(e:any){
-      await updateExecutionLedger(env.DB,row.crossing_id,'TPSL_FAILED_AFTER_RETRIES',{last_error:e?.message??String(e)});
-      out.push({coin,status:'LIMIT_FILLED_PROTECTION_ERROR',error:e?.message??String(e)});
-    }
-  }
-  return out;
-}
-
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
   if (!env?.DB) return { success: false, reason: "D1_NOT_BOUND" };
   await ensureExecutionLedger(env.DB);
-  const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
-  const pending_limits = await reconcilePendingLimitEntries(env, secretRaw);
   const rows: any = await env.DB.prepare(`
     SELECT * FROM hyperliquid_execution_ledger
     WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
     ORDER BY id ASC LIMIT 100
   `).all();
   const items = Array.isArray(rows?.results) ? rows.results : [];
+  const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   const secretOk = privateKeyFormatOk(secretRaw);
   const out: any[] = [];
 
@@ -1396,17 +1296,17 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       continue;
     }
 
-    // V2.10 — confirm 50% partial TP from the actual remaining position and fills.
+    // V2.10 — confirm 50% final TP from the actual remaining position and fills.
     const liveSzi = Math.abs(Number(position?.szi));
     const reducedSize = entrySize - liveSzi;
 
-    // V2.10.6 — partial-TP detection must respect Hyperliquid size granularity.
+    // V2.12.0 — partial-TP detection must respect Hyperliquid size granularity.
     // Example: UNI entry 1.1 with szDecimals=1 cannot close exactly 0.55; the
     // bracket floors the 50% TP to 0.5 and the real runner is therefore 0.6.
     // The old expectedRunnerSize*1.08 check capped the runner at 0.594 and missed
     // this perfectly valid fill. Detect the actual position reduction instead;
     // the fill lookup below confirms the close and supplies its exact size/price.
-    if (
+    if (false &&
       !Number(row.partial_tp_filled_at) &&
       Number.isFinite(liveSzi) && liveSzi > 0 &&
       Number.isFinite(reducedSize) && reducedSize > 0 &&
@@ -1425,16 +1325,16 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       row.partial_tp_filled_at=partialAt; row.partial_tp_price=Number.isFinite(partialPx)?partialPx:null; row.partial_tp_size=Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi); row.partial_tp_realized_pnl=Number.isFinite(partialPnl)?partialPnl:null; row.runner_active=1; row.runner_size=liveSzi;
       await sendTelegram(env,[`🟢 <b>PARTIAL TP 50%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Partial TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Runner remaining: ${liveSzi}`,`🛡 Progressive runner active`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
     }
-    if (Number(row.partial_tp_filled_at)) {
+    if (false && Number(row.partial_tp_filled_at)) {
       try {
         const rawCtx=await postInfo({type:"metaAndAssetCtxs"}); const uni=Array.isArray(rawCtx?.[0]?.universe)?rawCtx[0].universe:[]; const ctxs=Array.isArray(rawCtx?.[1])?rawCtx[1]:[]; const ai=uni.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin); const mp=Number(ctxs?.[ai]?.midPx??ctxs?.[ai]?.markPx); const rr=directionalReturnPct(side,entryPrice,mp);
         if(Number.isFinite(rr)) await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET runner_max_return_pct=MAX(COALESCE(runner_max_return_pct,0),?),runner_size=?,runner_active=1 WHERE id=?`).bind(rr,liveSzi,row.id).run();
       } catch {}
     }
 
-    // V2.10: progressive engine continues beyond partial TP through runner stages.
+    // V2.10: progressive engine continues beyond final TP through runner stages.
     let progressive: any = null;
-    if (secretOk && String(row.status) === "PROTECTED") {
+    if (false && secretOk && String(row.status) === "PROTECTED") {
       try {
         progressive = await advanceProgressiveProtection(
           env,
@@ -1447,8 +1347,10 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       }
     }
 
-    if (heldMs < CONFIG.MAX_HOLD_MS) {
-      out.push({coin,status:"OPEN",held_ms:heldMs,progressive});
+    if (true) {
+      // V2.12.0 fixed strategy: exits are ONLY exchange TP +0.20% or SL -0.10%.
+      // No TIME exit and no progressive management.
+      out.push({coin,status:"OPEN",held_ms:heldMs,progressive:null});
       continue;
     }
     if (!secretOk) { out.push({coin,status:"MAX_HOLD_BLOCKED",reason:"PRIVATE_KEY_INVALID"}); continue; }
@@ -1494,7 +1396,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       Number.isFinite(exchangeClosedPnl) ? exchangeClosedPnl : null
     );
 
-    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_60M',exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
+    await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_EXIT',updated_at=?,closed_at=?,close_reason='MAX_HOLD_30M',exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
       .bind(Date.now(),Date.now(),Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
 
     await sendTelegram(env,lifecycleTelegram({
@@ -1507,7 +1409,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }));
     out.push({coin,status:"MAX_HOLD_EXIT",exit_price:exitPrice,net_pnl:pnl.netPnl});
   }
-  return { success:true, pending_limits, checked:items.length, results:out };
+  return { success:true, checked:items.length, results:out };
 }
 
 export async function buildHyperliquidExecutionCandidate(
@@ -1605,47 +1507,79 @@ export async function buildHyperliquidExecutionCandidate(
     positionUsdTarget / effectiveLeverage;
   const isLong = side === "LONG";
 
-  // V2.11.1 PULLBACK LIMIT ENTRY + MAX HOLD 60M:
-  // FAST >=65 is a setup, not an immediate market buy/sell.
-  // LONG rests 0.20% BELOW the signal price; SHORT rests 0.20% ABOVE it.
-  // Protection starts only after the exchange confirms the limit fill.
+  // Market entry policy: use the current Hyperliquid market, not the old
+  // crossing price. A market order is represented as a marketable IOC limit.
   const markPx = Number(contexts?.[asset]?.markPx);
   const midPx = Number(contexts?.[asset]?.midPx);
   const currentMarketPrice =
-    Number.isFinite(midPx) && midPx > 0 ? midPx :
-    Number.isFinite(markPx) && markPx > 0 ? markPx : NaN;
+    Number.isFinite(midPx) && midPx > 0
+      ? midPx
+      : Number.isFinite(markPx) && markPx > 0
+        ? markPx
+        : NaN;
 
   if (!Number.isFinite(currentMarketPrice) || currentMarketPrice <= 0) {
-    return { eligible:false,status:"SKIPPED",reason:"CURRENT_MARKET_PRICE_UNAVAILABLE",coin,live_trading:CONFIG.LIVE_TRADING };
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "CURRENT_MARKET_PRICE_UNAVAILABLE",
+      coin,
+      live_trading: CONFIG.LIVE_TRADING,
+    };
   }
 
-  const entryTargetRaw = isLong
-    ? entryPrice * (1 - CONFIG.ENTRY_PULLBACK_PCT / 100)
-    : entryPrice * (1 + CONFIG.ENTRY_PULLBACK_PCT / 100);
-  const entryTargetWire = priceToWire(entryTargetRaw, szDecimals);
-  const entryTargetPrice = Number(entryTargetWire);
+  const marketReferenceWire = priceToWire(currentMarketPrice, szDecimals);
+  const marketReference = Number(marketReferenceWire);
 
+  // LONG pays up to +slippage; SHORT sells down to -slippage.
+  // IOC means fill immediately inside this protection band or cancel.
+  const iocLimitRaw = isLong
+    ? currentMarketPrice * (1 + CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100)
+    : currentMarketPrice * (1 - CONFIG.MAX_ENTRY_SLIPPAGE_PCT / 100);
+  const iocLimitWire = priceToWire(iocLimitRaw, szDecimals);
+  const iocLimitPrice = Number(iocLimitWire);
+
+  // Size from the current market reference, not the stale signal price.
   const size = bestValidSize(
-    positionUsdTarget / entryTargetPrice,
-    entryTargetPrice,
+    positionUsdTarget / marketReference,
+    marketReference,
     szDecimals,
     positionUsdTarget
   );
   const sizeWire = toWire(size, szDecimals);
-  const estimatedNotionalUsd = entryTargetPrice * size;
+  const estimatedNotionalUsd = marketReference * size;
 
   if (estimatedNotionalUsd < 10) {
-    return { eligible:false,status:"SKIPPED",reason:"CALCULATED_NOTIONAL_BELOW_10",actual_notional_usd:estimatedNotionalUsd,live_trading:CONFIG.LIVE_TRADING };
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "CALCULATED_NOTIONAL_BELOW_10",
+      actual_notional_usd: estimatedNotionalUsd,
+      live_trading: CONFIG.LIVE_TRADING,
+    };
   }
 
-  const takeProfitPct = isLong ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
-  const stopLossPct = isLong ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
+  const takeProfitPct = isLong
+    ? CONFIG.LONG_TAKE_PROFIT_PCT
+    : CONFIG.SHORT_TAKE_PROFIT_PCT;
+  const stopLossPct = isLong
+    ? CONFIG.LONG_STOP_LOSS_PCT
+    : CONFIG.SHORT_STOP_LOSS_PCT;
 
   const entryOrder = {
-    a: asset, b: isLong, p: entryTargetWire, s: sizeWire, r: false,
-    t: { limit: { tif: CONFIG.ENTRY_TIF } },
+    a: asset,
+    b: isLong,
+    p: iocLimitWire,
+    s: sizeWire,
+    r: false,
+    t: { limit: { tif: CONFIG.TIF } },
   };
-  const entryAction = { type:"order", orders:[entryOrder], grouping:"na" };
+
+  const entryAction = {
+    type: "order",
+    orders: [entryOrder],
+    grouping: "na",
+  };
 
   // Read current per-asset leverage. Hyperliquid leverage is configured per coin.
   // This call is read-only and is safe in DRY RUN.
@@ -1684,7 +1618,7 @@ export async function buildHyperliquidExecutionCandidate(
   // In DRY RUN there is no real fill. For preview only, use the current
   // market reference as the estimated fill. LIVE TP/SL are recalculated from
   // the actual Hyperliquid fill price returned by /exchange.
-  const previewFillPrice = entryTargetPrice;
+  const previewFillPrice = marketReference;
   const previewTpRaw = isLong
     ? previewFillPrice * (1 + takeProfitPct / 100)
     : previewFillPrice * (1 - takeProfitPct / 100);
@@ -1733,7 +1667,7 @@ export async function buildHyperliquidExecutionCandidate(
   const result: Record<string, any> = {
     eligible: true,
     status: CONFIG.LIVE_TRADING ? "LIVE_READY" : "DRY_RUN_READY",
-    reason: "NEW_65_CROSSING",
+    reason: "NEW_AB_SETUP",
     live_trading: CONFIG.LIVE_TRADING,
     exchange_request_sent: false,
 
@@ -1769,21 +1703,21 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_already_correct: leverageAlreadyCorrect,
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
-      entry_mode: "PULLBACK_LIMIT_GTC",
-      entry_price_source: "SIGNAL_PRICE_MINUS_PLUS_0_20PCT",
-      entry_pullback_pct: CONFIG.ENTRY_PULLBACK_PCT,
-      entry_target_price: entryTargetPrice,
-      market_reference_price: currentMarketPrice,
-      max_entry_slippage_pct: null,
-      limit_entry_price: entryTargetWire,
+      entry_mode: "MARKETABLE_IOC_AB_FIXED",
+      strategy_version: "AB_FIXED_TPSL_V1",
+      setup_name: signal.setup_name ?? null,
+      entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
+      market_reference_price: marketReferenceWire,
+      max_entry_slippage_pct: CONFIG.MAX_ENTRY_SLIPPAGE_PCT,
+      ioc_limit_price: iocLimitWire,
       size: sizeWire,
       estimated_notional_usd: Number(estimatedNotionalUsd.toFixed(8)),
       take_profit_pct: takeProfitPct,
       stop_loss_pct: stopLossPct,
-      progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
-      progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
+      progressive_strategy: "DISABLED",
+      progressive_steps: [],
       tpsl_price_source_live: "ACTUAL_FILL_PRICE",
-      preview_fill_price: entryTargetWire,
+      preview_fill_price: marketReferenceWire,
       preview_take_profit_trigger: previewTpWire,
       preview_stop_loss_trigger: previewSlWire,
       trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
@@ -1950,69 +1884,13 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
-  // V2.11.2 — NEW CROSSING SUPERSEDES AN OLDER UNFILLED PULLBACK LIMIT FOR THE SAME COIN.
-  // A real open position still blocks the new signal. We only cancel exact entry OIDs that
-  // belong to D1 rows in ENTRY_LIMIT_OPEN / LIMIT_PULLBACK_V1. Protective or unknown orders
-  // are never cancelled by this path.
-  let existingPosition = await getOpenPositionForCoin(coin);
-  let existingOrders = await getOpenOrdersForCoin(coin);
-
-  if (existingPosition) {
-    const reason = "EXISTING_POSITION_FOR_COIN";
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
-    const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
-    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
-  }
-
-  const supersededLimits:any[] = [];
-  if (existingOrders.length > 0 && env?.DB) {
-    const pendingQ:any = await env.DB.prepare(`
-      SELECT * FROM hyperliquid_execution_ledger
-      WHERE coin=?
-        AND status='ENTRY_LIMIT_OPEN'
-        AND strategy_version='LIMIT_PULLBACK_V1'
-        AND crossing_id<>?
-      ORDER BY id ASC
-    `).bind(coin, String(signal.crossing_id)).all();
-    const pendingRows:any[] = Array.isArray(pendingQ?.results) ? pendingQ.results : [];
-    const openOidSet = new Set(existingOrders.map((o:any)=>Number(o?.oid)).filter((x:number)=>Number.isFinite(x)));
-
-    for (const oldRow of pendingRows) {
-      const oldOid = Number(oldRow?.entry_oid);
-      if (!Number.isFinite(oldOid) || !openOidSet.has(oldOid)) continue;
-
-      const cancelResponse = await sendLifecycleSignedAction(
-        { type:'cancel', cancels:[{ a:asset, o:oldOid }] },
-        secret as `0x${string}`
-      );
-
-      // Fail closed: verify that the exact old entry OID disappeared before superseding it.
-      const verifyOrders = await getOpenOrdersForCoin(coin);
-      const stillOpen = verifyOrders.some((o:any)=>Number(o?.oid)===oldOid);
-      if (stillOpen) {
-        const reason = `OLD_PENDING_LIMIT_CANCEL_NOT_CONFIRMED:${oldOid}`;
-        await updateExecutionLedger(env.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
-        const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
-        return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_OLD_LIMIT_CANCEL_FAILED",reason,old_crossing_id:oldRow.crossing_id,old_entry_oid:oldOid,cancel_response:cancelResponse,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:true};
-      }
-
-      await updateExecutionLedger(env.DB, oldRow.crossing_id, "ENTRY_LIMIT_SUPERSEDED", {
-        last_error: `SUPERSEDED_BY_NEW_CROSSING:${String(signal.crossing_id)}`
-      });
-      supersededLimits.push({crossing_id:oldRow.crossing_id,oid:oldOid,side:oldRow.side});
-      existingOrders = verifyOrders;
-    }
-  }
-
-  // Re-check exchange state after cancellation. If any position appeared meanwhile, or any
-  // unknown/open order remains, do not place the new entry.
-  existingPosition = await getOpenPositionForCoin(coin);
-  existingOrders = await getOpenOrdersForCoin(coin);
+  const existingPosition = await getOpenPositionForCoin(coin);
+  const existingOrders = await getOpenOrdersForCoin(coin);
   if (existingPosition || existingOrders.length > 0) {
-    const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN_AFTER_SUPERSEDE_CHECK" : "UNRELATED_OR_UNTRACKED_OPEN_ORDERS_FOR_COIN";
+    const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN" : "EXISTING_OPEN_ORDERS_FOR_COIN";
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
     const tg = await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason,balance:preEntryBalance}));
-    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,superseded_limits:supersededLimits,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:supersededLimits.length>0};
+    return {...result,eligible:false,status:"LIVE_ENTRY_BLOCKED_EXISTING_EXPOSURE",reason,existing_position:existingPosition??null,existing_open_orders:existingOrders.length,telegram:{sent:tg.sent,reason:tg.reason??null},exchange_request_sent:false};
   }
 
   let lastNonce = 0;
@@ -2139,31 +2017,10 @@ export async function buildHyperliquidExecutionCandidate(
   const entryStatuses = entryResponse?.json?.response?.data?.statuses ?? null;
   const entryStatus = Array.isArray(entryStatuses) ? entryStatuses[0] : null;
   const fill = entryStatus?.filled ?? null;
-  const resting = entryStatus?.resting ?? null;
   const entryError = entryStatus?.error ?? null;
 
-  if (!fill && resting?.oid != null && !entryError) {
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_LIMIT_OPEN", {
-      entry_oid: resting.oid,
-      last_error: null,
-    });
-    try {
-      await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET strategy_version='LIMIT_PULLBACK_V1',entry_target_price=?,updated_at=? WHERE crossing_id=?`)
-        .bind(entryTargetPrice, Date.now(), String(signal.crossing_id)).run();
-    } catch {}
-    return {
-      ...result,
-      status:"LIVE_LIMIT_ENTRY_OPEN",
-      reason:"WAITING_PULLBACK_LIMIT_FILL",
-      exchange_request_sent:true,
-      live_entry:{filled:false,resting:true,oid:resting.oid,target_price:entryTargetPrice,pullback_pct:CONFIG.ENTRY_PULLBACK_PCT,http_status:entryResponse.httpStatus,response_json:entryResponse.json},
-      superseded_limits:supersededLimits,
-      timestamp:new Date().toISOString(),
-    };
-  }
-
   if (!fill || entryError) {
-    const rejectReason = entryError ?? "LIMIT_NOT_ACCEPTED";
+    const rejectReason = entryError ?? "IOC_NOT_FILLED";
     await updateExecutionLedger(
       env?.DB,
       signal.crossing_id,
@@ -2196,7 +2053,7 @@ export async function buildHyperliquidExecutionCandidate(
       },
       ...result,
       status: entryError ? "LIVE_ENTRY_REJECTED" : "LIVE_ENTRY_NOT_FILLED",
-      reason: entryError ?? "LIMIT_NOT_ACCEPTED",
+      reason: entryError ?? "IOC_NOT_FILLED",
       exchange_request_sent: true,
       live_entry: {
         http_status: entryResponse.httpStatus,
@@ -2242,14 +2099,13 @@ export async function buildHyperliquidExecutionCandidate(
     last_error: null,
   });
   try {
-    await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=?,strategy_version='LIMIT_PULLBACK_V1',entry_target_price=? WHERE crossing_id=?`)
-      .bind(Date.now(), entryTargetPrice, String(signal.crossing_id)).run();
+    await env?.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET entry_filled_at=? WHERE crossing_id=?`)
+      .bind(Date.now(), String(signal.crossing_id)).run();
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
-  const partialTpSizeRaw = Math.floor((fillSize * CONFIG.PARTIAL_TP_FRACTION) * (10 ** szDecimals) + 1e-12) / (10 ** szDecimals);
-  const partialTpSize = partialTpSizeRaw > 0 ? partialTpSizeRaw : fillSize;
-  const partialTpSizeWire = toWire(partialTpSize, szDecimals);
+  const partialTpSize = fillSize;
+  const partialTpSizeWire = actualSizeWire;
   const tpRaw = isLong
     ? fillPrice * (1 + takeProfitPct / 100)
     : fillPrice * (1 - takeProfitPct / 100);
@@ -2417,8 +2273,8 @@ export async function buildHyperliquidExecutionCandidate(
       take_profit_trigger: tpWire,
       stop_loss_pct: stopLossPct,
       stop_loss_trigger: slWire,
-      progressive_strategy: isLong ? "LONG_PROGRESSIVE_A" : "SHORT_PROGRESSIVE_C",
-      progressive_steps: isLong ? CONFIG.LONG_PROGRESSIVE_STEPS : CONFIG.SHORT_PROGRESSIVE_STEPS,
+      progressive_strategy: "DISABLED",
+      progressive_steps: [],
       partial_tp_fraction: CONFIG.PARTIAL_TP_FRACTION,
       partial_tp_size: partialTpSizeWire,
       runner_fraction: 1 - CONFIG.PARTIAL_TP_FRACTION,
