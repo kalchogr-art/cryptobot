@@ -16,7 +16,7 @@ import { privateKeyToAccount } from "viem/accounts";
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
-// V2.7.2:
+// V2.7.2:re
  // - ENTRY balance guard now uses Hyperliquid activeAssetData.availableToTrade for the exact coin/side.
  // - clearinghouseState.withdrawable is no longer used as the live ENTRY availability source.
  // - Account snapshots also expose USDC token state for diagnostics/Telegram.
