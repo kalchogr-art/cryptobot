@@ -8,15 +8,15 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.12.0 — A+B FIXED TP020 SL010
-// V2.12.0: direct MARKETABLE IOC entry for A/B setup signals
-// V2.12.0: fixed full-position TP +0.20% and SL -0.10%
-// V2.12.0: NO final TP, NO break-even, NO progressive runner
+// HYPERLIQUID SIGNAL EXECUTION V2.12.1 — A+B FIXED TP020 SL010
+// V2.12.1: direct MARKETABLE IOC entry for A/B setup signals
+// V2.12.1: fixed full-position TP +0.20% and SL -0.10%
+// V2.12.1: NO final TP, NO break-even, NO progressive runner
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
 // - LIVE_TRADING is FALSE by default.
-// V2.7.2:re
+// V2.7.2:
  // - ENTRY balance guard now uses Hyperliquid activeAssetData.availableToTrade for the exact coin/side.
  // - clearinghouseState.withdrawable is no longer used as the live ENTRY availability source.
  // - Account snapshots also expose USDC token state for diagnostics/Telegram.
@@ -57,9 +57,9 @@ const CONFIG = {
 
   LONG_TAKE_PROFIT_PCT: 0.20,
   PARTIAL_TP_FRACTION: 1.00,
-  LONG_STOP_LOSS_PCT: 0.10,
+  LONG_STOP_LOSS_PCT: 0.20,
   SHORT_TAKE_PROFIT_PCT: 0.20,
-  SHORT_STOP_LOSS_PCT: 0.10,
+  SHORT_STOP_LOSS_PCT: 0.20,
 
   // V2.10.5 symmetric LONG/SHORT protection:
   // 1) Initial SL = -0.20%.
@@ -387,7 +387,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.12.0 A+B FIXED TP020 SL010",
+    version: "V2.12.1 A+B FIXED TP020 SL010",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -623,7 +623,7 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 PARTIAL TP 50%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🟢 FULL TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
     `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🛡 TP/SL: ${protection}`,
     ``,
@@ -1300,7 +1300,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     const liveSzi = Math.abs(Number(position?.szi));
     const reducedSize = entrySize - liveSzi;
 
-    // V2.12.0 — partial-TP detection must respect Hyperliquid size granularity.
+    // V2.12.1 — partial-TP detection must respect Hyperliquid size granularity.
     // Example: UNI entry 1.1 with szDecimals=1 cannot close exactly 0.55; the
     // bracket floors the 50% TP to 0.5 and the real runner is therefore 0.6.
     // The old expectedRunnerSize*1.08 check capped the runner at 0.594 and missed
@@ -1323,7 +1323,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,runner_active=1,runner_size=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
         .bind(partialAt,Number.isFinite(partialPx)?partialPx:null,Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi),Number.isFinite(partialPnl)?partialPnl:null,liveSzi,Date.now(),row.id).run();
       row.partial_tp_filled_at=partialAt; row.partial_tp_price=Number.isFinite(partialPx)?partialPx:null; row.partial_tp_size=Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi); row.partial_tp_realized_pnl=Number.isFinite(partialPnl)?partialPnl:null; row.runner_active=1; row.runner_size=liveSzi;
-      await sendTelegram(env,[`🟢 <b>PARTIAL TP 50%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Partial TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Runner remaining: ${liveSzi}`,`🛡 Progressive runner active`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
+      await sendTelegram(env,[`🟢 <b>FULL TP 100%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Full TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Position closed at full TP: ${liveSzi}`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
     }
     if (false && Number(row.partial_tp_filled_at)) {
       try {
@@ -1348,7 +1348,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }
 
     if (true) {
-      // V2.12.0 fixed strategy: exits are ONLY exchange TP +0.20% or SL -0.10%.
+      // V2.12.1 fixed strategy: exits are ONLY exchange TP +0.20% or SL -0.10%.
       // No TIME exit and no progressive management.
       out.push({coin,status:"OPEN",held_ms:heldMs,progressive:null});
       continue;
