@@ -1153,7 +1153,7 @@ async function getV06Status(env:Env):Promise<any>{
 
 
 // ============================================================
-// V0.7 REGIME + RELATIVE MOVE ML
+// V0.7.1 REGIME + RELATIVE MOVE ML — MODEL INSERT FIX
 // - Separate research layer; V0.6 and V0.5 remain untouched.
 // - Same first-touch target as V0.6 for an apples-to-apples benchmark.
 // - Adds BTC 1m/5m/15m regime, BTC acceleration, coin-vs-BTC relative
@@ -1289,7 +1289,7 @@ async function trainV07Once(env:Env):Promise<any>{
     const conf=Math.max(p,1-p); for(const t of th)if(conf>=t){const b=buckets[String(t)];b.selected++;if(ok)b.correct++;pred?b.long++:b.short++;}
   }
   const acc=test.length?correct/test.length*100:null, base=test.length?Math.max(longN,shortN)/test.length*100:null;
-  await env.DB.prepare(`INSERT OR REPLACE INTO ml_raw_v07_model(model_key,trained_at,episode_minutes,sampled_rows,directional_rows,training_rows,test_rows,test_correct,test_accuracy,majority_baseline,weights_json) VALUES(?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?)`)
+  await env.DB.prepare(`INSERT OR REPLACE INTO ml_raw_v07_model(model_key,trained_at,episode_minutes,sampled_rows,directional_rows,training_rows,test_rows,test_correct,test_accuracy,majority_baseline,weights_json) VALUES(?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?)`)
     .bind(V07_MODEL_KEY,5,sampled.length,rows.length,train.length,test.length,correct,acc,base,JSON.stringify(w)).run();
   return {status:'TRAINED_AND_FROZEN',model_key:V07_MODEL_KEY,target:'FIRST_TOUCH_+0.20_VS_-0.20_WITHIN_10M',episode_sampling:'ONE_PER_COIN_PER_5M_BUCKET',sampled_rows:sampled.length,directional_rows:rows.length,train_rows:train.length,test_rows:test.length,test_correct:correct,test_accuracy_pct:acc==null?null:Number(acc.toFixed(2)),majority_baseline_pct:base==null?null:Number(base.toFixed(2)),beats_majority_baseline:acc!=null&&base!=null&&acc>base,confidence_filters:th.map(t=>{const b=buckets[String(t)];return {minimum_confidence:`${Math.round(t*100)}%`,signals_selected:b.selected,long_predictions:b.long,short_predictions:b.short,correct:b.correct,accuracy_pct:b.selected?Number((b.correct/b.selected*100).toFixed(2)):null};}),by_coin:Object.entries(coinStats).map(([coin,x]:any)=>({coin,test_samples:x.total,correct:x.correct,accuracy_pct:x.total?Number((x.correct/x.total*100).toFixed(2)):null,actual_long:x.actualLong,actual_short:x.actualShort,predicted_long:x.predLong,predicted_short:x.predShort})).sort((a,b)=>b.test_samples-a.test_samples),weights:w};
 }
