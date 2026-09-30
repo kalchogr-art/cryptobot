@@ -8,13 +8,11 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
-// V2.14.0: MOVE + BTC DIRECTION V1; full-position TP +0.20%, SL -0.20%.
-// V2.14.0: no scale-out, no BE rearm, no progressive exit, no TIME exit.
-// V2.13.1: lifecycle final-close classification uses the LAST real close fill, not the first.
-// V2.13.1: TP stages are reconstructed from real Hyperliquid close fills + position size.
-// V2.13.1: repairs missing partial_tp_* bookkeeping when progressive_stage already proves TP1 rearm.
-// V2.13.1: activeAssetData INFO 429 retry/backoff + cache retained; SHORT live remains disabled.
+// HYPERLIQUID SIGNAL EXECUTION V2.12.3 — A+B TP020 SL020 + INFO 429 GUARD
+// V2.12.3: direct MARKETABLE IOC entry for A/B setup signals
+// V2.12.3: fixed full-position TP +0.20% and SL -0.20%
+// V2.12.3: activeAssetData INFO 429 retry/backoff + short cache; no parallel account-info burst
+// V2.12.3: NO final TP, NO break-even, NO progressive runner
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -59,9 +57,7 @@ const CONFIG = {
   IS_CROSS: true,
 
   LONG_TAKE_PROFIT_PCT: 0.20,
-  LONG_TP2_PCT: 0.30,
-  LONG_TP3_PCT: 0.40,
-  PARTIAL_TP_FRACTION: 0.50,
+  PARTIAL_TP_FRACTION: 1.00,
   LONG_STOP_LOSS_PCT: 0.20,
   SHORT_TAKE_PROFIT_PCT: 0.20,
   SHORT_STOP_LOSS_PCT: 0.20,
@@ -656,9 +652,7 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
-    `🔴 SL 100%: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
-    `🔭 Post-TP research: +0.30 / +0.40 / +0.50% tracked virtually`,
+    `🟢 FULL TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
     `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🛡 TP/SL: ${protection}`,
     ``,
@@ -801,7 +795,7 @@ async function claimExecutionOnce(
     INSERT OR IGNORE INTO hyperliquid_execution_ledger (
       crossing_id, episode_id, coin, side, crossing_ts,
       status, claimed_at, updated_at, strategy_version, setup_name
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'MOVE_BTC_DIRECTION_V1', ?)
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'AB_FIXED_TPSL_V1', ?)
   `).bind(
     crossingId,
     episodeId,
@@ -1289,78 +1283,34 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     try { position = await getOpenPositionForCoin(coin); } catch (e:any) { out.push({coin,error:e?.message??String(e)}); continue; }
 
     if (!position) {
-      // V2.13.1: a scale-out trade can have several close fills.  The old code
-      // selected the FIRST non-zero closedPnl fill, which is normally TP1, and
-      // then used that price as the final exit.  That produced CLOSED_OTHER and
-      // TP1_FULL_CLOSE_UNEXPECTED even when a later BE/SL/TP2/TP3 fill actually
-      // closed the position.  Reconstruct the lifecycle from ALL real close fills.
       const fills = await getRecentFillsForCoin(coin);
-      const afterEntry = fills
-        .filter((f:any) => Number(f?.time ?? 0) >= filledAt - 5000)
-        .sort((a:any,b:any) => Number(a?.time ?? 0) - Number(b?.time ?? 0));
-      const closeFills = afterEntry.filter((f:any) => {
-        const cp = Number(f?.closedPnl);
-        const dir = String(f?.dir ?? "").toLowerCase();
-        return (Number.isFinite(cp) && Math.abs(cp) > 1e-15) || dir.includes("close");
-      });
-      const finalFill = closeFills.length ? closeFills[closeFills.length - 1] : (afterEntry.length ? afterEntry[afterEntry.length - 1] : null);
-      const exitPrice = Number(finalFill?.px);
-      const realizedPnl = Number(finalFill?.closedPnl);
+      const exit = fills.find((f:any) => Number(f?.time ?? 0) >= filledAt && Number(f?.closedPnl ?? 0) !== 0)
+        ?? fills.find((f:any) => Number(f?.time ?? 0) >= filledAt);
+      const exitPrice = Number(exit?.px);
+      const realizedPnl = Number(exit?.closedPnl);
       const pnl = lifecyclePnlFromFills(
         fills, filledAt, entryPrice, exitPrice, entrySize, side,
         Number.isFinite(realizedPnl) ? realizedPnl : null
       );
-      const tp1Pct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
+      const tpPct = side === "LONG" ? CONFIG.LONG_TAKE_PROFIT_PCT : CONFIG.SHORT_TAKE_PROFIT_PCT;
       const slPct = side === "LONG" ? CONFIG.LONG_STOP_LOSS_PCT : CONFIG.SHORT_STOP_LOSS_PCT;
-      const tp1 = side === "LONG" ? entryPrice*(1+tp1Pct/100) : entryPrice*(1-tp1Pct/100);
-      const tp2 = side === "LONG" ? entryPrice*(1+CONFIG.LONG_TP2_PCT/100) : entryPrice*(1-CONFIG.LONG_TP2_PCT/100);
-      const tp3 = side === "LONG" ? entryPrice*(1+CONFIG.LONG_TP3_PCT/100) : entryPrice*(1-CONFIG.LONG_TP3_PCT/100);
+      const tp = side === "LONG" ? entryPrice*(1+tpPct/100) : entryPrice*(1-tpPct/100);
       const sl = side === "LONG" ? entryPrice*(1-slPct/100) : entryPrice*(1+slPct/100);
+      const progressiveStop = Number(row.progressive_stop_price);
       const progressiveStage = Number(row.progressive_stage ?? 0);
-
-      const pxs = closeFills.map((f:any)=>Number(f?.px)).filter((x:number)=>Number.isFinite(x));
-      const hitAt = (target:number, tolerance:number) => side === "LONG"
-        ? pxs.some((px:number)=>px >= target*(1-tolerance))
-        : pxs.some((px:number)=>px <= target*(1+tolerance));
-      const tp1Seen = hitAt(tp1,0.00015) || progressiveStage >= 1 || Number(row.partial_tp_filled_at) > 0;
-      const tp2Seen = hitAt(tp2,0.00015);
-      const tp3Seen = hitAt(tp3,0.00015);
-
-      // Backfill TP1 bookkeeping from the first TP1-like close fill.  This fixes
-      // rows where the rearm succeeded (progressive_stage=1) but partial_tp_* was
-      // lost/missed before the next lifecycle tick.
-      if (!Number(row.partial_tp_filled_at) && tp1Seen && closeFills.length) {
-        const tp1Fill = closeFills.find((f:any)=>{
-          const px=Number(f?.px); if(!Number.isFinite(px)) return false;
-          return side === "LONG" ? px >= tp1*0.99985 : px <= tp1*1.00015;
-        }) ?? closeFills[0];
-        const pAt=Number(tp1Fill?.time), pPx=Number(tp1Fill?.px), pSz=Math.abs(Number(tp1Fill?.sz)), pPnl=Number(tp1Fill?.closedPnl);
-        try {
-          await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
-            .bind(Number.isFinite(pAt)?pAt:Date.now(),Number.isFinite(pPx)?pPx:null,Number.isFinite(pSz)?pSz:null,Number.isFinite(pPnl)?pPnl:null,Date.now(),row.id).run();
-        } catch {}
-      }
-
       let reason = "CLOSED_OTHER", title = "POSITION CLOSED", emoji = "⚪";
-      if (tp3Seen) { reason="TP3_HIT"; title="TP3 HIT · SCALEOUT COMPLETE"; emoji="🟢"; }
-      else if (tp2Seen && tp1Seen) { reason="TP2_THEN_BE_OR_CLOSE"; title="TP2 HIT · POSITION CLOSED"; emoji="🟢"; }
-      else if (tp1Seen) {
-        // After TP1, a later close around entry is the intended BE outcome.
-        // If there is only one close fill and it consumed the whole position,
-        // preserve the explicit unexpected-full-close diagnostic.
-        const onlyOneClose = closeFills.length === 1;
-        const finalNearEntry = Number.isFinite(exitPrice) && Math.abs((exitPrice-entryPrice)/entryPrice) <= 0.0012;
-        if (onlyOneClose && Number.isFinite(exitPrice) && (side === "LONG" ? exitPrice >= tp1*0.99985 : exitPrice <= tp1*1.00015)) {
-          reason="TP_HIT"; title="TP +0.20% HIT"; emoji="🟢";
-        } else if (finalNearEntry || progressiveStage >= 1) {
-          reason="BE_AFTER_TP1"; title="BE AFTER TP1"; emoji="🟡";
-        }
-      } else if (Number.isFinite(exitPrice)) {
-        const slHit = side === "LONG" ? exitPrice <= sl*1.00015 : exitPrice >= sl*0.99985;
-        if (slHit) { reason="SL_HIT"; title="INITIAL SL HIT"; emoji="🔴"; }
+      if (Number.isFinite(exitPrice)) {
+        const tpHit = side === "LONG" ? exitPrice >= tp*0.9999 : exitPrice <= tp*1.0001;
+        const progressiveHit =
+          progressiveStage > 0 && Number.isFinite(progressiveStop) &&
+          (side === "LONG" ? exitPrice <= progressiveStop*1.0005 : exitPrice >= progressiveStop*0.9995);
+        const slHit = side === "LONG" ? exitPrice <= sl*1.0001 : exitPrice >= sl*0.9999;
+        if (Number(row.partial_tp_filled_at) && progressiveHit) { reason="RUNNER_PROGRESSIVE_SL_HIT"; title="RUNNER PROGRESSIVE SL HIT"; emoji="🟡"; }
+        else if (tpHit && !Number(row.partial_tp_filled_at)) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
+        else if (progressiveHit) { reason="PROGRESSIVE_SL_HIT"; title="PROGRESSIVE SL HIT"; emoji="🟡"; }
+        else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
       }
-
-      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=?,runner_active=0,runner_size=0 WHERE id=?`)
+      await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
         .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
       await sendTelegram(env,lifecycleTelegram({
         emoji,title,coin,side,entryPrice,
@@ -1371,11 +1321,11 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         netPnl:pnl.netPnl,
         heldMs,crossingId:row.crossing_id
       }));
-      out.push({coin,status:reason,exit_price:exitPrice,close_fills:closeFills.length,tp1_seen:tp1Seen,tp2_seen:tp2Seen,tp3_seen:tp3Seen});
+      out.push({coin,status:reason,exit_price:exitPrice});
       continue;
     }
 
-    // V2.13 — detect TP1 50%, then replace initial SL with BE + TP2/TP3.
+    // V2.10 — confirm 50% final TP from the actual remaining position and fills.
     const liveSzi = Math.abs(Number(position?.szi));
     const reducedSize = entrySize - liveSzi;
 
@@ -1385,8 +1335,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     // The old expectedRunnerSize*1.08 check capped the runner at 0.594 and missed
     // this perfectly valid fill. Detect the actual position reduction instead;
     // the fill lookup below confirms the close and supplies its exact size/price.
-    if (
-      String(row.strategy_version ?? "") !== "MOVE_BTC_DIRECTION_V1" &&
+    if (false &&
       !Number(row.partial_tp_filled_at) &&
       Number.isFinite(liveSzi) && liveSzi > 0 &&
       Number.isFinite(reducedSize) && reducedSize > 0 &&
@@ -1403,62 +1352,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,runner_active=1,runner_size=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
         .bind(partialAt,Number.isFinite(partialPx)?partialPx:null,Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi),Number.isFinite(partialPnl)?partialPnl:null,liveSzi,Date.now(),row.id).run();
       row.partial_tp_filled_at=partialAt; row.partial_tp_price=Number.isFinite(partialPx)?partialPx:null; row.partial_tp_size=Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi); row.partial_tp_realized_pnl=Number.isFinite(partialPnl)?partialPnl:null; row.runner_active=1; row.runner_size=liveSzi;
-      // V2.13.1: progressive_stage=1 means TP1 rearm was already confirmed on a
-      // previous tick.  Backfill missing partial_tp_* above, but NEVER cancel and
-      // recreate BE/TP2/TP3 a second time.
-      if (Number(row.progressive_stage ?? 0) >= 1) {
-        out.push({coin,status:"TP1_BOOKKEEPING_BACKFILLED",live_size:liveSzi});
-        continue;
-      }
-      // TP1 confirmed. Cancel the old full-size SL, then arm TP2 +0.30%, TP3 +0.40% and BE SL for the remainder.
-      if (!secretOk) {
-        out.push({coin,status:"TP1_CONFIRMED_BUT_BE_REARM_BLOCKED",reason:"PRIVATE_KEY_INVALID"});
-        continue;
-      }
-      try {
-        const rawMeta=await postInfo({type:"metaAndAssetCtxs"});
-        const universe=Array.isArray(rawMeta?.[0]?.universe)?rawMeta[0].universe:[];
-        const asset=universe.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin);
-        if(asset<0) throw new Error("ASSET_NOT_FOUND_AFTER_TP1");
-        const szDecimals=Number(universe[asset]?.szDecimals);
-        const open=await getOpenOrdersForCoin(coin);
-        const cancels=open.filter((o:any)=>o?.oid!=null).map((o:any)=>({a:asset,o:Number(o.oid)}));
-        if(cancels.length) await sendLifecycleSignedAction({type:"cancel",cancels},secretRaw as `0x${string}`);
-
-        const scale=10**szDecimals;
-        const remUnits=Math.round(liveSzi*scale);
-        if(remUnits<2) throw new Error("REMAINING_SIZE_TOO_SMALL_FOR_TP2_TP3");
-        const tp2Units=Math.max(1,Math.floor(remUnits/2));
-        const tp3Units=remUnits-tp2Units;
-        if(tp3Units<1) throw new Error("TP3_SIZE_ZERO");
-        const tp2Size=tp2Units/scale, tp3Size=tp3Units/scale;
-        const tp2Px=priceToWire(entryPrice*(1+CONFIG.LONG_TP2_PCT/100),szDecimals);
-        const tp3Px=priceToWire(entryPrice*(1+CONFIG.LONG_TP3_PCT/100),szDecimals);
-        const bePx=priceToWire(entryPrice,szDecimals);
-        const closeBuy=false; // LONG-only live strategy: exits sell.
-        const orders=[
-          {a:asset,b:closeBuy,p:tp2Px,s:toWire(tp2Size,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:tp2Px,tpsl:"tp"}}},
-          {a:asset,b:closeBuy,p:tp3Px,s:toWire(tp3Size,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:tp3Px,tpsl:"tp"}}},
-          {a:asset,b:closeBuy,p:bePx,s:toWire(liveSzi,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:bePx,tpsl:"sl"}}},
-        ];
-        const rearm=await sendLifecycleSignedAction({type:"order",orders,grouping:"na"},secretRaw as `0x${string}`);
-        const sts=rearm?.json?.response?.data?.statuses??[];
-        const errs=Array.isArray(sts)?sts.map((x:any)=>x?.error).filter(Boolean):["NO_STATUSES"];
-        if(rearm?.json?.status!=="ok" || errs.length){
-          await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`).bind(`TP1_REARM_FAILED: ${errs.join(" | ")}`,Date.now(),row.id).run();
-          await sendTelegram(env,`🚨 <b>TP1 HIT — REARM FAILED</b>\n\n🪙 <b>${escapeTelegramHtml(coin)}</b>\nTP1 filled, but TP2/TP3/BE protection was not confirmed. CHECK POSITION.\n🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`);
-          out.push({coin,status:"TP1_REARM_FAILED",errors:errs});
-          continue;
-        }
-        await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET progressive_stage=1,progressive_stop_pct=0,progressive_stop_price=?,progressive_updated_at=?,runner_active=1,runner_size=?,updated_at=? WHERE id=?`)
-          .bind(Number(bePx),Date.now(),liveSzi,Date.now(),row.id).run();
-        row.progressive_stage=1; row.progressive_stop_price=Number(bePx);
-        await sendTelegram(env,[`🟢 <b>TP1 HIT · 50%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`📈 LONG`,`🎯 Entry: ${entryPrice}`,`🏁 TP1 +0.20%: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Remaining: ${liveSzi}`,`🛡 SL moved to ENTRY: ${bePx}`,`🎯 TP2 +0.30%: ${tp2Px} · 25% initial`,`🎯 TP3 +0.40%: ${tp3Px} · 25% initial`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
-      } catch(e:any) {
-        await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`).bind(`TP1_REARM_EXCEPTION: ${e?.message??String(e)}`,Date.now(),row.id).run();
-        out.push({coin,status:"TP1_REARM_EXCEPTION",error:e?.message??String(e)});
-        continue;
-      }
+      await sendTelegram(env,[`🟢 <b>FULL TP 100%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Full TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Position closed at full TP: ${liveSzi}`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
     }
     if (false && Number(row.partial_tp_filled_at)) {
       try {
@@ -1483,7 +1377,8 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }
 
     if (true) {
-      // V2.13 LONG scale-out: TP1 +0.20% 50%, TP2 +0.30% 25%, TP3 +0.40% 25%; after TP1 SL=BE. No TIME exit.
+      // V2.12.1 fixed strategy: exits are ONLY exchange TP +0.20% or SL -0.10%.
+      // No TIME exit and no progressive management.
       out.push({coin,status:"OPEN",held_ms:heldMs,progressive:null});
       continue;
     }
@@ -1801,7 +1696,7 @@ export async function buildHyperliquidExecutionCandidate(
   const result: Record<string, any> = {
     eligible: true,
     status: CONFIG.LIVE_TRADING ? "LIVE_READY" : "DRY_RUN_READY",
-    reason: "NEW_MOVE_BTC_DIRECTION_SIGNAL",
+    reason: "NEW_AB_SETUP",
     live_trading: CONFIG.LIVE_TRADING,
     exchange_request_sent: false,
 
@@ -1837,8 +1732,8 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_already_correct: leverageAlreadyCorrect,
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
-      entry_mode: "MARKETABLE_IOC_MOVE_BTC_DIRECTION",
-      strategy_version: "MOVE_BTC_DIRECTION_V1",
+      entry_mode: "MARKETABLE_IOC_AB_FIXED",
+      strategy_version: "AB_FIXED_TPSL_V1",
       setup_name: signal.setup_name ?? null,
       entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
       market_reference_price: marketReferenceWire,
@@ -1854,7 +1749,7 @@ export async function buildHyperliquidExecutionCandidate(
       preview_fill_price: marketReferenceWire,
       preview_take_profit_trigger: previewTpWire,
       preview_stop_loss_trigger: previewSlWire,
-      trade_policy: "MOVE_DETECTOR_PLUS_BTC_DIRECTION",
+      trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
       idempotency_policy: "D1_CROSSING_AND_EPISODE_UNIQUE",
       freshness_policy: {
         max_signal_age_ms: CONFIG.MAX_SIGNAL_AGE_MS,
@@ -2242,7 +2137,7 @@ export async function buildHyperliquidExecutionCandidate(
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
-  // V2.14.0: TP closes 100% of the filled position. 0.30/0.40/0.50 are dashboard-only research targets.
+  const partialTpSize = fillSize;
   const partialTpSizeWire = actualSizeWire;
   const tpRaw = isLong
     ? fillPrice * (1 + takeProfitPct / 100)
