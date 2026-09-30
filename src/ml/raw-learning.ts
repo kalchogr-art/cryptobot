@@ -1,6 +1,6 @@
 // ============================================================
-// CRYPTOBOT ML — RAW LEARNING V0.5 FORWARD VALIDATION
-// RESEARCH ONLY / NO TRADING / NO EFFECT ON MECHANICAL SYSTEM
+// CRYPTOBOT ML — RAW LEARNING V0.6 AI FIRST-TOUCH + V0.5 CONTROL
+// RESEARCH ONLY / NO TRADING / NO EFFECT ON LIVE SYSTEM
 //
 // CPU FIX:
 // - NO historical 500-row backfill loops.
@@ -934,6 +934,222 @@ async function getForwardStatus(env: Env): Promise<any> {
   };
 }
 
+
+
+// ============================================================
+// V0.6 AI FIRST-TOUCH
+// - PREVIOUS V0.5 forward model remains frozen and untouched.
+// - V0.6 is a separate learned classifier.
+// - Target: which barrier is touched FIRST within 10 minutes:
+//     LONG  = +0.20% first
+//     SHORT = -0.20% first
+//     NONE  = neither (excluded from directional training/accuracy)
+// - No mechanical score/side formula is used for prediction.
+// - Feature transforms only normalize raw market state for ML.
+// - Model is trained once from historical market states and persisted.
+// - New predictions are strictly forward and are never used for trading.
+// ============================================================
+
+const V06_MODEL_KEY = "raw_v06_ai_first_touch_020_10m_20260930";
+const V06_TOUCH_PCT = 0.20;
+const V06_WINDOW_MS = 10 * 60_000;
+const V06_TRAIN_LIMIT = 6000;
+
+type V06Features = {
+  chart: number;
+  orderFlow: number;
+  funding: number;
+  premium: number;
+  momentum1m: number;
+  momentum5m: number;
+  oiChange5m: number;
+  btcMomentum5m: number;
+};
+
+type V06Weights = V06Features & { bias: number };
+
+function v06ZeroWeights(): V06Weights {
+  return { bias:0, chart:0, orderFlow:0, funding:0, premium:0,
+    momentum1m:0, momentum5m:0, oiChange5m:0, btcMomentum5m:0 };
+}
+
+function v06Features(row:any): V06Features {
+  const price=num(row.price);
+  const p1=num(row.price_1m_ago);
+  const p5=num(row.price_5m_ago);
+  const oi=num(row.open_interest);
+  const oi5=num(row.oi_5m_ago);
+  const btc=num(row.btc_price);
+  const btc5=num(row.btc_price_5m_ago);
+  const pct=(a:number,b:number)=>b>0?((a/b)-1)*100:0;
+  return {
+    chart: clamp(num(row.chart_signed)/100,-1,1),
+    orderFlow: clamp(num(row.order_flow_signed)/100,-1,1),
+    funding: clamp(num(row.funding)*10000,-1,1),
+    premium: clamp(num(row.premium)*1000,-1,1),
+    momentum1m: clamp(pct(price,p1)/0.50,-1,1),
+    momentum5m: clamp(pct(price,p5)/1.00,-1,1),
+    oiChange5m: clamp(pct(oi,oi5)/1.00,-1,1),
+    btcMomentum5m: clamp(pct(btc,btc5)/1.00,-1,1),
+  };
+}
+
+function v06Probability(x:V06Features,w:V06Weights):number {
+  return sigmoid(w.bias + w.chart*x.chart + w.orderFlow*x.orderFlow +
+    w.funding*x.funding + w.premium*x.premium +
+    w.momentum1m*x.momentum1m + w.momentum5m*x.momentum5m +
+    w.oiChange5m*x.oiChange5m + w.btcMomentum5m*x.btcMomentum5m);
+}
+
+function v06Learn(x:V06Features,y:0|1,w:V06Weights,lr=0.025):V06Weights {
+  const e=y-v06Probability(x,w);
+  return {
+    bias:w.bias+lr*e,
+    chart:w.chart+lr*e*x.chart,
+    orderFlow:w.orderFlow+lr*e*x.orderFlow,
+    funding:w.funding+lr*e*x.funding,
+    premium:w.premium+lr*e*x.premium,
+    momentum1m:w.momentum1m+lr*e*x.momentum1m,
+    momentum5m:w.momentum5m+lr*e*x.momentum5m,
+    oiChange5m:w.oiChange5m+lr*e*x.oiChange5m,
+    btcMomentum5m:w.btcMomentum5m+lr*e*x.btcMomentum5m,
+  };
+}
+
+async function ensureV06Tables(env:Env):Promise<void>{
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ml_raw_v06_model (
+    model_key TEXT PRIMARY KEY, trained_at TEXT NOT NULL,
+    training_rows INTEGER NOT NULL, directional_rows INTEGER NOT NULL,
+    test_rows INTEGER NOT NULL, test_correct INTEGER NOT NULL,
+    test_accuracy REAL, majority_baseline REAL,
+    weights_json TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ml_raw_v06_forward (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_key TEXT NOT NULL, source_snapshot_id INTEGER NOT NULL,
+    coin TEXT NOT NULL, snapshot_ts INTEGER NOT NULL, snapshot_datetime TEXT,
+    entry_price REAL NOT NULL, probability_long REAL NOT NULL,
+    predicted_side TEXT NOT NULL, confidence REAL NOT NULL,
+    feature_chart REAL, feature_order_flow REAL, feature_funding REAL, feature_premium REAL,
+    feature_momentum_1m REAL, feature_momentum_5m REAL, feature_oi_change_5m REAL, feature_btc_momentum_5m REAL,
+    first_up_ts INTEGER, first_down_ts INTEGER, actual_class TEXT, correct INTEGER,
+    outcome_ready INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT,
+    UNIQUE(model_key,source_snapshot_id)
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_v06_forward_pending ON ml_raw_v06_forward(model_key,outcome_ready,snapshot_ts)`).run();
+}
+
+async function getV06Model(env:Env):Promise<{weights:V06Weights,meta:any}|null>{
+  const r:any=await env.DB.prepare(`SELECT * FROM ml_raw_v06_model WHERE model_key=? LIMIT 1`).bind(V06_MODEL_KEY).first();
+  if(!r) return null;
+  try { return {weights:JSON.parse(String(r.weights_json)),meta:r}; } catch { return null; }
+}
+
+async function trainV06Once(env:Env):Promise<any>{
+  await ensureV06Tables(env);
+  const existing=await getV06Model(env);
+  if(existing) return {status:'FROZEN',...existing.meta,weights:existing.weights};
+
+  // Bounded historical sample. Future touch timestamps are calculated only from
+  // snapshots that already existed historically. The newest 30% is held out.
+  const q:any=await env.DB.prepare(`
+    WITH base AS (
+      SELECT r.id,r.coin,r.snapshot_ts,r.snapshot_datetime,r.price,
+             r.chart_signed,r.order_flow_signed,r.open_interest,r.funding,r.premium
+      FROM ml_raw_dataset r
+      WHERE r.snapshot_ts <= ? - ${V06_WINDOW_MS}
+      ORDER BY r.snapshot_ts DESC
+      LIMIT ${V06_TRAIN_LIMIT}
+    )
+    SELECT b.*,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-60000 ORDER BY s.ts DESC LIMIT 1) price_1m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) price_5m_ago,
+      (SELECT s.open_interest FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) oi_5m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts ORDER BY s.ts DESC LIMIT 1) btc_price,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) btc_price_5m_ago,
+      (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=b.coin AND s.ts>b.snapshot_ts AND s.ts<=b.snapshot_ts+${V06_WINDOW_MS} AND s.price>=b.price*(1+${V06_TOUCH_PCT}/100.0)) first_up_ts,
+      (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=b.coin AND s.ts>b.snapshot_ts AND s.ts<=b.snapshot_ts+${V06_WINDOW_MS} AND s.price<=b.price*(1-${V06_TOUCH_PCT}/100.0)) first_down_ts
+    FROM base b ORDER BY b.snapshot_ts ASC,b.id ASC
+  `).bind(Date.now()).all();
+  const rows:any[]=(q?.results??[]).filter((r:any)=>r.first_up_ts!=null||r.first_down_ts!=null);
+  if(rows.length<200) return {status:'WAITING_FOR_FIRST_TOUCH_DATA',directional_rows:rows.length,required:200};
+  const split=Math.max(1,Math.floor(rows.length*0.70));
+  const train=rows.slice(0,split), test=rows.slice(split);
+  let w=v06ZeroWeights();
+  const actual=(r:any):0|1 => (r.first_up_ts!=null && (r.first_down_ts==null || num(r.first_up_ts)<num(r.first_down_ts)))?1:0;
+  // Multiple chronological passes over TRAIN only. No test-row learning.
+  for(let epoch=0;epoch<4;epoch++) for(const r of train) w=v06Learn(v06Features(r),actual(r),w,0.02);
+  let correct=0,longN=0,shortN=0;
+  for(const r of test){ const y=actual(r); if(y)longN++;else shortN++; const pred=v06Probability(v06Features(r),w)>=0.5?1:0; if(pred===y)correct++; }
+  const acc=test.length?correct/test.length*100:null;
+  const base=test.length?Math.max(longN,shortN)/test.length*100:null;
+  await env.DB.prepare(`INSERT OR REPLACE INTO ml_raw_v06_model(model_key,trained_at,training_rows,directional_rows,test_rows,test_correct,test_accuracy,majority_baseline,weights_json) VALUES(?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?)`)
+    .bind(V06_MODEL_KEY,train.length,rows.length,test.length,correct,acc,base,JSON.stringify(w)).run();
+  return {status:'TRAINED_AND_FROZEN',model_key:V06_MODEL_KEY,target:'FIRST_TOUCH_+0.20_VS_-0.20_WITHIN_10M',sample_limit:V06_TRAIN_LIMIT,directional_rows:rows.length,train_rows:train.length,test_rows:test.length,test_correct:correct,test_accuracy_pct:acc==null?null:Number(acc.toFixed(2)),majority_baseline_pct:base==null?null:Number(base.toFixed(2)),beats_majority_baseline:acc!=null&&base!=null&&acc>base,weights:w};
+}
+
+async function createV06Forward(env:Env):Promise<number>{
+  const model=await getV06Model(env); if(!model)return 0;
+  const q:any=await env.DB.prepare(`
+    SELECT s.*,
+      (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-60000 ORDER BY x.ts DESC LIMIT 1) price_1m_ago,
+      (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) price_5m_ago,
+      (SELECT x.open_interest FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) oi_5m_ago,
+      (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts ORDER BY x.ts DESC LIMIT 1) btc_price,
+      (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) btc_price_5m_ago
+    FROM market_snapshots s
+    INNER JOIN (SELECT coin,MAX(ts) max_ts FROM market_snapshots GROUP BY coin) z ON z.coin=s.coin AND z.max_ts=s.ts
+    WHERE s.price>0 AND NOT EXISTS(SELECT 1 FROM ml_raw_v06_forward f WHERE f.model_key=? AND f.source_snapshot_id=s.id)
+  `).bind(V06_MODEL_KEY).all();
+  let n=0;
+  for(const r of q?.results??[]){
+    const x=v06Features(r), p=v06Probability(x,model.weights), side=p>=0.5?'LONG':'SHORT', conf=Math.max(p,1-p);
+    const z:any=await env.DB.prepare(`INSERT OR IGNORE INTO ml_raw_v06_forward(model_key,source_snapshot_id,coin,snapshot_ts,snapshot_datetime,entry_price,probability_long,predicted_side,confidence,feature_chart,feature_order_flow,feature_funding,feature_premium,feature_momentum_1m,feature_momentum_5m,feature_oi_change_5m,feature_btc_momentum_5m) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(V06_MODEL_KEY,r.id,r.coin,r.ts,r.datetime??null,r.price,p,side,conf,x.chart,x.orderFlow,x.funding,x.premium,x.momentum1m,x.momentum5m,x.oiChange5m,x.btcMomentum5m).run();
+    n+=Math.max(0,Math.trunc(num(z?.meta?.changes)));
+  }
+  return n;
+}
+
+async function resolveV06Forward(env:Env):Promise<number>{
+  const now=Date.now();
+  const r:any=await env.DB.prepare(`
+    UPDATE ml_raw_v06_forward SET
+      first_up_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)),
+      first_down_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)),
+      actual_class=CASE
+        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL
+         AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'NONE'
+        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG'
+        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT'
+        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) <
+             (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) THEN 'LONG'
+        ELSE 'SHORT' END,
+      correct=CASE
+        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL
+         AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN NULL
+        WHEN predicted_side = CASE
+          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG'
+          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT'
+          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) <
+               (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END THEN 1 ELSE 0 END,
+      outcome_ready=1,resolved_at=CURRENT_TIMESTAMP
+    WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V06_WINDOW_MS}
+  `).bind(V06_MODEL_KEY,now).run();
+  return Math.max(0,Math.trunc(num(r?.meta?.changes)));
+}
+
+async function getV06Status(env:Env):Promise<any>{
+  await ensureV06Tables(env);
+  const training=await trainV06Once(env);
+  const totals:any=await env.DB.prepare(`SELECT COUNT(*) predictions,SUM(outcome_ready=0) pending,SUM(outcome_ready=1) resolved,SUM(actual_class='NONE') none_resolved,SUM(actual_class IN ('LONG','SHORT')) directional_resolved,SUM(correct=1) correct FROM ml_raw_v06_forward WHERE model_key=?`).bind(V06_MODEL_KEY).first();
+  const buckets:any=await env.DB.prepare(`SELECT threshold,COUNT(*) predictions,SUM(CASE WHEN outcome_ready=1 AND actual_class IN ('LONG','SHORT') THEN 1 ELSE 0 END) directional,SUM(CASE WHEN correct=1 THEN 1 ELSE 0 END) correct FROM (SELECT *,CASE WHEN confidence>=0.70 THEN '70%' WHEN confidence>=0.65 THEN '65%' WHEN confidence>=0.60 THEN '60%' WHEN confidence>=0.55 THEN '55%' ELSE '<55%' END threshold FROM ml_raw_v06_forward WHERE model_key=?) GROUP BY threshold ORDER BY threshold DESC`).bind(V06_MODEL_KEY).all();
+  const d=num(totals?.directional_resolved),c=num(totals?.correct);
+  return {model_key:V06_MODEL_KEY,model:'AI_LOGISTIC_FIRST_TOUCH',research_only:true,trading_enabled:false,target:`FIRST +${V06_TOUCH_PCT}% vs -${V06_TOUCH_PCT}% within 10m`,mechanical_direction_formula_used:false,training,predictions:num(totals?.predictions),pending:num(totals?.pending),resolved:num(totals?.resolved),none_resolved:num(totals?.none_resolved),directional_resolved:d,correct:c,directional_accuracy_pct:d?Number((c/d*100).toFixed(2)):null,confidence_filters:(buckets?.results??[]).map((x:any)=>({minimum_confidence:x.threshold,predictions:num(x.predictions),directional_resolved:num(x.directional),correct:num(x.correct),accuracy_pct:num(x.directional)?Number((num(x.correct)/num(x.directional)*100).toFixed(2)):null}))};
+}
+
+
 // ============================================================
 // CRON ENTRY
 // ============================================================
@@ -941,6 +1157,7 @@ async function getForwardStatus(env: Env): Promise<any> {
 export async function updateRawML(env: Env): Promise<any> {
   await ensureTables(env);
   await ensureForwardTable(env);
+  await ensureV06Tables(env);
 
   const snapshotsAdded = await collectLatestPerCoin(env);
 
@@ -953,11 +1170,16 @@ export async function updateRawML(env: Env): Promise<any> {
   const forwardPredictionsAdded = await createForwardPredictions(env);
   const forwardResolved = await resolveForwardPredictions(env);
 
+  // V0.6 stays research-only. Train once/freeze, then create and resolve forward predictions.
+  await trainV06Once(env);
+  const v06ForwardPredictionsAdded = await createV06Forward(env);
+  const v06ForwardResolved = await resolveV06Forward(env);
+
   await markHealth(env);
 
   return {
     module: MODULE,
-    version: "V0.5 FORWARD VALIDATION",
+    version: "V0.6 AI FIRST-TOUCH + V0.5 CONTROL",
     mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
     snapshots_added: snapshotsAdded,
@@ -966,6 +1188,8 @@ export async function updateRawML(env: Env): Promise<any> {
     labels_30m_added: labels30,
     forward_predictions_added: forwardPredictionsAdded,
     forward_resolved: forwardResolved,
+    v06_forward_predictions_added: v06ForwardPredictionsAdded,
+    v06_forward_resolved: v06ForwardResolved,
   };
 }
 
@@ -998,6 +1222,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   const training = await runFirstTraining(env);
   const forward = await getForwardStatus(env);
+  const v06 = await getV06Status(env);
 
   const totalRows = Math.max(0, Math.trunc(num(totals?.total_rows)));
   const ready5 = Math.max(0, Math.trunc(num(totals?.ready_5m)));
@@ -1007,7 +1232,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.5 FORWARD VALIDATION",
+    version: "V0.6 AI FIRST-TOUCH + V0.5 CONTROL",
     runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
@@ -1041,8 +1266,9 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
     first_training: training,
     forward_validation: forward,
+    ai_first_touch_v06: v06,
     training_note:
-      "Training runs only when /ml-raw status is requested; normal cron collection does not train the model.",
+      "V0.5 legacy training remains status-only. V0.6 trains once from historical data, freezes its learned weights, then only performs forward validation.",
     mechanical_score_filter: "NONE",
     trading: "REAL_TRADING_DISABLED",
   };
