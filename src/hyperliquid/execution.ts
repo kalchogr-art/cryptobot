@@ -8,11 +8,11 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.12.3 — A+B TP020 SL020 + INFO 429 GUARD
-// V2.12.3: direct MARKETABLE IOC entry for A/B setup signals
-// V2.12.3: fixed full-position TP +0.20% and SL -0.20%
-// V2.12.3: activeAssetData INFO 429 retry/backoff + short cache; no parallel account-info burst
-// V2.12.3: NO final TP, NO break-even, NO progressive runner
+// HYPERLIQUID SIGNAL EXECUTION V2.13.0 — A+B TP020 SL020 + INFO 429 GUARD
+// V2.13.0: direct MARKETABLE IOC entry for A/B setup signals
+// V2.13.0: fixed full-position TP +0.20% and SL -0.20%
+// V2.13.0: activeAssetData INFO 429 retry/backoff + short cache; no parallel account-info burst
+// V2.13.0: NO final TP, NO break-even, NO progressive runner
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -57,7 +57,9 @@ const CONFIG = {
   IS_CROSS: true,
 
   LONG_TAKE_PROFIT_PCT: 0.20,
-  PARTIAL_TP_FRACTION: 1.00,
+  LONG_TP2_PCT: 0.30,
+  LONG_TP3_PCT: 0.40,
+  PARTIAL_TP_FRACTION: 0.50,
   LONG_STOP_LOSS_PCT: 0.20,
   SHORT_TAKE_PROFIT_PCT: 0.20,
   SHORT_STOP_LOSS_PCT: 0.20,
@@ -652,7 +654,10 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 FULL TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🟢 TP1 50%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🟢 TP2 25%: +0.30% after TP1`,
+    `🟢 TP3 25%: +0.40% after TP1`,
+    `🛡 After TP1: SL moves to ENTRY (BE)`,
     `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🛡 TP/SL: ${protection}`,
     ``,
@@ -795,7 +800,7 @@ async function claimExecutionOnce(
     INSERT OR IGNORE INTO hyperliquid_execution_ledger (
       crossing_id, episode_id, coin, side, crossing_ts,
       status, claimed_at, updated_at, strategy_version, setup_name
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'AB_FIXED_TPSL_V1', ?)
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'AB_LONG_SCALEOUT_V1', ?)
   `).bind(
     crossingId,
     episodeId,
@@ -1305,10 +1310,13 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
           progressiveStage > 0 && Number.isFinite(progressiveStop) &&
           (side === "LONG" ? exitPrice <= progressiveStop*1.0005 : exitPrice >= progressiveStop*0.9995);
         const slHit = side === "LONG" ? exitPrice <= sl*1.0001 : exitPrice >= sl*0.9999;
-        if (Number(row.partial_tp_filled_at) && progressiveHit) { reason="RUNNER_PROGRESSIVE_SL_HIT"; title="RUNNER PROGRESSIVE SL HIT"; emoji="🟡"; }
-        else if (tpHit && !Number(row.partial_tp_filled_at)) { reason="TP_HIT"; title="TP HIT"; emoji="🟢"; }
-        else if (progressiveHit) { reason="PROGRESSIVE_SL_HIT"; title="PROGRESSIVE SL HIT"; emoji="🟡"; }
-        else if (slHit) { reason="SL_HIT"; title="SL HIT"; emoji="🔴"; }
+        if (Number(row.partial_tp_filled_at)) {
+          const dirPct=side==="LONG"?((exitPrice-entryPrice)/entryPrice)*100:((entryPrice-exitPrice)/entryPrice)*100;
+          if(dirPct>=CONFIG.LONG_TP3_PCT-0.03){ reason="TP3_HIT"; title="TP3 HIT · SCALEOUT COMPLETE"; emoji="🟢"; }
+          else if(dirPct>=CONFIG.LONG_TP2_PCT-0.03){ reason="TP2_THEN_BE_OR_CLOSE"; title="TP2 HIT · POSITION CLOSED"; emoji="🟢"; }
+          else { reason="BE_AFTER_TP1"; title="BE AFTER TP1"; emoji="🟡"; }
+        } else if (tpHit) { reason="TP1_FULL_CLOSE_UNEXPECTED"; title="TP1 CLOSED POSITION"; emoji="🟢"; }
+        else if (slHit) { reason="SL_HIT"; title="INITIAL SL HIT"; emoji="🔴"; }
       }
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,closed_at=?,close_reason=?,exit_price=?,realized_pnl=?,runner_active=0 WHERE id=?`)
         .bind(reason,Date.now(),Date.now(),reason,Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,row.id).run();
@@ -1325,7 +1333,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       continue;
     }
 
-    // V2.10 — confirm 50% final TP from the actual remaining position and fills.
+    // V2.13 — detect TP1 50%, then replace initial SL with BE + TP2/TP3.
     const liveSzi = Math.abs(Number(position?.szi));
     const reducedSize = entrySize - liveSzi;
 
@@ -1335,7 +1343,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     // The old expectedRunnerSize*1.08 check capped the runner at 0.594 and missed
     // this perfectly valid fill. Detect the actual position reduction instead;
     // the fill lookup below confirms the close and supplies its exact size/price.
-    if (false &&
+    if (
       !Number(row.partial_tp_filled_at) &&
       Number.isFinite(liveSzi) && liveSzi > 0 &&
       Number.isFinite(reducedSize) && reducedSize > 0 &&
@@ -1352,7 +1360,55 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET partial_tp_filled_at=?,partial_tp_price=?,partial_tp_size=?,partial_tp_realized_pnl=?,runner_active=1,runner_size=?,updated_at=? WHERE id=? AND partial_tp_filled_at IS NULL`)
         .bind(partialAt,Number.isFinite(partialPx)?partialPx:null,Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi),Number.isFinite(partialPnl)?partialPnl:null,liveSzi,Date.now(),row.id).run();
       row.partial_tp_filled_at=partialAt; row.partial_tp_price=Number.isFinite(partialPx)?partialPx:null; row.partial_tp_size=Number.isFinite(partialSz)?Math.abs(partialSz):(entrySize-liveSzi); row.partial_tp_realized_pnl=Number.isFinite(partialPnl)?partialPnl:null; row.runner_active=1; row.runner_size=liveSzi;
-      await sendTelegram(env,[`🟢 <b>FULL TP 100%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`${side === "LONG" ? "📈" : "📉"} ${escapeTelegramHtml(side)}`,`🎯 Entry: ${entryPrice}`,`🏁 Full TP: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Position closed at full TP: ${liveSzi}`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
+      // TP1 confirmed. Cancel the old full-size SL, then arm TP2 +0.30%, TP3 +0.40% and BE SL for the remainder.
+      if (!secretOk) {
+        out.push({coin,status:"TP1_CONFIRMED_BUT_BE_REARM_BLOCKED",reason:"PRIVATE_KEY_INVALID"});
+        continue;
+      }
+      try {
+        const rawMeta=await postInfo({type:"metaAndAssetCtxs"});
+        const universe=Array.isArray(rawMeta?.[0]?.universe)?rawMeta[0].universe:[];
+        const asset=universe.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin);
+        if(asset<0) throw new Error("ASSET_NOT_FOUND_AFTER_TP1");
+        const szDecimals=Number(universe[asset]?.szDecimals);
+        const open=await getOpenOrdersForCoin(coin);
+        const cancels=open.filter((o:any)=>o?.oid!=null).map((o:any)=>({a:asset,o:Number(o.oid)}));
+        if(cancels.length) await sendLifecycleSignedAction({type:"cancel",cancels},secretRaw as `0x${string}`);
+
+        const scale=10**szDecimals;
+        const remUnits=Math.round(liveSzi*scale);
+        if(remUnits<2) throw new Error("REMAINING_SIZE_TOO_SMALL_FOR_TP2_TP3");
+        const tp2Units=Math.max(1,Math.floor(remUnits/2));
+        const tp3Units=remUnits-tp2Units;
+        if(tp3Units<1) throw new Error("TP3_SIZE_ZERO");
+        const tp2Size=tp2Units/scale, tp3Size=tp3Units/scale;
+        const tp2Px=priceToWire(entryPrice*(1+CONFIG.LONG_TP2_PCT/100),szDecimals);
+        const tp3Px=priceToWire(entryPrice*(1+CONFIG.LONG_TP3_PCT/100),szDecimals);
+        const bePx=priceToWire(entryPrice,szDecimals);
+        const closeBuy=false; // LONG-only live strategy: exits sell.
+        const orders=[
+          {a:asset,b:closeBuy,p:tp2Px,s:toWire(tp2Size,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:tp2Px,tpsl:"tp"}}},
+          {a:asset,b:closeBuy,p:tp3Px,s:toWire(tp3Size,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:tp3Px,tpsl:"tp"}}},
+          {a:asset,b:closeBuy,p:bePx,s:toWire(liveSzi,szDecimals),r:true,t:{trigger:{isMarket:true,triggerPx:bePx,tpsl:"sl"}}},
+        ];
+        const rearm=await sendLifecycleSignedAction({type:"order",orders,grouping:"na"},secretRaw as `0x${string}`);
+        const sts=rearm?.json?.response?.data?.statuses??[];
+        const errs=Array.isArray(sts)?sts.map((x:any)=>x?.error).filter(Boolean):["NO_STATUSES"];
+        if(rearm?.json?.status!=="ok" || errs.length){
+          await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`).bind(`TP1_REARM_FAILED: ${errs.join(" | ")}`,Date.now(),row.id).run();
+          await sendTelegram(env,`🚨 <b>TP1 HIT — REARM FAILED</b>\n\n🪙 <b>${escapeTelegramHtml(coin)}</b>\nTP1 filled, but TP2/TP3/BE protection was not confirmed. CHECK POSITION.\n🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`);
+          out.push({coin,status:"TP1_REARM_FAILED",errors:errs});
+          continue;
+        }
+        await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET progressive_stage=1,progressive_stop_pct=0,progressive_stop_price=?,progressive_updated_at=?,runner_active=1,runner_size=?,updated_at=? WHERE id=?`)
+          .bind(Number(bePx),Date.now(),liveSzi,Date.now(),row.id).run();
+        row.progressive_stage=1; row.progressive_stop_price=Number(bePx);
+        await sendTelegram(env,[`🟢 <b>TP1 HIT · 50%</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b>`,`📈 LONG`,`🎯 Entry: ${entryPrice}`,`🏁 TP1 +0.20%: ${Number.isFinite(partialPx)?partialPx:"confirmed"}`,`📦 Remaining: ${liveSzi}`,`🛡 SL moved to ENTRY: ${bePx}`,`🎯 TP2 +0.30%: ${tp2Px} · 25% initial`,`🎯 TP3 +0.40%: ${tp3Px} · 25% initial`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,``,`🕐 ${new Date().toISOString()}`].join("\n"));
+      } catch(e:any) {
+        await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`).bind(`TP1_REARM_EXCEPTION: ${e?.message??String(e)}`,Date.now(),row.id).run();
+        out.push({coin,status:"TP1_REARM_EXCEPTION",error:e?.message??String(e)});
+        continue;
+      }
     }
     if (false && Number(row.partial_tp_filled_at)) {
       try {
@@ -1377,8 +1433,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }
 
     if (true) {
-      // V2.12.1 fixed strategy: exits are ONLY exchange TP +0.20% or SL -0.10%.
-      // No TIME exit and no progressive management.
+      // V2.13 LONG scale-out: TP1 +0.20% 50%, TP2 +0.30% 25%, TP3 +0.40% 25%; after TP1 SL=BE. No TIME exit.
       out.push({coin,status:"OPEN",held_ms:heldMs,progressive:null});
       continue;
     }
@@ -1463,6 +1518,17 @@ export async function buildHyperliquidExecutionCandidate(
       status: "SKIPPED",
       reason: "INVALID_SIGNAL",
       live_trading: CONFIG.LIVE_TRADING,
+    };
+  }
+
+  // V2.13.0 hard safety: SHORT is temporarily research-only.
+  if (side === "SHORT") {
+    return {
+      eligible: false,
+      status: "SKIPPED",
+      reason: "SHORT_LIVE_TEMPORARILY_DISABLED",
+      live_trading: CONFIG.LIVE_TRADING,
+      exchange_request_sent: false,
     };
   }
 
@@ -1733,7 +1799,7 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
       entry_mode: "MARKETABLE_IOC_AB_FIXED",
-      strategy_version: "AB_FIXED_TPSL_V1",
+      strategy_version: "AB_LONG_SCALEOUT_V1",
       setup_name: signal.setup_name ?? null,
       entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
       market_reference_price: marketReferenceWire,
@@ -2137,8 +2203,16 @@ export async function buildHyperliquidExecutionCandidate(
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
-  const partialTpSize = fillSize;
-  const partialTpSizeWire = actualSizeWire;
+  const sizeScale = 10 ** szDecimals;
+  const totalUnits = Math.round(fillSize * sizeScale);
+  if (totalUnits < 4) {
+    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILLED_SCALEOUT_GRANULARITY_ERROR", { last_error: "FILLED_POSITION_TOO_SMALL_FOR_50_25_25_SCALEOUT" });
+    await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason:"CRITICAL: entry filled but size cannot be split 50/25/25 — CHECK POSITION",balance:await getAccountSnapshot()}));
+    return {...result,status:"LIVE_ENTRY_FILLED_SCALEOUT_GRANULARITY_ERROR",exchange_request_sent:true};
+  }
+  const tp1Units = Math.max(1, Math.floor(totalUnits * 0.50));
+  const partialTpSize = tp1Units / sizeScale;
+  const partialTpSizeWire = toWire(partialTpSize, szDecimals);
   const tpRaw = isLong
     ? fillPrice * (1 + takeProfitPct / 100)
     : fillPrice * (1 - takeProfitPct / 100);
