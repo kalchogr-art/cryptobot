@@ -9,8 +9,8 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
-// V2.13.1: LONG MARKET; TP1 +0.20% 50%, TP2 +0.30% 25%, TP3 +0.40% 25%.
-// V2.13.1: initial SL -0.20%; after confirmed TP1 cancel old SL and arm BE for remainder.
+// V2.14.0: MOVE + BTC DIRECTION V1; full-position TP +0.20%, SL -0.20%.
+// V2.14.0: no scale-out, no BE rearm, no progressive exit, no TIME exit.
 // V2.13.1: lifecycle final-close classification uses the LAST real close fill, not the first.
 // V2.13.1: TP stages are reconstructed from real Hyperliquid close fills + position size.
 // V2.13.1: repairs missing partial_tp_* bookkeeping when progressive_stage already proves TP1 rearm.
@@ -656,10 +656,9 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 TP1 50%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
-    `🟢 TP2 25%: +0.30% after TP1`,
-    `🟢 TP3 25%: +0.40% after TP1`,
-    `🛡 After TP1: SL moves to ENTRY (BE)`,
+    `🟢 TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🔴 SL 100%: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
+    `🔭 Post-TP research: +0.30 / +0.40 / +0.50% tracked virtually`,
     `🔴 SL: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🛡 TP/SL: ${protection}`,
     ``,
@@ -802,7 +801,7 @@ async function claimExecutionOnce(
     INSERT OR IGNORE INTO hyperliquid_execution_ledger (
       crossing_id, episode_id, coin, side, crossing_ts,
       status, claimed_at, updated_at, strategy_version, setup_name
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'AB_LONG_SCALEOUT_V1', ?)
+    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'MOVE_BTC_DIRECTION_V1', ?)
   `).bind(
     crossingId,
     episodeId,
@@ -1352,7 +1351,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         const onlyOneClose = closeFills.length === 1;
         const finalNearEntry = Number.isFinite(exitPrice) && Math.abs((exitPrice-entryPrice)/entryPrice) <= 0.0012;
         if (onlyOneClose && Number.isFinite(exitPrice) && (side === "LONG" ? exitPrice >= tp1*0.99985 : exitPrice <= tp1*1.00015)) {
-          reason="TP1_FULL_CLOSE_UNEXPECTED"; title="TP1 CLOSED POSITION"; emoji="🟢";
+          reason="TP_HIT"; title="TP +0.20% HIT"; emoji="🟢";
         } else if (finalNearEntry || progressiveStage >= 1) {
           reason="BE_AFTER_TP1"; title="BE AFTER TP1"; emoji="🟡";
         }
@@ -1387,6 +1386,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     // this perfectly valid fill. Detect the actual position reduction instead;
     // the fill lookup below confirms the close and supplies its exact size/price.
     if (
+      String(row.strategy_version ?? "") !== "MOVE_BTC_DIRECTION_V1" &&
       !Number(row.partial_tp_filled_at) &&
       Number.isFinite(liveSzi) && liveSzi > 0 &&
       Number.isFinite(reducedSize) && reducedSize > 0 &&
@@ -1568,17 +1568,6 @@ export async function buildHyperliquidExecutionCandidate(
       status: "SKIPPED",
       reason: "INVALID_SIGNAL",
       live_trading: CONFIG.LIVE_TRADING,
-    };
-  }
-
-  // V2.13.0 hard safety: SHORT is temporarily research-only.
-  if (side === "SHORT") {
-    return {
-      eligible: false,
-      status: "SKIPPED",
-      reason: "SHORT_LIVE_TEMPORARILY_DISABLED",
-      live_trading: CONFIG.LIVE_TRADING,
-      exchange_request_sent: false,
     };
   }
 
@@ -1812,7 +1801,7 @@ export async function buildHyperliquidExecutionCandidate(
   const result: Record<string, any> = {
     eligible: true,
     status: CONFIG.LIVE_TRADING ? "LIVE_READY" : "DRY_RUN_READY",
-    reason: "NEW_AB_SETUP",
+    reason: "NEW_MOVE_BTC_DIRECTION_SIGNAL",
     live_trading: CONFIG.LIVE_TRADING,
     exchange_request_sent: false,
 
@@ -1848,8 +1837,8 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_already_correct: leverageAlreadyCorrect,
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
-      entry_mode: "MARKETABLE_IOC_AB_FIXED",
-      strategy_version: "AB_LONG_SCALEOUT_V1",
+      entry_mode: "MARKETABLE_IOC_MOVE_BTC_DIRECTION",
+      strategy_version: "MOVE_BTC_DIRECTION_V1",
       setup_name: signal.setup_name ?? null,
       entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
       market_reference_price: marketReferenceWire,
@@ -1865,7 +1854,7 @@ export async function buildHyperliquidExecutionCandidate(
       preview_fill_price: marketReferenceWire,
       preview_take_profit_trigger: previewTpWire,
       preview_stop_loss_trigger: previewSlWire,
-      trade_policy: "ONE_TRADE_PER_COIN_PER_EPISODE",
+      trade_policy: "MOVE_DETECTOR_PLUS_BTC_DIRECTION",
       idempotency_policy: "D1_CROSSING_AND_EPISODE_UNIQUE",
       freshness_policy: {
         max_signal_age_ms: CONFIG.MAX_SIGNAL_AGE_MS,
@@ -2253,16 +2242,8 @@ export async function buildHyperliquidExecutionCandidate(
   } catch {}
 
   const actualSizeWire = toWire(fillSize, szDecimals);
-  const sizeScale = 10 ** szDecimals;
-  const totalUnits = Math.round(fillSize * sizeScale);
-  if (totalUnits < 4) {
-    await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_FILLED_SCALEOUT_GRANULARITY_ERROR", { last_error: "FILLED_POSITION_TOO_SMALL_FOR_50_25_25_SCALEOUT" });
-    await sendTelegram(env, buildRejectedTelegramMessage({coin,side,score,crossingId:signal.crossing_id,episodeId:signal.episode_id,marginUsd:effectiveMarginUsd,leverage:effectiveLeverage,reason:"CRITICAL: entry filled but size cannot be split 50/25/25 — CHECK POSITION",balance:await getAccountSnapshot()}));
-    return {...result,status:"LIVE_ENTRY_FILLED_SCALEOUT_GRANULARITY_ERROR",exchange_request_sent:true};
-  }
-  const tp1Units = Math.max(1, Math.floor(totalUnits * 0.50));
-  const partialTpSize = tp1Units / sizeScale;
-  const partialTpSizeWire = toWire(partialTpSize, szDecimals);
+  // V2.14.0: TP closes 100% of the filled position. 0.30/0.40/0.50 are dashboard-only research targets.
+  const partialTpSizeWire = actualSizeWire;
   const tpRaw = isLong
     ? fillPrice * (1 + takeProfitPct / 100)
     : fillPrice * (1 - takeProfitPct / 100);
