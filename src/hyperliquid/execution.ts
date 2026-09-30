@@ -8,10 +8,11 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.12.1 — A+B FIXED TP020 SL010
-// V2.12.1: direct MARKETABLE IOC entry for A/B setup signals
-// V2.12.1: fixed full-position TP +0.20% and SL -0.10%
-// V2.12.1: NO final TP, NO break-even, NO progressive runner
+// HYPERLIQUID SIGNAL EXECUTION V2.12.3 — A+B TP020 SL020 + INFO 429 GUARD
+// V2.12.3: direct MARKETABLE IOC entry for A/B setup signals
+// V2.12.3: fixed full-position TP +0.20% and SL -0.20%
+// V2.12.3: activeAssetData INFO 429 retry/backoff + short cache; no parallel account-info burst
+// V2.12.3: NO final TP, NO break-even, NO progressive runner
 // FRESH+D1 -> AUTO LEVERAGE -> IOC FILL -> TP/SL RETRY -> BALANCE -> TELEGRAM
 //
 // COMPLETE EXECUTION PATH:
@@ -505,16 +506,42 @@ async function getAccountSnapshot(): Promise<any> {
   }
 }
 
+const ACTIVE_ASSET_CACHE_TTL_MS = 15_000;
+const activeAssetAvailabilityCache = new Map<string, { ts: number; value: any }>();
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function postActiveAssetDataWith429Retry(coin: string): Promise<any> {
+  // Keep this retry local to the entry-critical endpoint. We intentionally do not
+  // retry every /info request globally because that could amplify rate limiting.
+  const delays = [0, 1000, 3000, 7000];
+  let lastError: any = null;
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt] > 0) await sleepMs(delays[attempt]);
+    try {
+      return await postInfo({ type: "activeAssetData", user: MASTER_ACCOUNT, coin });
+    } catch (e: any) {
+      lastError = e;
+      const msg = String(e?.message ?? e);
+      if (!msg.includes("INFO_HTTP_429") || attempt === delays.length - 1) throw e;
+    }
+  }
+  throw lastError ?? new Error("ACTIVE_ASSET_DATA_RETRY_FAILED");
+}
+
 async function getActiveAssetTradingAvailability(
   coin: string,
   side: "LONG" | "SHORT"
 ): Promise<any> {
+  const cacheKey = `${coin}:${side}`;
+  const cached = activeAssetAvailabilityCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts <= ACTIVE_ASSET_CACHE_TTL_MS) {
+    return { ...cached.value, source: "HYPERLIQUID_ACTIVE_ASSET_DATA_CACHE", cache_age_ms: Date.now() - cached.ts };
+  }
   try {
-    const data = await postInfo({
-      type: "activeAssetData",
-      user: MASTER_ACCOUNT,
-      coin,
-    });
+    const data = await postActiveAssetDataWith429Retry(coin);
 
     const available = Array.isArray(data?.availableToTrade)
       ? data.availableToTrade
@@ -540,7 +567,7 @@ async function getActiveAssetTradingAvailability(
       };
     }
 
-    return {
+    const value = {
       success: true,
       source: "HYPERLIQUID_ACTIVE_ASSET_DATA",
       coin,
@@ -554,6 +581,8 @@ async function getActiveAssetTradingAvailability(
       raw_available_to_trade: available,
       raw_max_trade_szs: maxTrade,
     };
+    activeAssetAvailabilityCache.set(cacheKey, { ts: Date.now(), value });
+    return value;
   } catch (e: any) {
     return {
       success: false,
@@ -1807,10 +1836,14 @@ export async function buildHyperliquidExecutionCandidate(
   // Use Hyperliquid's per-asset/per-direction availableToTrade, not
   // clearinghouseState.withdrawable. The latter can be 0 while the account
   // still reports USDC and Hyperliquid itself exposes tradable availability.
-  const [preEntryBalance, tradingAvailability] = await Promise.all([
-    getAccountSnapshot(),
-    getActiveAssetTradingAvailability(coin, side),
-  ]);
+  // Entry-critical availability is intentionally requested alone. The old code
+  // launched activeAssetData + clearinghouseState + spotClearinghouseState at
+  // the same time, creating a burst of three /info calls exactly when a signal
+  // arrived. That made INFO_HTTP_429 much more likely.
+  const tradingAvailability = await getActiveAssetTradingAvailability(coin, side);
+  const preEntryBalance = tradingAvailability?.success
+    ? await getAccountSnapshot()
+    : { success:false, error:"SKIPPED_AFTER_ACTIVE_ASSET_FAILURE", account_value_usd:null, margin_used_usd:null, withdrawable_usd:null, usdc_total:null, usdc_hold:null };
 
   const availableMargin = Number(tradingAvailability?.available_to_trade);
   const maxTradeSz = Number(tradingAvailability?.max_trade_sz);
