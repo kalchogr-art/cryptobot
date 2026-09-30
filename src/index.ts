@@ -7,7 +7,7 @@
 
             // ============================================================
             // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
-            // READ ONLY / NO TRADING
+            // READ ONLY / NO TRADING. re
             //
             // Coins: BTC / ETH / SOL / XRP / BNB / DOGE / AVAX / LINK / SUI / HYPE
             //
