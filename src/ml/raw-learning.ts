@@ -1150,6 +1150,192 @@ async function getV06Status(env:Env):Promise<any>{
 }
 
 
+
+
+// ============================================================
+// V0.7 REGIME + RELATIVE MOVE ML
+// - Separate research layer; V0.6 and V0.5 remain untouched.
+// - Same first-touch target as V0.6 for an apples-to-apples benchmark.
+// - Adds BTC 1m/5m/15m regime, BTC acceleration, coin-vs-BTC relative
+//   momentum/divergence, plus existing microstructure features.
+// - Historical training uses one sample per coin per 5-minute episode bucket
+//   to reduce adjacent-minute correlation/leakage.
+// - Model trains once, freezes, then performs strict forward validation only.
+// - RESEARCH ONLY / REAL TRADING DISABLED.
+// ============================================================
+
+const V07_MODEL_KEY = "raw_v07_regime_relative_touch_020_10m_ep5_20260930";
+const V07_TOUCH_PCT = 0.20;
+const V07_WINDOW_MS = 10 * 60_000;
+const V07_EPISODE_MS = 5 * 60_000;
+const V07_TRAIN_LIMIT = 8000;
+
+type V07Features = {
+  chart:number; orderFlow:number; funding:number; premium:number;
+  momentum1m:number; momentum5m:number; momentum15m:number; oiChange5m:number;
+  btcMomentum1m:number; btcMomentum5m:number; btcMomentum15m:number;
+  btcAcceleration:number; relative1m:number; relative5m:number; relative15m:number;
+  relativeAcceleration:number;
+};
+type V07Weights = V07Features & { bias:number };
+
+function v07ZeroWeights():V07Weights { return {
+  bias:0, chart:0, orderFlow:0, funding:0, premium:0,
+  momentum1m:0, momentum5m:0, momentum15m:0, oiChange5m:0,
+  btcMomentum1m:0, btcMomentum5m:0, btcMomentum15m:0,
+  btcAcceleration:0, relative1m:0, relative5m:0, relative15m:0,
+  relativeAcceleration:0
+}; }
+
+function v07Features(row:any):V07Features {
+  const pct=(a:number,b:number)=>b>0?((a/b)-1)*100:0;
+  const cp=num(row.price), c1=num(row.price_1m_ago), c5=num(row.price_5m_ago), c15=num(row.price_15m_ago);
+  const bp=num(row.btc_price), b1=num(row.btc_price_1m_ago), b5=num(row.btc_price_5m_ago), b15=num(row.btc_price_15m_ago);
+  const cm1=pct(cp,c1), cm5=pct(cp,c5), cm15=pct(cp,c15);
+  const bm1=pct(bp,b1), bm5=pct(bp,b5), bm15=pct(bp,b15);
+  const rel1=cm1-bm1, rel5=cm5-bm5, rel15=cm15-bm15;
+  // Acceleration compares recent 1m pace with average 5m pace.
+  const btcAcc=bm1-(bm5/5);
+  const relAcc=rel1-(rel5/5);
+  const oi=num(row.open_interest), oi5=num(row.oi_5m_ago);
+  return {
+    chart:clamp(num(row.chart_signed)/100,-1,1),
+    orderFlow:clamp(num(row.order_flow_signed)/100,-1,1),
+    funding:clamp(num(row.funding)*10000,-1,1),
+    premium:clamp(num(row.premium)*1000,-1,1),
+    momentum1m:clamp(cm1/0.50,-1,1), momentum5m:clamp(cm5/1.00,-1,1), momentum15m:clamp(cm15/2.00,-1,1),
+    oiChange5m:clamp(pct(oi,oi5)/1.00,-1,1),
+    btcMomentum1m:clamp(bm1/0.50,-1,1), btcMomentum5m:clamp(bm5/1.00,-1,1), btcMomentum15m:clamp(bm15/2.00,-1,1),
+    btcAcceleration:clamp(btcAcc/0.35,-1,1),
+    relative1m:clamp(rel1/0.50,-1,1), relative5m:clamp(rel5/1.00,-1,1), relative15m:clamp(rel15/2.00,-1,1),
+    relativeAcceleration:clamp(relAcc/0.35,-1,1)
+  };
+}
+
+function v07Probability(x:V07Features,w:V07Weights):number {
+  return sigmoid(w.bias + w.chart*x.chart + w.orderFlow*x.orderFlow + w.funding*x.funding + w.premium*x.premium +
+    w.momentum1m*x.momentum1m + w.momentum5m*x.momentum5m + w.momentum15m*x.momentum15m + w.oiChange5m*x.oiChange5m +
+    w.btcMomentum1m*x.btcMomentum1m + w.btcMomentum5m*x.btcMomentum5m + w.btcMomentum15m*x.btcMomentum15m +
+    w.btcAcceleration*x.btcAcceleration + w.relative1m*x.relative1m + w.relative5m*x.relative5m +
+    w.relative15m*x.relative15m + w.relativeAcceleration*x.relativeAcceleration);
+}
+
+function v07Learn(x:V07Features,y:0|1,w:V07Weights,lr=0.015):V07Weights {
+  const e=y-v07Probability(x,w);
+  const n:any={bias:w.bias+lr*e};
+  for(const k of Object.keys(x) as (keyof V07Features)[]) n[k]=w[k]+lr*e*x[k];
+  return n as V07Weights;
+}
+
+async function ensureV07Tables(env:Env):Promise<void>{
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ml_raw_v07_model (
+    model_key TEXT PRIMARY KEY, trained_at TEXT NOT NULL, episode_minutes INTEGER NOT NULL,
+    sampled_rows INTEGER NOT NULL, directional_rows INTEGER NOT NULL, training_rows INTEGER NOT NULL,
+    test_rows INTEGER NOT NULL, test_correct INTEGER NOT NULL, test_accuracy REAL, majority_baseline REAL,
+    weights_json TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ml_raw_v07_forward (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, model_key TEXT NOT NULL, source_snapshot_id INTEGER NOT NULL,
+    coin TEXT NOT NULL, snapshot_ts INTEGER NOT NULL, snapshot_datetime TEXT, entry_price REAL NOT NULL,
+    probability_long REAL NOT NULL, predicted_side TEXT NOT NULL, confidence REAL NOT NULL,
+    features_json TEXT NOT NULL, first_up_ts INTEGER, first_down_ts INTEGER, actual_class TEXT, correct INTEGER,
+    outcome_ready INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT,
+    UNIQUE(model_key,source_snapshot_id)
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_v07_forward_pending ON ml_raw_v07_forward(model_key,outcome_ready,snapshot_ts)`).run();
+}
+
+async function getV07Model(env:Env):Promise<{weights:V07Weights,meta:any}|null>{
+  const r:any=await env.DB.prepare(`SELECT * FROM ml_raw_v07_model WHERE model_key=? LIMIT 1`).bind(V07_MODEL_KEY).first();
+  if(!r)return null; try{return {weights:JSON.parse(String(r.weights_json)),meta:r};}catch{return null;}
+}
+
+async function trainV07Once(env:Env):Promise<any>{
+  await ensureV07Tables(env); const existing=await getV07Model(env);
+  if(existing)return {status:'FROZEN',...existing.meta,weights:existing.weights};
+  const q:any=await env.DB.prepare(`
+    WITH ranked AS (
+      SELECT r.*, ROW_NUMBER() OVER(PARTITION BY r.coin, CAST(r.snapshot_ts/${V07_EPISODE_MS} AS INTEGER) ORDER BY r.snapshot_ts ASC,r.id ASC) rn
+      FROM ml_raw_dataset r WHERE r.snapshot_ts<=?-${V07_WINDOW_MS}
+    ), base AS (
+      SELECT * FROM ranked WHERE rn=1 ORDER BY snapshot_ts DESC LIMIT ${V07_TRAIN_LIMIT}
+    )
+    SELECT b.*,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-60000 ORDER BY s.ts DESC LIMIT 1) price_1m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) price_5m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-900000 ORDER BY s.ts DESC LIMIT 1) price_15m_ago,
+      (SELECT s.open_interest FROM market_snapshots s WHERE s.coin=b.coin AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) oi_5m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts ORDER BY s.ts DESC LIMIT 1) btc_price,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts-60000 ORDER BY s.ts DESC LIMIT 1) btc_price_1m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts-300000 ORDER BY s.ts DESC LIMIT 1) btc_price_5m_ago,
+      (SELECT s.price FROM market_snapshots s WHERE s.coin='BTC' AND s.ts<=b.snapshot_ts-900000 ORDER BY s.ts DESC LIMIT 1) btc_price_15m_ago,
+      (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=b.coin AND s.ts>b.snapshot_ts AND s.ts<=b.snapshot_ts+${V07_WINDOW_MS} AND s.price>=b.price*(1+${V07_TOUCH_PCT}/100.0)) first_up_ts,
+      (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=b.coin AND s.ts>b.snapshot_ts AND s.ts<=b.snapshot_ts+${V07_WINDOW_MS} AND s.price<=b.price*(1-${V07_TOUCH_PCT}/100.0)) first_down_ts
+    FROM base b ORDER BY b.snapshot_ts ASC,b.id ASC
+  `).bind(Date.now()).all();
+  const sampled:any[]=q?.results??[];
+  const rows=sampled.filter((r:any)=>r.first_up_ts!=null||r.first_down_ts!=null);
+  if(rows.length<300)return {status:'WAITING_FOR_EPISODE_DIRECTIONAL_DATA',sampled_rows:sampled.length,directional_rows:rows.length,required:300,episode_minutes:5};
+  const split=Math.max(1,Math.floor(rows.length*0.70)), train=rows.slice(0,split), test=rows.slice(split);
+  const actual=(r:any):0|1=>(r.first_up_ts!=null&&(r.first_down_ts==null||num(r.first_up_ts)<num(r.first_down_ts)))?1:0;
+  let w=v07ZeroWeights();
+  for(let epoch=0;epoch<5;epoch++)for(const r of train)w=v07Learn(v07Features(r),actual(r),w,0.012);
+  let correct=0,longN=0,shortN=0; const coinStats:Record<string,any>={};
+  const th=[0.55,0.60,0.65,0.70], buckets:Record<string,any>={}; th.forEach(t=>buckets[String(t)]={selected:0,correct:0,long:0,short:0});
+  for(const r of test){
+    const y=actual(r); y?longN++:shortN++; const p=v07Probability(v07Features(r),w), pred=p>=0.5?1:0, ok=pred===y; if(ok)correct++;
+    const coin=String(r.coin??'UNKNOWN'); const cs=coinStats[coin]??(coinStats[coin]={total:0,correct:0,actualLong:0,actualShort:0,predLong:0,predShort:0});
+    cs.total++; if(ok)cs.correct++; y?cs.actualLong++:cs.actualShort++; pred?cs.predLong++:cs.predShort++;
+    const conf=Math.max(p,1-p); for(const t of th)if(conf>=t){const b=buckets[String(t)];b.selected++;if(ok)b.correct++;pred?b.long++:b.short++;}
+  }
+  const acc=test.length?correct/test.length*100:null, base=test.length?Math.max(longN,shortN)/test.length*100:null;
+  await env.DB.prepare(`INSERT OR REPLACE INTO ml_raw_v07_model(model_key,trained_at,episode_minutes,sampled_rows,directional_rows,training_rows,test_rows,test_correct,test_accuracy,majority_baseline,weights_json) VALUES(?,CURRENT_TIMESTAMP,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(V07_MODEL_KEY,5,sampled.length,rows.length,train.length,test.length,correct,acc,base,JSON.stringify(w)).run();
+  return {status:'TRAINED_AND_FROZEN',model_key:V07_MODEL_KEY,target:'FIRST_TOUCH_+0.20_VS_-0.20_WITHIN_10M',episode_sampling:'ONE_PER_COIN_PER_5M_BUCKET',sampled_rows:sampled.length,directional_rows:rows.length,train_rows:train.length,test_rows:test.length,test_correct:correct,test_accuracy_pct:acc==null?null:Number(acc.toFixed(2)),majority_baseline_pct:base==null?null:Number(base.toFixed(2)),beats_majority_baseline:acc!=null&&base!=null&&acc>base,confidence_filters:th.map(t=>{const b=buckets[String(t)];return {minimum_confidence:`${Math.round(t*100)}%`,signals_selected:b.selected,long_predictions:b.long,short_predictions:b.short,correct:b.correct,accuracy_pct:b.selected?Number((b.correct/b.selected*100).toFixed(2)):null};}),by_coin:Object.entries(coinStats).map(([coin,x]:any)=>({coin,test_samples:x.total,correct:x.correct,accuracy_pct:x.total?Number((x.correct/x.total*100).toFixed(2)):null,actual_long:x.actualLong,actual_short:x.actualShort,predicted_long:x.predLong,predicted_short:x.predShort})).sort((a,b)=>b.test_samples-a.test_samples),weights:w};
+}
+
+async function createV07Forward(env:Env):Promise<number>{
+  const model=await getV07Model(env); if(!model)return 0;
+  const q:any=await env.DB.prepare(`SELECT s.*,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-60000 ORDER BY x.ts DESC LIMIT 1) price_1m_ago,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) price_5m_ago,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-900000 ORDER BY x.ts DESC LIMIT 1) price_15m_ago,
+    (SELECT x.open_interest FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) oi_5m_ago,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts ORDER BY x.ts DESC LIMIT 1) btc_price,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-60000 ORDER BY x.ts DESC LIMIT 1) btc_price_1m_ago,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) btc_price_5m_ago,
+    (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-900000 ORDER BY x.ts DESC LIMIT 1) btc_price_15m_ago
+    FROM market_snapshots s INNER JOIN(SELECT coin,MAX(ts) max_ts FROM market_snapshots GROUP BY coin)z ON z.coin=s.coin AND z.max_ts=s.ts
+    WHERE s.price>0 AND NOT EXISTS(SELECT 1 FROM ml_raw_v07_forward f WHERE f.model_key=? AND f.source_snapshot_id=s.id)`)
+    .bind(V07_MODEL_KEY).all();
+  let n=0; for(const r of q?.results??[]){const x=v07Features(r),p=v07Probability(x,model.weights),side=p>=0.5?'LONG':'SHORT',conf=Math.max(p,1-p);
+    const z:any=await env.DB.prepare(`INSERT OR IGNORE INTO ml_raw_v07_forward(model_key,source_snapshot_id,coin,snapshot_ts,snapshot_datetime,entry_price,probability_long,predicted_side,confidence,features_json) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .bind(V07_MODEL_KEY,r.id,r.coin,r.ts,r.datetime??null,r.price,p,side,conf,JSON.stringify(x)).run(); n+=Math.max(0,Math.trunc(num(z?.meta?.changes)));}
+  return n;
+}
+
+async function resolveV07Forward(env:Env):Promise<number>{
+  const now=Date.now(); const r:any=await env.DB.prepare(`UPDATE ml_raw_v07_forward SET
+    first_up_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)),
+    first_down_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)),
+    actual_class=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'NONE' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) < (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END,
+    correct=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN NULL WHEN predicted_side=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) < (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END THEN 1 ELSE 0 END,
+    outcome_ready=1,resolved_at=CURRENT_TIMESTAMP WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V07_WINDOW_MS}`)
+    .bind(V07_MODEL_KEY,now).run(); return Math.max(0,Math.trunc(num(r?.meta?.changes)));
+}
+
+async function getV07Status(env:Env):Promise<any>{
+  await ensureV07Tables(env); const training=await trainV07Once(env);
+  const totals:any=await env.DB.prepare(`SELECT COUNT(*) predictions,SUM(outcome_ready=0) pending,SUM(outcome_ready=1) resolved,SUM(actual_class='NONE') none_resolved,SUM(actual_class IN ('LONG','SHORT')) directional_resolved,SUM(correct=1) correct FROM ml_raw_v07_forward WHERE model_key=?`).bind(V07_MODEL_KEY).first();
+  const rows:any=await env.DB.prepare(`SELECT confidence,predicted_side,actual_class,correct,outcome_ready,coin FROM ml_raw_v07_forward WHERE model_key=?`).bind(V07_MODEL_KEY).all();
+  const all:any[]=rows?.results??[], thresholds=[0.55,0.60,0.65,0.70];
+  const filters=thresholds.map(t=>{const e=all.filter(r=>num(r.confidence)>=t),d=e.filter(r=>r.actual_class==='LONG'||r.actual_class==='SHORT'),c=d.filter(r=>num(r.correct)===1).length;return {minimum_confidence:`${Math.round(t*100)}%`,predictions:e.length,pending:e.filter(r=>num(r.outcome_ready)===0).length,directional_resolved:d.length,correct:c,accuracy_pct:d.length?Number((c/d.length*100).toFixed(2)):null,predicted_long:e.filter(r=>r.predicted_side==='LONG').length,predicted_short:e.filter(r=>r.predicted_side==='SHORT').length};});
+  const coins=[...new Set(all.map(r=>String(r.coin)))].sort().map(coin=>{const e=all.filter(r=>String(r.coin)===coin),d=e.filter(r=>r.actual_class==='LONG'||r.actual_class==='SHORT'),c=d.filter(r=>num(r.correct)===1).length;return {coin,predictions:e.length,pending:e.filter(r=>num(r.outcome_ready)===0).length,directional_resolved:d.length,correct:c,accuracy_pct:d.length?Number((c/d.length*100).toFixed(2)):null};});
+  const d=num(totals?.directional_resolved),c=num(totals?.correct);
+  return {model_key:V07_MODEL_KEY,model:'AI_LOGISTIC_REGIME_RELATIVE_FIRST_TOUCH',research_only:true,trading_enabled:false,target:`FIRST +${V07_TOUCH_PCT}% vs -${V07_TOUCH_PCT}% within 10m`,episode_sampling:'ONE_PER_COIN_PER_5M_BUCKET_FOR_TRAINING',features:['chart','orderFlow','funding','premium','momentum1m','momentum5m','momentum15m','oiChange5m','btcMomentum1m','btcMomentum5m','btcMomentum15m','btcAcceleration','relative1m','relative5m','relative15m','relativeAcceleration'],training,predictions:num(totals?.predictions),pending:num(totals?.pending),resolved:num(totals?.resolved),none_resolved:num(totals?.none_resolved),directional_resolved:d,correct:c,directional_accuracy_pct:d?Number((c/d*100).toFixed(2)):null,confidence_filters:filters,by_coin:coins};
+}
+
+
 // ============================================================
 // CRON ENTRY
 // ============================================================
@@ -1158,6 +1344,7 @@ export async function updateRawML(env: Env): Promise<any> {
   await ensureTables(env);
   await ensureForwardTable(env);
   await ensureV06Tables(env);
+  await ensureV07Tables(env);
 
   const snapshotsAdded = await collectLatestPerCoin(env);
 
@@ -1175,11 +1362,16 @@ export async function updateRawML(env: Env): Promise<any> {
   const v06ForwardPredictionsAdded = await createV06Forward(env);
   const v06ForwardResolved = await resolveV06Forward(env);
 
+  // V0.7 regime + relative-move model: separate frozen research benchmark.
+  await trainV07Once(env);
+  const v07ForwardPredictionsAdded = await createV07Forward(env);
+  const v07ForwardResolved = await resolveV07Forward(env);
+
   await markHealth(env);
 
   return {
     module: MODULE,
-    version: "V0.6 AI FIRST-TOUCH + V0.5 CONTROL",
+    version: "V0.7 REGIME + RELATIVE MOVE + V0.6/V0.5 CONTROL",
     mode: "RAW_DATASET_STREAM",
     trading: "REAL_TRADING_DISABLED",
     snapshots_added: snapshotsAdded,
@@ -1190,6 +1382,8 @@ export async function updateRawML(env: Env): Promise<any> {
     forward_resolved: forwardResolved,
     v06_forward_predictions_added: v06ForwardPredictionsAdded,
     v06_forward_resolved: v06ForwardResolved,
+    v07_forward_predictions_added: v07ForwardPredictionsAdded,
+    v07_forward_resolved: v07ForwardResolved,
   };
 }
 
@@ -1200,6 +1394,8 @@ export async function updateRawML(env: Env): Promise<any> {
 export async function getRawMLStatus(env: Env): Promise<any> {
   await ensureTables(env);
   await ensureForwardTable(env);
+  await ensureV06Tables(env);
+  await ensureV07Tables(env);
 
   const health: any = await env.DB.prepare(`
     SELECT module, runs, last_run, status
@@ -1223,6 +1419,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
   const training = await runFirstTraining(env);
   const forward = await getForwardStatus(env);
   const v06 = await getV06Status(env);
+  const v07 = await getV07Status(env);
 
   const totalRows = Math.max(0, Math.trunc(num(totals?.total_rows)));
   const ready5 = Math.max(0, Math.trunc(num(totals?.ready_5m)));
@@ -1232,7 +1429,7 @@ export async function getRawMLStatus(env: Env): Promise<any> {
 
   return {
     module: MODULE,
-    version: "V0.6 AI FIRST-TOUCH + V0.5 CONTROL",
+    version: "V0.7 REGIME + RELATIVE MOVE + V0.6/V0.5 CONTROL",
     runs: Math.max(0, Math.trunc(num(health?.runs))),
     last_run: health?.last_run ?? null,
     status: health?.status ?? "NEW",
@@ -1267,8 +1464,9 @@ export async function getRawMLStatus(env: Env): Promise<any> {
     first_training: training,
     forward_validation: forward,
     ai_first_touch_v06: v06,
+    regime_relative_v07: v07,
     training_note:
-      "V0.5 legacy training remains status-only. V0.6 trains once from historical data, freezes its learned weights, then only performs forward validation.",
+      "V0.5 and V0.6 remain frozen controls. V0.7 adds 5m episode sampling plus BTC regime and coin-vs-BTC relative features, freezes once, then only performs forward validation.",
     mechanical_score_filter: "NONE",
     trading: "REAL_TRADING_DISABLED",
   };
