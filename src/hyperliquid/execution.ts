@@ -9,8 +9,9 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
-// V2.15.0: MOVE + BTC LOOKBACK — 100% Progressive Profit Lock LIVE test.
-// No fixed TP. Initial SL -0.20%. +0.25% => lock +0.20%; every next +0.10% => lock +0.10% higher, no ceiling.
+// V2.16.0: LIVE 3-minute scalp protection + existing 100% Progressive Profit Lock.
+// First 180s: Initial SL -0.20%. At >=180s once: ROI<0 MARKET; 0..0.20 BE; 0.20..<0.25 lock +0.20; >=0.25 existing Progressive.
+// No fixed TP. Progressive remains +0.25% => lock +0.20%; every next +0.10% => lock +0.10% higher, no ceiling.
 // Tracks virtual +0.20%, MFE, TP20->NO_TP25 control cohort, real lock stages and live stop replacement.
 // V2.13.1: lifecycle final-close classification uses the LAST real close fill, not the first.
 // V2.13.1: TP stages are reconstructed from real Hyperliquid close fills + position size.
@@ -80,6 +81,12 @@ const CONFIG = {
   PROGRESSIVE_FIRST_STOP_PCT: 0.20,
   PROGRESSIVE_STEP_PCT: 0.10,
   VIRTUAL_TP20_PCT: 0.20,
+
+  // V2.16.0 one-shot scalp protection. Decision is taken on the first LIVE lifecycle tick at/after 180s.
+  THREE_MIN_PROTECTION_MS: 180_000,
+  THREE_MIN_BE_MAX_PCT: 0.20,
+  THREE_MIN_LOCK20_MAX_PCT: 0.25,
+  THREE_MIN_LOCK20_STOP_PCT: 0.20,
 
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
@@ -383,7 +390,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.15.0 MOVE BTC 100% PROGRESSIVE PROFIT LOCK",
+    version: "V2.16.0 MOVE BTC + 3M SCALP PROTECTION + PROGRESSIVE",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -721,6 +728,14 @@ async function ensureExecutionLedger(db: any): Promise<void> {
       close_reason TEXT,
       exit_price REAL,
       realized_pnl REAL,
+      three_min_decision_at INTEGER,
+      three_min_action TEXT,
+      three_min_roi_pct REAL,
+      three_min_market_price REAL,
+      three_min_stop_pct REAL,
+      three_min_stop_price REAL,
+      three_min_exit_at INTEGER,
+      three_min_last_error TEXT,
       progressive_stage INTEGER DEFAULT 0,
       progressive_stop_pct REAL,
       progressive_stop_price REAL,
@@ -751,6 +766,14 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN close_reason TEXT",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN exit_price REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN realized_pnl REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_decision_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_action TEXT",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_roi_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_market_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_stop_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_stop_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_exit_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN three_min_last_error TEXT",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stage INTEGER DEFAULT 0",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_pct REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN progressive_stop_price REAL",
@@ -1282,6 +1305,148 @@ export async function executeProgressiveWsTrigger(
   return {success:result?.advanced===true||reachedStage>=targetStage,executed:result?.advanced===true,ledger_id:ledgerId,requested_target_stage:targetStage,result};
 }
 
+
+async function applyThreeMinuteScalpProtection(
+  env: HyperliquidExecutionEnv,
+  row: any,
+  position: any,
+  secret: `0x${string}`
+): Promise<any> {
+  const filledAt = Number(row.entry_filled_at ?? row.updated_at ?? row.claimed_at);
+  const now = Date.now();
+  if (!Number.isFinite(filledAt) || now - filledAt < CONFIG.THREE_MIN_PROTECTION_MS) {
+    return { handled:false, reason:"BEFORE_3M" };
+  }
+  if (Number(row.three_min_decision_at) > 0) {
+    return { handled:false, reason:"ALREADY_DECIDED", action:row.three_min_action ?? null };
+  }
+
+  const coin = String(row.coin ?? "").toUpperCase();
+  const side = String(row.side ?? "").toUpperCase();
+  const entryPrice = Number(row.entry_fill_price);
+  const szi = Number(position?.szi);
+  if (!coin || !Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(szi) || szi === 0) {
+    return { handled:false, reason:"INVALID_3M_POSITION" };
+  }
+
+  // If Progressive has already triggered, 3m protection must never downgrade it.
+  if (Number(row.tp25_triggered_at) > 0 || Number(row.progressive_stage ?? 0) >= 1) {
+    await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
+      SET three_min_decision_at=?, three_min_action='PROGRESSIVE_ALREADY_ACTIVE', three_min_last_error=NULL, updated_at=?
+      WHERE id=? AND three_min_decision_at IS NULL`)
+      .bind(now,now,row.id).run();
+    row.three_min_decision_at=now; row.three_min_action="PROGRESSIVE_ALREADY_ACTIVE";
+    return { handled:true, action:"PROGRESSIVE_ALREADY_ACTIVE" };
+  }
+
+  const raw = await postInfo({ type:"metaAndAssetCtxs" });
+  const universe = Array.isArray(raw?.[0]?.universe) ? raw[0].universe : [];
+  const contexts = Array.isArray(raw?.[1]) ? raw[1] : [];
+  const asset = universe.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin);
+  if (asset < 0) return { handled:false, reason:"3M_ASSET_NOT_FOUND" };
+  const szDecimals = Number(universe[asset]?.szDecimals);
+  const marketPrice = Number(contexts?.[asset]?.midPx ?? contexts?.[asset]?.markPx);
+  if (!Number.isFinite(marketPrice) || marketPrice <= 0) return { handled:false, reason:"3M_MARKET_PRICE_INVALID" };
+
+  const roi = directionalReturnPct(side, entryPrice, marketPrice);
+  if (!Number.isFinite(roi)) return { handled:false, reason:"3M_ROI_INVALID" };
+
+  // Price is already in the Progressive zone. Mark the one-shot decision and let
+  // advanceProgressiveProtection() below install the normal +0.20% floor.
+  if (roi + 1e-12 >= CONFIG.THREE_MIN_LOCK20_MAX_PCT) {
+    await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
+      SET three_min_decision_at=?, three_min_action='PROGRESSIVE_ZONE', three_min_roi_pct=?, three_min_market_price=?, three_min_last_error=NULL, updated_at=?
+      WHERE id=? AND three_min_decision_at IS NULL`)
+      .bind(now,roundTo(roi,6),marketPrice,now,row.id).run();
+    row.three_min_decision_at=now; row.three_min_action="PROGRESSIVE_ZONE"; row.three_min_roi_pct=roi;
+    return { handled:true, action:"PROGRESSIVE_ZONE", roi_pct:roundTo(roi,4), market_price:marketPrice };
+  }
+
+  // ROI < 0 at the 3m decision: close the whole live position immediately with
+  // a marketable IOC. This is the only branch that force-closes at 3m.
+  if (roi < 0) {
+    const closeBuy = szi < 0;
+    const limitRaw = closeBuy
+      ? marketPrice * (1 + CONFIG.MAX_ENTRY_SLIPPAGE_PCT/100)
+      : marketPrice * (1 - CONFIG.MAX_ENTRY_SLIPPAGE_PCT/100);
+    const limitWire = priceToWire(limitRaw,szDecimals);
+    const closeAction = {type:"order",orders:[{
+      a:asset,b:closeBuy,p:limitWire,s:toWire(Math.abs(szi),szDecimals),r:true,t:{limit:{tif:"Ioc"}}
+    }],grouping:"na"};
+    const closeRes = await sendLifecycleSignedAction(closeAction,secret);
+    const st = closeRes?.json?.response?.data?.statuses?.[0];
+    if (!st?.filled) {
+      const err=String(st?.error ?? "3M_FORCED_MARKET_NOT_FILLED");
+      await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET three_min_last_error=?,updated_at=? WHERE id=?`)
+        .bind(err,Date.now(),row.id).run();
+      return { handled:false, reason:err, response:closeRes?.json ?? null };
+    }
+
+    try {
+      const open=await getOpenOrdersForCoin(coin);
+      const cancels=open.filter((o:any)=>o?.oid!=null).map((o:any)=>({a:asset,o:Number(o.oid)}));
+      if(cancels.length) await sendLifecycleSignedAction({type:"cancel",cancels},secret);
+    } catch {}
+
+    const exitPrice=Number(st.filled?.avgPx ?? st.filled?.px ?? marketPrice);
+    const fills=await getRecentFillsForCoin(coin);
+    const pnl=lifecyclePnlFromFills(fills,filledAt,entryPrice,exitPrice,Math.abs(szi),side,Number(st.filled?.closedPnl));
+    const closedAt=Date.now();
+    await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET
+      status='THREE_MIN_FORCED_SL',closed_at=?,close_reason='THREE_MIN_FORCED_SL',exit_price=?,realized_pnl=?,runner_active=0,runner_size=0,
+      three_min_decision_at=?,three_min_action='FORCED_SL',three_min_roi_pct=?,three_min_market_price=?,three_min_exit_at=?,three_min_last_error=NULL,updated_at=?
+      WHERE id=?`)
+      .bind(closedAt,Number.isFinite(exitPrice)?exitPrice:null,pnl.netPnl,now,roundTo(roi,6),marketPrice,closedAt,closedAt,row.id).run();
+    await sendTelegram(env,lifecycleTelegram({emoji:"🛡",title:"3M FORCED SL · MARKET EXIT",coin,side,entryPrice,exitPrice:Number.isFinite(exitPrice)?exitPrice:null,size:Math.abs(szi),grossPnl:pnl.grossPnl,fees:pnl.fees,netPnl:pnl.netPnl,heldMs:closedAt-filledAt,crossingId:row.crossing_id}));
+    return { handled:true, closed:true, action:"FORCED_SL", roi_pct:roundTo(roi,4), exit_price:exitPrice, net_pnl:pnl.netPnl };
+  }
+
+  // Positive but not yet +0.25%: install a protective stop for 100% of the
+  // position. 0..<0.20 => BE. +0.20..<+0.25 => +0.20% floor.
+  const action = roi < CONFIG.THREE_MIN_BE_MAX_PCT ? "BEST_EXIT" : "TP020";
+  const stopPct = action === "BEST_EXIT" ? 0 : CONFIG.THREE_MIN_LOCK20_STOP_PCT;
+  const stopRaw = progressiveStopPrice(side,entryPrice,stopPct);
+  const stopWire = priceToWire(stopRaw,szDecimals);
+  const stopPx = Number(stopWire);
+  const closeIsBuy = side === "SHORT";
+  const addRes = await sendLifecycleSignedAction({type:"order",orders:[{
+    a:asset,b:closeIsBuy,p:stopWire,s:toWire(Math.abs(szi),szDecimals),r:true,
+    t:{trigger:{isMarket:true,triggerPx:stopWire,tpsl:"sl"}}
+  }],grouping:"na"},secret);
+  const addStatus=addRes?.json?.response?.data?.statuses?.[0];
+  const newOid=responseOrderOid(addStatus);
+  const addOk=addRes?.httpStatus>=200&&addRes?.httpStatus<300&&addRes?.json?.status==="ok"&&!addStatus?.error&&newOid!=null;
+  if(!addOk){
+    const err=String(addStatus?.error ?? "3M_PROTECTIVE_STOP_ADD_FAILED");
+    await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET three_min_last_error=?,updated_at=? WHERE id=?`).bind(err,Date.now(),row.id).run();
+    return {handled:false,reason:err,response:addRes?.json??null};
+  }
+
+  // New stop is live first; only then cancel the previous tracked initial stop.
+  const oldOid=Number(row.progressive_stop_oid);
+  if(Number.isInteger(oldOid)&&oldOid>=0&&oldOid!==newOid){
+    try{await sendLifecycleSignedAction({type:"cancel",cancels:[{a:asset,o:oldOid}]},secret);}catch{}
+  } else {
+    // Legacy fallback if the initial OID was not persisted: cancel only the stop
+    // nearest the expected -0.20% initial-SL price, never unrelated orders.
+    try{
+      const open=await getOpenOrdersForCoin(coin);
+      const initialSl=side==="LONG"?entryPrice*(1-CONFIG.LONG_STOP_LOSS_PCT/100):entryPrice*(1+CONFIG.SHORT_STOP_LOSS_PCT/100);
+      const cand=open.filter((o:any)=>o?.oid!=null&&Number(o.oid)!==newOid).map((o:any)=>({oid:Number(o.oid),px:openOrderPx(o)})).filter((o:any)=>Number.isFinite(o.px)).sort((a:any,b:any)=>Math.abs(a.px-initialSl)-Math.abs(b.px-initialSl))[0];
+      if(cand&&Math.abs(cand.px-initialSl)/entryPrice<0.0015) await sendLifecycleSignedAction({type:"cancel",cancels:[{a:asset,o:cand.oid}]},secret);
+    }catch{}
+  }
+
+  const decidedAt=Date.now();
+  await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET
+    three_min_decision_at=?,three_min_action=?,three_min_roi_pct=?,three_min_market_price=?,three_min_stop_pct=?,three_min_stop_price=?,three_min_last_error=NULL,
+    progressive_stop_oid=?,progressive_stop_price=?,progressive_updated_at=?,updated_at=? WHERE id=? AND three_min_decision_at IS NULL`)
+    .bind(decidedAt,action,roundTo(roi,6),marketPrice,stopPct,stopPx,newOid,stopPx,decidedAt,decidedAt,row.id).run();
+  row.three_min_decision_at=decidedAt; row.three_min_action=action; row.three_min_roi_pct=roi; row.three_min_stop_pct=stopPct; row.three_min_stop_price=stopPx; row.progressive_stop_oid=newOid; row.progressive_stop_price=stopPx;
+  await sendTelegram(env,[`🛡 <b>3M SCALP PROTECTION</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b> · ${side}`,`⏱ ${Math.round((decidedAt-filledAt)/1000)}s from fill`,`📊 ROI: ${roi>=0?"+":""}${roi.toFixed(3)}%`,`🎯 Action: ${action==="BEST_EXIT"?"BEST EXIT · BE":"0.20% TP · LOCK +0.20%"}`,`🛡 Stop: ${stopWire}`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`].join("\n"));
+  return {handled:true,closed:false,action,roi_pct:roundTo(roi,4),stop_pct:stopPct,stop_price:stopPx};
+}
+
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
   if (!env?.DB) return { success: false, reason: "D1_NOT_BOUND" };
   await ensureExecutionLedger(env.DB);
@@ -1359,6 +1524,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       }
 
       let reason = "CLOSED_OTHER", title = "POSITION CLOSED", emoji = "⚪";
+      const threeMinAction=String(row.three_min_action??"").toUpperCase();
       if (progressiveStage >= 1) {
         reason="PROGRESSIVE_LOCK_HIT";
         title=`PROGRESSIVE LOCK HIT · +${Number(row.progressive_stop_pct ?? 0).toFixed(2)}% FLOOR`;
@@ -1377,6 +1543,10 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         } else if (finalNearEntry || progressiveStage >= 1) {
           reason="BE_AFTER_TP1"; title="BE AFTER TP1"; emoji="🟡";
         }
+      } else if (threeMinAction === "BEST_EXIT") {
+        reason="THREE_MIN_BEST_EXIT"; title="3M BEST EXIT · BE PROTECTION"; emoji="🛡";
+      } else if (threeMinAction === "TP020") {
+        reason="THREE_MIN_TP020"; title="3M 0.20% TP · PROTECTED EXIT"; emoji="🟢";
       } else if (Number.isFinite(exitPrice)) {
         const slHit = side === "LONG" ? exitPrice <= sl*1.00015 : exitPrice >= sl*0.99985;
         if (slHit) { reason="SL_HIT"; title="INITIAL SL HIT"; emoji="🔴"; }
@@ -1395,6 +1565,18 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       }));
       out.push({coin,status:reason,exit_price:exitPrice,close_fills:closeFills.length,tp1_seen:tp1Seen,tp2_seen:tp2Seen,tp3_seen:tp3Seen});
       continue;
+    }
+
+    // V2.16.0 — one-shot LIVE 3-minute scalp protection.
+    // Uses the current Hyperliquid mid/mark on the first lifecycle tick at/after 180s.
+    // Historical market_snapshots are NOT used for live decisions.
+    if (secretOk && String(row.strategy_version ?? "") === "MOVE_BTC_LOOKBACK_V1") {
+      try {
+        const threeMin = await applyThreeMinuteScalpProtection(env,row,position,secretRaw as `0x${string}`);
+        if (threeMin?.closed) { out.push({coin,status:"THREE_MIN_FORCED_SL",three_min:threeMin}); continue; }
+      } catch (e:any) {
+        try { await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET three_min_last_error=?,updated_at=? WHERE id=?`).bind(e?.message??String(e),Date.now(),row.id).run(); } catch {}
+      }
     }
 
     // V2.13 — detect TP1 50%, then replace initial SL with BE + TP2/TP3.
