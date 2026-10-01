@@ -9,8 +9,9 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
-// V2.14.1: MOVE + BTC DIRECTION V1; full-position TP +0.20%, SL -0.20%.
-// V2.14.1: no scale-out, no BE rearm, no progressive exit, no TIME exit.
+// V2.15.0: MOVE + BTC LOOKBACK — 100% Progressive Profit Lock LIVE test.
+// No fixed TP. Initial SL -0.20%. +0.25% => lock +0.20%; every next +0.10% => lock +0.10% higher, no ceiling.
+// Tracks virtual +0.20%, MFE, TP20->NO_TP25 control cohort, real lock stages and live stop replacement.
 // V2.13.1: lifecycle final-close classification uses the LAST real close fill, not the first.
 // V2.13.1: TP stages are reconstructed from real Hyperliquid close fills + position size.
 // V2.13.1: repairs missing partial_tp_* bookkeeping when progressive_stage already proves TP1 rearm.
@@ -72,24 +73,14 @@ const CONFIG = {
   // 3) +0.50% is the existing 50% final TP. Only AFTER that fill is confirmed
   //    may Stage 2 replace the runner SL with +0.25%.
   // 4) +0.75% -> runner SL +0.50%, then continue the wider runner ladder.
-  LONG_PROGRESSIVE_STEPS: [
-    { trigger: 0.25, stop: 0.00 },
-    { trigger: 0.50, stop: 0.25 },
-    { trigger: 0.75, stop: 0.50 },
-    { trigger: 1.00, stop: 0.75 },
-    { trigger: 1.50, stop: 1.00 },
-    { trigger: 2.00, stop: 1.50 },
-    { trigger: 3.00, stop: 2.00 },
-  ],
-  SHORT_PROGRESSIVE_STEPS: [
-    { trigger: 0.25, stop: 0.00 },
-    { trigger: 0.50, stop: 0.25 },
-    { trigger: 0.75, stop: 0.50 },
-    { trigger: 1.00, stop: 0.75 },
-    { trigger: 1.50, stop: 1.00 },
-    { trigger: 2.00, stop: 1.50 },
-    { trigger: 3.00, stop: 2.00 },
-  ],
+  // V2.15.0: stage 1 = +0.25 trigger / +0.20 locked.
+  // Every additional +0.10% of favorable movement raises the locked floor by +0.10%.
+  // The ladder is generated mathematically, so there is no fixed upper ceiling.
+  PROGRESSIVE_FIRST_TRIGGER_PCT: 0.25,
+  PROGRESSIVE_FIRST_STOP_PCT: 0.20,
+  PROGRESSIVE_STEP_PCT: 0.10,
+  VIRTUAL_TP20_PCT: 0.20,
+
 
   MAX_ENTRY_SLIPPAGE_PCT: 0.30,
   TIF: "Ioc" as const,
@@ -392,7 +383,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.12.1 A+B FIXED TP020 SL010",
+    version: "V2.15.0 MOVE BTC 100% PROGRESSIVE PROFIT LOCK",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -656,9 +647,9 @@ function buildEntryTelegramMessage(args: {
     `Fill: ${a.fillPrice}`,
     `Size: ${escapeTelegramHtml(a.fillSize)} ${escapeTelegramHtml(a.coin)}`,
     ``,
-    `🟢 TP 100%: ${escapeTelegramHtml(a.tpWire)} (${a.takeProfitPct.toFixed(2)}%)`,
+    `🔭 Virtual TP control: +0.20% (NO close order)`,
     `🔴 SL 100%: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
-    `🔭 Post-TP research: +0.30 / +0.40 / +0.50% tracked virtually`,
+    `🔒 Progressive: +0.25→lock +0.20; then every +0.10→lock +0.10 higher`,
     `🛡 TP/SL: ${protection}`,
     ``,
     bal,
@@ -773,7 +764,16 @@ async function ensureExecutionLedger(db: any): Promise<void> {
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_size REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN runner_max_return_pct REAL",
     "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN strategy_version TEXT",
-    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN setup_name TEXT"
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN setup_name TEXT",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN virtual_tp20_hit_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN virtual_tp20_hit_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN max_favorable_return_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN max_favorable_price REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN tp25_triggered_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN lock_trigger_pct REAL",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN lock_requested_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN lock_confirmed_at INTEGER",
+    "ALTER TABLE hyperliquid_execution_ledger ADD COLUMN lock_latency_ms INTEGER"
   ]) {
     try { await db.prepare(sql).run(); } catch {}
   }
@@ -960,10 +960,12 @@ function lifecyclePnlFromFills(
 
 type ProgressiveStep = { trigger: number; stop: number };
 
-function progressiveStepsForSide(side: string): ProgressiveStep[] {
-  return side === "SHORT"
-    ? CONFIG.SHORT_PROGRESSIVE_STEPS
-    : CONFIG.LONG_PROGRESSIVE_STEPS;
+function progressiveStepsForSide(_side: string): ProgressiveStep[] {
+  // Compatibility helper for diagnostics. Runtime stage selection is unbounded.
+  return Array.from({ length: 100 }, (_, i) => ({
+    trigger: roundTo(CONFIG.PROGRESSIVE_FIRST_TRIGGER_PCT + i * CONFIG.PROGRESSIVE_STEP_PCT, 8),
+    stop: roundTo(CONFIG.PROGRESSIVE_FIRST_STOP_PCT + i * CONFIG.PROGRESSIVE_STEP_PCT, 8),
+  }));
 }
 
 function directionalReturnPct(side: string, entryPrice: number, marketPrice: number): number {
@@ -975,16 +977,15 @@ function directionalReturnPct(side: string, entryPrice: number, marketPrice: num
     : ((marketPrice - entryPrice) / entryPrice) * 100;
 }
 
-function reachedProgressiveStep(side: string, directionalReturn: number): { stage: number; stop: number; trigger: number } | null {
-  if (!Number.isFinite(directionalReturn)) return null;
-  const steps = progressiveStepsForSide(side);
-  let reached: { stage: number; stop: number; trigger: number } | null = null;
-  for (let i = 0; i < steps.length; i++) {
-    if (directionalReturn + 1e-12 >= steps[i].trigger) {
-      reached = { stage: i + 1, stop: steps[i].stop, trigger: steps[i].trigger };
-    }
-  }
-  return reached;
+function reachedProgressiveStep(_side: string, directionalReturn: number): { stage: number; stop: number; trigger: number } | null {
+  if (!Number.isFinite(directionalReturn) || directionalReturn + 1e-12 < CONFIG.PROGRESSIVE_FIRST_TRIGGER_PCT) return null;
+  const extra = Math.floor((directionalReturn - CONFIG.PROGRESSIVE_FIRST_TRIGGER_PCT + 1e-10) / CONFIG.PROGRESSIVE_STEP_PCT);
+  const stage = Math.max(1, extra + 1);
+  return {
+    stage,
+    trigger: roundTo(CONFIG.PROGRESSIVE_FIRST_TRIGGER_PCT + (stage - 1) * CONFIG.PROGRESSIVE_STEP_PCT, 8),
+    stop: roundTo(CONFIG.PROGRESSIVE_FIRST_STOP_PCT + (stage - 1) * CONFIG.PROGRESSIVE_STEP_PCT, 8),
+  };
 }
 
 function progressiveStopPrice(side: string, entryPrice: number, stopPct: number): number {
@@ -1050,15 +1051,31 @@ async function advanceProgressiveProtection(
   }
 
   const dirReturn = directionalReturnPct(side, entryPrice, marketPrice);
+  const nowObserved = Date.now();
+  if (Number.isFinite(dirReturn)) {
+    const oldMfe = Number(row.max_favorable_return_pct);
+    if (!Number.isFinite(oldMfe) || dirReturn > oldMfe) {
+      try {
+        await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
+          SET max_favorable_return_pct=?, max_favorable_price=?, updated_at=? WHERE id=?`)
+          .bind(roundTo(dirReturn,6), marketPrice, nowObserved, row.id).run();
+        row.max_favorable_return_pct = dirReturn;
+        row.max_favorable_price = marketPrice;
+      } catch {}
+    }
+    if (dirReturn + 1e-12 >= CONFIG.VIRTUAL_TP20_PCT && !Number(row.virtual_tp20_hit_at)) {
+      try {
+        await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
+          SET virtual_tp20_hit_at=?, virtual_tp20_hit_price=?, updated_at=? WHERE id=? AND virtual_tp20_hit_at IS NULL`)
+          .bind(nowObserved, marketPrice, nowObserved, row.id).run();
+        row.virtual_tp20_hit_at = nowObserved;
+        row.virtual_tp20_hit_price = marketPrice;
+      } catch {}
+    }
+  }
   let target = reachedProgressiveStep(side, dirReturn);
   const currentStage = Math.max(0, Number(row.progressive_stage ?? 0) || 0);
 
-  // Once the exchange confirms the 50% TP fill, Stage 2 (+0.25% runner lock)
-  // is mandatory even if price has already pulled back below +0.50% before the
-  // lifecycle poll runs. A higher currently-reached stage still wins.
-  if (Number(row.partial_tp_filled_at) && currentStage < 2 && (!target || target.stage < 2)) {
-    target = { stage: 2, trigger: 0.50, stop: 0.25 };
-  }
 
   if (!target || target.stage <= currentStage) {
     return {
@@ -1085,10 +1102,12 @@ async function advanceProgressiveProtection(
     r: true,
     t: { trigger: { isMarket: true, triggerPx: stopWire, tpsl: "sl" } },
   };
+  const lockRequestedAt = Date.now();
   const addRes = await sendLifecycleSignedAction(
     { type: "order", orders: [newStopOrder], grouping: "na" },
     secret
   );
+  const lockConfirmedAt = Date.now();
   const addStatus = addRes?.json?.response?.data?.statuses?.[0];
   const addOk =
     addRes?.httpStatus >= 200 &&
@@ -1180,15 +1199,24 @@ async function advanceProgressiveProtection(
   await env.DB?.prepare(`
     UPDATE hyperliquid_execution_ledger
     SET progressive_stage=?, progressive_stop_pct=?, progressive_stop_price=?,
-        progressive_stop_oid=?, progressive_updated_at=?, updated_at=?
+        progressive_stop_oid=?, progressive_updated_at=?, lock_trigger_pct=?,
+        lock_requested_at=?, lock_confirmed_at=?, lock_latency_ms=?,
+        tp25_triggered_at=COALESCE(tp25_triggered_at, CASE WHEN ?=1 THEN ? ELSE NULL END),
+        updated_at=?
     WHERE id=?
   `).bind(
     target.stage,
     target.stop,
     stopPx,
     newStopOid,
-    Date.now(),
-    Date.now(),
+    lockConfirmedAt,
+    target.trigger,
+    lockRequestedAt,
+    lockConfirmedAt,
+    Math.max(0, lockConfirmedAt - lockRequestedAt),
+    target.stage,
+    lockConfirmedAt,
+    lockConfirmedAt,
     row.id
   ).run();
 
@@ -1245,16 +1273,6 @@ export async function executeProgressiveWsTrigger(
   if (!Number.isInteger(targetStage)||targetStage<=currentStage)
     return {success:true,executed:false,reason:"ALREADY_AT_OR_ABOVE_TARGET_STAGE",ledger_id:ledgerId,current_stage:currentStage,target_stage:targetStage};
 
-  // V2.10.5: LONG and SHORT Stage 2 (+0.50 -> runner SL +0.25) must never be armed
-  // merely because markPx touched +0.50. The exchange must first confirm that
-  // the existing 50% TP actually reduced the position. This also guarantees
-  // that the replacement SL is sized to the remaining runner, not full size.
-  if (targetStage >= 2 && !Number(row.partial_tp_filled_at)) {
-    return {
-      success:false, executed:false, reason:"WAITING_CONFIRMED_PARTIAL_TP",
-      ledger_id:ledgerId, current_stage:currentStage, target_stage:targetStage
-    };
-  }
   let position:any=null;
   try { position=await getOpenPositionForCoin(String(row.coin??"").toUpperCase()); }
   catch(err:any){ return {success:false,executed:false,reason:"POSITION_LOOKUP_FAILED",error:err?.message??String(err)}; }
@@ -1341,7 +1359,12 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       }
 
       let reason = "CLOSED_OTHER", title = "POSITION CLOSED", emoji = "⚪";
-      if (tp3Seen) { reason="TP3_HIT"; title="TP3 HIT · SCALEOUT COMPLETE"; emoji="🟢"; }
+      if (progressiveStage >= 1) {
+        reason="PROGRESSIVE_LOCK_HIT";
+        title=`PROGRESSIVE LOCK HIT · +${Number(row.progressive_stop_pct ?? 0).toFixed(2)}% FLOOR`;
+        emoji="🟢";
+      }
+      else if (tp3Seen) { reason="TP3_HIT"; title="TP3 HIT · SCALEOUT COMPLETE"; emoji="🟢"; }
       else if (tp2Seen && tp1Seen) { reason="TP2_THEN_BE_OR_CLOSE"; title="TP2 HIT · POSITION CLOSED"; emoji="🟢"; }
       else if (tp1Seen) {
         // After TP1, a later close around entry is the intended BE outcome.
@@ -1468,7 +1491,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
 
     // V2.10: progressive engine continues beyond final TP through runner stages.
     let progressive: any = null;
-    if (false && secretOk && String(row.status) === "PROTECTED") {
+    if (secretOk && String(row.status) === "PROTECTED" && String(row.strategy_version ?? "") === "MOVE_BTC_LOOKBACK_V1") {
       try {
         progressive = await advanceProgressiveProtection(
           env,
@@ -1482,8 +1505,13 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     }
 
     if (true) {
-      // V2.13 LONG scale-out: TP1 +0.20% 50%, TP2 +0.30% 25%, TP3 +0.40% 25%; after TP1 SL=BE. No TIME exit.
-      out.push({coin,status:"OPEN",held_ms:heldMs,progressive:null});
+      // V2.15.0 MOVE+BTC: full position stays open; no fixed TP and no scale-out.
+      // Progressive lock is advanced above whenever the live price reaches the next trigger.
+      out.push({
+        coin,status:"OPEN",held_ms:heldMs,progressive,
+        virtual_tp20_hit:Boolean(row.virtual_tp20_hit_at),
+        max_favorable_return_pct:Number.isFinite(Number(row.max_favorable_return_pct))?Number(row.max_favorable_return_pct):null
+      });
       continue;
     }
     if (!secretOk) { out.push({coin,status:"MAX_HOLD_BLOCKED",reason:"PRIVATE_KEY_INVALID"}); continue; }
@@ -2268,9 +2296,11 @@ export async function buildHyperliquidExecutionCandidate(
     r: true,
     t: { trigger: { isMarket: true, triggerPx: slWire, tpsl: "sl" } },
   };
+  // V2.15.0: NO fixed TP order. Keep 100% of the position open.
+  // The initial exchange protection is SL only; profit is protected by the live progressive ladder.
   const protectionAction = {
     type: "order",
-    orders: [tpOrder, slOrder],
+    orders: [slOrder],
     grouping: "na",
   };
 
@@ -2301,14 +2331,14 @@ export async function buildHyperliquidExecutionCandidate(
         protectionResponse?.httpStatus >= 200 &&
         protectionResponse?.httpStatus < 300;
       const exchangeOk = protectionResponse?.json?.status === "ok";
-      const twoStatuses =
+      const protectionStatusPresent =
         Array.isArray(protectionStatuses) &&
-        protectionStatuses.length >= 2;
+        protectionStatuses.length >= 1;
 
       protectionOk =
         httpOk &&
         exchangeOk &&
-        twoStatuses &&
+        protectionStatusPresent &&
         protectionErrors.length === 0;
 
       if (protectionOk) break;
@@ -2338,7 +2368,7 @@ export async function buildHyperliquidExecutionCandidate(
   // stop is live, instead of relying on legacy price matching. This prevents
   // the stale Initial-SL + Progressive-SL pair observed in live trading.
   if (protectionOk && env?.DB && signal.crossing_id != null && Array.isArray(protectionStatuses)) {
-    const initialSlOid = responseOrderOid(protectionStatuses[1]);
+    const initialSlOid = responseOrderOid(protectionStatuses[0]);
     if (initialSlOid != null) {
       try {
         await env.DB.prepare(`
@@ -2410,12 +2440,14 @@ export async function buildHyperliquidExecutionCandidate(
       take_profit_trigger: tpWire,
       stop_loss_pct: stopLossPct,
       stop_loss_trigger: slWire,
-      progressive_strategy: "DISABLED",
-      progressive_steps: [],
-      partial_tp_fraction: CONFIG.PARTIAL_TP_FRACTION,
-      partial_tp_size: partialTpSizeWire,
-      runner_fraction: 1 - CONFIG.PARTIAL_TP_FRACTION,
-      runner_mode: "PROGRESSIVE_RUNNER_TO_STOP_OR_30M",
+      progressive_strategy: "FULL_POSITION_UNBOUNDED_PROFIT_LOCK",
+      progressive_first_trigger_pct: CONFIG.PROGRESSIVE_FIRST_TRIGGER_PCT,
+      progressive_first_stop_pct: CONFIG.PROGRESSIVE_FIRST_STOP_PCT,
+      progressive_step_pct: CONFIG.PROGRESSIVE_STEP_PCT,
+      virtual_tp20_pct: CONFIG.VIRTUAL_TP20_PCT,
+      fixed_take_profit_order: false,
+      position_fraction_kept_open: 1.0,
+      runner_mode: "100_PERCENT_PROGRESSIVE_PROFIT_LOCK",
       grouping: "na",
       http_status: protectionResponse?.httpStatus ?? null,
       returned_statuses: protectionStatuses,
