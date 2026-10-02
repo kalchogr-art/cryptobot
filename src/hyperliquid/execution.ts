@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// V2.16.1: EXECUTION LATENCY AUDIT — timing only; LIVE strategy/order logic unchanged.
 // V2.16.0: LIVE 3-minute scalp protection + existing 100% Progressive Profit Lock.
 // First 180s: Initial SL -0.20%. At >=180s once: ROI<0 MARKET; 0..0.20 BE; 0.20..<0.25 lock +0.20; >=0.25 existing Progressive.
 // No fixed TP. Progressive remains +0.25% => lock +0.20%; every next +0.10% => lock +0.10% higher, no ceiling.
@@ -595,6 +596,57 @@ async function getActiveAssetTradingAvailability(
   }
 }
 
+function buildExecutionLatencyTelegramLines(a: any): string[] {
+  const l = a?.latencyAudit ?? {};
+  const signalTs = Number(a?.signalTs);
+  const executionStartedAt = Number(l?.execution_started_at);
+  const fillReceivedAt = Number(l?.fill_received_at);
+  const signalPrice = Number(a?.signalPrice);
+  const fillPrice = Number(a?.fillPrice);
+  const side = String(a?.side ?? "").toUpperCase();
+
+  const signalToExecutionMs =
+    Number.isFinite(signalTs) && Number.isFinite(executionStartedAt)
+      ? Math.max(0, executionStartedAt - signalTs)
+      : NaN;
+  const signalToFillMs =
+    Number.isFinite(signalTs) && Number.isFinite(fillReceivedAt)
+      ? Math.max(0, fillReceivedAt - signalTs)
+      : NaN;
+  const executionToFillMs =
+    Number.isFinite(executionStartedAt) && Number.isFinite(fillReceivedAt)
+      ? Math.max(0, fillReceivedAt - executionStartedAt)
+      : NaN;
+
+  let directionalMoveBeforeFillPct = NaN;
+  if (Number.isFinite(signalPrice) && signalPrice > 0 && Number.isFinite(fillPrice) && fillPrice > 0) {
+    directionalMoveBeforeFillPct =
+      side === "SHORT"
+        ? ((signalPrice - fillPrice) / signalPrice) * 100
+        : ((fillPrice - signalPrice) / signalPrice) * 100;
+  }
+
+  const ms = (v: any) => Number.isFinite(Number(v)) ? `${Number(v)} ms` : "n/a";
+  const sec = (v: any) => Number.isFinite(Number(v)) ? `${(Number(v) / 1000).toFixed(2)} s` : "n/a";
+
+  return [
+    `⏱ <b>EXECUTION LATENCY AUDIT</b>`,
+    `Signal → execution: ${sec(signalToExecutionMs)}`,
+    `META: ${ms(l?.meta_ms)}`,
+    `ActiveAsset preview: ${ms(l?.active_asset_preview_ms)}`,
+    `D1 claim: ${ms(l?.claim_ms)}`,
+    `Availability: ${ms(l?.availability_ms)}`,
+    `Account snapshot: ${ms(l?.account_snapshot_ms)}`,
+    `Exposure check: ${ms(l?.exposure_check_ms)}`,
+    `Leverage: ${ms(l?.leverage_ms)}`,
+    `IOC → fill: ${ms(l?.ioc_ms)}`,
+    `Execution → fill: ${sec(executionToFillMs)}`,
+    `Signal → fill: ${sec(signalToFillMs)}`,
+    `Signal px: ${Number.isFinite(signalPrice) ? signalPrice : "n/a"} → Fill: ${Number.isFinite(fillPrice) ? fillPrice : "n/a"}`,
+    `Move before fill: ${Number.isFinite(directionalMoveBeforeFillPct) ? `${directionalMoveBeforeFillPct >= 0 ? "+" : ""}${directionalMoveBeforeFillPct.toFixed(4)}%` : "n/a"} (${side || "n/a"})`,
+  ];
+}
+
 function buildEntryTelegramMessage(args: {
   coin: string;
   side: string;
@@ -614,6 +666,9 @@ function buildEntryTelegramMessage(args: {
   protectionOk: boolean;
   protectionAttempts: number;
   balance: any;
+  latencyAudit?: any;
+  signalTs?: number | null;
+  signalPrice?: number | null;
 }): string {
   const a = args;
   const protection = a.protectionOk
@@ -658,6 +713,14 @@ function buildEntryTelegramMessage(args: {
     `🔴 SL 100%: ${escapeTelegramHtml(a.slWire)} (${a.stopLossPct.toFixed(2)}%)`,
     `🔒 Progressive: +0.25→lock +0.20; then every +0.10→lock +0.10 higher`,
     `🛡 TP/SL: ${protection}`,
+    ``,
+    ...buildExecutionLatencyTelegramLines({
+      latencyAudit: a.latencyAudit,
+      signalTs: a.signalTs,
+      signalPrice: a.signalPrice,
+      fillPrice: a.fillPrice,
+      side: a.side,
+    }),
     ``,
     bal,
     ``,
@@ -1060,7 +1123,9 @@ async function advanceProgressiveProtection(
     return { advanced: false, reason: "INVALID_ENTRY" };
   }
 
+  const latencyMetaStartedAt = Date.now();
   const raw = await postInfo({ type: "metaAndAssetCtxs" });
+  latencyAudit.meta_ms = Date.now() - latencyMetaStartedAt;
   const universe = Array.isArray(raw?.[0]?.universe) ? raw[0].universe : [];
   const contexts = Array.isArray(raw?.[1]) ? raw[1] : [];
   const asset = universe.findIndex((x:any) => String(x?.name ?? "").toUpperCase() === coin);
@@ -1759,6 +1824,22 @@ export async function buildHyperliquidExecutionCandidate(
   signal: HyperliquidExecutionSignal,
   env?: HyperliquidExecutionEnv
 ): Promise<Record<string, any>> {
+  // V2.16.1 READ-ONLY TIMING INSTRUMENTATION.
+  // These timestamps do not gate, delay or alter execution.
+  const latencyExecutionStartedAt = Date.now();
+  const latencyAudit: Record<string, number | null> = {
+    execution_started_at: latencyExecutionStartedAt,
+    meta_ms: null,
+    active_asset_preview_ms: null,
+    claim_ms: null,
+    availability_ms: null,
+    account_snapshot_ms: null,
+    exposure_check_ms: null,
+    leverage_ms: null,
+    ioc_ms: null,
+    fill_received_at: null,
+  };
+
   const coin = String(signal?.coin ?? "").toUpperCase();
   const side = signal?.side;
   const score = Number(signal?.score);
@@ -1927,12 +2008,14 @@ export async function buildHyperliquidExecutionCandidate(
   // Read current per-asset leverage. Hyperliquid leverage is configured per coin.
   // This call is read-only and is safe in DRY RUN.
   let activeAssetData: any = null;
+  const latencyActiveAssetPreviewStartedAt = Date.now();
   try {
     activeAssetData = await postInfo({
       type: "activeAssetData",
       user: MASTER_ACCOUNT,
       coin,
     });
+    latencyAudit.active_asset_preview_ms = Date.now() - latencyActiveAssetPreviewStartedAt;
   } catch (e: any) {
     return {
       eligible: false,
@@ -2132,7 +2215,9 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
+  const latencyClaimStartedAt = Date.now();
   const claim = await claimExecutionOnce(env?.DB, signal, coin, side);
+  latencyAudit.claim_ms = Date.now() - latencyClaimStartedAt;
   if (!claim.claimed) {
     return {
       ...result,
@@ -2154,10 +2239,17 @@ export async function buildHyperliquidExecutionCandidate(
   // launched activeAssetData + clearinghouseState + spotClearinghouseState at
   // the same time, creating a burst of three /info calls exactly when a signal
   // arrived. That made INFO_HTTP_429 much more likely.
+  const latencyAvailabilityStartedAt = Date.now();
   const tradingAvailability = await getActiveAssetTradingAvailability(coin, side);
+  latencyAudit.availability_ms = Date.now() - latencyAvailabilityStartedAt;
+
+  const latencyAccountSnapshotStartedAt = Date.now();
   const preEntryBalance = tradingAvailability?.success
     ? await getAccountSnapshot()
     : { success:false, error:"SKIPPED_AFTER_ACTIVE_ASSET_FAILURE", account_value_usd:null, margin_used_usd:null, withdrawable_usd:null, usdc_total:null, usdc_hold:null };
+  latencyAudit.account_snapshot_ms = tradingAvailability?.success
+    ? Date.now() - latencyAccountSnapshotStartedAt
+    : 0;
 
   const availableMargin = Number(tradingAvailability?.available_to_trade);
   const maxTradeSz = Number(tradingAvailability?.max_trade_sz);
@@ -2231,8 +2323,10 @@ export async function buildHyperliquidExecutionCandidate(
     };
   }
 
+  const latencyExposureStartedAt = Date.now();
   const existingPosition = await getOpenPositionForCoin(coin);
   const existingOrders = await getOpenOrdersForCoin(coin);
+  latencyAudit.exposure_check_ms = Date.now() - latencyExposureStartedAt;
   if (existingPosition || existingOrders.length > 0) {
     const reason = existingPosition ? "EXISTING_POSITION_FOR_COIN" : "EXISTING_OPEN_ORDERS_FOR_COIN";
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_BLOCKED_EXISTING_EXPOSURE", { last_error: reason });
@@ -2269,6 +2363,7 @@ export async function buildHyperliquidExecutionCandidate(
   // Guarantee the configured leverage for THIS coin before any order is sent.
   // If the exchange does not confirm the update, do not send ENTRY.
   let leverageResponse: any = null;
+  const latencyLeverageStartedAt = Date.now();
   if (!leverageAlreadyCorrect) {
     try {
       leverageResponse = await sendSignedAction(leverageAction);
@@ -2323,10 +2418,14 @@ export async function buildHyperliquidExecutionCandidate(
       };
     }
   }
+  latencyAudit.leverage_ms = leverageAlreadyCorrect ? 0 : Date.now() - latencyLeverageStartedAt;
 
   let entryResponse: any;
+  const latencyIocStartedAt = Date.now();
   try {
     entryResponse = await sendSignedAction(entryAction);
+    latencyAudit.ioc_ms = Date.now() - latencyIocStartedAt;
+    latencyAudit.fill_received_at = Date.now();
   } catch (e: any) {
     const rejectReason = e?.message ?? String(e);
     await updateExecutionLedger(env?.DB, signal.crossing_id, "ENTRY_ERROR", {
@@ -2588,6 +2687,9 @@ export async function buildHyperliquidExecutionCandidate(
     protectionOk,
     protectionAttempts,
     balance: accountBalance,
+    latencyAudit,
+    signalTs: Number.isFinite(crossingTs) ? crossingTs : null,
+    signalPrice: entryPrice,
   });
   const telegram = await sendTelegram(env, telegramMessage);
 
@@ -2606,6 +2708,30 @@ export async function buildHyperliquidExecutionCandidate(
       strategy_target: CONFIG.TARGET_LEVERAGE,
       asset_max: assetMaxLeverage,
       capped_by_asset: leverageWasCapped,
+    },
+    execution_latency_audit: {
+      ...latencyAudit,
+      signal_to_execution_ms:
+        Number.isFinite(crossingTs) ? Math.max(0, latencyExecutionStartedAt - crossingTs) : null,
+      execution_to_fill_ms:
+        Number.isFinite(Number(latencyAudit.fill_received_at))
+          ? Math.max(0, Number(latencyAudit.fill_received_at) - latencyExecutionStartedAt)
+          : null,
+      signal_to_fill_ms:
+        Number.isFinite(crossingTs) && Number.isFinite(Number(latencyAudit.fill_received_at))
+          ? Math.max(0, Number(latencyAudit.fill_received_at) - crossingTs)
+          : null,
+      signal_price: entryPrice,
+      fill_price: fillPrice,
+      directional_move_before_fill_pct:
+        Number.isFinite(entryPrice) && entryPrice > 0
+          ? roundTo(
+              side === "SHORT"
+                ? ((entryPrice - fillPrice) / entryPrice) * 100
+                : ((fillPrice - entryPrice) / entryPrice) * 100,
+              6
+            )
+          : null,
     },
     live_entry: {
       filled: true,
