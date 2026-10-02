@@ -2,7 +2,7 @@
             import { updateRawML, getRawMLStatus } from "./ml/raw-learning";
             import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
             import { getHyperliquidSigningDiagnostic } from "./hyperliquid/signing-diagnostic";
-            import { buildHyperliquidExecutionCandidate, monitorHyperliquidExecutionLifecycle, executeProgressiveWsTrigger, getHyperliquidOrderWireAudit } from "./hyperliquid/execution";
+            import { buildHyperliquidExecutionCandidate, hmonitorHyperliquidExecutionLifecycle, executeProgressiveWsTrigger, getHyperliquidOrderWireAudit } from "./hyperliquid/execution";
             export { ProgressiveMonitor } from "./hyperliquid/progressive-monitor";
 
             // ============================================================
