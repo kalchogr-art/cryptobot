@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// V2.16.2: FAST D1 CLAIM — duplicate guard remains atomic; schema migration removed from hot entry path.
 // V2.16.1: EXECUTION LATENCY AUDIT — timing only; LIVE strategy/order logic unchanged.
 // V2.16.0: LIVE 3-minute scalp protection + existing 100% Progressive Profit Lock.
 // First 180s: Initial SL -0.20%. At >=180s once: ROI<0 MARKET; 0..0.20 BE; 0.20..<0.25 lock +0.20; >=0.25 existing Progressive.
@@ -871,7 +872,16 @@ async function claimExecutionOnce(
   coin: string,
   side: string
 ): Promise<{ claimed: boolean; existing?: any }> {
-  await ensureExecutionLedger(db);
+  // V2.16.2 FAST HOT PATH:
+  // DO NOT run ensureExecutionLedger() here. It performs CREATE/ALTER schema
+  // maintenance and was measured at ~12–14s inside every live entry.
+  //
+  // Safety is unchanged: INSERT OR IGNORE remains the atomic D1 duplicate
+  // claim. The ledger schema is initialized by the normal non-hot-path
+  // initialization/maintenance calls already present in this worker.
+  //
+  // Fail closed: if the table/schema is unexpectedly missing, this INSERT
+  // throws and execution does NOT proceed to an exchange order.
 
   const crossingId = String(signal.crossing_id ?? "");
   const episodeId = String(signal.episode_id ?? "");
@@ -882,21 +892,27 @@ async function claimExecutionOnce(
   }
 
   const now = Date.now();
-  const insert: any = await db.prepare(`
-    INSERT OR IGNORE INTO hyperliquid_execution_ledger (
-      crossing_id, episode_id, coin, side, crossing_ts,
-      status, claimed_at, updated_at, strategy_version, setup_name
-    ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'MOVE_BTC_LOOKBACK_V1', ?)
-  `).bind(
-    crossingId,
-    episodeId,
-    coin,
-    side,
-    crossingTs,
-    now,
-    now,
-    String(signal.setup_name ?? '') || null
-  ).run();
+  let insert: any;
+  try {
+    insert = await db.prepare(`
+      INSERT OR IGNORE INTO hyperliquid_execution_ledger (
+        crossing_id, episode_id, coin, side, crossing_ts,
+        status, claimed_at, updated_at, strategy_version, setup_name
+      ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'MOVE_BTC_LOOKBACK_V1', ?)
+    `).bind(
+      crossingId,
+      episodeId,
+      coin,
+      side,
+      crossingTs,
+      now,
+      now,
+      String(signal.setup_name ?? '') || null
+    ).run();
+  } catch (e: any) {
+    // Never bypass the duplicate guard. A D1/schema failure blocks entry.
+    throw new Error(`FAST_D1_CLAIM_FAILED: ${e?.message ?? String(e)}`);
+  }
 
   const changes = Number(insert?.meta?.changes ?? 0);
   if (changes > 0) return { claimed: true };
