@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// V2.16.9: LIFECYCLE HEALTH WATCHDOG — alerts/persists Progressive failures without changing strategy.
 // V2.16.3: BTC1M DIRECTIONAL SYNC — strategy metadata/lifecycle synced to Index V1.11.44; FAST D1 + latency audit preserved.
 // V2.16.2: FAST D1 CLAIM — duplicate guard remains atomic; schema migration removed from hot entry path.
 // V2.16.1: EXECUTION LATENCY AUDIT — timing only; LIVE strategy/order logic unchanged.
@@ -1792,7 +1793,57 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
           row.tp25_triggered_at = row.tp25_triggered_at || Date.now();
         }
       } catch (e:any) {
+        const watchdogError = `LIFECYCLE_WATCHDOG: PROGRESSIVE_EXCEPTION: ${e?.message ?? String(e)}`;
         progressive = { advanced:false, reason:"PROGRESSIVE_EXCEPTION", error:e?.message ?? String(e) };
+        // V2.16.9: never allow a Progressive lifecycle exception to stay silent.
+        // Persist the exact failure and send Telegram only when the error changes,
+        // so a recurring cron failure cannot spam every minute.
+        const previousError = String(row.last_error ?? "");
+        try {
+          await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
+            .bind(watchdogError,Date.now(),row.id).run();
+          row.last_error = watchdogError;
+        } catch {}
+        if (previousError !== watchdogError) {
+          await sendTelegram(env,[
+            `🚨 <b>LIFECYCLE WATCHDOG</b>`,
+            ``,
+            `🪙 <b>${escapeTelegramHtml(coin)}</b> · ${escapeTelegramHtml(side)}`,
+            `🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,
+            `📌 Status: ${escapeTelegramHtml(row.status)}`,
+            `🔒 Stage: ${Number(row.progressive_stage ?? 0)}`,
+            `🚫 ${escapeTelegramHtml(watchdogError)}`,
+            ``,
+            `🕐 ${new Date().toISOString()}`
+          ].join("\n"));
+        }
+      }
+
+      // V2.16.9: order-placement/verification failures are returned rather than thrown.
+      // Surface those too; successful advancement clears last_error inside
+      // advanceProgressiveProtection(). This is monitoring only — no entry/signal
+      // formula, Progressive percentage, or 3-minute rule is changed.
+      if (progressive && !progressive.advanced && progressive.target_stage && String(progressive.reason ?? "").startsWith("PROGRESSIVE_")) {
+        const watchdogError = `LIFECYCLE_WATCHDOG: ${String(progressive.reason)} target_stage=${Number(progressive.target_stage)} current_stage=${Number(row.progressive_stage ?? 0)}`;
+        const previousError = String(row.last_error ?? "");
+        try {
+          await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
+            .bind(watchdogError,Date.now(),row.id).run();
+          row.last_error = watchdogError;
+        } catch {}
+        if (previousError !== watchdogError) {
+          await sendTelegram(env,[
+            `🚨 <b>LIFECYCLE STUCK</b>`,
+            ``,
+            `🪙 <b>${escapeTelegramHtml(coin)}</b> · ${escapeTelegramHtml(side)}`,
+            `🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`,
+            `🔒 Current stage: ${Number(row.progressive_stage ?? 0)}`,
+            `🎯 Expected stage: ${Number(progressive.target_stage)}`,
+            `🚫 Reason: ${escapeTelegramHtml(progressive.reason)}`,
+            ``,
+            `🕐 ${new Date().toISOString()}`
+          ].join("\n"));
+        }
       }
     }
 
