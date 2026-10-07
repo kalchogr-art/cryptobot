@@ -1178,7 +1178,7 @@ async function advanceProgressiveProtection(
       } catch {}
     }
   }
-  // V2.16.5 SELF-HEALING: never derive the deserved Progressive stage only
+  // V2.16.6 SELF-HEALING + READ-ONLY DIAGNOSTIC: never derive the deserved Progressive stage only
   // from the current tick.  A position may already have reached a higher ROI
   // before a missed lifecycle run.  Preserve the highest evidence we have:
   // D1 MFE, the 3-minute observed ROI, and the current live ROI.
@@ -1577,6 +1577,61 @@ async function applyThreeMinuteScalpProtection(
   row.three_min_decision_at=decidedAt; row.three_min_action=action; row.three_min_roi_pct=roi; row.three_min_stop_pct=stopPct; row.three_min_stop_price=stopPx; row.progressive_stop_oid=newOid; row.progressive_stop_price=stopPx;
   await sendTelegram(env,[`🛡 <b>3M SCALP PROTECTION</b>`,``,`🪙 <b>${escapeTelegramHtml(coin)}</b> · ${side}`,`⏱ ${Math.round((decidedAt-filledAt)/1000)}s from fill`,`📊 ROI: ${roi>=0?"+":""}${roi.toFixed(3)}%`,`🎯 Action: ${action==="BEST_EXIT"?"BEST EXIT · BE":"0.20% TP · LOCK +0.20%"}`,`🛡 Stop: ${stopWire}`,`🆔 Crossing: ${escapeTelegramHtml(row.crossing_id)}`].join("\n"));
   return {handled:true,closed:false,action,roi_pct:roundTo(roi,4),stop_pct:stopPct,stop_price:stopPx};
+}
+
+
+
+// V2.16.6 READ-ONLY lifecycle diagnostic.
+// Does NOT place/cancel orders. It shows whether BTC1M PROTECTED rows are
+// selected, whether the private key gate is valid, whether Hyperliquid still
+// has the position, and which Progressive stage is deserved from live/D1 peak.
+export async function getHyperliquidLifecycleDiagnostic(env?: HyperliquidExecutionEnv): Promise<any> {
+  if (!env?.DB) return { success:false, reason:"D1_NOT_BOUND" };
+  await ensureExecutionLedger(env.DB);
+  const secretRaw=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  const secretOk=privateKeyFormatOk(secretRaw);
+  const q:any=await env.DB.prepare(`
+    SELECT * FROM hyperliquid_execution_ledger
+    WHERE status='PROTECTED' AND strategy_version='BTC1M_DIRECTIONAL_V1'
+    ORDER BY id DESC LIMIT 30
+  `).all();
+  const rows=Array.isArray(q?.results)?q.results:[];
+  let raw:any=null;
+  try { raw=await postInfo({type:"metaAndAssetCtxs"}); } catch {}
+  const universe=Array.isArray(raw?.[0]?.universe)?raw[0].universe:[];
+  const contexts=Array.isArray(raw?.[1])?raw[1]:[];
+  const items:any[]=[];
+  for(const row of rows){
+    const coin=String(row.coin??"").toUpperCase();
+    const side=String(row.side??"").toUpperCase();
+    const entry=Number(row.entry_fill_price);
+    let position:any=null, positionError:string|null=null;
+    try { position=await getOpenPositionForCoin(coin); } catch(e:any){ positionError=e?.message??String(e); }
+    const ai=universe.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin);
+    const market=ai>=0?Number(contexts?.[ai]?.midPx??contexts?.[ai]?.markPx):NaN;
+    const liveRoi=Number.isFinite(entry)&&entry>0&&Number.isFinite(market)?directionalReturnPct(side,entry,market):NaN;
+    const mfe=Number(row.max_favorable_return_pct);
+    const r3=Number(row.three_min_roi_pct);
+    const peaks=[liveRoi,mfe,r3].filter(Number.isFinite);
+    const effectivePeak=peaks.length?Math.max(...peaks):NaN;
+    const target=Number.isFinite(effectivePeak)?reachedProgressiveStep(side,effectivePeak):null;
+    items.push({
+      id:row.id,crossing_id:row.crossing_id,coin,side,status:row.status,
+      strategy_version:row.strategy_version,setup_name:row.setup_name,
+      selected_by_lifecycle:true,secret_ok:secretOk,
+      position_found:Boolean(position),position_error:positionError,
+      entry_price:Number.isFinite(entry)?entry:null,market_price:Number.isFinite(market)?market:null,
+      live_roi_pct:Number.isFinite(liveRoi)?roundTo(liveRoi,6):null,
+      stored_mfe_pct:Number.isFinite(mfe)?mfe:null,
+      three_min_roi_pct:Number.isFinite(r3)?r3:null,
+      effective_peak_pct:Number.isFinite(effectivePeak)?roundTo(effectivePeak,6):null,
+      current_stage:Number(row.progressive_stage??0),current_stop_pct:row.progressive_stop_pct??null,
+      expected_stage:target?.stage??0,expected_stop_pct:target?.stop??null,
+      needs_progressive_advance:Boolean(target&&target.stage>Number(row.progressive_stage??0)),
+      progressive_updated_at:row.progressive_updated_at??null,updated_at:row.updated_at??null,last_error:row.last_error??null
+    });
+  }
+  return {success:true,module:"HYPERLIQUID_LIFECYCLE_DIAGNOSTIC_READ_ONLY",exchange_request_sent:false,secret_ok:secretOk,selected_rows:items.length,items};
 }
 
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
