@@ -8,7 +8,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
-// HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX re
 // V2.17.0: BTC3M LIVE strategy metadata support; BTC1M + BTC3M share the proven Progressive + 3M fallback lifecycle.
 // V2.16.9: LIFECYCLE HEALTH WATCHDOG — alerts/persists Progressive failures without changing strategy.
 // V2.16.3: BTC1M DIRECTIONAL SYNC — strategy metadata/lifecycle synced to Index V1.11.44; FAST D1 + latency audit preserved.
