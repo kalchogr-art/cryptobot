@@ -1634,13 +1634,23 @@ export async function getHyperliquidLifecycleDiagnostic(env?: HyperliquidExecuti
   return {success:true,module:"HYPERLIQUID_LIFECYCLE_DIAGNOSTIC_READ_ONLY",exchange_request_sent:false,secret_ok:secretOk,selected_rows:items.length,items};
 }
 
+// V2.16.7: prioritize current BTC1M protected positions in the lifecycle batch.
+// The previous ORDER BY id ASC LIMIT 100 could permanently starve newer BTC1M rows
+// when more than 100 legacy active-status ledger rows existed.
 export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExecutionEnv): Promise<any> {
   if (!env?.DB) return { success: false, reason: "D1_NOT_BOUND" };
   await ensureExecutionLedger(env.DB);
   const rows: any = await env.DB.prepare(`
     SELECT * FROM hyperliquid_execution_ledger
     WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
-    ORDER BY id ASC LIMIT 100
+    ORDER BY
+      CASE
+        WHEN strategy_version='BTC1M_DIRECTIONAL_V1' AND status='PROTECTED' THEN 0
+        WHEN strategy_version='BTC1M_DIRECTIONAL_V1' THEN 1
+        ELSE 2
+      END ASC,
+      id DESC
+    LIMIT 100
   `).all();
   const items = Array.isArray(rows?.results) ? rows.results : [];
   const secretRaw = normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
