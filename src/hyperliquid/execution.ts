@@ -393,7 +393,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.16.0 MOVE BTC + 3M SCALP PROTECTION + PROGRESSIVE",
+    version: "V2.16.4 PROGRESSIVE FIRST + 3M FALLBACK",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -1307,7 +1307,7 @@ async function advanceProgressiveProtection(
         progressive_stop_oid=?, progressive_updated_at=?, lock_trigger_pct=?,
         lock_requested_at=?, lock_confirmed_at=?, lock_latency_ms=?,
         tp25_triggered_at=COALESCE(tp25_triggered_at, CASE WHEN ?=1 THEN ? ELSE NULL END),
-        updated_at=?
+        runner_active=1, runner_size=?, last_error=NULL, updated_at=?
     WHERE id=?
   `).bind(
     target.stage,
@@ -1321,6 +1321,7 @@ async function advanceProgressiveProtection(
     Math.max(0, lockConfirmedAt - lockRequestedAt),
     target.stage,
     lockConfirmedAt,
+    Math.abs(szi),
     lockConfirmedAt,
     row.id
   ).run();
@@ -1433,8 +1434,9 @@ async function applyThreeMinuteScalpProtection(
   const roi = directionalReturnPct(side, entryPrice, marketPrice);
   if (!Number.isFinite(roi)) return { handled:false, reason:"3M_ROI_INVALID" };
 
-  // Price is already in the Progressive zone. Mark the one-shot decision and let
-  // advanceProgressiveProtection() below install the normal +0.20% floor.
+  // Safety fallback only: Progressive is called BEFORE this function. If ROI is
+  // already >= +0.25% but the lock was not confirmed, never apply a weaker 3m
+  // action; mark the state and let Progressive retry on subsequent lifecycle ticks.
   if (roi + 1e-12 >= CONFIG.THREE_MIN_LOCK20_MAX_PCT) {
     await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
       SET three_min_decision_at=?, three_min_action='PROGRESSIVE_ZONE', three_min_roi_pct=?, three_min_market_price=?, three_min_last_error=NULL, updated_at=?
@@ -1649,13 +1651,39 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
       continue;
     }
 
-    // V2.16.0 — one-shot LIVE 3-minute scalp protection.
-    // Uses the current Hyperliquid mid/mark on the first lifecycle tick at/after 180s.
-    // Historical market_snapshots are NOT used for live decisions.
+    // V2.16.4 — BTC1M protection priority:
+    // 1) Progressive Profit Lock ALWAYS gets first chance on every lifecycle tick.
+    //    The instant live ROI reaches +0.25%, it installs the highest floor already
+    //    earned (+0.20%, +0.30%, +0.40% ...), with no 3-minute dependency.
+    // 2) The 3-minute module is only a fallback for positions that have NOT reached
+    //    +0.25%. If Progressive is active, applyThreeMinuteScalpProtection() records
+    //    PROGRESSIVE_ALREADY_ACTIVE and never downgrades/replaces the profit lock.
+    let progressive: any = null;
+    if (secretOk && String(row.status) === "PROTECTED" && String(row.strategy_version ?? "") === "BTC1M_DIRECTIONAL_V1") {
+      try {
+        progressive = await advanceProgressiveProtection(
+          env,
+          row,
+          position,
+          secretRaw as `0x${string}`
+        );
+        if (progressive?.advanced) {
+          row.progressive_stage = progressive.stage;
+          row.progressive_stop_pct = progressive.protected_gross_pct;
+          row.progressive_stop_price = Number(progressive.stop_price);
+          row.tp25_triggered_at = row.tp25_triggered_at || Date.now();
+        }
+      } catch (e:any) {
+        progressive = { advanced:false, reason:"PROGRESSIVE_EXCEPTION", error:e?.message ?? String(e) };
+      }
+    }
+
+    // One-shot LIVE 3-minute fallback protection. It runs AFTER Progressive.
+    // Uses current Hyperliquid mid/mark; historical market_snapshots are not used.
     if (secretOk && String(row.strategy_version ?? "") === "BTC1M_DIRECTIONAL_V1") {
       try {
         const threeMin = await applyThreeMinuteScalpProtection(env,row,position,secretRaw as `0x${string}`);
-        if (threeMin?.closed) { out.push({coin,status:"THREE_MIN_FORCED_SL",three_min:threeMin}); continue; }
+        if (threeMin?.closed) { out.push({coin,status:"THREE_MIN_FORCED_SL",three_min:threeMin,progressive}); continue; }
       } catch (e:any) {
         try { await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET three_min_last_error=?,updated_at=? WHERE id=?`).bind(e?.message??String(e),Date.now(),row.id).run(); } catch {}
       }
@@ -1751,21 +1779,6 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
         const rawCtx=await postInfo({type:"metaAndAssetCtxs"}); const uni=Array.isArray(rawCtx?.[0]?.universe)?rawCtx[0].universe:[]; const ctxs=Array.isArray(rawCtx?.[1])?rawCtx[1]:[]; const ai=uni.findIndex((x:any)=>String(x?.name??"").toUpperCase()===coin); const mp=Number(ctxs?.[ai]?.midPx??ctxs?.[ai]?.markPx); const rr=directionalReturnPct(side,entryPrice,mp);
         if(Number.isFinite(rr)) await env.DB.prepare(`UPDATE hyperliquid_execution_ledger SET runner_max_return_pct=MAX(COALESCE(runner_max_return_pct,0),?),runner_size=?,runner_active=1 WHERE id=?`).bind(rr,liveSzi,row.id).run();
       } catch {}
-    }
-
-    // V2.10: progressive engine continues beyond final TP through runner stages.
-    let progressive: any = null;
-    if (secretOk && String(row.status) === "PROTECTED" && String(row.strategy_version ?? "") === "BTC1M_DIRECTIONAL_V1") {
-      try {
-        progressive = await advanceProgressiveProtection(
-          env,
-          row,
-          position,
-          secretRaw as `0x${string}`
-        );
-      } catch (e:any) {
-        progressive = { advanced:false, reason:"PROGRESSIVE_EXCEPTION", error:e?.message ?? String(e) };
-      }
     }
 
     if (true) {
