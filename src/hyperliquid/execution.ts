@@ -393,7 +393,7 @@ export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   return {
     success: true,
     read_only: true,
-    version: "V2.16.4 PROGRESSIVE FIRST + 3M FALLBACK",
+    version: "V2.16.5 PROGRESSIVE SELF-HEALING + 3M FALLBACK",
     account: MASTER_ACCOUNT,
     wire_fix: {
       fixed: true,
@@ -1178,15 +1178,35 @@ async function advanceProgressiveProtection(
       } catch {}
     }
   }
-  let target = reachedProgressiveStep(side, dirReturn);
-  const currentStage = Math.max(0, Number(row.progressive_stage ?? 0) || 0);
+  // V2.16.5 SELF-HEALING: never derive the deserved Progressive stage only
+  // from the current tick.  A position may already have reached a higher ROI
+  // before a missed lifecycle run.  Preserve the highest evidence we have:
+  // D1 MFE, the 3-minute observed ROI, and the current live ROI.
+  const oldMfe = Number(row.max_favorable_return_pct);
+  const threeMinObserved = Number(row.three_min_roi_pct);
+  const peakCandidates = [dirReturn];
+  if (Number.isFinite(oldMfe)) peakCandidates.push(oldMfe);
+  if (Number.isFinite(threeMinObserved)) peakCandidates.push(threeMinObserved);
+  const effectivePeak = Math.max(...peakCandidates.filter(Number.isFinite));
 
+  if (!Number.isFinite(oldMfe) || effectivePeak > oldMfe) {
+    try {
+      await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger
+        SET max_favorable_return_pct=?, max_favorable_price=COALESCE(max_favorable_price, ?), updated_at=? WHERE id=?`)
+        .bind(roundTo(effectivePeak,6), marketPrice, nowObserved, row.id).run();
+      row.max_favorable_return_pct = effectivePeak;
+    } catch {}
+  }
+
+  let target = reachedProgressiveStep(side, effectivePeak);
+  const currentStage = Math.max(0, Number(row.progressive_stage ?? 0) || 0);
 
   if (!target || target.stage <= currentStage) {
     return {
       advanced: false,
       stage: currentStage,
       directional_return_pct: Number.isFinite(dirReturn) ? roundTo(dirReturn, 4) : null,
+      effective_peak_pct: Number.isFinite(effectivePeak) ? roundTo(effectivePeak, 4) : null,
       market_price: marketPrice,
     };
   }
@@ -1236,6 +1256,32 @@ async function advanceProgressiveProtection(
   // unprotected gap. A price-based fallback is used only for legacy rows that
   // predate exact OID tracking.
   const newStopOid = responseOrderOid(addStatus);
+
+  // V2.16.5 SELF-HEALING VERIFY: an exchange "ok" response is not enough.
+  // Before cancelling the previous protection, confirm that the newly-created
+  // reduce-only SL is actually visible among Hyperliquid open orders.
+  // If it is not visible, KEEP the old SL and retry on the next lifecycle tick.
+  if (newStopOid == null) {
+    try {
+      await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
+        .bind(`PROGRESSIVE_NEW_STOP_OID_MISSING stage=${target.stage} stop=${target.stop}`,Date.now(),row.id).run();
+    } catch {}
+    return { advanced:false, reason:"PROGRESSIVE_NEW_STOP_OID_MISSING", target_stage:target.stage, target_stop_pct:target.stop, effective_peak_pct:roundTo(effectivePeak,4) };
+  }
+
+  let newStopVisible = false;
+  try {
+    const verifyOpen = await getOpenOrdersForCoin(coin);
+    newStopVisible = verifyOpen.some((o:any) => Number(o?.oid) === Number(newStopOid));
+  } catch {}
+  if (!newStopVisible) {
+    try {
+      await env.DB?.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
+        .bind(`PROGRESSIVE_NEW_STOP_NOT_VISIBLE oid=${newStopOid} stage=${target.stage} stop=${target.stop}`,Date.now(),row.id).run();
+    } catch {}
+    return { advanced:false, reason:"PROGRESSIVE_NEW_STOP_NOT_VISIBLE", new_stop_oid:newStopOid, target_stage:target.stage, target_stop_pct:target.stop, effective_peak_pct:roundTo(effectivePeak,4) };
+  }
+
   let cancelledOids: number[] = [];
   let oldStopOid: number | null = null;
   let cancelMode = "NONE";
@@ -1334,6 +1380,8 @@ async function advanceProgressiveProtection(
     stop_price: stopWire,
     active_stop_oid: newStopOid,
     directional_return_pct: roundTo(dirReturn, 4),
+    effective_peak_pct: roundTo(effectivePeak, 4),
+    verified_on_exchange: true,
     market_price: marketPrice,
     old_stop_cancel_mode: cancelMode,
     cancelled_old_stop_oids: cancelledOids,
