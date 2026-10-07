@@ -1140,9 +1140,13 @@ async function advanceProgressiveProtection(
     return { advanced: false, reason: "INVALID_ENTRY" };
   }
 
+  // V2.16.8 CRITICAL FIX: advanceProgressiveProtection() runs from the lifecycle
+  // monitor, outside the entry function where latencyAudit is declared.
+  // Referencing latencyAudit here threw ReferenceError on every Progressive attempt,
+  // before MFE/stage/SL updates could execute. Keep timing local to this function.
   const latencyMetaStartedAt = Date.now();
   const raw = await postInfo({ type: "metaAndAssetCtxs" });
-  latencyAudit.meta_ms = Date.now() - latencyMetaStartedAt;
+  const progressiveMetaMs = Date.now() - latencyMetaStartedAt;
   const universe = Array.isArray(raw?.[0]?.universe) ? raw[0].universe : [];
   const contexts = Array.isArray(raw?.[1]) ? raw[1] : [];
   const asset = universe.findIndex((x:any) => String(x?.name ?? "").toUpperCase() === coin);
@@ -1382,6 +1386,7 @@ async function advanceProgressiveProtection(
     directional_return_pct: roundTo(dirReturn, 4),
     effective_peak_pct: roundTo(effectivePeak, 4),
     verified_on_exchange: true,
+    meta_ms: progressiveMetaMs,
     market_price: marketPrice,
     old_stop_cancel_mode: cancelMode,
     cancelled_old_stop_oids: cancelledOids,
