@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// V2.17.0: BTC3M LIVE strategy metadata support; BTC1M + BTC3M share the proven Progressive + 3M fallback lifecycle.
 // V2.16.9: LIFECYCLE HEALTH WATCHDOG — alerts/persists Progressive failures without changing strategy.
 // V2.16.3: BTC1M DIRECTIONAL SYNC — strategy metadata/lifecycle synced to Index V1.11.44; FAST D1 + latency audit preserved.
 // V2.16.2: FAST D1 CLAIM — duplicate guard remains atomic; schema migration removed from hot entry path.
@@ -126,6 +127,7 @@ export type HyperliquidExecutionSignal = {
   episode_id?: number | string | null;
   crossing_ts?: number | null;
   setup_name?: "A" | "B1" | "B2" | "B3" | string | null;
+  strategy_version?: string | null;
 
   // READ_ONLY_STATUS is used by /hyperliquid-execution and is permanently
   // forbidden from sending live exchange actions even if LIVE_TRADING=true.
@@ -900,7 +902,7 @@ async function claimExecutionOnce(
       INSERT OR IGNORE INTO hyperliquid_execution_ledger (
         crossing_id, episode_id, coin, side, crossing_ts,
         status, claimed_at, updated_at, strategy_version, setup_name
-      ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, 'BTC1M_DIRECTIONAL_V1', ?)
+      ) VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?, ?, ?)
     `).bind(
       crossingId,
       episodeId,
@@ -909,6 +911,7 @@ async function claimExecutionOnce(
       crossingTs,
       now,
       now,
+      String(signal.strategy_version ?? 'BTC1M_DIRECTIONAL_V1'),
       String(signal.setup_name ?? '') || null
     ).run();
   } catch (e: any) {
@@ -1598,7 +1601,7 @@ export async function getHyperliquidLifecycleDiagnostic(env?: HyperliquidExecuti
   const secretOk=privateKeyFormatOk(secretRaw);
   const q:any=await env.DB.prepare(`
     SELECT * FROM hyperliquid_execution_ledger
-    WHERE status='PROTECTED' AND strategy_version='BTC1M_DIRECTIONAL_V1'
+    WHERE status='PROTECTED' AND strategy_version IN ('BTC1M_DIRECTIONAL_V1','BTC3M_DIRECTIONAL_V1')
     ORDER BY id DESC LIMIT 30
   `).all();
   const rows=Array.isArray(q?.results)?q.results:[];
@@ -1651,8 +1654,8 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     WHERE status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
     ORDER BY
       CASE
-        WHEN strategy_version='BTC1M_DIRECTIONAL_V1' AND status='PROTECTED' THEN 0
-        WHEN strategy_version='BTC1M_DIRECTIONAL_V1' THEN 1
+        WHEN strategy_version IN ('BTC1M_DIRECTIONAL_V1','BTC3M_DIRECTIONAL_V1') AND status='PROTECTED' THEN 0
+        WHEN strategy_version IN ('BTC1M_DIRECTIONAL_V1','BTC3M_DIRECTIONAL_V1') THEN 1
         ELSE 2
       END ASC,
       id DESC
@@ -1778,7 +1781,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     //    +0.25%. If Progressive is active, applyThreeMinuteScalpProtection() records
     //    PROGRESSIVE_ALREADY_ACTIVE and never downgrades/replaces the profit lock.
     let progressive: any = null;
-    if (secretOk && String(row.status) === "PROTECTED" && String(row.strategy_version ?? "") === "BTC1M_DIRECTIONAL_V1") {
+    if (secretOk && String(row.status) === "PROTECTED" && ["BTC1M_DIRECTIONAL_V1","BTC3M_DIRECTIONAL_V1"].includes(String(row.strategy_version ?? ""))) {
       try {
         progressive = await advanceProgressiveProtection(
           env,
@@ -1849,7 +1852,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
 
     // One-shot LIVE 3-minute fallback protection. It runs AFTER Progressive.
     // Uses current Hyperliquid mid/mark; historical market_snapshots are not used.
-    if (secretOk && String(row.strategy_version ?? "") === "BTC1M_DIRECTIONAL_V1") {
+    if (secretOk && ["BTC1M_DIRECTIONAL_V1","BTC3M_DIRECTIONAL_V1"].includes(String(row.strategy_version ?? ""))) {
       try {
         const threeMin = await applyThreeMinuteScalpProtection(env,row,position,secretRaw as `0x${string}`);
         if (threeMin?.closed) { out.push({coin,status:"THREE_MIN_FORCED_SL",three_min:threeMin,progressive}); continue; }
@@ -1869,7 +1872,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
     // this perfectly valid fill. Detect the actual position reduction instead;
     // the fill lookup below confirms the close and supplies its exact size/price.
     if (
-      String(row.strategy_version ?? "") !== "BTC1M_DIRECTIONAL_V1" &&
+      !["BTC1M_DIRECTIONAL_V1","BTC3M_DIRECTIONAL_V1"].includes(String(row.strategy_version ?? "")) &&
       !Number(row.partial_tp_filled_at) &&
       Number.isFinite(liveSzi) && liveSzi > 0 &&
       Number.isFinite(reducedSize) && reducedSize > 0 &&
@@ -2329,7 +2332,7 @@ export async function buildHyperliquidExecutionCandidate(
       leverage_update_required: !leverageAlreadyCorrect,
       position_usd_target: positionUsdTarget,
       entry_mode: "MARKETABLE_IOC_MOVE_BTC_LOOKBACK",
-      strategy_version: "BTC1M_DIRECTIONAL_V1",
+      strategy_version: String(signal.strategy_version ?? "BTC1M_DIRECTIONAL_V1"),
       setup_name: signal.setup_name ?? null,
       entry_price_source: "CURRENT_HYPERLIQUID_MID_FALLBACK_MARK",
       market_reference_price: marketReferenceWire,
