@@ -1112,31 +1112,43 @@ async function createV06Forward(env:Env):Promise<number>{
   return n;
 }
 
+// D1 indexed, bounded first-touch resolution. Exactly one price-window scan per pending row.
 async function resolveV06Forward(env:Env):Promise<number>{
   const now=Date.now();
   const r:any=await env.DB.prepare(`
-    UPDATE ml_raw_v06_forward SET
-      first_up_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)),
-      first_down_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)),
-      actual_class=CASE
-        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL
-         AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'NONE'
-        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG'
-        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT'
-        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) <
-             (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) THEN 'LONG'
-        ELSE 'SHORT' END,
-      correct=CASE
-        WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL
-         AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN NULL
-        WHEN predicted_side = CASE
-          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG'
-          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT'
-          WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price>=ml_raw_v06_forward.entry_price*(1+${V06_TOUCH_PCT}/100.0)) <
-               (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v06_forward.coin AND s.ts>ml_raw_v06_forward.snapshot_ts AND s.ts<=ml_raw_v06_forward.snapshot_ts+${V06_WINDOW_MS} AND s.price<=ml_raw_v06_forward.entry_price*(1-${V06_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END THEN 1 ELSE 0 END,
-      outcome_ready=1,resolved_at=CURRENT_TIMESTAMP
-    WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V06_WINDOW_MS}
-  `).bind(V06_MODEL_KEY,now).run();
+    WITH pending AS MATERIALIZED (
+      SELECT id, coin, snapshot_ts, entry_price, predicted_side
+      FROM ml_raw_v06_forward
+      WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V06_WINDOW_MS}
+      ORDER BY snapshot_ts ASC LIMIT 500
+    ), hits AS MATERIALIZED (
+      SELECT p.id,
+        MIN(CASE WHEN s.price>=p.entry_price*(1+${V06_TOUCH_PCT}/100.0) THEN s.ts END) AS up_ts,
+        MIN(CASE WHEN s.price<=p.entry_price*(1-${V06_TOUCH_PCT}/100.0) THEN s.ts END) AS down_ts
+      FROM pending p
+      LEFT JOIN market_snapshots s
+        ON s.coin=p.coin AND s.ts>p.snapshot_ts AND s.ts<=p.snapshot_ts+${V06_WINDOW_MS}
+      GROUP BY p.id
+    ), classified AS MATERIALIZED (
+      SELECT p.id, h.up_ts, h.down_ts, p.predicted_side,
+        CASE
+          WHEN h.up_ts IS NULL AND h.down_ts IS NULL THEN 'NONE'
+          WHEN h.down_ts IS NULL THEN 'LONG'
+          WHEN h.up_ts IS NULL THEN 'SHORT'
+          WHEN h.up_ts<h.down_ts THEN 'LONG'
+          ELSE 'SHORT'
+        END AS actual_side
+      FROM pending p JOIN hits h ON h.id=p.id
+    )
+    UPDATE ml_raw_v06_forward AS f SET
+      first_up_ts=c.up_ts, first_down_ts=c.down_ts,
+      actual_class=c.actual_side,
+      correct=CASE WHEN c.actual_side='NONE' THEN NULL
+                   WHEN c.predicted_side=c.actual_side THEN 1 ELSE 0 END,
+      outcome_ready=1, resolved_at=CURRENT_TIMESTAMP
+    FROM classified c
+    WHERE f.id=c.id AND f.model_key=? AND f.outcome_ready=0
+  `).bind(V06_MODEL_KEY,now,V06_MODEL_KEY).run();
   return Math.max(0,Math.trunc(num(r?.meta?.changes)));
 }
 
@@ -1314,14 +1326,44 @@ async function createV07Forward(env:Env):Promise<number>{
   return n;
 }
 
+// D1 indexed, bounded first-touch resolution. Exactly one price-window scan per pending row.
 async function resolveV07Forward(env:Env):Promise<number>{
-  const now=Date.now(); const r:any=await env.DB.prepare(`UPDATE ml_raw_v07_forward SET
-    first_up_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)),
-    first_down_ts=(SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)),
-    actual_class=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'NONE' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) < (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END,
-    correct=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL AND (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN NULL WHEN predicted_side=CASE WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'LONG' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) IS NULL THEN 'SHORT' WHEN (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price>=ml_raw_v07_forward.entry_price*(1+${V07_TOUCH_PCT}/100.0)) < (SELECT MIN(s.ts) FROM market_snapshots s WHERE s.coin=ml_raw_v07_forward.coin AND s.ts>ml_raw_v07_forward.snapshot_ts AND s.ts<=ml_raw_v07_forward.snapshot_ts+${V07_WINDOW_MS} AND s.price<=ml_raw_v07_forward.entry_price*(1-${V07_TOUCH_PCT}/100.0)) THEN 'LONG' ELSE 'SHORT' END THEN 1 ELSE 0 END,
-    outcome_ready=1,resolved_at=CURRENT_TIMESTAMP WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V07_WINDOW_MS}`)
-    .bind(V07_MODEL_KEY,now).run(); return Math.max(0,Math.trunc(num(r?.meta?.changes)));
+  const now=Date.now();
+  const r:any=await env.DB.prepare(`
+    WITH pending AS MATERIALIZED (
+      SELECT id, coin, snapshot_ts, entry_price, predicted_side
+      FROM ml_raw_v07_forward
+      WHERE model_key=? AND outcome_ready=0 AND snapshot_ts<=?-${V07_WINDOW_MS}
+      ORDER BY snapshot_ts ASC LIMIT 500
+    ), hits AS MATERIALIZED (
+      SELECT p.id,
+        MIN(CASE WHEN s.price>=p.entry_price*(1+${V07_TOUCH_PCT}/100.0) THEN s.ts END) AS up_ts,
+        MIN(CASE WHEN s.price<=p.entry_price*(1-${V07_TOUCH_PCT}/100.0) THEN s.ts END) AS down_ts
+      FROM pending p
+      LEFT JOIN market_snapshots s
+        ON s.coin=p.coin AND s.ts>p.snapshot_ts AND s.ts<=p.snapshot_ts+${V07_WINDOW_MS}
+      GROUP BY p.id
+    ), classified AS MATERIALIZED (
+      SELECT p.id, h.up_ts, h.down_ts, p.predicted_side,
+        CASE
+          WHEN h.up_ts IS NULL AND h.down_ts IS NULL THEN 'NONE'
+          WHEN h.down_ts IS NULL THEN 'LONG'
+          WHEN h.up_ts IS NULL THEN 'SHORT'
+          WHEN h.up_ts<h.down_ts THEN 'LONG'
+          ELSE 'SHORT'
+        END AS actual_side
+      FROM pending p JOIN hits h ON h.id=p.id
+    )
+    UPDATE ml_raw_v07_forward AS f SET
+      first_up_ts=c.up_ts, first_down_ts=c.down_ts,
+      actual_class=c.actual_side,
+      correct=CASE WHEN c.actual_side='NONE' THEN NULL
+                   WHEN c.predicted_side=c.actual_side THEN 1 ELSE 0 END,
+      outcome_ready=1, resolved_at=CURRENT_TIMESTAMP
+    FROM classified c
+    WHERE f.id=c.id AND f.model_key=? AND f.outcome_ready=0
+  `).bind(V07_MODEL_KEY,now,V07_MODEL_KEY).run();
+  return Math.max(0,Math.trunc(num(r?.meta?.changes)));
 }
 
 async function getV07Status(env:Env):Promise<any>{
