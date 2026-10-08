@@ -7,6 +7,7 @@
 // - Collect only the latest snapshot for each coin.
 // - One batch INSERT statement per run.
 // - Labels are filled in bounded indexed batches (5m/15m/30m).
+// - V0.7 forward coin discovery is limited to recently active coins.
 // - No per-row future-price SELECT loops.
 // - Existing ml_raw_dataset is preserved.
 //
@@ -94,6 +95,9 @@ async function ensureTables(env: Env): Promise<void> {
       WHERE label_${minutes}m_ready = 0`).run();
   }
 
+  // Efficient recent coin discovery for V0.7 forward (avoids full-history GROUP BY).
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts ON market_snapshots(ts DESC)`).run();
+
   // Helps the set-based future-price lookups.
   await env.DB.prepare(`
     CREATE INDEX IF NOT EXISTS idx_market_snapshots_coin_ts
@@ -158,8 +162,9 @@ async function collectLatestPerCoin(env: Env): Promise<number> {
 
 // Bounded backfill. Preserve the exact original future window and earliest
 // valid future snapshot semantics. A partial index skips already labeled rows.
-// The CTE materializes at most 300 resolved candidates, then updates by PK.
-const RAW_LABEL_BATCH = 300;
+// The CTE reads at most 300 pending candidates; only rows with a valid future price update.
+// NOTE: pending rows without a valid future snapshot remain pending, preserving labels.
+const RAW_LABEL_BATCH = 300; // bounded D1 work per horizon per run
 
 async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
   const offset = minutes * 60000;
@@ -174,13 +179,6 @@ async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
       FROM ml_raw_dataset r
       WHERE r.${ready} = 0
         AND r.snapshot_ts <= ? - ?
-        AND EXISTS (
-          SELECT 1 FROM market_snapshots s
-          WHERE s.coin = r.coin
-            AND s.ts >= r.snapshot_ts + ?
-            AND s.ts <= r.snapshot_ts + ?
-            AND s.price IS NOT NULL AND s.price > 0
-        )
       ORDER BY r.snapshot_ts ASC, r.id ASC
       LIMIT ${RAW_LABEL_BATCH}
     ),
@@ -203,7 +201,7 @@ async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
     WHERE ml_raw_dataset.id = resolved.id
       AND ml_raw_dataset.${ready} = 0
       AND resolved.exit_price IS NOT NULL
-  `).bind(Date.now(), offset, offset, upperOffset, offset, upperOffset).run();
+  `).bind(Date.now(), offset, offset, upperOffset).run();
   return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
@@ -1232,7 +1230,10 @@ async function trainV07Once(env:Env):Promise<any>{
 
 async function createV07Forward(env:Env):Promise<number>{
   const model=await getV07Model(env); if(!model)return 0;
-  const q:any=await env.DB.prepare(`SELECT s.*,
+  const q:any=await env.DB.prepare(`WITH recent_coins AS MATERIALIZED (
+      SELECT DISTINCT coin FROM market_snapshots WHERE ts >= ?
+    )
+    SELECT s.*,
     (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-60000 ORDER BY x.ts DESC LIMIT 1) price_1m_ago,
     (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) price_5m_ago,
     (SELECT x.price FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-900000 ORDER BY x.ts DESC LIMIT 1) price_15m_ago,
@@ -1241,9 +1242,13 @@ async function createV07Forward(env:Env):Promise<number>{
     (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-60000 ORDER BY x.ts DESC LIMIT 1) btc_price_1m_ago,
     (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) btc_price_5m_ago,
     (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-900000 ORDER BY x.ts DESC LIMIT 1) btc_price_15m_ago
-    FROM market_snapshots s INNER JOIN(SELECT coin,MAX(ts) max_ts FROM market_snapshots GROUP BY coin)z ON z.coin=s.coin AND z.max_ts=s.ts
+    FROM recent_coins rc
+    JOIN market_snapshots s ON s.id = (
+      SELECT m.id FROM market_snapshots m
+      WHERE m.coin=rc.coin ORDER BY m.ts DESC, m.id DESC LIMIT 1
+    )
     WHERE s.price>0 AND NOT EXISTS(SELECT 1 FROM ml_raw_v07_forward f WHERE f.model_key=? AND f.source_snapshot_id=s.id)`)
-    .bind(V07_MODEL_KEY).all();
+    .bind(Date.now()-15*60000,V07_MODEL_KEY).all();
   let n=0; for(const r of q?.results??[]){const x=v07Features(r),p=v07Probability(x,model.weights),side=p>=0.5?'LONG':'SHORT',conf=Math.max(p,1-p);
     const z:any=await env.DB.prepare(`INSERT OR IGNORE INTO ml_raw_v07_forward(model_key,source_snapshot_id,coin,snapshot_ts,snapshot_datetime,entry_price,probability_long,predicted_side,confidence,features_json) VALUES(?,?,?,?,?,?,?,?,?,?)`)
       .bind(V07_MODEL_KEY,r.id,r.coin,r.ts,r.datetime??null,r.price,p,side,conf,JSON.stringify(x)).run(); n+=Math.max(0,Math.trunc(num(z?.meta?.changes)));}
