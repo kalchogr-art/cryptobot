@@ -90,7 +90,7 @@ async function ensureTables(env: Env): Promise<void> {
 
   // One partial index per horizon: avoids scanning all completed labels.
   for (const minutes of [5, 15, 30]) {
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_pending_${minutes}m
+    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_${minutes}m_pending_ts
       ON ml_raw_dataset(snapshot_ts, id)
       WHERE label_${minutes}m_ready = 0`).run();
   }
@@ -171,12 +171,13 @@ async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
   const upperOffset = offset + 120000;
   // The horizon is an internal literal union, not user input.
   const ready = `label_${minutes}m_ready`;
+  const pendingIndex = `idx_ml_raw_${minutes}m_pending_ts`;
   const futurePrice = `price_${minutes}m`;
   const futureReturn = `return_${minutes}m_pct`;
   const result: any = await env.DB.prepare(`
     WITH candidates AS MATERIALIZED (
       SELECT r.id, r.coin, r.snapshot_ts, r.price
-      FROM ml_raw_dataset r
+      FROM ml_raw_dataset r INDEXED BY ${pendingIndex}
       WHERE r.${ready} = 0
         AND r.snapshot_ts <= ? - ?
       ORDER BY r.snapshot_ts ASC, r.id ASC
