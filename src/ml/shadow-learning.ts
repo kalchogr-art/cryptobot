@@ -190,6 +190,12 @@ async function ensureTables(env: Env): Promise<void> {
     `).run();
   } catch (_) {}
 
+  // Target the completed FAST65 training cohort without scanning unrelated crossings.
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_signal65_shadow_pending
+    ON signal_65_crossings (outcome_complete, first_barrier, crossing_ts, id)
+  `).run();
+
   await env.DB.prepare(`
     CREATE INDEX IF NOT EXISTS idx_ml_shadow_predictions_ts
     ON ml_shadow_predictions (crossing_ts DESC)
