@@ -1,3 +1,4 @@
+// V0.7.4 D1 LOW READ: indexed 15-minute active-coin discovery for dataset, frozen forward and V0.6. No model or LIVE changes.
 // ============================================================
 // CRYPTOBOT ML — RAW LEARNING V0.6 AI FIRST-TOUCH + V0.5 CONTROL
 // RESEARCH ONLY / NO TRADING / NO EFFECT ON LIVE SYSTEM
@@ -90,7 +91,7 @@ async function ensureTables(env: Env): Promise<void> {
 
   // One partial index per horizon: avoids scanning all completed labels.
   for (const minutes of [5, 15, 30]) {
-    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_${minutes}m_pending_ts
+    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_pending_${minutes}m
       ON ml_raw_dataset(snapshot_ts, id)
       WHERE label_${minutes}m_ready = 0`).run();
   }
@@ -136,14 +137,15 @@ async function collectLatestPerCoin(env: Env): Promise<number> {
       s.open_interest,
       s.funding,
       s.premium
-    FROM market_snapshots s
-    INNER JOIN (
-      SELECT coin, MAX(ts) AS max_ts
-      FROM market_snapshots
-      GROUP BY coin
-    ) latest
-      ON latest.coin = s.coin
-     AND latest.max_ts = s.ts
+    FROM (
+      SELECT DISTINCT coin FROM market_snapshots
+      WHERE ts >= ?
+    ) recent_coins
+    JOIN market_snapshots s ON s.id = (
+      SELECT m.id FROM market_snapshots m
+      WHERE m.coin = recent_coins.coin
+      ORDER BY m.ts DESC, m.id DESC LIMIT 1
+    )
     WHERE s.price IS NOT NULL
       AND s.price > 0
       AND NOT EXISTS (
@@ -151,7 +153,7 @@ async function collectLatestPerCoin(env: Env): Promise<number> {
         FROM ml_raw_dataset r
         WHERE r.source_snapshot_id = s.id
       )
-  `).run();
+  `).bind(Date.now() - 15 * 60000).run();
 
   return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
@@ -171,13 +173,12 @@ async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
   const upperOffset = offset + 120000;
   // The horizon is an internal literal union, not user input.
   const ready = `label_${minutes}m_ready`;
-  const pendingIndex = `idx_ml_raw_${minutes}m_pending_ts`;
   const futurePrice = `price_${minutes}m`;
   const futureReturn = `return_${minutes}m_pct`;
   const result: any = await env.DB.prepare(`
     WITH candidates AS MATERIALIZED (
       SELECT r.id, r.coin, r.snapshot_ts, r.price
-      FROM ml_raw_dataset r INDEXED BY ${pendingIndex}
+      FROM ml_raw_dataset r
       WHERE r.${ready} = 0
         AND r.snapshot_ts <= ? - ?
       ORDER BY r.snapshot_ts ASC, r.id ASC
@@ -552,14 +553,15 @@ async function createForwardPredictions(env: Env): Promise<number> {
       s.order_flow_signed,
       s.funding,
       s.premium
-    FROM market_snapshots s
-    INNER JOIN (
-      SELECT coin, MAX(ts) AS max_ts
-      FROM market_snapshots
-      GROUP BY coin
-    ) latest
-      ON latest.coin = s.coin
-     AND latest.max_ts = s.ts
+    FROM (
+      SELECT DISTINCT coin FROM market_snapshots
+      WHERE ts >= ?
+    ) recent_coins
+    JOIN market_snapshots s ON s.id = (
+      SELECT m.id FROM market_snapshots m
+      WHERE m.coin = recent_coins.coin
+      ORDER BY m.ts DESC, m.id DESC LIMIT 1
+    )
     WHERE s.price IS NOT NULL
       AND s.price > 0
       AND NOT EXISTS (
@@ -568,7 +570,7 @@ async function createForwardPredictions(env: Env): Promise<number> {
         WHERE p.model_key = ?
           AND p.source_snapshot_id = s.id
       )
-  `).bind(FORWARD_MODEL_KEY).all();
+  `).bind(Date.now() - 15 * 60000, FORWARD_MODEL_KEY).all();
 
   let inserted = 0;
 
@@ -1021,10 +1023,14 @@ async function createV06Forward(env:Env):Promise<number>{
       (SELECT x.open_interest FROM market_snapshots x WHERE x.coin=s.coin AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) oi_5m_ago,
       (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts ORDER BY x.ts DESC LIMIT 1) btc_price,
       (SELECT x.price FROM market_snapshots x WHERE x.coin='BTC' AND x.ts<=s.ts-300000 ORDER BY x.ts DESC LIMIT 1) btc_price_5m_ago
-    FROM market_snapshots s
-    INNER JOIN (SELECT coin,MAX(ts) max_ts FROM market_snapshots GROUP BY coin) z ON z.coin=s.coin AND z.max_ts=s.ts
+    FROM (SELECT DISTINCT coin FROM market_snapshots WHERE ts >= ?) recent_coins
+    JOIN market_snapshots s ON s.id = (
+      SELECT m.id FROM market_snapshots m
+      WHERE m.coin = recent_coins.coin
+      ORDER BY m.ts DESC, m.id DESC LIMIT 1
+    )
     WHERE s.price>0 AND NOT EXISTS(SELECT 1 FROM ml_raw_v06_forward f WHERE f.model_key=? AND f.source_snapshot_id=s.id)
-  `).bind(V06_MODEL_KEY).all();
+  `).bind(Date.now() - 15 * 60000, V06_MODEL_KEY).all();
   let n=0;
   for(const r of q?.results??[]){
     const x=v06Features(r), p=v06Probability(x,model.weights), side=p>=0.5?'LONG':'SHORT', conf=Math.max(p,1-p);
