@@ -6,7 +6,7 @@
 // - NO historical 500-row backfill loops.
 // - Collect only the latest snapshot for each coin.
 // - One batch INSERT statement per run.
-// - Labels are filled with 3 set-based UPDATE statements (5m/15m/30m).
+// - Labels are filled in bounded indexed batches (5m/15m/30m).
 // - No per-row future-price SELECT loops.
 // - Existing ml_raw_dataset is preserved.
 //
@@ -87,6 +87,13 @@ async function ensureTables(env: Env): Promise<void> {
     )
   `).run();
 
+  // One partial index per horizon: avoids scanning all completed labels.
+  for (const minutes of [5, 15, 30]) {
+    await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ml_raw_pending_${minutes}m
+      ON ml_raw_dataset(snapshot_ts, id)
+      WHERE label_${minutes}m_ready = 0`).run();
+  }
+
   // Helps the set-based future-price lookups.
   await env.DB.prepare(`
     CREATE INDEX IF NOT EXISTS idx_market_snapshots_coin_ts
@@ -149,143 +156,60 @@ async function collectLatestPerCoin(env: Env): Promise<number> {
 // LABELS — set based, no per-row loops
 // ============================================================
 
-async function fill5m(env: Env): Promise<number> {
-  const result: any = await env.DB.prepare(`
-    UPDATE ml_raw_dataset
-    SET
-      price_5m = (
-        SELECT s.price
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-        ORDER BY s.ts ASC
-        LIMIT 1
-      ),
-      return_5m_pct = (
-        (
-          SELECT s.price
-          FROM market_snapshots s
-          WHERE s.coin = ml_raw_dataset.coin
-            AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
-            AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
-            AND s.price IS NOT NULL
-            AND s.price > 0
-          ORDER BY s.ts ASC
-          LIMIT 1
-        ) / price - 1.0
-      ) * 100.0,
-      label_5m_ready = 1,
-      updated_at = CURRENT_TIMESTAMP
-    WHERE label_5m_ready = 0
-      AND snapshot_ts <= ? - 300000
-      AND EXISTS (
-        SELECT 1
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 300000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 420000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-      )
-  `).bind(Date.now()).run();
+// Bounded backfill. Preserve the exact original future window and earliest
+// valid future snapshot semantics. A partial index skips already labeled rows.
+// The CTE materializes at most 300 resolved candidates, then updates by PK.
+const RAW_LABEL_BATCH = 300;
 
+async function fillHorizon(env: Env, minutes: 5 | 15 | 30): Promise<number> {
+  const offset = minutes * 60000;
+  const upperOffset = offset + 120000;
+  // The horizon is an internal literal union, not user input.
+  const ready = `label_${minutes}m_ready`;
+  const futurePrice = `price_${minutes}m`;
+  const futureReturn = `return_${minutes}m_pct`;
+  const result: any = await env.DB.prepare(`
+    WITH candidates AS MATERIALIZED (
+      SELECT r.id, r.coin, r.snapshot_ts, r.price
+      FROM ml_raw_dataset r
+      WHERE r.${ready} = 0
+        AND r.snapshot_ts <= ? - ?
+        AND EXISTS (
+          SELECT 1 FROM market_snapshots s
+          WHERE s.coin = r.coin
+            AND s.ts >= r.snapshot_ts + ?
+            AND s.ts <= r.snapshot_ts + ?
+            AND s.price IS NOT NULL AND s.price > 0
+        )
+      ORDER BY r.snapshot_ts ASC, r.id ASC
+      LIMIT ${RAW_LABEL_BATCH}
+    ),
+    resolved AS MATERIALIZED (
+      SELECT c.id, c.price AS entry_price,
+        (SELECT s.price FROM market_snapshots s
+         WHERE s.coin = c.coin
+           AND s.ts >= c.snapshot_ts + ?
+           AND s.ts <= c.snapshot_ts + ?
+           AND s.price IS NOT NULL AND s.price > 0
+         ORDER BY s.ts ASC LIMIT 1) AS exit_price
+      FROM candidates c
+    )
+    UPDATE ml_raw_dataset
+    SET ${futurePrice} = resolved.exit_price,
+        ${futureReturn} = (resolved.exit_price / ml_raw_dataset.price - 1.0) * 100.0,
+        ${ready} = 1,
+        updated_at = CURRENT_TIMESTAMP
+    FROM resolved
+    WHERE ml_raw_dataset.id = resolved.id
+      AND ml_raw_dataset.${ready} = 0
+      AND resolved.exit_price IS NOT NULL
+  `).bind(Date.now(), offset, offset, upperOffset, offset, upperOffset).run();
   return Math.max(0, Math.trunc(num(result?.meta?.changes)));
 }
 
-async function fill15m(env: Env): Promise<number> {
-  const result: any = await env.DB.prepare(`
-    UPDATE ml_raw_dataset
-    SET
-      price_15m = (
-        SELECT s.price
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-        ORDER BY s.ts ASC
-        LIMIT 1
-      ),
-      return_15m_pct = (
-        (
-          SELECT s.price
-          FROM market_snapshots s
-          WHERE s.coin = ml_raw_dataset.coin
-            AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
-            AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
-            AND s.price IS NOT NULL
-            AND s.price > 0
-          ORDER BY s.ts ASC
-          LIMIT 1
-        ) / price - 1.0
-      ) * 100.0,
-      label_15m_ready = 1,
-      updated_at = CURRENT_TIMESTAMP
-    WHERE label_15m_ready = 0
-      AND snapshot_ts <= ? - 900000
-      AND EXISTS (
-        SELECT 1
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 900000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 1020000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-      )
-  `).bind(Date.now()).run();
-
-  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
-}
-
-async function fill30m(env: Env): Promise<number> {
-  const result: any = await env.DB.prepare(`
-    UPDATE ml_raw_dataset
-    SET
-      price_30m = (
-        SELECT s.price
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-        ORDER BY s.ts ASC
-        LIMIT 1
-      ),
-      return_30m_pct = (
-        (
-          SELECT s.price
-          FROM market_snapshots s
-          WHERE s.coin = ml_raw_dataset.coin
-            AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
-            AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
-            AND s.price IS NOT NULL
-            AND s.price > 0
-          ORDER BY s.ts ASC
-          LIMIT 1
-        ) / price - 1.0
-      ) * 100.0,
-      label_30m_ready = 1,
-      updated_at = CURRENT_TIMESTAMP
-    WHERE label_30m_ready = 0
-      AND snapshot_ts <= ? - 1800000
-      AND EXISTS (
-        SELECT 1
-        FROM market_snapshots s
-        WHERE s.coin = ml_raw_dataset.coin
-          AND s.ts >= ml_raw_dataset.snapshot_ts + 1800000
-          AND s.ts <= ml_raw_dataset.snapshot_ts + 1920000
-          AND s.price IS NOT NULL
-          AND s.price > 0
-      )
-  `).bind(Date.now()).run();
-
-  return Math.max(0, Math.trunc(num(result?.meta?.changes)));
-}
+async function fill5m(env: Env): Promise<number> { return fillHorizon(env, 5); }
+async function fill15m(env: Env): Promise<number> { return fillHorizon(env, 15); }
+async function fill30m(env: Env): Promise<number> { return fillHorizon(env, 30); }
 
 
 type RawWeights = {
