@@ -1,4 +1,5 @@
-import {COINS,fetchClosed,quality} from './ohlcv';
+import {COINS,quality} from './ohlcv';
+import {safeFetchClosed} from './stability';
 import {structure} from './market-structure';
 import {detectBreakout} from './patterns';
 import {decide} from './decision-engine';
@@ -26,7 +27,7 @@ function setup(c:Candle[],s:Structure){
 }
 async function analyzeCoin(coin:string){
   try{
-    const [h1,h4,d1]=await Promise.all([fetchClosed(coin,'1h'),fetchClosed(coin,'4h'),fetchClosed(coin,'1d')]);
+    const [h1,h4,d1]=await Promise.all([safeFetchClosed(coin,'1h'),safeFetchClosed(coin,'4h'),safeFetchClosed(coin,'1d')]);
     const sets=[h1,h4,d1],checks=sets.map(x=>{const {last3,...rest}=quality(x);return rest;});
     if(checks.some(x=>!x.ready))return {coin,status:'DATA_NOT_READY',quality:checks};
     const [s1,s4,sd]=sets.map(x=>structure(x.closed));
@@ -37,22 +38,23 @@ async function analyzeCoin(coin:string){
     const near=p1.nearBreakout||p4.nearBreakout;
     const status=candidate.status==='CANDIDATE'?'CANDIDATE':near?'NEAR_SIGNAL':'NO_SIGNAL';
     const blockers:string[]=[];
+    const candleIntegrity={h1CloseTime:p1.closeTime,h4CloseTime:p4.closeTime,identicalClose:p1.close===p4.close,needsVerification:p1.close===p4.close};
     if(!align1&&!align4)blockers.push('HIGHER_TIMEFRAME_MISMATCH');
     if(!p1.pattern&&!p4.pattern)blockers.push('NO_CONFIRMED_RANGE_BREAKOUT');
     if(p1.volumeRatio!==null&&p1.volumeRatio<1.2&&p4.volumeRatio!==null&&p4.volumeRatio<1.2)blockers.push('LOW_VOLUME_ON_BOTH_FRAMES');
-    return {coin,status,nearDiagnosticOnly:near&&candidate.status!=='CANDIDATE',mode:candidate.mode,side:candidate.side,quality:checks,trend:{'1h':s1.direction,'4h':s4.direction,'1d':sd.direction},setups:{'1h':p1,'4h':p4},blockers,candidate};
+    return {coin,status,nearDiagnosticOnly:near&&candidate.status!=='CANDIDATE',mode:candidate.mode,side:candidate.side,quality:checks,trend:{'1h':s1.direction,'4h':s4.direction,'1d':sd.direction},setups:{'1h':p1,'4h':p4},candleIntegrity,blockers,candidate};
   }catch(e){return {coin,status:'ERROR',error:e instanceof Error?e.message:String(e)};}
 }
 export async function scanMarket(){
   const started=Date.now();const results:Awaited<ReturnType<typeof analyzeCoin>>[]=[];
-  // Three coins concurrently (up to nine upstream candle requests). No D1 calls.
-  for(let i=0;i<COINS.length;i+=3){
-    const batch=await Promise.all(COINS.slice(i,i+3).map(coin=>analyzeCoin(coin)));
+  // Two coins concurrently (up to six upstream candle requests). No D1 calls.
+  for(let i=0;i<COINS.length;i+=2){
+    const batch=await Promise.all(COINS.slice(i,i+2).map(coin=>analyzeCoin(coin)));
     results.push(...batch);
   }
   const counts:Record<string,number>={};for(const r of results)counts[r.status]=(counts[r.status]||0)+1;
   const blockerCounts:Record<string,number>={};for(const r of results){if('blockers' in r && Array.isArray(r.blockers))for(const b of r.blockers)blockerCounts[b]=(blockerCounts[b]||0)+1;}
   const priority=(s:string)=>s==='CANDIDATE'?0:s==='NEAR_SIGNAL'?1:s==='NO_SIGNAL'?2:s==='DATA_NOT_READY'?3:4;
   results.sort((a,b)=>priority(a.status)-priority(b.status)||(('setups' in a && a.setups)?Math.min(a.setups['1h'].distanceToBreakoutATR??999,a.setups['4h'].distanceToBreakoutATR??999):999)-(('setups' in b && b.setups)?Math.min(b.setups['1h'].distanceToBreakoutATR??999,b.setups['4h'].distanceToBreakoutATR??999):999)||a.coin.localeCompare(b.coin));
-  return {success:true,module:'SWING_HUNTER_V1_2_MULTI_COIN_SCAN',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scan_time:new Date().toISOString(),duration_ms:Date.now()-started,coins_requested:COINS.length,counts,blockerCounts,notes:['NEAR_SIGNAL is diagnostic only, not an executable trade','No historical persistence or automatic scheduling','Up to 60 Hyperliquid candle requests per full scan'],results};
+  return {success:true,module:'SWING_HUNTER_V1_3_MULTI_COIN_SCAN',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scan_time:new Date().toISOString(),duration_ms:Date.now()-started,coins_requested:COINS.length,counts,blockerCounts,notes:['NEAR_SIGNAL is diagnostic only, not an executable trade','No historical persistence or automatic scheduling','Up to 60 unique candle requests; cache and 429 retry can reduce upstream calls'],results};
 }
