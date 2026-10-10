@@ -22,7 +22,7 @@ function setup(c:Candle[],s:Structure){
   if(s.direction==='NEUTRAL')reasons.push('TREND_NEUTRAL');
   const near=distanceAtr>=0&&distanceAtr<=0.5;
   if(near)reasons.push('NEAR_BREAKOUT_WITHIN_0_5_ATR');
-  return {trend:s.direction,close:round(s.close,6),atrPct:round(s.atrPct,3),support:round(s.support,6),resistance:round(s.resistance,6),volumeRatio:round(volumeRatio,3),preferredSide:preferred,distanceToBreakoutATR:round(distanceAtr,3),nearBreakout:near,pattern:breakout,reasons};
+  return {trend:s.direction,close:round(last.c,6),closeTime:new Date(last.t).toISOString(),atrPct:round(s.atrPct,3),support:round(s.support,6),resistance:round(s.resistance,6),volumeRatio:round(volumeRatio,3),preferredSide:preferred,distanceToBreakoutATR:round(distanceAtr,3),nearBreakout:near,pattern:breakout,reasons};
 }
 async function analyzeCoin(coin:string){
   try{
@@ -34,13 +34,13 @@ async function analyzeCoin(coin:string){
     const candidate=decide(coin,h1,h4,d1);
     const align1=p1.preferredSide===s4.direction&&p1.preferredSide===sd.direction;
     const align4=p4.preferredSide===sd.direction;
-    const near=(p1.nearBreakout&&align1)||(p4.nearBreakout&&align4);
+    const near=p1.nearBreakout||p4.nearBreakout;
     const status=candidate.status==='CANDIDATE'?'CANDIDATE':near?'NEAR_SIGNAL':'NO_SIGNAL';
     const blockers:string[]=[];
     if(!align1&&!align4)blockers.push('HIGHER_TIMEFRAME_MISMATCH');
     if(!p1.pattern&&!p4.pattern)blockers.push('NO_CONFIRMED_RANGE_BREAKOUT');
     if(p1.volumeRatio!==null&&p1.volumeRatio<1.2&&p4.volumeRatio!==null&&p4.volumeRatio<1.2)blockers.push('LOW_VOLUME_ON_BOTH_FRAMES');
-    return {coin,status,mode:candidate.mode,side:candidate.side,quality:checks,trend:{'1h':s1.direction,'4h':s4.direction,'1d':sd.direction},setups:{'1h':p1,'4h':p4},blockers,candidate};
+    return {coin,status,nearDiagnosticOnly:near&&candidate.status!=='CANDIDATE',mode:candidate.mode,side:candidate.side,quality:checks,trend:{'1h':s1.direction,'4h':s4.direction,'1d':sd.direction},setups:{'1h':p1,'4h':p4},blockers,candidate};
   }catch(e){return {coin,status:'ERROR',error:e instanceof Error?e.message:String(e)};}
 }
 export async function scanMarket(){
@@ -51,7 +51,8 @@ export async function scanMarket(){
     results.push(...batch);
   }
   const counts:Record<string,number>={};for(const r of results)counts[r.status]=(counts[r.status]||0)+1;
+  const blockerCounts:Record<string,number>={};for(const r of results){if('blockers' in r && Array.isArray(r.blockers))for(const b of r.blockers)blockerCounts[b]=(blockerCounts[b]||0)+1;}
   const priority=(s:string)=>s==='CANDIDATE'?0:s==='NEAR_SIGNAL'?1:s==='NO_SIGNAL'?2:s==='DATA_NOT_READY'?3:4;
-  results.sort((a,b)=>priority(a.status)-priority(b.status)||a.coin.localeCompare(b.coin));
-  return {success:true,module:'SWING_HUNTER_V1_1_MULTI_COIN_SCAN',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scan_time:new Date().toISOString(),duration_ms:Date.now()-started,coins_requested:COINS.length,counts,notes:['NEAR_SIGNAL is diagnostic only, not an executable trade','No historical persistence or automatic scheduling','Up to 60 Hyperliquid candle requests per full scan'],results};
+  results.sort((a,b)=>priority(a.status)-priority(b.status)||(('setups' in a && a.setups)?Math.min(a.setups['1h'].distanceToBreakoutATR??999,a.setups['4h'].distanceToBreakoutATR??999):999)-(('setups' in b && b.setups)?Math.min(b.setups['1h'].distanceToBreakoutATR??999,b.setups['4h'].distanceToBreakoutATR??999):999)||a.coin.localeCompare(b.coin));
+  return {success:true,module:'SWING_HUNTER_V1_2_MULTI_COIN_SCAN',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scan_time:new Date().toISOString(),duration_ms:Date.now()-started,coins_requested:COINS.length,counts,blockerCounts,notes:['NEAR_SIGNAL is diagnostic only, not an executable trade','No historical persistence or automatic scheduling','Up to 60 Hyperliquid candle requests per full scan'],results};
 }
