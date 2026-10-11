@@ -1,3 +1,4 @@
+import {chartLearningCoin,chartLearningMarket} from './chart-pattern-learning';
 import {fetchClosed,quality,COINS} from './ohlcv';
 import type {Interval} from './types';
 import {decide} from './decision-engine';
@@ -20,10 +21,11 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
   if(u.pathname==='/swing-hunter/intelligence')return new Response(intelligenceDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
   if(u.pathname==='/swing-hunter')return new Response(dashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
   if(u.pathname==='/api/swing'||u.pathname==='/api/swing/status')
-    return json({success:true,module:'SWING_HUNTER_V1_7',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scheduled:false,coins:COINS.length,routes:['/swing-hunter','/api/swing/status','/api/swing/ohlcv','/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow','/api/swing/dashboard','/api/swing/scan','/api/swing/replay','/api/swing/research','/api/swing/compare','/api/swing/health','/api/swing/outcomes','/api/swing/audit','/api/swing/unified','/api/swing/unified-market','/api/swing/catalog','/api/swing/intelligence','/api/swing/intelligence-market','/swing-hunter/intelligence']});
-  if(u.pathname==='/api/swing/dashboard')return json({success:true,module:'SWING_HUNTER_V1_7',mode:'READ_ONLY',dashboard:'/swing-hunter'});
+    return json({success:true,module:'SWING_HUNTER_V1_8',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scheduled:false,coins:COINS.length,routes:['/swing-hunter','/api/swing/status','/api/swing/ohlcv','/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow','/api/swing/dashboard','/api/swing/scan','/api/swing/replay','/api/swing/research','/api/swing/compare','/api/swing/health','/api/swing/outcomes','/api/swing/audit','/api/swing/unified','/api/swing/unified-market','/api/swing/catalog','/api/swing/intelligence','/api/swing/intelligence-market','/api/swing/chart-learning','/api/swing/chart-learning-market','/swing-hunter/intelligence']});
+  if(u.pathname==='/api/swing/dashboard')return json({success:true,module:'SWING_HUNTER_V1_8',mode:'READ_ONLY',dashboard:'/swing-hunter'});
   if(u.pathname==='/api/swing/health')return json(healthReport());
   if(u.pathname==='/api/swing/catalog')return json({success:true,module:'SWING_HUNTER_V1_6_PATTERN_CATALOG',patternIds:CATALOG_IDS,patternsCount:CATALOG_IDS.length,notes:['20 directional detectors, not every conceivable market pattern','Signals include triggerPatterns and supportingPatterns','Research-only']});
+  if(u.pathname==='/api/swing/chart-learning-market'){try{return json(await chartLearningMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2),(u.searchParams.get('interval')||'4h') as Interval));}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502);}}
   if(u.pathname==='/api/swing/intelligence-market'){try{return json(await intelligenceMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2)));}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502);}}
   if(u.pathname==='/api/swing/unified-market'){try{return json(await unifiedMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2)));}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502);}}
   if(u.pathname==='/api/swing/scan'){
@@ -32,6 +34,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
   const coin=(u.searchParams.get('coin')||'BTC').toUpperCase();
   if(!(COINS as readonly string[]).includes(coin))return json({success:false,error:'INVALID_COIN'},400);
   try {
+    if(u.pathname==='/api/swing/chart-learning')return json(await chartLearningCoin(coin,(u.searchParams.get('interval')||'4h') as Interval,Number(u.searchParams.get('limit')||30)));
     if(u.pathname==='/api/swing/intelligence')return json(await intelligenceCoin(coin));
     if(u.pathname==='/api/swing/unified')return json(await unifiedCoin(coin));
     if(u.pathname==='/api/swing/audit')return json(await auditCoin(coin));
