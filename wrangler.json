@@ -10,11 +10,16 @@
   },
 
   "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "cryptobot-db",
-      "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
-    }
+  {
+    "binding": "DB",
+    "database_name": "cryptobot-db",
+    "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+  },
+  {
+    "binding": "SWING_DB",
+    "database_name": "cryptobot-db",
+    "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+  }
   ],
 
   "durable_objects": {
