@@ -1,4 +1,5 @@
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
+import {swingMonitorDashboard} from './swing-monitor-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
 import {entryResearchCoin} from './entry-research';
@@ -22,6 +23,7 @@ const json=(x:unknown,status=200)=>new Response(JSON.stringify(x,null,2),{status
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
   const env=_env as any;
   const u=new URL(req.url);
+  if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
   // V1.9: privileged logger operations; public GET diagnostics remain unchanged.
   if(u.pathname==='/api/swing/v19/scan'||u.pathname==='/api/swing/v19/settle'||u.pathname==='/api/swing/v19/log'){
     if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
