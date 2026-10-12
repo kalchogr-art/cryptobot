@@ -25,20 +25,20 @@ details{margin:10px 0}.status{font-size:13px}.nowrap{white-space:nowrap}
 <div id="message"></div></section>
 <div class="cards"><div class="metric"><small>Последни сигнали</small><strong id="total">—</strong></div>
 <div class="metric"><small>TRACKING</small><strong id="tracking">—</strong></div>
-<div class="metric"><small>RESOLVED</small><strong id="resolved">—</strong></div>
+<div class="metric"><small>RESOLVED (цялата D1)</small><strong id="resolved">—</strong></div>
 <div class="metric"><small>LONG / SHORT</small><strong id="sides">—</strong></div></div>
 <section class="panel"><h2>Записани патерни и резултати</h2>
 <div class="filters"><select id="side"><option value="">Всички посоки</option><option>LONG</option><option>SHORT</option></select>
 <select id="tf"><option value="">Всички таймфреймове</option><option>1h</option><option>4h</option><option>1d</option></select>
 <select id="status"><option value="">Всички статуси</option><option>TRACKING</option><option>RESOLVED</option></select>
 <input id="coin" placeholder="Монета, напр. BTC" maxlength="10" style="width:150px">
-</div><small>Показват се до 100 най-нови записа от D1. Статистиката е само за заредените записи, не за цялата история.</small>
+</div><small>Показват се до 100 най-нови записа от D1. Останалите показатели са за заредените записи; RESOLVED се брои от цялата D1 база.</small>
 <div class="tablewrap"><table><thead><tr><th>Време (UTC)</th><th>Монета</th><th>TF</th><th>Патерн</th><th>Посока</th><th>Цена</th><th>Статус</th><th>Филтри / TP-SL</th></tr></thead><tbody id="rows"><tr><td colspan="8">Свържи се, за да заредиш данни.</td></tr></tbody></table></div></section>
 <section class="panel" style="margin-top:14px"><h2>Подробности за избрания сигнал</h2><div id="detail" class="muted">Избери „Виж“ от таблицата.</div></section>
 <script>
 (function(){
 'use strict';
-var token='',records=[],busy=false;
+var token='',records=[],busy=false,resolvedAll=null;
 var el=function(id){return document.getElementById(id)};
 var escapeHtml=function(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
 function fmt(v){var n=Number(v);return Number.isFinite(n)?n.toLocaleString('en-US',{maximumFractionDigits:7}):'—'}
@@ -48,7 +48,7 @@ function render(){
 var side=el('side').value,tf=el('tf').value,status=el('status').value,coin=el('coin').value.trim().toUpperCase();
 var r=records.filter(function(x){return (!side||x.side===side)&&(!tf||x.interval===tf)&&(!status||x.status===status)&&(!coin||String(x.coin).toUpperCase().includes(coin))});
 el('total').textContent=r.length;el('tracking').textContent=r.filter(function(x){return x.status==='TRACKING'}).length;
-el('resolved').textContent=r.filter(function(x){return x.status==='RESOLVED'}).length;
+el('resolved').textContent=resolvedAll===null?'—':resolvedAll;
 el('sides').textContent=r.filter(function(x){return x.side==='LONG'}).length+' / '+r.filter(function(x){return x.side==='SHORT'}).length;
 el('rows').innerHTML=r.length?r.map(function(x){
 var i=records.indexOf(x),sc=x.outcome&&x.outcome.scenarios||[],tp=sc.filter(function(s){return s.status==='TP_FIRST'}).length,sl=sc.filter(function(s){return s.status==='SL_FIRST'}).length;
@@ -59,7 +59,11 @@ if(!token){el('message').textContent='Въведи SWING_ADMIN_TOKEN от Cloudf
 if(busy)return;busy=true;el('message').textContent='Зареждане…';
 try{var r=await fetch('/api/swing/v19/log?limit=100',{headers:{'x-swing-token':token},cache:'no-store'});
 var j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);
-records=Array.isArray(j.rows)?j.rows:[];render();el('message').textContent=records.length?'Данните са заредени успешно.':'Връзката работи. Все още няма записани сигнали.';
+records=Array.isArray(j.rows)?j.rows:[];
+var rr=await fetch('/api/swing/v19/resolved-count',{headers:{'x-swing-token':token},cache:'no-store'});
+var rc=await rr.json();if(!rr.ok||!rc.success)throw Error(rc.error||'RESOLVED_COUNT_HTTP_'+rr.status);
+resolvedAll=Number(rc.resolved)||0;
+render();el('message').textContent=records.length?'Данните са заредени успешно.':'Връзката работи. Все още няма записани сигнали.';
 el('updated').textContent='Обновено: '+new Date().toLocaleTimeString('bg-BG');
 }catch(e){el('message').textContent='Грешка: '+e.message;el('updated').textContent='Неуспешно зареждане'}finally{busy=false}
 }
