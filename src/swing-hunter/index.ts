@@ -28,15 +28,59 @@ async function resolvedCount(env:any){
  return {success:true,module:'SWING_RESOLVED_COUNT',read_only:true,resolved:Number(row?.resolved||0)};
 }
 
+// Read-only D1 pagination: filtering occurs BEFORE LIMIT, including old RESOLVED records.
+async function swingHistory(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
+ const clamp=(v:string|null,d:number,min:number,max:number)=>{const n=Number(v);return v!==null&&Number.isFinite(n)?Math.max(min,Math.min(max,Math.floor(n))):d};
+ const limit=clamp(u.searchParams.get('limit'),100,1,100);
+ const page=clamp(u.searchParams.get('page'),1,1,100000);
+ const side=u.searchParams.get('side')||'';
+ const status=u.searchParams.get('status')||'';
+ const interval=u.searchParams.get('interval')||'';
+ const coin=(u.searchParams.get('coin')||'').trim().toUpperCase();
+ if(side&&!['LONG','SHORT'].includes(side))throw new Error('INVALID_SIDE');
+ if(status&&!['TRACKING','RESOLVED'].includes(status))throw new Error('INVALID_STATUS');
+ if(interval&&!['1h','4h','1d'].includes(interval))throw new Error('INVALID_INTERVAL');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw new Error('INVALID_COIN');
+ const where:string[]=[],args:any[]=[];
+ if(side){where.push('side=?');args.push(side)}
+ if(status){where.push('status=?');args.push(status)}
+ if(interval){where.push('interval=?');args.push(interval)}
+ if(coin){where.push('coin LIKE ?');args.push('%'+coin+'%')}
+ const w=where.length?' WHERE '+where.join(' AND '):'';
+ const d=env.SWING_DB;
+ const [totalRow,statsRow]=await Promise.all([
+  d.prepare('SELECT COUNT(*) AS n FROM swing_context_signals'+w).bind(...args).first(),
+  d.prepare(`SELECT COUNT(*) AS total,
+   COALESCE(SUM(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END),0) AS tracking,
+   COALESCE(SUM(CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END),0) AS resolved,
+   COALESCE(SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END),0) AS longs,
+   COALESCE(SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END),0) AS shorts
+   FROM swing_context_signals`).first()
+ ]);
+ const total=Number(totalRow?.n||0),pages=Math.max(1,Math.ceil(total/limit));
+ const actualPage=Math.min(page,pages),offset=(actualPage-1)*limit;
+ const result=await d.prepare('SELECT * FROM swing_context_signals'+w+' ORDER BY signal_bar_open DESC,id DESC LIMIT ? OFFSET ?').bind(...args,limit,offset).all();
+ const parse=(v:any)=>{if(typeof v!=='string'||!v)return null;try{return JSON.parse(v)}catch{return null}};
+ return {success:true,module:'SWING_HISTORY_V1_9_5',read_only:true,trading:false,
+  stats:{total:Number(statsRow?.total||0),tracking:Number(statsRow?.tracking||0),resolved:Number(statsRow?.resolved||0),longs:Number(statsRow?.longs||0),shorts:Number(statsRow?.shorts||0)},
+  filteredTotal:total,page:actualPage,pages,limit,
+  rows:(result.results||[]).map((r:any)=>({...r,context:parse(r.context_json),outcome:parse(r.outcome_json),context_json:undefined,outcome_json:undefined}))};
+}
+
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
  if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
  // Protected operations. Existing token security is preserved.
- if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count'].includes(u.pathname)){
+ if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history'].includes(u.pathname)){
   if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
   if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
   try{
+   if(u.pathname==='/api/swing/v19/history'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await swingHistory(env,u));
+   }
    if(u.pathname==='/api/swing/v19/resolved-count'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
     return json(await resolvedCount(env));
@@ -53,7 +97,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
  if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
  if(u.pathname==='/swing-hunter/intelligence')return new Response(intelligenceDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
  if(u.pathname==='/swing-hunter')return new Response(dashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
- if(u.pathname==='/api/swing'||u.pathname==='/api/swing/status')return json({success:true,module:'SWING_HUNTER_V1_9_3',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scheduled:false,coins:COINS.length,routes:['/swing-hunter','/swing-hunter/monitor','/api/swing/status','/api/swing/ohlcv','/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow','/api/swing/dashboard','/api/swing/scan','/api/swing/replay','/api/swing/research','/api/swing/compare','/api/swing/health','/api/swing/outcomes','/api/swing/audit','/api/swing/unified','/api/swing/unified-market','/api/swing/catalog','/api/swing/intelligence','/api/swing/intelligence-market','/api/swing/chart-learning','/api/swing/chart-learning-market','/api/swing/entry-research','/api/swing/integrity-audit','/api/swing/tp-first-touch','/api/swing/tp-sl-first-touch','/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/swing-hunter/intelligence']});
+ if(u.pathname==='/api/swing'||u.pathname==='/api/swing/status')return json({success:true,module:'SWING_HUNTER_V1_9_3',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scheduled:false,coins:COINS.length,routes:['/swing-hunter','/swing-hunter/monitor','/api/swing/status','/api/swing/ohlcv','/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow','/api/swing/dashboard','/api/swing/scan','/api/swing/replay','/api/swing/research','/api/swing/compare','/api/swing/health','/api/swing/outcomes','/api/swing/audit','/api/swing/unified','/api/swing/unified-market','/api/swing/catalog','/api/swing/intelligence','/api/swing/intelligence-market','/api/swing/chart-learning','/api/swing/chart-learning-market','/api/swing/entry-research','/api/swing/integrity-audit','/api/swing/tp-first-touch','/api/swing/tp-sl-first-touch','/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/swing-hunter/intelligence']});
  if(u.pathname==='/api/swing/dashboard')return json({success:true,module:'SWING_HUNTER_V1_8_5',mode:'READ_ONLY',dashboard:'/swing-hunter'});
  if(u.pathname==='/api/swing/health')return json(healthReport());
  if(u.pathname==='/api/swing/catalog')return json({success:true,module:'SWING_HUNTER_V1_6_PATTERN_CATALOG',patternIds:CATALOG_IDS,patternsCount:CATALOG_IDS.length,notes:['20 directional detectors, not every conceivable market pattern','Signals include triggerPatterns and supportingPatterns','Research-only']});
