@@ -1,4 +1,4 @@
-/** Swing Hunter V1.9.3 — protected, read-only monitoring UI. */
+/** Swing Hunter V1.9.5 — protected, read-only monitoring UI. */
 export function swingMonitorDashboard(): string {
   return `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Swing Hunter • Monitor</title>
@@ -16,7 +16,7 @@ table{border-collapse:collapse;width:100%;min-width:850px}th,td{padding:11px;bor
 details{margin:10px 0}.status{font-size:13px}.nowrap{white-space:nowrap}
 @media(max-width:700px){body{padding:12px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}h1{font-size:21px}}
 </style></head><body>
-<div class="top"><div><h1>SWING HUNTER <span style="color:#71b5ff">MONITOR</span></h1><small>V1.9.3 • Research only • Без реални сделки</small></div>
+<div class="top"><div><h1>SWING HUNTER <span style="color:#71b5ff">MONITOR</span></h1><small>V1.9.5 • Research only • Без реални сделки</small></div>
 <div class="status" id="updated">Не са заредени данни</div></div>
 <section class="panel"><h2>Достъп до мониторинга</h2><div class="filters">
 <input id="token" type="password" placeholder="SWING_ADMIN_TOKEN" autocomplete="off" style="flex:1;min-width:190px">
@@ -32,44 +32,51 @@ details{margin:10px 0}.status{font-size:13px}.nowrap{white-space:nowrap}
 <select id="tf"><option value="">Всички таймфреймове</option><option>1h</option><option>4h</option><option>1d</option></select>
 <select id="status"><option value="">Всички статуси</option><option>TRACKING</option><option>RESOLVED</option></select>
 <input id="coin" placeholder="Монета, напр. BTC" maxlength="10" style="width:150px">
-</div><small>Показват се до 100 най-нови записа от D1. Останалите показатели са за заредените записи; RESOLVED се брои от цялата D1 база.</small>
+</div><small>Филтрите се прилагат върху цялата D1 база. По 100 записа на страница.</small>
+<div class="filters"><button id="prev">← Предишна</button><span id="pageInfo" class="muted">Страница —</span><button id="next">Следваща →</button></div>
 <div class="tablewrap"><table><thead><tr><th>Време (UTC)</th><th>Монета</th><th>TF</th><th>Патерн</th><th>Посока</th><th>Цена</th><th>Статус</th><th>Филтри / TP-SL</th></tr></thead><tbody id="rows"><tr><td colspan="8">Свържи се, за да заредиш данни.</td></tr></tbody></table></div></section>
 <section class="panel" style="margin-top:14px"><h2>Подробности за избрания сигнал</h2><div id="detail" class="muted">Избери „Виж“ от таблицата.</div></section>
 <script>
 (function(){
 'use strict';
-var token='',records=[],busy=false,resolvedAll=null;
+var token='',records=[],busy=false,page=1,pages=1,requestId=0;
 var el=function(id){return document.getElementById(id)};
 var escapeHtml=function(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
-function fmt(v){var n=Number(v);return Number.isFinite(n)?n.toLocaleString('en-US',{maximumFractionDigits:7}):'—'}
+function fmt(v){if(v==null||v==='')return '—';var n=Number(v);return Number.isFinite(n)?n.toLocaleString('en-US',{maximumFractionDigits:7}):'—'}
 function time(v){var n=Number(v);var d=Number.isFinite(n)&&n>0?new Date(n):new Date(v);return isNaN(d.getTime())?'—':d.toISOString().replace('T',' ').slice(0,16)}
 function filters(x){var c=x.context||{};var keys=['btcDirection','fearGreed','macroEvents','multiTimeframe','supportResistance','volume','indicators','liquiditySpread'];return keys.map(function(k){return k+': '+((c[k]||{}).status||'—')}).join(' | ')}
 function render(){
-var side=el('side').value,tf=el('tf').value,status=el('status').value,coin=el('coin').value.trim().toUpperCase();
-var r=records.filter(function(x){return (!side||x.side===side)&&(!tf||x.interval===tf)&&(!status||x.status===status)&&(!coin||String(x.coin).toUpperCase().includes(coin))});
-el('total').textContent=r.length;el('tracking').textContent=r.filter(function(x){return x.status==='TRACKING'}).length;
-el('resolved').textContent=resolvedAll===null?'—':resolvedAll;
-el('sides').textContent=r.filter(function(x){return x.side==='LONG'}).length+' / '+r.filter(function(x){return x.side==='SHORT'}).length;
-el('rows').innerHTML=r.length?r.map(function(x){
-var i=records.indexOf(x),sc=x.outcome&&x.outcome.scenarios||[],tp=sc.filter(function(s){return s.status==='TP_FIRST'}).length,sl=sc.filter(function(s){return s.status==='SL_FIRST'}).length;
-return '<tr><td class="nowrap">'+escapeHtml(time(x.signal_bar_open))+'</td><td><b>'+escapeHtml(x.coin)+'</b></td><td>'+escapeHtml(x.interval)+'</td><td>'+escapeHtml(x.pattern)+'</td><td class="'+(x.side==='LONG'?'long':'short')+'">'+escapeHtml(x.side)+'</td><td>'+escapeHtml(fmt(x.reference_price??x.entry_price))+'</td><td><span class="pill">'+escapeHtml(x.status)+'</span></td><td><button data-i="'+i+'">Виж</button> <small>'+ (sc.length?'TP: '+tp+' · SL: '+sl:'8 филтъра')+'</small></td></tr>'}).join(''):'<tr><td colspan="8">Няма записи по избраните филтри.</td></tr>';
+ el('rows').innerHTML=records.length?records.map(function(x,i){
+ var sc=x.outcome&&x.outcome.scenarios||[],tp=sc.filter(function(s){return s.status==='TP_FIRST'}).length,sl=sc.filter(function(s){return s.status==='SL_FIRST'}).length;
+ return '<tr><td class="nowrap">'+escapeHtml(time(x.signal_bar_open))+'</td><td><b>'+escapeHtml(x.coin)+'</b></td><td>'+escapeHtml(x.interval)+'</td><td>'+escapeHtml(x.pattern)+'</td><td class="'+(x.side==='LONG'?'long':'short')+'">'+escapeHtml(x.side)+'</td><td>'+escapeHtml(fmt(x.reference_price??x.entry_price))+'</td><td><span class="pill">'+escapeHtml(x.status)+'</span></td><td><button data-i="'+i+'">Виж</button> <small>'+(sc.length?'TP: '+tp+' · SL: '+sl:'8 филтъра')+'</small></td></tr>'}).join(''):'<tr><td colspan="8">Няма записи по избраните филтри.</td></tr>';
+ el('pageInfo').textContent='Страница '+page+' / '+pages;
+ el('prev').disabled=page<=1;el('next').disabled=page>=pages;
 }
 async function load(){
-if(!token){el('message').textContent='Въведи SWING_ADMIN_TOKEN от Cloudflare Secrets.';return}
-if(busy)return;busy=true;el('message').textContent='Зареждане…';
-try{var r=await fetch('/api/swing/v19/log?limit=100',{headers:{'x-swing-token':token},cache:'no-store'});
-var j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);
-records=Array.isArray(j.rows)?j.rows:[];
-var rr=await fetch('/api/swing/v19/resolved-count',{headers:{'x-swing-token':token},cache:'no-store'});
-var rc=await rr.json();if(!rr.ok||!rc.success)throw Error(rc.error||'RESOLVED_COUNT_HTTP_'+rr.status);
-resolvedAll=Number(rc.resolved)||0;
-render();el('message').textContent=records.length?'Данните са заредени успешно.':'Връзката работи. Все още няма записани сигнали.';
-el('updated').textContent='Обновено: '+new Date().toLocaleTimeString('bg-BG');
-}catch(e){el('message').textContent='Грешка: '+e.message;el('updated').textContent='Неуспешно зареждане'}finally{busy=false}
+ if(!token){el('message').textContent='Въведи SWING_ADMIN_TOKEN от Cloudflare Secrets.';return}
+ if(busy){return}busy=true;el('message').textContent='Зареждане…';
+ try{
+ var qs=new URLSearchParams({limit:'100',page:String(page)});
+ if(el('side').value)qs.set('side',el('side').value);
+ if(el('tf').value)qs.set('interval',el('tf').value);
+ if(el('status').value)qs.set('status',el('status').value);
+ if(el('coin').value.trim())qs.set('coin',el('coin').value.trim().toUpperCase());
+ var r=await fetch('/api/swing/v19/history?'+qs.toString(),{headers:{'x-swing-token':token},cache:'no-store'});
+ var j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);
+ records=Array.isArray(j.rows)?j.rows:[];page=Number(j.page)||1;pages=Number(j.pages)||1;
+ var s=j.stats||{};
+ el('total').textContent=Number(s.total)||0;el('tracking').textContent=Number(s.tracking)||0;
+ el('resolved').textContent=Number(s.resolved)||0;
+ el('sides').textContent=(Number(s.longs)||0)+' / '+(Number(s.shorts)||0);
+ render();el('message').textContent='Заредени '+records.length+' от '+(Number(j.filteredTotal)||0)+' записа по филтрите.';
+ el('updated').textContent='Обновено: '+new Date().toLocaleTimeString('bg-BG');
+ }catch(e){el('message').textContent='Грешка: '+e.message;el('updated').textContent='Неуспешно зареждане'}finally{busy=false}
 }
-el('connect').onclick=function(){token=el('token').value.trim();el('token').value='';load()};
+el('connect').onclick=function(){token=el('token').value.trim();el('token').value='';page=1;load()};
 el('refresh').onclick=load;
-['side','tf','status','coin'].forEach(function(k){el(k).addEventListener(k==='coin'?'input':'change',render)});
+el('prev').onclick=function(){if(page>1&&!busy){page--;load()}};
+el('next').onclick=function(){if(page<pages&&!busy){page++;load()}};
+['side','tf','status','coin'].forEach(function(k){el(k).addEventListener(k==='coin'?'change':'change',function(){page=1;load()})});
 el('rows').onclick=function(e){var b=e.target.closest('button[data-i]');if(!b)return;var x=records[Number(b.dataset.i)];if(!x)return;
 el('detail').innerHTML='<div><b>'+escapeHtml(x.coin)+' · '+escapeHtml(x.pattern)+' · '+escapeHtml(x.side)+'</b></div><details open><summary>8 филтъра — статус</summary><pre class="detail">'+escapeHtml(filters(x))+'</pre></details><details open><summary>Контекст при сигнала</summary><pre class="detail">'+escapeHtml(JSON.stringify(x.context||{},null,2))+'</pre></details><details><summary>TP / SL сценарии (хипотетични)</summary><pre class="detail">'+escapeHtml(JSON.stringify(x.outcome||{status:'PENDING'},null,2))+'</pre></details>';
 };
