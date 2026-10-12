@@ -10,6 +10,7 @@ import { structure } from './market-structure';
 import { detectCatalog } from './pattern-catalog';
 import { collectContext } from './context';
 
+const NEW_SIGNALS_ENABLED = false; // Frozen cohort: settlement continues.
 const TPS = [0.3, 0.5, 0.75, 1, 1.5, 2];
 const SLS = [0.3, 0.5, 0.75, 1, 1.5];
 const HOUR = 3_600_000;
@@ -35,6 +36,22 @@ export async function scanAndLog(
   env: any,
   opts: { offset?: number; limit?: number; interval?: Interval } = {}
 ) {
+  if (!NEW_SIGNALS_ENABLED) {
+    return {
+      success: true,
+      module: 'SWING_HUNTER_V1_9_2_SIGNAL_LOGGER',
+      mode: 'FROZEN_SETTLEMENT_ONLY',
+      status: 'COLLECTION_FROZEN',
+      new_signals_enabled: false,
+      settlement_enabled: true,
+      trading: false,
+      processed: 0,
+      inserted: 0,
+      duplicates: 0,
+      errors: 0,
+      results: []
+    };
+  }
   const d = db(env);
   const interval = opts.interval || '1h';
   if (!['1h', '4h', '1d'].includes(interval)) throw new Error('INVALID_INTERVAL');
