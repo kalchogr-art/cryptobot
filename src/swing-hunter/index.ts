@@ -19,6 +19,9 @@ import {unifiedCoin,unifiedMarket} from './unified-backtest';
 import {detectCatalog,CATALOG_IDS} from './pattern-catalog';
 import {intelligenceCoin,intelligenceMarket,intelligenceDashboard} from './pattern-intelligence';
 
+// FROZEN COHORT: stop all new context signals, keep settlement active.
+const NEW_SIGNALS_ENABLED = false;
+
 const json=(x:unknown,status=200)=>new Response(JSON.stringify(x,null,2),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}});
 
 // Aggregate over the full D1 table, independently of the 100-row log limit.
@@ -91,6 +94,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
    }
    if(req.method!=='POST')return json({success:false,error:'POST_REQUIRED'},405);
    if(u.pathname==='/api/swing/v19/settle')return json(await settleSignals(env,Number(u.searchParams.get('limit')||12)));
+   if(!NEW_SIGNALS_ENABLED)return json({success:true,module:'SWING_HUNTER_V1_9_5',status:'SIGNAL_COLLECTION_PAUSED',new_signals_enabled:false,existing_signals_settlement_enabled:true,trading:false,signals_created:0});
    return json(await scanAndLog(env,{interval:(u.searchParams.get('interval')||'1h') as Interval,offset:Number(u.searchParams.get('offset')||0),limit:Number(u.searchParams.get('limit')||3)}));
   }catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}
  }
@@ -144,7 +148,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
 }
 /** Optional cron hook; no new scheduled export. */
 export async function swingHunterScheduled(env:any,offset=0,interval:Interval='1h'){
- const scan=await scanAndLog(env,{offset,limit:3,interval});
+ const scan=NEW_SIGNALS_ENABLED?await scanAndLog(env,{offset,limit:3,interval}):{success:true,status:'SIGNAL_COLLECTION_PAUSED',signals_created:0};
  const settlement=await settleSignals(env,8);
  return {scan,settlement};
 }
