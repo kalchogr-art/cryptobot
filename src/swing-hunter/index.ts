@@ -30,11 +30,33 @@ async function resolvedCount(env:any){
  return {success:true,module:'SWING_RESOLVED_COUNT',read_only:true,resolved:Number(row?.resolved||0)};
 }
 
+// Today is the current calendar day in Europe/Sofia; all-time retains the complete archive.
+function swingTodayStartMs():number {
+ const now=new Date();
+ const date=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).format(now);
+ const [year,month,day]=date.split('-').map(Number);
+ const localMidnight=Date.UTC(year,month-1,day);
+ const fmt=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+ let candidate=localMidnight-2*3600000;
+ for(let i=0;i<3;i++){
+  const parts=Object.fromEntries(fmt.formatToParts(new Date(candidate)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));
+  const represented=Date.UTC(parts.year,parts.month-1,parts.day,parts.hour,parts.minute);
+  candidate+=localMidnight-represented;
+ }
+ return candidate;
+}
+function swingPeriod(u:URL):'today'|'total' {
+ const period=u.searchParams.get('period')||'total';
+ if(period!=='today'&&period!=='total')throw Error('INVALID_PERIOD');
+ return period;
+}
+
 async function swingHistory(env:any,u:URL){
  if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
  const clamp=(v:string|null,d:number,min:number,max:number)=>{const n=Number(v);return v!==null&&Number.isFinite(n)?Math.max(min,Math.min(max,Math.floor(n))):d};
  const limit=clamp(u.searchParams.get('limit'),100,1,100);
  const page=clamp(u.searchParams.get('page'),1,1,100000);
+ const period=swingPeriod(u);
  const side=u.searchParams.get('side')||'';
  const status=u.searchParams.get('status')||'';
  const interval=u.searchParams.get('interval')||'';
@@ -44,6 +66,7 @@ async function swingHistory(env:any,u:URL){
  if(interval&&!['1h','4h','1d'].includes(interval))throw new Error('INVALID_INTERVAL');
  if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw new Error('INVALID_COIN');
  const where:string[]=[],args:any[]=[];
+ if(period==='today'){where.push('signal_bar_open>=?');args.push(swingTodayStartMs())}
  if(side){where.push('side=?');args.push(side)}
  if(status){where.push('status=?');args.push(status)}
  if(interval){where.push('interval=?');args.push(interval)}
@@ -57,7 +80,7 @@ async function swingHistory(env:any,u:URL){
    COALESCE(SUM(CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END),0) AS resolved,
    COALESCE(SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END),0) AS longs,
    COALESCE(SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END),0) AS shorts
-   FROM swing_context_signals`).first()
+   FROM swing_context_signals${period==='today'?' WHERE signal_bar_open>='+swingTodayStartMs():''}`).first()
  ]);
  const total=Number(totalRow?.n||0),pages=Math.max(1,Math.ceil(total/limit));
  const actualPage=Math.min(page,pages),offset=(actualPage-1)*limit;
@@ -65,7 +88,7 @@ async function swingHistory(env:any,u:URL){
  const parse=(v:any)=>{if(typeof v!=='string'||!v)return null;try{return JSON.parse(v)}catch{return null}};
  return {success:true,module:'SWING_HISTORY_V1_9_5',read_only:true,trading:false,
   stats:{total:Number(statsRow?.total||0),tracking:Number(statsRow?.tracking||0),resolved:Number(statsRow?.resolved||0),longs:Number(statsRow?.longs||0),shorts:Number(statsRow?.shorts||0)},
-  filteredTotal:total,page:actualPage,pages,limit,
+  period,filteredTotal:total,page:actualPage,pages,limit,
   rows:(result.results||[]).map((r:any)=>({...r,context:parse(r.context_json),outcome:parse(r.outcome_json),context_json:undefined,outcome_json:undefined}))};
 }
 
@@ -79,6 +102,7 @@ async function filteredShortHistory(env:any,u:URL){
   return v!==null&&Number.isInteger(n)?Math.max(min,Math.min(max,n)):def;
  };
  const page=numberParam('page',1,1,100000),limit=numberParam('limit',50,1,100);
+ const period=swingPeriod(u);
  const interval=u.searchParams.get('interval')||'';
  const status=u.searchParams.get('status')||'';
  const confirmations=u.searchParams.get('confirmations')||'';
@@ -112,6 +136,7 @@ async function filteredShortHistory(env:any,u:URL){
    AND s.pattern IN ('DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
      'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT')
    AND json_extract(s.context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+   ${period==='today'?'AND s.signal_bar_open>='+swingTodayStartMs():''}
 ), grouped AS (
  SELECT coin,interval,signal_bar_open,
         COUNT(DISTINCT pattern) AS confirmations,
@@ -143,7 +168,7 @@ async function filteredShortHistory(env:any,u:URL){
  ]);
  const total=Number(stats?.total||0);
  return {success:true,module:'SWING_FILTERED_SHORT_V1',read_only:true,trading:false,
-  filters:{side:'SHORT',btc_1h:'MIXED',tp:2,sl:1},
+  period,filters:{side:'SHORT',btc_1h:'MIXED',tp:2,sl:1},
   stats:{total,tracking:Number(stats?.tracking||0),tp:Number(stats?.tp||0),sl:Number(stats?.sl||0)},
   filteredTotal:total,page,pages:Math.max(1,Math.ceil(total/limit)),limit,rows:rows.results||[]};
 }
