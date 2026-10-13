@@ -1,5 +1,6 @@
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
+import {swingFilteredDashboard} from './swing-filtered-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
 import {entryResearchCoin} from './entry-research';
@@ -69,14 +70,98 @@ async function swingHistory(env:any,u:URL){
   rows:(result.results||[]).map((r:any)=>({...r,context:parse(r.context_json),outcome:parse(r.outcome_json),context_json:undefined,outcome_json:undefined}))};
 }
 
+
+// One SHORT opportunity per coin + interval + signal candle.
+// The existing D1 table and LONG records are not modified.
+async function filteredShortHistory(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
+ const numberParam=(key:string,def:number,min:number,max:number)=>{
+  const v=u.searchParams.get(key),n=Number(v);
+  return v!==null&&Number.isInteger(n)?Math.max(min,Math.min(max,n)):def;
+ };
+ const page=numberParam('page',1,1,100000),limit=numberParam('limit',50,1,100);
+ const interval=u.searchParams.get('interval')||'';
+ const status=u.searchParams.get('status')||'';
+ const confirmations=u.searchParams.get('confirmations')||'';
+ const coin=(u.searchParams.get('coin')||'').trim().toUpperCase();
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(status&&!['TRACKING','TP_FIRST','SL_FIRST','TIME_EXIT','AMBIGUOUS','PENDING','CONFLICT'].includes(status))throw Error('INVALID_STATUS');
+ if(confirmations&&!['1','2','3'].includes(confirmations))throw Error('INVALID_CONFIRMATIONS');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ const args:any[]=[];
+ const wheres:string[]=[];
+ if(interval){wheres.push('interval=?');args.push(interval)}
+ if(coin){wheres.push('coin=?');args.push(coin)}
+ const having:string[]=[];
+ if(status){having.push('result=?');args.push(status)}
+ if(confirmations){having.push(confirmations==='3'?'confirmations>=3':'confirmations=?');if(confirmations!=='3')args.push(Number(confirmations))}
+ const base=`WITH base AS (
+ SELECT s.coin,s.interval,s.signal_bar_open,s.pattern,s.status,
+        s.reference_price,s.entry_price,
+        json_extract(s.context_json,'$.indicators.rsi14') AS rsi,
+        json_extract(s.context_json,'$.volume.relativeVolume') AS relative_volume,
+        (SELECT json_extract(j.value,'$.status')
+           FROM json_each(s.outcome_json,'$.scenarios') j
+          WHERE CAST(json_extract(j.value,'$.tp') AS REAL)=2
+            AND CAST(json_extract(j.value,'$.sl') AS REAL)=1 LIMIT 1) AS scenario_result,
+        (SELECT CAST(json_extract(j.value,'$.hypotheticalNetPct') AS REAL)
+           FROM json_each(s.outcome_json,'$.scenarios') j
+          WHERE CAST(json_extract(j.value,'$.tp') AS REAL)=2
+            AND CAST(json_extract(j.value,'$.sl') AS REAL)=1 LIMIT 1) AS scenario_net
+ FROM swing_context_signals s
+ WHERE s.side='SHORT' AND s.interval IN ('1h','4h')
+   AND s.pattern IN ('DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
+     'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT')
+   AND json_extract(s.context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+), grouped AS (
+ SELECT coin,interval,signal_bar_open,
+        COUNT(DISTINCT pattern) AS confirmations,
+        GROUP_CONCAT(DISTINCT pattern) AS patterns,
+        ROUND(AVG(COALESCE(reference_price,entry_price)),8) AS entry_price,
+        ROUND(AVG(CAST(rsi AS REAL)),2) AS rsi,
+        ROUND(AVG(CAST(relative_volume AS REAL)),3) AS relative_volume,
+        CASE WHEN SUM(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END)>0 THEN 'TRACKING'
+             WHEN COUNT(DISTINCT COALESCE(scenario_result,'PENDING'))>1 THEN 'CONFLICT'
+             ELSE COALESCE(MAX(scenario_result),'PENDING') END AS result,
+        ROUND(AVG(scenario_net),4) AS net
+ FROM base GROUP BY coin,interval,signal_bar_open
+), selected AS (
+ SELECT * FROM grouped
+ ${wheres.length?'WHERE '+wheres.join(' AND '):''}
+), filtered AS (
+ SELECT * FROM selected
+ ${having.length?'WHERE '+having.join(' AND '):''}
+)`;
+ const d=env.SWING_DB;
+ const [stats,rows]=await Promise.all([
+  d.prepare(base+` SELECT COUNT(*) AS total,
+   SUM(CASE WHEN result='TRACKING' THEN 1 ELSE 0 END) AS tracking,
+   SUM(CASE WHEN result='TP_FIRST' THEN 1 ELSE 0 END) AS tp,
+   SUM(CASE WHEN result='SL_FIRST' THEN 1 ELSE 0 END) AS sl
+   FROM filtered`).bind(...args).first(),
+  d.prepare(base+` SELECT * FROM filtered ORDER BY signal_bar_open DESC,coin,interval LIMIT ? OFFSET ?`)
+   .bind(...args,limit,(page-1)*limit).all()
+ ]);
+ const total=Number(stats?.total||0);
+ return {success:true,module:'SWING_FILTERED_SHORT_V1',read_only:true,trading:false,
+  filters:{side:'SHORT',btc_1h:'MIXED',tp:2,sl:1},
+  stats:{total,tracking:Number(stats?.tracking||0),tp:Number(stats?.tp||0),sl:Number(stats?.sl||0)},
+  filteredTotal:total,page,pages:Math.max(1,Math.ceil(total/limit)),limit,rows:rows.results||[]};
+}
+
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
- if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
- if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history'].includes(u.pathname)){
+ if(req.method==='GET'&&u.pathname==='/swing-hunter/filtered-short')return new Response(swingFilteredDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'}});
+ if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard().replace('</body>',`<div style="position:fixed;right:16px;bottom:16px;background:#18375d;padding:13px;border-radius:12px;border:1px solid #4d78a9"><a style="color:white;font-weight:700" href="/swing-hunter/filtered-short">SWING SHORT · FILTERED →</a></div></body>`),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
+ if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/api/swing/v19/filtered-short'].includes(u.pathname)){
   if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
   if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
   try{
+   if(u.pathname==='/api/swing/v19/filtered-short'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await filteredShortHistory(env,u));
+   }
    if(u.pathname==='/api/swing/v19/history'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
     return json(await swingHistory(env,u));
