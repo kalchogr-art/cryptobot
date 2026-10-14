@@ -10,7 +10,7 @@ import { privateKeyToAccount } from "viem/accounts";
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
 // V2.17.2: FIX BTC5M/BTC10M progressive + 3m lifecycle allowlists, diagnostic and batch priority.
-// V2.17.1: BTC5M/BTC10.M strategy metadata support; BTC1M/BTC3M/BTC5M/BTC10M share the proven Progressive + 3M fallback lifecycle.
+// V2.17.1: BTC5M/BTC10M strategy metadata support; BTC1M/BTC3M/BTC5M/BTC10M share the proven Progressive + 3M fallback lifecycle.
 // V2.17.0: BTC3M LIVE strategy metadata support; BTC1M + BTC3M share the proven Progressive + 3M fallback lifecycle.
 // V2.16.9: LIFECYCLE HEALTH WATCHDOG — alerts/persists Progressive failures without changing strategy.
 // V2.16.3: BTC1M DIRECTIONAL SYNC — strategy metadata/lifecycle synced to Index V1.11.44; FAST D1 + latency audit preserved.
@@ -3150,7 +3150,8 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
 }
 export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?:any}){
  const db=env.DB;if(!db)return {ok:false,reason:'DB_MISSING'};
- if((env as any).SWING_LIVE_ENABLED !== 'true')return {ok:true,live:false,reason:'SWING_LIVE_DISABLED'};
+ // Collect eligible signals even when real SWING trading is disabled.
+ // The execution switch is checked only AFTER the D1 queue is populated.
  await swingSchema(db);
  const now=Date.now();
  // Keep only newly available signals. Never backfill old research as live trades.
@@ -3179,9 +3180,11 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
  const due:any=await db.prepare(`SELECT * FROM swing_live_queue WHERE status='WAITING_POSITION'
   AND next_retry_at<=? AND expires_at>? ORDER BY next_retry_at LIMIT 4`).bind(now,now).all();
+ const liveEnabled=(env as any).SWING_LIVE_ENABLED === 'true';
+ if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const entered=[];
  for(const row of due.results??[])entered.push({coin:row.coin,result:await swingEnter(env,row)});
- return {ok:true,entered,queued:groups.size};
+ return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length};
 }
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
