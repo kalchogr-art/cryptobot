@@ -3114,28 +3114,51 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    {a,b:true,p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}},
    {a,b:true,p:sl,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:sl,tpsl:'sl'}}}
   ],grouping:'na'};
+  // Fail closed: inspect exchange before submission, submit ONCE, then reconcile.
+  // Never resend on an ambiguous response: the first request may have succeeded.
+  const inspectSwingProtection=async()=>{
+    const all=await postInfo({type:'frontendOpenOrders',user:MASTER_ACCOUNT});
+    if(!Array.isArray(all))throw Error('FRONTEND_OPEN_ORDERS_UNAVAILABLE');
+    const same=all.filter((o:any)=>String(o.coin??'').toUpperCase()===coin);
+    const match=(o:any,target:string,kind:'tp'|'sl')=>{
+      const actual=Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
+      const type=String(o.orderType??o.orderTypeName??o.tpsl??'').toLowerCase();
+      const isTp=type.includes('take profit')||type.includes('takeprofit')||type==='tp';
+      const isSl=type.includes('stop')||type==='sl';
+      return Number.isFinite(actual)&&Math.abs(actual-Number(target))<=Number(target)*0.0001 &&
+       (kind==='tp'?isTp:isSl);
+    };
+    return {tp:same.filter((o:any)=>match(o,tp,'tp')),sl:same.filter((o:any)=>match(o,sl,'sl'))};
+  };
   let protectedOk=false;
-  for(let j=0;j<4;j++){
-   const orders=await getOpenOrdersForCoin(coin);
-   // Do not duplicate triggers when an earlier network attempt may have succeeded.
-   if(orders.length){
-     const tpPresent=orders.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(tp))<Number(tp)*0.0001);
-     const slPresent=orders.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(sl))<Number(sl)*0.0001);
-     if(tpPresent&&slPresent){protectedOk=true;break;}
-     if(tpPresent||slPresent)throw Error('PARTIAL_PROTECTION_REQUIRES_MANUAL_RECONCILIATION');
-   }
-   const r=await sendLifecycleSignedAction(protection,secret);
-   if(swingOrderAccepted(r,2)){
-     const verified=await getOpenOrdersForCoin(coin);
-     const tpVerified=verified.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(tp))<Number(tp)*0.0001);
-     const slVerified=verified.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(sl))<Number(sl)*0.0001);
-     if(tpVerified&&slVerified){protectedOk=true;break;}
-   }
+  let protectionReason='SWING_PROTECTION_UNCONFIRMED';
+  // Durable one-shot marker BEFORE exchange submission. No automatic retries.
+  const existing=await inspectSwingProtection();
+  if(existing.tp.length>1||existing.sl.length>1){
+    protectionReason='DUPLICATE_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
+  }else if(existing.tp.length===1&&existing.sl.length===1){
+    protectedOk=true;
+  }else if(existing.tp.length||existing.sl.length){
+    protectionReason='PARTIAL_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
+  }else{
+    await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='PROTECTION_SUBMITTING',
+      last_error='PROTECTION_REQUEST_MAY_HAVE_BEEN_SENT',updated_at=? WHERE crossing_id=?`)
+      .bind(Date.now(),key).run();
+    // Exactly one non-idempotent exchange request. A timeout is NOT a retry signal.
+    try { await sendLifecycleSignedAction(protection,secret); }
+    catch(e:any){protectionReason='PROTECTION_SUBMISSION_AMBIGUOUS:'+String(e?.message??e);}
+    try{
+      const verified=await inspectSwingProtection();
+      if(verified.tp.length===1&&verified.sl.length===1)protectedOk=true;
+      else if(verified.tp.length>1||verified.sl.length>1)
+        protectionReason='DUPLICATE_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
+      else protectionReason='PROTECTION_UNCONFIRMED_NO_AUTOMATIC_RETRY';
+    }catch(e:any){protectionReason='PROTECTION_RECONCILIATION_FAILED:'+String(e?.message??e);}
   }
   await db.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,last_error=? WHERE crossing_id=?`)
-   .bind(protectedOk?'PROTECTED':'TPSL_FAILED_AFTER_RETRIES',Date.now(),protectedOk?null:'SWING_PROTECTION_UNCONFIRMED',key).run();
+   .bind(protectedOk?'PROTECTED':'TPSL_FAILED_AFTER_RETRIES',Date.now(),protectedOk?null:protectionReason,key).run();
   await db.prepare(`UPDATE swing_live_queue SET status=?,updated_at=?,reason=? WHERE signal_key=?`)
-   .bind(protectedOk?'OPEN':'UNKNOWN',Date.now(),protectedOk?null:'PROTECTION_UNCONFIRMED',key).run();
+   .bind(protectedOk?'OPEN':'UNKNOWN',Date.now(),protectedOk?null:protectionReason,key).run();
   return protectedOk?'PROTECTED':'TPSL_UNCONFIRMED';
  }catch(err:any){
   const reason=String(err?.message??err);
@@ -3182,8 +3205,12 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
  const due:any=await db.prepare(`SELECT * FROM swing_live_queue WHERE status='WAITING_POSITION'
   AND next_retry_at<=? AND expires_at>? ORDER BY next_retry_at LIMIT 4`).bind(now,now).all();
- const liveEnabled=String((env as any).SWING_LIVE_ENABLED ?? 'true').toLowerCase() === 'true';
+ const liveEnabled=String((env as any).SWING_LIVE_ENABLED ?? 'false').toLowerCase() === 'true';
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
+ const unsafe:any=await db.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
+  WHERE strategy_version=? AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
+  .bind(SWING_STRATEGY).first();
+ if(Number(unsafe?.n??0)>0)return {ok:false,live:false,reason:'UNRESOLVED_SWING_PROTECTION_BLOCKS_NEW_ENTRIES',unresolved:Number(unsafe.n),orders_sent:0};
  const entered=[];
  for(const row of due.results??[])entered.push({coin:row.coin,result:await swingEnter(env,row)});
  return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length};
