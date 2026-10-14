@@ -3083,10 +3083,10 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   if(lev.httpStatus<200||lev.httpStatus>=300||lev.json?.status!=='ok')throw Error('LEVERAGE_FAILED');
   // Write durable intent before any non-idempotent network request.
   await db.prepare(`INSERT INTO hyperliquid_execution_ledger
-   (crossing_id,episode_id,coin,side,crossing_ts,status,claimed_at,updated_at,strategy_version,setup_name,entry_target_price)
-   VALUES (?,?,?,'SHORT',?,'CLAIMED',?,?,?, ?,?)`)
+   (crossing_id,episode_id,coin,side,crossing_ts,status,claimed_at,updated_at,strategy_version,setup_name)
+   VALUES (?,?,?,'SHORT',?,'CLAIMED',?,?,?, ?)`)
    .bind(key,key,coin,Number(row.signal_available_at),now,now,SWING_STRATEGY,
-      String(row.patterns_json),price).run();
+      String(row.patterns_json)).run();
   await db.prepare(`UPDATE swing_live_queue SET status='ENTERING',reason=NULL,updated_at=? WHERE signal_key=?`)
    .bind(now,key).run();
   const action={type:'order',orders:[{a,b:false,p:priceToWire(price*0.997,decimals),
@@ -3127,7 +3127,9 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    const r=await sendLifecycleSignedAction(protection,secret);
    if(swingOrderAccepted(r,2)){
      const verified=await getOpenOrdersForCoin(coin);
-     if(verified.length>=2){protectedOk=true;break;}
+     const tpVerified=verified.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(tp))<Number(tp)*0.0001);
+     const slVerified=verified.some((o:any)=>Math.abs(Number(o.triggerPx??o.trigger?.triggerPx)-Number(sl))<Number(sl)*0.0001);
+     if(tpVerified&&slVerified){protectedOk=true;break;}
    }
   }
   await db.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,last_error=? WHERE crossing_id=?`)
@@ -3180,7 +3182,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
  const due:any=await db.prepare(`SELECT * FROM swing_live_queue WHERE status='WAITING_POSITION'
   AND next_retry_at<=? AND expires_at>? ORDER BY next_retry_at LIMIT 4`).bind(now,now).all();
- const liveEnabled=(env as any).SWING_LIVE_ENABLED === 'true';
+ const liveEnabled=String((env as any).SWING_LIVE_ENABLED ?? 'true').toLowerCase() === 'true';
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const entered=[];
  for(const row of due.results??[])entered.push({coin:row.coin,result:await swingEnter(env,row)});
