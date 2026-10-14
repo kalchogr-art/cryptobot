@@ -56,8 +56,14 @@ const EXPECTED_API_WALLET =
 const MASTER_ACCOUNT =
   "0xf1CF243f05024AE78aE2dFa31c2Bec1e1F6c9196";
 
+// REAL TRADING CONTROL — change these two values, then deploy.
+// false = no NEW live entries; true = allow NEW live entries.
+// Existing positions/orders are NOT cancelled by these switches.
+const FAST_TRADING_ENABLED = false;  // FAST / SCALP
+const SWING_TRADING_ENABLED = false; // SWING SHORT
+
 const CONFIG = {
-  LIVE_TRADING: true,
+  LIVE_TRADING: FAST_TRADING_ENABLED,
 
   MIN_SIGNAL_SCORE: 0,
 
@@ -3205,7 +3211,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
  const due:any=await db.prepare(`SELECT * FROM swing_live_queue WHERE status='WAITING_POSITION'
   AND next_retry_at<=? AND expires_at>? ORDER BY next_retry_at LIMIT 4`).bind(now,now).all();
- const liveEnabled=String((env as any).SWING_LIVE_ENABLED ?? 'false').toLowerCase() === 'true';
+ const liveEnabled=SWING_TRADING_ENABLED;
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const unsafe:any=await db.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
   WHERE strategy_version=? AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
