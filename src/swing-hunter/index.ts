@@ -173,6 +173,106 @@ async function filteredShortHistory(env:any,u:URL){
   filteredTotal:total,page,pages:Math.max(1,Math.ceil(total/limit)),limit,rows:rows.results||[]};
 }
 
+/** SWING SHORT EXECUTABLE V2 — read-only portfolio replay.
+ * One open SHORT per coin across 1h and 4h. Never places orders.
+ * Historical OHLC first-touch time is known only to the end of its 1h bar.
+ * Uncertain exits block re-entry; no invented closure timestamps.
+ */
+const PATTERNS = ['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF','VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT'];
+const HOUR = 3600000;
+type Outcome = 'TP_FIRST'|'SL_FIRST'|'TIME_EXIT'|'AMBIGUOUS'|'TRACKING'|'PENDING'|'CONFLICT';
+type Signal = {coin:string;interval:string;signal_bar_open:number;signal_available_at:number;patterns:string[];confirmations:number;entry_price:number|null;rsi:number|null;relative_volume:number|null;result:Outcome;net:number|null;exit_bar_open:number|null;exit_at:number|null;exit_precision:string;};
+function number(x:any):number|null {const n=Number(x);return x===null||x===undefined||!Number.isFinite(n)?null:n;}
+function parseReplayJson(x:any):any {try{return typeof x==='string'?JSON.parse(x):x||null;}catch{return null;}}
+function toMs(x:any):number|null {if(typeof x==='number'&&Number.isFinite(x))return x;if(typeof x==='string'){const n=Date.parse(x);return Number.isFinite(n)?n:null;}return null;}
+function todaySofia():number {
+ const now=new Date(),parts=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
+ const p:any={};for(const x of parts)if(x.type!=='literal')p[x.type]=Number(x.value);
+ const midnight=Date.UTC(p.year,p.month-1,p.day);
+ let guess=midnight-2*HOUR;
+ for(let i=0;i<3;i++){
+  const q:any={};for(const x of new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(guess)))if(x.type!=='literal')q[x.type]=Number(x.value);
+  guess+=midnight-Date.UTC(q.year,q.month-1,q.day,q.hour,q.minute);
+ }
+ return guess;
+}
+function scenario(r:any){const o=parseReplayJson(r.outcome_json);return (o?.scenarios||[]).find((x:any)=>Number(x.tp)===2&&Number(x.sl)===1)||null;}
+function group(rows:any[]):Signal[] {
+ const groups=new Map<string,any[]>();
+ for(const r of rows){const k=[r.coin,r.interval,r.signal_bar_open].join('|');const a=groups.get(k)||[];a.push(r);groups.set(k,a);}
+ const result:Signal[]=[];
+ for(const a of groups.values()){
+  const first=a[0],states=a.map(r=>r.status==='TRACKING'?'TRACKING':scenario(r)?.status||'PENDING');
+  const state:Outcome=states.includes('TRACKING')?'TRACKING':new Set(states).size>1?'CONFLICT':states[0] as Outcome;
+  const touches=a.map(scenario).map(s=>toMs(s?.firstTouchBarOpen));
+  const entryTimes=a.map(r=>number(r.signal_available_at)).filter((v):v is number=>v!==null);
+  const prices=a.map(r=>number(r.reference_price??r.entry_price)).filter((v):v is number=>v!==null);
+  const contexts=a.map(r=>parseReplayJson(r.context_json));
+  const avg=(vals:(number|null)[])=>{const valid=vals.filter((v):v is number=>v!==null);return valid.length?valid.reduce((x,y)=>x+y,0)/valid.length:null;};
+  const bar=states.every(s=>s===state)&&touches.every(t=>t!==null&&t===touches[0])?touches[0]:null;
+  // TIME_EXIT: do not guess exit timestamp from resolved_at (settlement processing time).
+  // First-touch: conservatively unlock only after the entire touched hourly candle.
+  const resolved=(state==='TP_FIRST'||state==='SL_FIRST')&&bar!==null;
+  const net=avg(a.map(r=>number(scenario(r)?.hypotheticalNetPct)));
+  result.push({coin:String(first.coin),interval:String(first.interval),signal_bar_open:Number(first.signal_bar_open),
+   signal_available_at:entryTimes.length?Math.max(...entryTimes):Number(first.signal_bar_open)+(first.interval==='4h'?4:1)*HOUR,
+   patterns:[...new Set(a.map(r=>String(r.pattern)))],confirmations:new Set(a.map(r=>r.pattern)).size,
+   entry_price:avg(prices),rsi:avg(contexts.map(c=>number(c?.indicators?.rsi14))),
+   relative_volume:avg(contexts.map(c=>number(c?.volume?.relativeVolume))),
+   result:state,net,exit_bar_open:resolved?bar:null,exit_at:resolved?bar!+HOUR:null,
+   exit_precision:resolved?'CONSERVATIVE_END_OF_1H_BAR':'UNKNOWN_BLOCKS_REENTRY'});
+ }
+ return result.sort((a,b)=>a.signal_available_at-b.signal_available_at||a.coin.localeCompare(b.coin)||a.interval.localeCompare(b.interval));
+}
+async function swingExecutableV2(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
+ const allowed=['period','page','limit','coin','interval','status'];
+ for(const key of u.searchParams.keys())if(!allowed.includes(key))throw Error('UNSUPPORTED_FILTER_'+key);
+ const period=u.searchParams.get('period')||'total';if(!['total','today'].includes(period))throw Error('INVALID_PERIOD');
+ const coin=(u.searchParams.get('coin')||'').toUpperCase(),interval=u.searchParams.get('interval')||'',status=u.searchParams.get('status')||'';
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(status&&!['TRACKING','TP_FIRST','SL_FIRST','TIME_EXIT','AMBIGUOUS','PENDING','CONFLICT','SKIPPED_ALREADY_OPEN'].includes(status))throw Error('INVALID_STATUS');
+ const bounded=(key:string,def:number,max:number)=>{const n=Number(u.searchParams.get(key));return Number.isInteger(n)&&n>0?Math.min(n,max):def;};
+ const page=bounded('page',1,100000),limit=bounded('limit',50,100);
+ // IMPORTANT: replay the FULL history first. Filtering by date/coin/TF before replay changes eligibility.
+ // D1 all() can be truncated by row limits: use keyset paging with deterministic id ordering.
+ const d=env.SWING_DB;const raw:any[]=[];let lastId=0;
+ for(let batch=0;batch<200;batch++){
+  const res=await d.prepare(`SELECT id,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
+   FROM swing_context_signals WHERE id>? AND side='SHORT' AND interval IN ('1h','4h')
+   AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
+   AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+   ORDER BY id ASC LIMIT 500`).bind(lastId,...PATTERNS).all();
+  const rows=res.results||[];raw.push(...rows);if(rows.length<500)break;
+  lastId=Number(rows[rows.length-1].id);
+  if(batch===199)throw Error('REPLAY_ROW_LIMIT_REACHED_REFUSING_PARTIAL_STATISTICS');
+ }
+ const signals=group(raw),active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
+ for(const s of signals){
+  const old=active.get(s.coin);
+  if(old&&(old.exit_at===null||s.signal_available_at<old.exit_at)){
+   skipped.push({...s,skip_reason:'SKIPPED_ALREADY_OPEN',blocked_by:old.signal_bar_open});continue;
+  }
+  accepted.push(s);active.set(s.coin,s);
+ }
+ const start=period==='today'?todaySofia():-Infinity;
+ const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const visible=visibleAll.filter(s=>!status||s.result===status);
+ const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visible;
+ const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
+ const tracking=visibleAll.filter(s=>s.result==='TRACKING').length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
+ return {success:true,module:'SWING_SHORT_EXECUTABLE_V2',read_only:true,trading:false,
+  methodology:{position_limit:'ONE_PER_COIN_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'BLOCK_ALL_FUTURE_SAME_COIN_ENTRIES',time_exit:'UNKNOWN_EXIT_BLOCKS_REENTRY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  period,filters:{coin,interval,status,btc_1h:'MIXED',tp:2,sl:1},
+  stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+  all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
+  page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
+  rows:selected.slice((page-1)*limit,page*limit)};
+}
+
+
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
@@ -183,7 +283,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
   try{
    if(u.pathname==='/api/swing/v19/filtered-short'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
-    return json(await filteredShortHistory(env,u));
+    return json(await swingExecutableV2(env,u));
    }
    if(u.pathname==='/api/swing/v19/history'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
