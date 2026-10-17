@@ -267,6 +267,17 @@ async function swingExecutableV2(env:any,u:URL){
   return {accepted,skipped};
  }
  const shortReplay=replaySide(shortSignals),longReplay=replaySide(longSignals);
+ // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
+ const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
+  MIN(signal_bar_open) AS first_signal_ms, MAX(signal_bar_open) AS last_signal_ms,
+  SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS shorts,
+  SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS longs,
+  SUM(CASE WHEN json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' THEN 1 ELSE 0 END) AS mixed
+  FROM swing_context_signals`).first();
+ const source={total:Number(sourceRow?.total||0),first_signal_ms:sourceRow?.first_signal_ms??null,
+  last_signal_ms:sourceRow?.last_signal_ms??null,shorts:Number(sourceRow?.shorts||0),
+  longs:Number(sourceRow?.longs||0),mixed:Number(sourceRow?.mixed||0),
+  matching_short:shortSignals.length,matching_long:longSignals.length};
  const signals=mode==='SHORT'?shortSignals:mode==='LONG'?longSignals:[...shortSignals,...longSignals];
  const accepted=mode==='SHORT'?shortReplay.accepted:mode==='LONG'?longReplay.accepted:[...shortReplay.accepted,...longReplay.accepted];
  const skipped=mode==='SHORT'?shortReplay.skipped:mode==='LONG'?longReplay.skipped:[...shortReplay.skipped,...longReplay.skipped];
@@ -293,7 +304,7 @@ async function swingExecutableV2(env:any,u:URL){
    return b.win_rate_pct-a.win_rate_pct||b.resolved-a.resolved||a.coin.localeCompare(b.coin);
   });
   return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',mode,read_only:true,trading:false,
-   period,interval,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
+   period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
  const visible=visibleAll.filter(s=>!status||s.result===status);
@@ -303,7 +314,7 @@ async function swingExecutableV2(env:any,u:URL){
  const tracking=visibleAll.filter(s=>s.result==='TRACKING').length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
   methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'BLOCK_ALL_FUTURE_SAME_COIN_ENTRIES',time_exit:'UNKNOWN_EXIT_BLOCKS_REENTRY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
-  period,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
+  period,source,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
   stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
