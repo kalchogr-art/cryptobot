@@ -253,8 +253,11 @@ async function swingExecutableV2(env:any,u:URL){
   if(batch===199)throw Error('REPLAY_ROW_LIMIT_REACHED_REFUSING_PARTIAL_STATISTICS');
  }
  // Independent position locks for LONG and SHORT. No database changes.
- const shortSignals=group(raw.filter(r=>r.side==='SHORT'));
- const longSignals=group(raw.filter(r=>r.side==='LONG'));
+ // Historical report: only completed TP/SL with a verified first-touch exit.
+ // Exclude incomplete records BEFORE overlap replay so they never lock a coin.
+ const isCompleted=(x:Signal)=> (x.result==='TP_FIRST'||x.result==='SL_FIRST') && x.exit_at!==null;
+ const shortSignals=group(raw.filter(r=>r.side==='SHORT')).filter(isCompleted);
+ const longSignals=group(raw.filter(r=>r.side==='LONG')).filter(isCompleted);
  function replaySide(signals:Signal[]){
   const active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
   for(const signal of signals){
@@ -313,7 +316,7 @@ async function swingExecutableV2(env:any,u:URL){
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
  const tracking=visibleAll.filter(s=>s.result==='TRACKING').length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'BLOCK_ALL_FUTURE_SAME_COIN_ENTRIES',time_exit:'UNKNOWN_EXIT_BLOCKS_REENTRY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
   period,source,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
   stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
