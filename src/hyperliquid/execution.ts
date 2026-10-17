@@ -60,7 +60,7 @@ const MASTER_ACCOUNT =
 // false = no NEW live entries; true = allow NEW live entries.
 // Existing positions/orders are NOT cancelled by these switches.
 const FAST_TRADING_ENABLED = false;  // FAST / SCALP
-const SWING_TRADING_ENABLED = false; // SWING SHORT
+const SWING_TRADING_ENABLED = true; // SWING LONG + SHORT; enable only after validation
 
 const CONFIG = {
   LIVE_TRADING: FAST_TRADING_ENABLED,
@@ -1432,7 +1432,7 @@ export async function executeProgressiveWsTrigger(
   if (!env?.DB) return { success:false, executed:false, reason:"D1_NOT_BOUND" };
   await ensureExecutionLedger(env.DB);
   const swingWsRow:any=await env.DB.prepare(`SELECT strategy_version FROM hyperliquid_execution_ledger WHERE id=?`).bind(ledgerId).first();
-  if (swingWsRow?.strategy_version === 'SWING_SHORT_FILTERED_V1')
+  if (String(swingWsRow?.strategy_version??'').startsWith('SWING_'))
     return {success:false,executed:false,reason:'SWING_EXCLUDED_FROM_PROGRESSIVE'};
   if (!CONFIG.LIVE_TRADING) return { success:true, executed:false, reason:"LIVE_TRADING_DISABLED", ledger_id:ledgerId, target_stage:targetStage };
   const secretRaw=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
@@ -1662,7 +1662,7 @@ export async function monitorHyperliquidExecutionLifecycle(env?: HyperliquidExec
   await ensureExecutionLedger(env.DB);
   const rows: any = await env.DB.prepare(`
     SELECT * FROM hyperliquid_execution_ledger
-    WHERE COALESCE(strategy_version,'') <> 'SWING_SHORT_FILTERED_V1' AND status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
+    WHERE COALESCE(strategy_version,'') NOT LIKE 'SWING_%' AND status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
     ORDER BY
       CASE
         WHEN strategy_version IN ('BTC1M_DIRECTIONAL_V1','BTC3M_DIRECTIONAL_V1','BTC5M_DIRECTIONAL_V1','BTC10M_DIRECTIONAL_V1') AND status='PROTECTED' THEN 0
@@ -2053,7 +2053,7 @@ export async function buildHyperliquidExecutionCandidate(
     fill_received_at: null,
   };
 
-  if (signal?.strategy_version === 'SWING_SHORT_FILTERED_V1')
+  if (String(signal?.strategy_version??'').startsWith('SWING_'))
     return {eligible:false,status:'BLOCKED',reason:'SWING_OWN_EXECUTOR_ONLY'};
   const coin = String(signal?.coin ?? "").toUpperCase();
   const side = signal?.side;
@@ -3009,10 +3009,55 @@ export async function buildHyperliquidExecutionCandidate(
 
 
 // ===== SWING SHORT FILTERED V1 — dedicated fixed TP/SL execution =====
-const SWING_STRATEGY='SWING_SHORT_FILTERED_V1';
+const SWING_SHORT_STRATEGY='SWING_SHORT_FILTERED_V1';
+const SWING_LONG_STRATEGY='SWING_LONG_FILTERED_V1';
+const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_LONG_STRATEGY];
 const SWING_PATTERNS=new Set(['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
  'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT']);
-const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000, SWING_MAX_HOLD=48*3600_000;
+const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000; // No timed MARKET close for SWING
+// Telegram lifecycle for filtered SWING positions only (does not affect SCALP messages).
+function swingTelegramMeta(key:string,side:string,patterns:any){
+ let parsed:any=[];try{parsed=JSON.parse(String(patterns??'[]'));}catch{}
+ const names=Array.isArray(parsed)?parsed.map(String).join(', '):String(patterns??'');
+ const match=/^SWING:(LONG|SHORT):[^:]+:(1h|4h):/.exec(key);
+ return [
+  `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} · FILTERED</b>`,
+  `🔎 Pattern: ${escapeTelegramHtml(names||'n/a')}`,
+  `🕒 Timeframe: ${escapeTelegramHtml(match?.[2]??'n/a')}`,
+  `₿ BTC 1H: MIXED`,
+  `🆔 Signal: ${escapeTelegramHtml(key)}`
+ ];
+}
+function swingEntryTelegram(a:{coin:string;side:string;key:string;patterns:any;px:number;sz:number;leverage:number;tp:string;sl:string;protectedOk:boolean;reason:string;}){
+ return [a.protectedOk?'🟢 <b>SWING LIVE ENTRY · PROTECTED</b>':'🚨 <b>SWING LIVE ENTRY · PROTECTION NOT CONFIRMED</b>',
+  '',`🪙 <b>${escapeTelegramHtml(a.coin)}</b> · ${a.side==='LONG'?'📈 LONG':'📉 SHORT'}`,
+  ...swingTelegramMeta(a.key,a.side,a.patterns),
+  `🎯 Fill: ${escapeTelegramHtml(a.px)}`,
+  `📦 Size: ${escapeTelegramHtml(a.sz)}`,
+  `💰 Margin target: $${CONFIG.BASE_MARGIN_USD.toFixed(2)}`,
+  `⚙️ ${CONFIG.IS_CROSS?'CROSS':'ISOLATED'} ${a.leverage}x (asset cap applied)`,
+  `📊 Filled notional: $${(a.px*a.sz).toFixed(4)}`,
+  `🟢 TP +2%: ${escapeTelegramHtml(a.tp)}`,
+  `🔴 SL −1%: ${escapeTelegramHtml(a.sl)}`,
+  `🛡 Protection: ${a.protectedOk?'CONFIRMED':'UNCONFIRMED — CHECK EXCHANGE'}`,
+  ...(!a.protectedOk?[`⚠️ ${escapeTelegramHtml(a.reason)}`]:[]),
+  `🕐 ${new Date().toISOString()}`].join('\n');
+}
+function swingExitTelegram(a:{coin:string;side:string;key:string;patterns:any;entry:number;exit:number;sz:number;reason:string;gross:any;fees:any;net:any;heldMs:number}){
+ const fmt=(v:any)=>v==null||!Number.isFinite(Number(v))?'n/a':'$'+Number(v).toFixed(4);
+ return [`🏁 <b>SWING LIVE EXIT · ${escapeTelegramHtml(a.reason)}</b>`,'',
+  `🪙 <b>${escapeTelegramHtml(a.coin)}</b> · ${a.side==='LONG'?'📈 LONG':'📉 SHORT'}`,
+  ...swingTelegramMeta(a.key,a.side,a.patterns),
+  `🎯 Entry: ${escapeTelegramHtml(a.entry)}`,
+  `🏁 Exit: ${escapeTelegramHtml(a.exit)}`,
+  `📦 Size: ${escapeTelegramHtml(a.sz)}`,
+  `💵 Gross P/L: ${fmt(a.gross)}`,
+  `💸 Fees: ${fmt(a.fees)}`,
+  `💰 NET P/L: ${fmt(a.net)}`,
+  `⏱ Held: ${Math.max(0,Math.round(a.heldMs/60000))} min`,
+  `🕐 ${new Date().toISOString()}`].join('\n');
+}
+
 
 async function swingSchema(db:any){
  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_coin_owners(
@@ -3021,8 +3066,38 @@ async function swingSchema(db:any){
  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_live_queue(
  signal_key TEXT PRIMARY KEY, coin TEXT NOT NULL, signal_available_at INTEGER NOT NULL,
  signal_bar_open INTEGER NOT NULL, reference_price REAL NOT NULL,
+ side TEXT NOT NULL DEFAULT 'SHORT',
  patterns_json TEXT NOT NULL, status TEXT NOT NULL, next_retry_at INTEGER NOT NULL,
  expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, reason TEXT)`).run();
+ const columns:any=await db.prepare('PRAGMA table_info(swing_live_queue)').all();
+ if(!(columns.results??[]).some((c:any)=>c.name==='side'))
+  await db.prepare("ALTER TABLE swing_live_queue ADD COLUMN side TEXT NOT NULL DEFAULT 'SHORT'").run();
+}
+// Persist confirmed protection order identifiers; no blind TP/SL resubmission.
+async function swingProtectionSchema(db:any){
+ await db.prepare(`CREATE TABLE IF NOT EXISTS swing_protection_orders(
+  signal_key TEXT PRIMARY KEY,coin TEXT NOT NULL,tp_oid TEXT NOT NULL,sl_oid TEXT NOT NULL,
+  tp_px TEXT NOT NULL,sl_px TEXT NOT NULL,confirmed_at INTEGER NOT NULL)`).run();
+}
+function swingProtectionOid(o:any):string|null {
+ const id=o?.oid??o?.orderId;
+ return id==null?null:String(id);
+}
+function swingProtectionKind(o:any):'tp'|'sl'|null {
+ const fields=[o?.orderType,o?.orderTypeName,o?.tpsl,o?.trigger?.tpsl,o?.order?.t?.trigger?.tpsl]
+  .filter(v=>v!=null).map(v=>String(v).toLowerCase());
+ if(fields.some(v=>v==='tp'||v.includes('take profit')||v.includes('takeprofit')))return 'tp';
+ if(fields.some(v=>v==='sl'||v.includes('stop loss')||v.includes('stoploss')))return 'sl';
+ return null;
+}
+async function swingProtectionInventory(coin:string){
+ const all=await postInfo({type:'frontendOpenOrders',user:MASTER_ACCOUNT});
+ if(!Array.isArray(all))throw Error('SWING_ORDER_INVENTORY_UNAVAILABLE');
+ const same=all.filter((o:any)=>String(o.coin??'').toUpperCase()===coin);
+ const tp=same.filter((o:any)=>swingProtectionKind(o)==='tp');
+ const sl=same.filter((o:any)=>swingProtectionKind(o)==='sl');
+ const unknown=same.filter((o:any)=>swingProtectionKind(o)===null);
+ return {same,tp,sl,unknown};
 }
 async function swingOwned(db:any,coin:string,key:string,status:string){
  await db.prepare(`UPDATE swing_coin_owners SET status=?,updated_at=? WHERE coin=? AND owner=?`)
@@ -3050,25 +3125,29 @@ async function swingCloseMarket(coin:string,sz:number,secret:`0x${string}`){
  if(a<0)throw Error('ASSET_NOT_FOUND');
  const decimals=Number(u[a].szDecimals),price=Number(ctx[a]?.markPx??ctx[a]?.midPx);
  if(!Number.isFinite(price)||price<=0)throw Error('MARK_PRICE_MISSING');
- const limit=price*1.01;
- const action={type:'order',orders:[{a,b:true,p:priceToWire(limit,decimals),
+ const buyToClose=sz<0;
+ const limit=price*(buyToClose?1.01:0.99);
+ const action={type:'order',orders:[{a,b:buyToClose,p:priceToWire(limit,decimals),
    s:toWire(Math.abs(sz),decimals),r:true,t:{limit:{tif:'Ioc'}}}],grouping:'na'};
  return sendLifecycleSignedAction(action,secret);
 }
 async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const db=env.DB!,coin=String(row.coin).toUpperCase(),key=String(row.signal_key),now=Date.now();
+ const side=String(row.side??'SHORT');
+ if(side!=='LONG'&&side!=='SHORT')throw Error('INVALID_SWING_SIDE');
+ const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_STRATEGY;
  if(now>Number(row.expires_at)){await swingExpire(db,key,'EXPIRED_20M');return 'EXPIRED';}
  // Atomic per-coin reservation; no execution if SCALP ledger is unresolved.
  const claim=await db.prepare(`INSERT OR IGNORE INTO swing_coin_owners
  (coin,owner,strategy,status,created_at,updated_at) VALUES (?,?,?,'RESERVED',?,?)`)
-  .bind(coin,key,SWING_STRATEGY,now,now).run();
+  .bind(coin,key,strategy,now,now).run();
  if(Number(claim.meta?.changes??0)!==1)return 'WAITING_POSITION';
  let entryAttempted=false;
  try{
   const scalp:any=await db.prepare(`SELECT id FROM hyperliquid_execution_ledger
-    WHERE coin=? AND COALESCE(strategy_version,'')<>? AND status IN
+    WHERE coin=? AND COALESCE(strategy_version,'') NOT LIKE 'SWING_%' AND status IN
     ('CLAIMED','ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING') LIMIT 1`)
-    .bind(coin,SWING_STRATEGY).first();
+    .bind(coin).first();
   if(scalp)throw Error('SCALP_LEDGER_ACTIVE');
   const clear=await swingExchangeClear(coin);
   if(!clear.clear)throw Error('EXCHANGE_COIN_OCCUPIED');
@@ -3081,21 +3160,22 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   if(Math.abs(price/Number(row.reference_price)-1)>0.005)throw Error('PRICE_DEVIATION_OVER_0_5PCT');
   const secret=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   if(!privateKeyFormatOk(secret))throw Error('PRIVATE_KEY_INVALID');
-  const size=bestValidSize(10.4/price,price,decimals,10.4);
+  const targetNotional=CONFIG.BASE_MARGIN_USD*CONFIG.TARGET_LEVERAGE;
+  const size=bestValidSize(targetNotional/price,price,decimals,targetNotional);
   if(!Number.isFinite(size)||size*price<10)throw Error('MIN_NOTIONAL');
-  const leverage=Math.min(10,Number(u[a]?.maxLeverage??10));
+  const leverage=Math.min(CONFIG.TARGET_LEVERAGE,Number(u[a]?.maxLeverage??CONFIG.TARGET_LEVERAGE));
   if(!Number.isFinite(leverage)||leverage<1)throw Error('INVALID_LEVERAGE');
-  const lev=await sendLifecycleSignedAction({type:'updateLeverage',asset:a,isCross:true,leverage},secret);
+  const lev=await sendLifecycleSignedAction({type:'updateLeverage',asset:a,isCross:CONFIG.IS_CROSS,leverage},secret);
   if(lev.httpStatus<200||lev.httpStatus>=300||lev.json?.status!=='ok')throw Error('LEVERAGE_FAILED');
   // Write durable intent before any non-idempotent network request.
   await db.prepare(`INSERT INTO hyperliquid_execution_ledger
    (crossing_id,episode_id,coin,side,crossing_ts,status,claimed_at,updated_at,strategy_version,setup_name)
-   VALUES (?,?,?,'SHORT',?,'CLAIMED',?,?,?, ?)`)
-   .bind(key,key,coin,Number(row.signal_available_at),now,now,SWING_STRATEGY,
+   VALUES (?,?,?,?,?,'CLAIMED',?,?,?,?)`)
+   .bind(key,key,coin,side,Number(row.signal_available_at),now,now,strategy,
       String(row.patterns_json)).run();
   await db.prepare(`UPDATE swing_live_queue SET status='ENTERING',reason=NULL,updated_at=? WHERE signal_key=?`)
    .bind(now,key).run();
-  const action={type:'order',orders:[{a,b:false,p:priceToWire(price*0.997,decimals),
+  const action={type:'order',orders:[{a,b:side==='LONG',p:priceToWire(price*(side==='LONG'?1.003:0.997),decimals),
    s:toWire(size,decimals),r:false,t:{limit:{tif:'Ioc'}}}],grouping:'na'};
   entryAttempted=true;
   const entry=await sendLifecycleSignedAction(action,secret);
@@ -3115,56 +3195,50 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    entry_fill_price=?,entry_fill_size=?,entry_oid=?,entry_filled_at=?,updated_at=? WHERE crossing_id=?`)
    .bind(px,sz,String(fill.oid??''),Date.now(),Date.now(),key).run();
   await swingOwned(db,coin,key,'OPEN');
-  const tp=priceToWire(px*0.98,decimals),sl=priceToWire(px*1.01,decimals),wire=toWire(sz,decimals);
+  const tp=priceToWire(px*(side==='LONG'?1.02:0.98),decimals),sl=priceToWire(px*(side==='LONG'?0.99:1.01),decimals),wire=toWire(sz,decimals);
   const protection={type:'order',orders:[
-   {a,b:true,p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}},
-   {a,b:true,p:sl,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:sl,tpsl:'sl'}}}
+   {a,b:side==='SHORT',p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}},
+   {a,b:side==='SHORT',p:sl,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:sl,tpsl:'sl'}}}
   ],grouping:'na'};
-  // Fail closed: inspect exchange before submission, submit ONCE, then reconcile.
-  // Never resend on an ambiguous response: the first request may have succeeded.
-  const inspectSwingProtection=async()=>{
-    const all=await postInfo({type:'frontendOpenOrders',user:MASTER_ACCOUNT});
-    if(!Array.isArray(all))throw Error('FRONTEND_OPEN_ORDERS_UNAVAILABLE');
-    const same=all.filter((o:any)=>String(o.coin??'').toUpperCase()===coin);
-    const match=(o:any,target:string,kind:'tp'|'sl')=>{
-      const actual=Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
-      const type=String(o.orderType??o.orderTypeName??o.tpsl??'').toLowerCase();
-      const isTp=type.includes('take profit')||type.includes('takeprofit')||type==='tp';
-      const isSl=type.includes('stop')||type==='sl';
-      return Number.isFinite(actual)&&Math.abs(actual-Number(target))<=Number(target)*0.0001 &&
-       (kind==='tp'?isTp:isSl);
-    };
-    return {tp:same.filter((o:any)=>match(o,tp,'tp')),sl:same.filter((o:any)=>match(o,sl,'sl'))};
-  };
+  // Never trust only the intended price: detect ALL existing TP/SL orders for the coin.
+  // Any partial, duplicate or unknown order requires manual reconciliation.
   let protectedOk=false;
   let protectionReason='SWING_PROTECTION_UNCONFIRMED';
-  // Durable one-shot marker BEFORE exchange submission. No automatic retries.
-  const existing=await inspectSwingProtection();
-  if(existing.tp.length>1||existing.sl.length>1){
-    protectionReason='DUPLICATE_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
-  }else if(existing.tp.length===1&&existing.sl.length===1){
-    protectedOk=true;
-  }else if(existing.tp.length||existing.sl.length){
-    protectionReason='PARTIAL_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
+  const existing=await swingProtectionInventory(coin);
+  if(existing.same.length!==0){
+    protectionReason='EXISTING_COIN_ORDERS_MANUAL_RECONCILIATION';
   }else{
+    // Durable marker before the non-idempotent request. Never retry automatically.
     await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='PROTECTION_SUBMITTING',
       last_error='PROTECTION_REQUEST_MAY_HAVE_BEEN_SENT',updated_at=? WHERE crossing_id=?`)
       .bind(Date.now(),key).run();
-    // Exactly one non-idempotent exchange request. A timeout is NOT a retry signal.
-    try { await sendLifecycleSignedAction(protection,secret); }
+    try {await sendLifecycleSignedAction(protection,secret);}
     catch(e:any){protectionReason='PROTECTION_SUBMISSION_AMBIGUOUS:'+String(e?.message??e);}
     try{
-      const verified=await inspectSwingProtection();
-      if(verified.tp.length===1&&verified.sl.length===1)protectedOk=true;
-      else if(verified.tp.length>1||verified.sl.length>1)
-        protectionReason='DUPLICATE_PROTECTION_REQUIRES_MANUAL_RECONCILIATION';
-      else protectionReason='PROTECTION_UNCONFIRMED_NO_AUTOMATIC_RETRY';
+      const verified=await swingProtectionInventory(coin);
+      const tpOrder=verified.tp[0],slOrder=verified.sl[0];
+      const px=(o:any)=>Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
+      const qty=(o:any)=>Number(o.sz??o.size??o.origSz);
+      const near=(a:number,b:number)=>Number.isFinite(a)&&Math.abs(a-b)<=Math.max(b*0.0001,1e-10);
+      const sizesOk=[tpOrder,slOrder].every(o=>o&&Number.isFinite(qty(o))&&Math.abs(qty(o)-sz)<=Math.max(sz*0.001,1e-9));
+      if(verified.same.length===2&&verified.tp.length===1&&verified.sl.length===1&&
+         verified.unknown.length===0&&near(px(tpOrder),Number(tp))&&near(px(slOrder),Number(sl))&&
+         sizesOk&&swingProtectionOid(tpOrder)&&swingProtectionOid(slOrder)){
+        await db.prepare(`INSERT INTO swing_protection_orders
+          (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at) VALUES (?,?,?,?,?,?,?)`)
+          .bind(key,coin,swingProtectionOid(tpOrder),swingProtectionOid(slOrder),tp,sl,Date.now()).run();
+        protectedOk=true;
+        protectionReason='CONFIRMED_ONE_TP_ONE_SL';
+      }else protectionReason='PROTECTION_COUNT_PRICE_SIZE_OR_OID_MISMATCH_MANUAL_RECONCILIATION';
     }catch(e:any){protectionReason='PROTECTION_RECONCILIATION_FAILED:'+String(e?.message??e);}
   }
   await db.prepare(`UPDATE hyperliquid_execution_ledger SET status=?,updated_at=?,last_error=? WHERE crossing_id=?`)
    .bind(protectedOk?'PROTECTED':'TPSL_FAILED_AFTER_RETRIES',Date.now(),protectedOk?null:protectionReason,key).run();
   await db.prepare(`UPDATE swing_live_queue SET status=?,updated_at=?,reason=? WHERE signal_key=?`)
    .bind(protectedOk?'OPEN':'UNKNOWN',Date.now(),protectedOk?null:protectionReason,key).run();
+  // Send only after the actual fill and protection reconciliation are persisted.
+  await sendTelegram(env,swingEntryTelegram({coin,side,key,patterns:row.patterns_json,
+   px,sz,leverage,tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
   return protectedOk?'PROTECTED':'TPSL_UNCONFIRMED';
  }catch(err:any){
   const reason=String(err?.message??err);
@@ -3183,29 +3257,32 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const db=env.DB;if(!db)return {ok:false,reason:'DB_MISSING'};
  // Collect eligible signals even when real SWING trading is disabled.
  // The execution switch is checked only AFTER the D1 queue is populated.
- await swingSchema(db);
+ await swingSchema(db);await swingProtectionSchema(db);
  const now=Date.now();
  // Keep only newly available signals. Never backfill old research as live trades.
- const signals:any=await (env.SWING_DB??db).prepare(`SELECT coin,signal_bar_open,
+ const signals:any=await (env.SWING_DB??db).prepare(`SELECT coin,interval,side,signal_bar_open,
   signal_available_at,reference_price,pattern,context_json FROM swing_context_signals
-  WHERE interval='1h' AND side='SHORT' AND signal_available_at BETWEEN ? AND ?
-  ORDER BY signal_available_at DESC LIMIT 250`).bind(now-SWING_MAX_WAIT,now).all();
+  WHERE interval IN ('1h','4h') AND side IN ('LONG','SHORT')
+  AND signal_available_at BETWEEN ? AND ?
+  ORDER BY signal_available_at DESC LIMIT 500`).bind(now-SWING_MAX_WAIT,now).all();
  const groups=new Map<string,any>();
- for(const s of signals.results??[]){
-  if(!SWING_PATTERNS.has(String(s.pattern)))continue;
-  let c:any;try{c=JSON.parse(String(s.context_json));}catch{continue;}
+ for(const item of signals.results??[]){
+  const side=String(item.side),pattern=String(item.pattern);
+  if(side==='SHORT'?!SWING_PATTERNS.has(pattern):side==='LONG'?pattern!=='TRIANGLE_UP':true)continue;
+  let c:any;try{c=JSON.parse(String(item.context_json));}catch{continue;}
   if(c?.btcDirection?.timeframes?.['1h']?.direction!=='MIXED')continue;
-  const key=`SWING:${s.coin}:${s.signal_bar_open}`;
-  if(!groups.has(key))groups.set(key,{...s,patterns:new Set<string>()});
-  groups.get(key).patterns.add(s.pattern);
+  // One candidate per coin, side, interval and candle. Coin ownership is global at execution.
+  const key=`SWING:${side}:${item.coin}:${item.interval}:${item.signal_bar_open}`;
+  if(!groups.has(key))groups.set(key,{...item,patterns:new Set<string>()});
+  groups.get(key).patterns.add(pattern);
  }
- for(const [key,s] of groups){
-  if(!Number.isFinite(Number(s.reference_price))||Number(s.reference_price)<=0)continue;
+ for(const [key,item] of groups){
+  if(!Number.isFinite(Number(item.reference_price))||Number(item.reference_price)<=0)continue;
   await db.prepare(`INSERT OR IGNORE INTO swing_live_queue
-   (signal_key,coin,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at)
-   VALUES (?,?,?,?,?,?,'WAITING_POSITION',?,?,?)`)
-   .bind(key,s.coin,s.signal_available_at,s.signal_bar_open,s.reference_price,
-    JSON.stringify([...s.patterns]),now,Number(s.signal_available_at)+SWING_MAX_WAIT,now).run();
+   (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at)
+   VALUES (?,?,?,?,?,?,?,'WAITING_POSITION',?,?,?)`)
+   .bind(key,item.coin,item.side,item.signal_available_at,item.signal_bar_open,item.reference_price,
+    JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now).run();
  }
  await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',reason='20M_TIMEOUT',updated_at=?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
@@ -3214,8 +3291,8 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const liveEnabled=SWING_TRADING_ENABLED;
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const unsafe:any=await db.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
-  WHERE strategy_version=? AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
-  .bind(SWING_STRATEGY).first();
+  WHERE strategy_version IN (?,?) AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
+  .bind(...SWING_STRATEGIES).first();
  if(Number(unsafe?.n??0)>0)return {ok:false,live:false,reason:'UNRESOLVED_SWING_PROTECTION_BLOCKS_NEW_ENTRIES',unresolved:Number(unsafe.n),orders_sent:0};
  const entered=[];
  for(const row of due.results??[])entered.push({coin:row.coin,result:await swingEnter(env,row)});
@@ -3223,26 +3300,31 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
 }
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
- const db=env.DB;await swingSchema(db);
+ const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);
  const rows:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
-  WHERE strategy_version=? AND status IN ('ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')
-  ORDER BY entry_filled_at LIMIT 20`).bind(SWING_STRATEGY).all();
+  WHERE strategy_version IN (?,?) AND status IN ('ENTRY_FILLED','PROTECTED','MAX_HOLD_CLOSING')
+  ORDER BY entry_filled_at LIMIT 20`).bind(...SWING_STRATEGIES).all();
  const events:any[]=[];
  for(const row of rows.results??[]){
   const coin=String(row.coin),key=String(row.crossing_id);
   try{
    const position=await getOpenPositionForCoin(coin);
    if(position){
-    if(Date.now()-Number(row.entry_filled_at??Date.now())>=SWING_MAX_HOLD){
-     const secret=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
-     if(!privateKeyFormatOk(secret))throw Error('PRIVATE_KEY_INVALID');
-     await swingOwned(db,coin,key,'CLOSING');
-     await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_CLOSING',updated_at=? WHERE id=?`)
-      .bind(Date.now(),row.id).run();
-     const result=await swingCloseMarket(coin,Number(position.szi),secret);
-     if(!swingOrderAccepted(result,1))throw Error('MAX_HOLD_CLOSE_NOT_CONFIRMED');
-     events.push({coin,status:'MAX_HOLD_CLOSE_SENT'});
-    }continue;
+    // Fixed exchange-native TP/SL only. No 48h MARKET close.
+    // If protection disappears, lock new entries and alert; never blindly resubmit.
+    const inventory=await swingProtectionInventory(coin);
+    const saved:any=await db.prepare(`SELECT * FROM swing_protection_orders WHERE signal_key=?`).bind(key).first();
+    const confirmed=!!saved&&inventory.same.length===2&&inventory.tp.length===1&&inventory.sl.length===1&&
+      swingProtectionOid(inventory.tp[0])===String(saved.tp_oid)&&
+      swingProtectionOid(inventory.sl[0])===String(saved.sl_oid);
+    if(!confirmed){
+      await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='TPSL_FAILED_AFTER_RETRIES',
+        last_error='SWING_PROTECTION_MISSING_OR_CHANGED_MANUAL_RECONCILIATION',updated_at=? WHERE id=?`)
+        .bind(Date.now(),row.id).run();
+      await sendTelegram(env,`🚨 SWING PROTECTION ALERT · ${escapeTelegramHtml(coin)} · ${escapeTelegramHtml(key)}\nTP/SL missing or changed. New SWING entries blocked. Check Hyperliquid manually.`).catch(()=>{});
+      events.push({coin,status:'PROTECTION_ALERT_NO_AUTOMATIC_ORDER'});
+    }
+    continue;
    }
    // Confirm both position and all open orders before releasing the coin.
    const orders=await getOpenOrdersForCoin(coin);
@@ -3262,16 +3344,22 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
       String(f.dir??'').toLowerCase().includes('close'));
    if(!exits.length)throw Error('CLOSE_FILL_NOT_YET_VISIBLE');
    const exit=exits.sort((a:any,b:any)=>Number(b.time)-Number(a.time))[0];
+   const side=String(row.side)==='LONG'?'LONG':'SHORT';
    const pnl=lifecyclePnlFromFills(fills,Number(row.entry_filled_at),Number(row.entry_fill_price),
-     Number(exit.px),Number(row.entry_fill_size),'SHORT');
+     Number(exit.px),Number(row.entry_fill_size),side);
    if(pnl.netPnl==null)throw Error('NET_PNL_UNAVAILABLE');
-   const closeReason=Number(exit.px)<=Number(row.entry_fill_price)*0.98?'TP':
-    Number(exit.px)>=Number(row.entry_fill_price)*1.01?'SL':'OTHER_OR_MAX_HOLD';
+   const closeReason=(side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*1.02:Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
+    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*0.99:Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER_OR_MAX_HOLD';
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
     close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=?`)
     .bind(Number(exit.time),closeReason,Number(exit.px),pnl.netPnl,Date.now(),row.id).run();
    await db.prepare(`UPDATE swing_live_queue SET status='CLOSED',updated_at=? WHERE signal_key=?`).bind(Date.now(),key).run();
    await db.prepare(`DELETE FROM swing_coin_owners WHERE coin=? AND owner=?`).bind(coin,key).run();
+   // Exit notification only after confirmed flat, close fill, and durable CLOSED state.
+   await sendTelegram(env,swingExitTelegram({coin,side,key,patterns:row.setup_name,
+    entry:Number(row.entry_fill_price),exit:Number(exit.px),sz:Number(row.entry_fill_size),
+    reason:closeReason,gross:pnl.grossPnl,fees:pnl.fees,net:pnl.netPnl,
+    heldMs:Number(exit.time)-Number(row.entry_filled_at)})).catch(()=>{});
    events.push({coin,status:'CLOSED',net_pnl:pnl.netPnl});
   }catch(err:any){
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
