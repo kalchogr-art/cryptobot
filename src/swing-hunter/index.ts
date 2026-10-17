@@ -225,7 +225,7 @@ function group(rows:any[]):Signal[] {
  return result.sort((a,b)=>a.signal_available_at-b.signal_available_at||a.coin.localeCompare(b.coin)||a.interval.localeCompare(b.interval));
 }
 async function swingExecutableV2(env:any,u:URL){
- const mode=u.searchParams.get('mode')||'SHORT';
+ const mode=u.searchParams.get('mode')||'ALL';
  if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
  if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
  const allowed=['period','page','limit','coin','interval','status','breakdown','mode'];
