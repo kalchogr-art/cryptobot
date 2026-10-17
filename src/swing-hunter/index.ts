@@ -241,7 +241,7 @@ async function swingExecutableV2(env:any,u:URL){
  // D1 all() can be truncated by row limits: use keyset paging with deterministic id ordering.
  const d=env.SWING_DB;const raw:any[]=[];let lastId=0;
  for(let batch=0;batch<200;batch++){
-  const res=await d.prepare(`SELECT id,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
+  const res=await d.prepare(`SELECT id,side,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
    FROM swing_context_signals WHERE id>? AND interval IN ('1h','4h')
    AND ((side='SHORT' AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
      AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED')
