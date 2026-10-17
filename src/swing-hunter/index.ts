@@ -225,8 +225,10 @@ function group(rows:any[]):Signal[] {
  return result.sort((a,b)=>a.signal_available_at-b.signal_available_at||a.coin.localeCompare(b.coin)||a.interval.localeCompare(b.interval));
 }
 async function swingExecutableV2(env:any,u:URL){
+ const mode=u.searchParams.get('mode')||'SHORT';
+ if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
  if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
- const allowed=['period','page','limit','coin','interval','status','breakdown'];
+ const allowed=['period','page','limit','coin','interval','status','breakdown','mode'];
  for(const key of u.searchParams.keys())if(!allowed.includes(key))throw Error('UNSUPPORTED_FILTER_'+key);
  const period=u.searchParams.get('period')||'total';if(!['total','today'].includes(period))throw Error('INVALID_PERIOD');
  const coin=(u.searchParams.get('coin')||'').toUpperCase(),interval=u.searchParams.get('interval')||'',status=u.searchParams.get('status')||'';
@@ -240,22 +242,34 @@ async function swingExecutableV2(env:any,u:URL){
  const d=env.SWING_DB;const raw:any[]=[];let lastId=0;
  for(let batch=0;batch<200;batch++){
   const res=await d.prepare(`SELECT id,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
-   FROM swing_context_signals WHERE id>? AND side='SHORT' AND interval IN ('1h','4h')
-   AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
-   AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+   FROM swing_context_signals WHERE id>? AND interval IN ('1h','4h')
+   AND ((side='SHORT' AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
+     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED')
+     OR (side='LONG' AND pattern='TRIANGLE_UP'
+     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))
    ORDER BY id ASC LIMIT 500`).bind(lastId,...PATTERNS).all();
   const rows=res.results||[];raw.push(...rows);if(rows.length<500)break;
   lastId=Number(rows[rows.length-1].id);
   if(batch===199)throw Error('REPLAY_ROW_LIMIT_REACHED_REFUSING_PARTIAL_STATISTICS');
  }
- const signals=group(raw),active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
- for(const s of signals){
-  const old=active.get(s.coin);
-  if(old&&(old.exit_at===null||s.signal_available_at<old.exit_at)){
-   skipped.push({...s,skip_reason:'SKIPPED_ALREADY_OPEN',blocked_by:old.signal_bar_open});continue;
+ // Independent position locks for LONG and SHORT. No database changes.
+ const shortSignals=group(raw.filter(r=>r.side==='SHORT'));
+ const longSignals=group(raw.filter(r=>r.side==='LONG'));
+ function replaySide(signals:Signal[]){
+  const active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
+  for(const signal of signals){
+   const old=active.get(signal.coin);
+   if(old&&(old.exit_at===null||signal.signal_available_at<old.exit_at)){
+    skipped.push({...signal,skip_reason:'SKIPPED_ALREADY_OPEN',blocked_by:old.signal_bar_open});continue;
+   }
+   accepted.push(signal);active.set(signal.coin,signal);
   }
-  accepted.push(s);active.set(s.coin,s);
+  return {accepted,skipped};
  }
+ const shortReplay=replaySide(shortSignals),longReplay=replaySide(longSignals);
+ const signals=mode==='SHORT'?shortSignals:mode==='LONG'?longSignals:[...shortSignals,...longSignals];
+ const accepted=mode==='SHORT'?shortReplay.accepted:mode==='LONG'?longReplay.accepted:[...shortReplay.accepted,...longReplay.accepted];
+ const skipped=mode==='SHORT'?shortReplay.skipped:mode==='LONG'?longReplay.skipped:[...shortReplay.skipped,...longReplay.skipped];
  const breakdown=u.searchParams.get('breakdown')||'';
  if(breakdown&&breakdown!=='coins')throw Error('INVALID_BREAKDOWN');
  const start=period==='today'?todaySofia():-Infinity;
@@ -278,8 +292,8 @@ async function swingExecutableV2(env:any,u:URL){
    if(b.win_rate_pct===null)return -1;
    return b.win_rate_pct-a.win_rate_pct||b.resolved-a.resolved||a.coin.localeCompare(b.coin);
   });
-  return {success:true,module:'SWING_SHORT_COIN_LEADERBOARD_V1',read_only:true,trading:false,
-   period,interval,methodology:'ACCEPTED_ENTRIES_ONLY_ONE_ACTIVE_SHORT_PER_COIN',coins};
+  return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',mode,read_only:true,trading:false,
+   period,interval,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
  const visible=visibleAll.filter(s=>!status||s.result===status);
@@ -287,9 +301,9 @@ async function swingExecutableV2(env:any,u:URL){
  const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visible;
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
  const tracking=visibleAll.filter(s=>s.result==='TRACKING').length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
- return {success:true,module:'SWING_SHORT_EXECUTABLE_V2',read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'BLOCK_ALL_FUTURE_SAME_COIN_ENTRIES',time_exit:'UNKNOWN_EXIT_BLOCKS_REENTRY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
-  period,filters:{coin,interval,status,btc_1h:'MIXED',tp:2,sl:1},
+ return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'BLOCK_ALL_FUTURE_SAME_COIN_ENTRIES',time_exit:'UNKNOWN_EXIT_BLOCKS_REENTRY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  period,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
   stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
