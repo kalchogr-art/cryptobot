@@ -226,7 +226,7 @@ function group(rows:any[]):Signal[] {
 }
 async function swingExecutableV2(env:any,u:URL){
  if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
- const allowed=['period','page','limit','coin','interval','status'];
+ const allowed=['period','page','limit','coin','interval','status','breakdown'];
  for(const key of u.searchParams.keys())if(!allowed.includes(key))throw Error('UNSUPPORTED_FILTER_'+key);
  const period=u.searchParams.get('period')||'total';if(!['total','today'].includes(period))throw Error('INVALID_PERIOD');
  const coin=(u.searchParams.get('coin')||'').toUpperCase(),interval=u.searchParams.get('interval')||'',status=u.searchParams.get('status')||'';
@@ -256,7 +256,31 @@ async function swingExecutableV2(env:any,u:URL){
   }
   accepted.push(s);active.set(s.coin,s);
  }
+ const breakdown=u.searchParams.get('breakdown')||'';
+ if(breakdown&&breakdown!=='coins')throw Error('INVALID_BREAKDOWN');
  const start=period==='today'?todaySofia():-Infinity;
+ // Coin leaderboard is calculated from the SAME accepted replay, not raw duplicated signals.
+ // It intentionally ignores coin/status table filters; period and timeframe still apply.
+ if(breakdown==='coins'){
+  const tracked=['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','HYPE','ADA','LTC','BCH','AAVE','UNI','NEAR','OP','ARB','WIF','TRX'];
+  const eligible=accepted.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
+  const names=[...new Set([...tracked,...eligible.map(s=>s.coin)])];
+  const coins=names.map(name=>{
+   const a=eligible.filter(s=>s.coin===name);
+   const tp=a.filter(s=>s.result==='TP_FIRST').length;
+   const sl=a.filter(s=>s.result==='SL_FIRST').length;
+   const tracking=a.filter(s=>s.result==='TRACKING').length;
+   const resolved=tp+sl;
+   return {coin:name,entries:a.length,tp,sl,tracking,resolved,
+    win_rate_pct:resolved?Number((100*tp/resolved).toFixed(2)):null};
+  }).sort((a,b)=>{
+   if(a.win_rate_pct===null)return b.win_rate_pct===null?a.coin.localeCompare(b.coin):1;
+   if(b.win_rate_pct===null)return -1;
+   return b.win_rate_pct-a.win_rate_pct||b.resolved-a.resolved||a.coin.localeCompare(b.coin);
+  });
+  return {success:true,module:'SWING_SHORT_COIN_LEADERBOARD_V1',read_only:true,trading:false,
+   period,interval,methodology:'ACCEPTED_ENTRIES_ONLY_ONE_ACTIVE_SHORT_PER_COIN',coins};
+ }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
  const visible=visibleAll.filter(s=>!status||s.result===status);
  const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
