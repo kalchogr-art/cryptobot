@@ -61,11 +61,33 @@ export async function swingFilteredRead(env:any,u:URL):Promise<any>{
   where.push('signal_bar_open>=?','signal_bar_open<=?');params.push(start,Date.now());
  }
  const w=where.join(' AND ');
- // One entry candidate per coin+side+interval+bar, even when several patterns match.
- const cte=`WITH g AS (SELECT coin,side,interval,signal_bar_open,MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) tracking,COUNT(DISTINCT pattern) confirmations,GROUP_CONCAT(DISTINCT pattern) patterns FROM swing_filtered_signals WHERE ${w} GROUP BY coin,side,interval,signal_bar_open)`;
- const row:any=await db.prepare(cte+` SELECT COUNT(*) eligible,COALESCE(SUM(tracking),0) tracking,COALESCE(SUM(CASE WHEN interval='1h' THEN 1 ELSE 0 END),0) h1,COALESCE(SUM(CASE WHEN interval='4h' THEN 1 ELSE 0 END),0) h4 FROM g`).bind(...params).first();
- const res:any=await db.prepare(cte+` SELECT * FROM g ORDER BY signal_bar_open DESC LIMIT ? OFFSET ?`).bind(...params,limit,(page-1)*limit).all();
+ // Deduplicate patterns on a single candle. Then select the most recent TRACKING
+ // signal per coin and direction ACROSS 1h/4h, as in swingExecutableV2.
+ // Historical completed replay entries cannot be inferred from this table.
+ const cte=`WITH grouped AS (
+   SELECT coin,side,interval,signal_bar_open,
+     MAX(COALESCE(signal_available_at,signal_bar_open)) signal_available_at,
+     MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) tracking,
+     COUNT(DISTINCT pattern) confirmations,GROUP_CONCAT(DISTINCT pattern) patterns
+   FROM swing_filtered_signals WHERE ${w}
+   GROUP BY coin,side,interval,signal_bar_open
+ ), ranked AS (
+   SELECT *,ROW_NUMBER() OVER (PARTITION BY coin,side
+     ORDER BY signal_available_at DESC,signal_bar_open DESC,interval DESC) rn
+   FROM grouped WHERE tracking=1
+ )`;
+ // 'eligible_signals' represents the current latest TRACKING candidate per coin/side,
+ // NOT all market-filter matches and NOT verified OHLC replay entries.
+ const row:any=await db.prepare(cte+` SELECT
+   (SELECT COUNT(*) FROM grouped) AS market_matches,
+   (SELECT COUNT(*) FROM ranked WHERE rn=1) AS eligible,
+   (SELECT COUNT(*) FROM ranked WHERE rn=1 AND interval='1h') AS h1,
+   (SELECT COUNT(*) FROM ranked WHERE rn=1 AND interval='4h') AS h4,
+   (SELECT COUNT(*) FROM grouped WHERE tracking=1) AS raw_tracking`).bind(...params).first();
+ const res:any=await db.prepare(cte+` SELECT coin,side,interval,signal_bar_open,signal_available_at,
+   tracking,confirmations,patterns FROM ranked WHERE rn=1
+   ORDER BY signal_available_at DESC LIMIT ? OFFSET ?`).bind(...params,limit,(page-1)*limit).all();
  const cursor:any=await db.prepare("SELECT last_id,updated_at FROM swing_filter_cursor WHERE name='v1'").first();
  const max:any=await db.prepare('SELECT MAX(id) latest FROM swing_context_signals').first();
- return {success:true,variant,mode,period,eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),breakdown:{'1h':Number(row?.h1||0),'4h':Number(row?.h4||0)},rows:res.results||[],page,limit,pages:Math.max(1,Math.ceil(Number(row?.eligible||0)/limit)),sync:{last_id:Number(cursor?.last_id||0),latest_id:Number(max?.latest||0),complete:Number(cursor?.last_id||0)>=Number(max?.latest||0),updated_at:cursor?.updated_at||null},source:{table:'swing_filtered_signals'}};
+ return {success:true,variant,mode,period,eligible_signals:Number(row?.eligible||0),tracking:Number(row?.eligible||0),market_matches:Number(row?.market_matches||0),raw_tracking:Number(row?.raw_tracking||0),methodology:"LATEST_TRACKING_PER_COIN_AND_SIDE_NO_OHLC_VERIFICATION",breakdown:{'1h':Number(row?.h1||0),'4h':Number(row?.h4||0)},rows:res.results||[],page,limit,pages:Math.max(1,Math.ceil(Number(row?.eligible||0)/limit)),sync:{last_id:Number(cursor?.last_id||0),latest_id:Number(max?.latest||0),complete:Number(cursor?.last_id||0)>=Number(max?.latest||0),updated_at:cursor?.updated_at||null},source:{table:'swing_filtered_signals'}};
 }
