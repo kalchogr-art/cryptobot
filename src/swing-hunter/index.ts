@@ -1,3 +1,4 @@
+import { swingFilteredRead } from './swing-filter-cache';
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
 import {swingABDashboard} from './swing-ab-dashboard';
@@ -485,6 +486,11 @@ async function swingEntryCounters(env:any,u:URL){
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
+ if(req.method==='GET'&&u.pathname==='/api/swing/v19/materialized'){
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  try{return json(await swingFilteredRead(env,u));}catch(e:any){return json({success:false,error:String(e?.message||e)},502)}
+ }
  if(req.method==='GET'&&u.pathname==='/api/swing/v19/entry-counters'){
   if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
   if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
