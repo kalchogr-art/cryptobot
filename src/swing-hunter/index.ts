@@ -426,20 +426,42 @@ async function swingEntryCounters(env:any,u:URL){
  const coin=(u.searchParams.get('coin')||'').toUpperCase();
  if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
  if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
- const start=period==='today'?todaySofia():0;
- const clauses=["interval IN ('1h','4h')",'signal_available_at>=?'];
- const args:any[]=[start];
- if(interval){clauses.push('interval=?');args.push(interval);}
- if(coin){clauses.push('coin=?');args.push(coin);}
- if(mode!=='ALL'){clauses.push('side=?');args.push(mode);}
- const patternParams=PATTERNS.map(()=>'?').join(',');
- clauses.push(`((side='SHORT' AND pattern IN (${patternParams}) AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''}) OR (side='LONG' AND pattern='TRIANGLE_UP' AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))`);
- args.push(...PATTERNS);
- // Group patterns belonging to the same coin/side/timeframe/candle into one signal.
- const sql=`WITH grouped AS (SELECT coin,side,interval,signal_bar_open,MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) AS tracking FROM swing_context_signals WHERE ${clauses.join(' AND ')} GROUP BY coin,side,interval,signal_bar_open) SELECT COUNT(*) AS eligible,COALESCE(SUM(tracking),0) AS tracking FROM grouped`;
- const row:any=await env.SWING_DB.prepare(sql).bind(...args).first();
+ // IMPORTANT: the source population MUST be identical to /api/swing/v19/history.
+ // History uses signal_bar_open and swingTodayStartMs(), NOT signal_available_at.
+ const start=period==='today'?swingTodayStartMs():0;
+ const baseWhere=['signal_bar_open>=?'];const baseArgs:any[]=[start];
+ if(interval){baseWhere.push('interval=?');baseArgs.push(interval);}
+ if(coin){baseWhere.push('coin=?');baseArgs.push(coin);}
+ if(mode!=='ALL'){baseWhere.push('side=?');baseArgs.push(mode);}
+ const d=env.SWING_DB;
+ const population:any=await d.prepare(`SELECT COUNT(*) AS total,
+  COALESCE(SUM(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END),0) AS tracking
+  FROM swing_context_signals WHERE ${baseWhere.join(' AND ')}`).bind(...baseArgs).first();
+ const rules=[...baseWhere,"interval IN ('1h','4h')"];
+ rules.push(`((side='SHORT' AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
+  AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+  ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''})
+  OR (side='LONG' AND pattern='TRIANGLE_UP'
+  AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))`);
+ const args=[...baseArgs,...PATTERNS];
+ // Match the replay's group key: coin + interval + signal_bar_open, separately per side.
+ // A signal with multiple confirmed patterns is ONE entry candidate, not N entries.
+ const sql=`WITH eligible AS (
+  SELECT coin,side,interval,signal_bar_open,
+    MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) AS is_tracking,
+    COUNT(DISTINCT pattern) AS confirmations
+  FROM swing_context_signals WHERE ${rules.join(' AND ')}
+  GROUP BY coin,side,interval,signal_bar_open
+ ) SELECT COUNT(*) AS eligible,
+  COALESCE(SUM(is_tracking),0) AS tracking,
+  COALESCE(SUM(CASE WHEN interval='1h' THEN 1 ELSE 0 END),0) AS h1,
+  COALESCE(SUM(CASE WHEN interval='4h' THEN 1 ELSE 0 END),0) AS h4,
+  COALESCE(SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END),0) AS shorts,
+  COALESCE(SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END),0) AS longs
+  FROM eligible`;
+ const row:any=await d.prepare(sql).bind(...args).first();
  let live:any=null,liveError:string|null=null;
- // Queue tracks actual B SHORT and unchanged LONG, not historical A SHORT.
+ // LIVE queue is a separate execution metric and never affects research eligibility.
  if(env.DB?.prepare){
   try{
    const filters=['signal_available_at>=?'];const params:any[]=[start];
@@ -447,10 +469,16 @@ async function swingEntryCounters(env:any,u:URL){
    if(mode!=='ALL'){filters.push('side=?');params.push(mode);}
    if(interval){filters.push('signal_key LIKE ?');params.push('%:'+interval+':%');}
    const lr:any=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) AS opened,COALESCE(SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END),0) AS expired FROM swing_live_queue WHERE ${filters.join(' AND ')}`).bind(...params).first();
-   live={opened:Number(lr?.opened||0),expired:Number(lr?.expired||0),short_strategy:'B_DOUBLE_MIXED',meaning:'QUEUE_OPEN_ENTRIES_NOT_CURRENT_EXCHANGE_POSITIONS'};
+   live={opened:Number(lr?.opened||0),expired:Number(lr?.expired||0),short_strategy:'B_DOUBLE_MIXED',meaning:'QUEUE_ROWS_NOT_EXCHANGE_POSITIONS'};
   }catch(e:any){liveError=String(e?.message||e);}
  }else liveError='MISSING_LIVE_DB_BINDING';
- return {success:true,read_only:true,variant,mode,period,coin,interval,eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),live,live_error:liveError};
+ return {success:true,read_only:true,variant,mode,period,coin,interval,
+  source:{table:'swing_context_signals',time_field:'signal_bar_open',start_ms:start,
+   total:Number(population?.total||0),tracking:Number(population?.tracking||0)},
+  eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),
+  breakdown:{'1h':Number(row?.h1||0),'4h':Number(row?.h4||0),short:Number(row?.shorts||0),long:Number(row?.longs||0)},
+  filter_rules:{patterns:mode==='LONG'?['TRIANGLE_UP']:PATTERNS,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',group_by:'coin,side,interval,signal_bar_open'},
+  note:'RESEARCH_FILTER_MATCHES_NOT_CONFIRMED_EXECUTION_ENTRIES',live,live_error:liveError};
 }
 
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
