@@ -32,7 +32,7 @@ async function resolvedCount(env:any){
  return {success:true,module:'SWING_RESOLVED_COUNT',read_only:true,resolved:Number(row?.resolved||0)};
 }
 
-// Today is the current calendar day in Europe/Sofia; all-time retains the complete archive.
+// Today is the current cal.endar day in Europe/Sofia; all-time retains the complete archive.
 function swingTodayStartMs():number {
  const now=new Date();
  const date=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).format(now);
