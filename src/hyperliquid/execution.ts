@@ -3205,11 +3205,33 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  if(Number(claim.meta?.changes??0)!==1)return 'WAITING_POSITION';
  let entryAttempted=false;
  try{
-  const scalp:any=await db.prepare(`SELECT id FROM hyperliquid_execution_ledger
+  // Reconcile abandoned legacy CLAIMED intents only. Never clear a filled or ambiguous record.
+  // Fail closed unless the exchange confirms NO position and NO open orders for this coin.
+  const legacy:any=await db.prepare(`SELECT id,status,claimed_at,entry_oid,entry_fill_size,entry_filled_at
+    FROM hyperliquid_execution_ledger
+    WHERE coin=? AND COALESCE(strategy_version,'') NOT LIKE 'SWING_%' AND status IN
+    ('CLAIMED','ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING')`)
+    .bind(coin).all();
+  const blockers:any[]=legacy.results??[];
+  const stale=blockers.filter((r:any)=>String(r.status)==='CLAIMED' &&
+    Number(r.claimed_at)>0 && Number(r.claimed_at)<Date.now()-24*60*60_000 &&
+    !r.entry_oid && !r.entry_fill_size && !r.entry_filled_at);
+  if(stale.length){
+    const exchange=await swingExchangeClear(coin);
+    if(!exchange.clear)throw Error('EXCHANGE_COIN_OCCUPIED');
+    for(const old of stale){
+      await db.prepare(`UPDATE hyperliquid_execution_ledger
+        SET status='STALE_CLAIM_CLEARED',last_error='LEGACY_CLAIM_24H_EXCHANGE_EMPTY',updated_at=?
+        WHERE id=? AND coin=? AND status='CLAIMED' AND claimed_at<?
+          AND entry_oid IS NULL AND entry_fill_size IS NULL AND entry_filled_at IS NULL`)
+        .bind(Date.now(),old.id,coin,Date.now()-24*60*60_000).run();
+    }
+  }
+  const active:any=await db.prepare(`SELECT id FROM hyperliquid_execution_ledger
     WHERE coin=? AND COALESCE(strategy_version,'') NOT LIKE 'SWING_%' AND status IN
     ('CLAIMED','ENTRY_FILLED','PROTECTED','TPSL_FAILED_AFTER_RETRIES','MAX_HOLD_CLOSING') LIMIT 1`)
     .bind(coin).first();
-  if(scalp)throw Error('SCALP_LEDGER_ACTIVE');
+  if(active)throw Error('SCALP_LEDGER_ACTIVE');
   const clear=await swingExchangeClear(coin);
   if(!clear.clear)throw Error('EXCHANGE_COIN_OCCUPIED');
   const raw=await postInfo({type:'metaAndAssetCtxs'});
@@ -3347,10 +3369,12 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
    .bind(key,item.coin,item.side,item.signal_available_at,item.signal_bar_open,item.reference_price,
     JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now).run();
  }
- await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',reason='20M_TIMEOUT',updated_at=?
+ await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',
+  reason=CASE WHEN reason IS NULL OR reason='' THEN '20M_TIMEOUT'
+    ELSE '20M_TIMEOUT | LAST_BLOCKER: ' || reason END,updated_at=?
   WHERE status='WAITING_POSITION' AND expires_at<=?`).bind(now,now).run();
  const due:any=await db.prepare(`SELECT * FROM swing_live_queue WHERE status='WAITING_POSITION'
-  AND next_retry_at<=? AND expires_at>? ORDER BY next_retry_at LIMIT 4`).bind(now,now).all();
+  AND next_retry_at<=? AND expires_at>? ORDER BY signal_available_at DESC, next_retry_at ASC LIMIT 20`).bind(now,now).all();
  const liveEnabled=SWING_TRADING_ENABLED;
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const unsafe:any=await db.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
