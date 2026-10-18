@@ -270,7 +270,17 @@ async function swingExecutableV2(env:any,u:URL){
   return {accepted,skipped};
  }
  const shortReplay=replaySide(shortSignals),longReplay=replaySide(longSignals);
- // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
+ // TRACKING is a separate read-only view. Never feed it into historical TP/SL replay.
+ // Do not let unresolved records lock later historical signals.
+ const trackingShort=group(raw.filter(r=>r.side==='SHORT'&&r.status==='TRACKING')).filter(r=>r.result==='TRACKING');
+ const trackingLong=group(raw.filter(r=>r.side==='LONG'&&r.status==='TRACKING')).filter(r=>r.result==='TRACKING');
+ function latestTracking(signals:Signal[]){
+  const m=new Map<string,Signal>();
+  for(const r of signals){const prev=m.get(r.coin);if(!prev||r.signal_available_at>prev.signal_available_at)m.set(r.coin,r);}
+  return [...m.values()];
+ }
+ const trackingShortLatest=latestTracking(trackingShort),trackingLongLatest=latestTracking(trackingLong);
+ // These are D1 signal states, NOT verified open Hyperliquid positions.
  const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
   MIN(signal_bar_open) AS first_signal_ms, MAX(signal_bar_open) AS last_signal_ms,
   SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS shorts,
@@ -284,6 +294,7 @@ async function swingExecutableV2(env:any,u:URL){
  const signals=mode==='SHORT'?shortSignals:mode==='LONG'?longSignals:[...shortSignals,...longSignals];
  const accepted=mode==='SHORT'?shortReplay.accepted:mode==='LONG'?longReplay.accepted:[...shortReplay.accepted,...longReplay.accepted];
  const skipped=mode==='SHORT'?shortReplay.skipped:mode==='LONG'?longReplay.skipped:[...shortReplay.skipped,...longReplay.skipped];
+ const tracking=mode==='SHORT'?trackingShortLatest:mode==='LONG'?trackingLongLatest:[...trackingShortLatest,...trackingLongLatest];
  const breakdown=u.searchParams.get('breakdown')||'';
  if(breakdown&&breakdown!=='coins')throw Error('INVALID_BREAKDOWN');
  const start=period==='today'?todaySofia():-Infinity;
@@ -292,14 +303,15 @@ async function swingExecutableV2(env:any,u:URL){
  if(breakdown==='coins'){
   const tracked=['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','HYPE','ADA','LTC','BCH','AAVE','UNI','NEAR','OP','ARB','WIF','TRX'];
   const eligible=accepted.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
+  const trackingEligible=tracking.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
   const names=[...new Set([...tracked,...eligible.map(s=>s.coin)])];
   const coins=names.map(name=>{
    const a=eligible.filter(s=>s.coin===name);
    const tp=a.filter(s=>s.result==='TP_FIRST').length;
    const sl=a.filter(s=>s.result==='SL_FIRST').length;
-   const tracking=a.filter(s=>s.result==='TRACKING').length;
+   const trackingCount=trackingEligible.filter(s=>s.coin===name).length;
    const resolved=tp+sl;
-   return {coin:name,entries:a.length,tp,sl,tracking,resolved,
+   return {coin:name,entries:a.length,tp,sl,tracking:trackingCount,resolved,
     win_rate_pct:resolved?Number((100*tp/resolved).toFixed(2)):null};
   }).sort((a,b)=>{
    if(a.win_rate_pct===null)return b.win_rate_pct===null?a.coin.localeCompare(b.coin):1;
@@ -310,15 +322,16 @@ async function swingExecutableV2(env:any,u:URL){
    period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const visible=visibleAll.filter(s=>!status||s.result===status);
+ const trackingVisible=tracking.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const visible=status==='TRACKING'?trackingVisible:status?visibleAll.filter(s=>s.result===status):[...visibleAll,...trackingVisible].sort((a,b)=>b.signal_available_at-a.signal_available_at);
  const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
  const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visible;
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
- const tracking=visibleAll.filter(s=>s.result==='TRACKING').length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
+ const trackingCount=trackingVisible.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS',tracking_source:'D1_SIGNAL_STATUS_NOT_VERIFIED_HYPERLIQUID'},
   period,source,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
-  stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+  stats:{total:visibleAll.length,tracking:trackingCount,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
   rows:selected.slice((page-1)*limit,page*limit)};
