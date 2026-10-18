@@ -212,17 +212,36 @@ function group(rows:any[]):Signal[] {
   const bar=states.every(s=>s===state)&&touches.every(t=>t!==null&&t===touches[0])?touches[0]:null;
   // TIME_EXIT: do not guess exit timestamp from resolved_at (settlement processing time).
   // First-touch: conservatively unlock only after the entire touched hourly candle.
+  const completeTimeExit=state==='TIME_EXIT' && a.every(r=>{
+    const o=parseReplayJson(r.outcome_json);
+    const expected=r.interval==='1h'?48:r.interval==='4h'?72:0;
+    return o?.windowComplete===true && Number(o.horizonHours)===expected &&
+      scenario(r)?.status==='TIME_EXIT' && Number.isFinite(Number(scenario(r)?.hypotheticalNetPct));
+  });
   const resolved=(state==='TP_FIRST'||state==='SL_FIRST')&&bar!==null;
+  const timeoutAt=completeTimeExit ? Number(first.signal_bar_open)+(first.interval==='1h'?48:72)*HOUR : null;
   const net=avg(a.map(r=>number(scenario(r)?.hypotheticalNetPct)));
   result.push({coin:String(first.coin),interval:String(first.interval),signal_bar_open:Number(first.signal_bar_open),
    signal_available_at:entryTimes.length?Math.max(...entryTimes):Number(first.signal_bar_open)+(first.interval==='4h'?4:1)*HOUR,
    patterns:[...new Set(a.map(r=>String(r.pattern)))],confirmations:new Set(a.map(r=>r.pattern)).size,
    entry_price:avg(prices),rsi:avg(contexts.map(c=>number(c?.indicators?.rsi14))),
    relative_volume:avg(contexts.map(c=>number(c?.volume?.relativeVolume))),
-   result:state,net,exit_bar_open:resolved?bar:null,exit_at:resolved?bar!+HOUR:null,
-   exit_precision:resolved?'CONSERVATIVE_END_OF_1H_BAR':'UNKNOWN_BLOCKS_REENTRY'});
+   result:state,net,exit_bar_open:resolved?bar:null,
+   exit_at:resolved?bar!+HOUR:(timeoutAt!==null&&timeoutAt>(entryTimes.length?Math.max(...entryTimes):0)?timeoutAt:null),
+   exit_precision:resolved?'CONSERVATIVE_END_OF_1H_BAR':timeoutAt!==null?'VERIFIED_WINDOW_COMPLETE_TIME_EXIT':'UNKNOWN_BLOCKS_REENTRY'});
  }
  return result.sort((a,b)=>a.signal_available_at-b.signal_available_at||a.coin.localeCompare(b.coin)||a.interval.localeCompare(b.interval));
+}
+const swingReportCache=new Map<string,{expires:number,promise:Promise<any>}>();
+function cachedSwingReport(env:any,u:URL):Promise<any>{
+ const key=u.searchParams.toString();const now=Date.now();
+ const existing=swingReportCache.get(key);
+ if(existing&&existing.expires>now)return existing.promise;
+ const promise=swingExecutableV2(env,u);
+ swingReportCache.set(key,{expires:now+60000,promise});
+ promise.catch(()=>{if(swingReportCache.get(key)?.promise===promise)swingReportCache.delete(key)});
+ if(swingReportCache.size>32){for(const [k,v] of swingReportCache){if(v.expires<=now||swingReportCache.size>32)swingReportCache.delete(k)}}
+ return promise;
 }
 async function swingExecutableV2(env:any,u:URL){
  const mode=u.searchParams.get('mode')||'ALL';
@@ -255,7 +274,7 @@ async function swingExecutableV2(env:any,u:URL){
  // Independent position locks for LONG and SHORT. No database changes.
  // Historical report: only completed TP/SL with a verified first-touch exit.
  // Exclude incomplete records BEFORE overlap replay so they never lock a coin.
- const isCompleted=(x:Signal)=> (x.result==='TP_FIRST'||x.result==='SL_FIRST') && x.exit_at!==null;
+ const isCompleted=(x:Signal)=> (x.result==='TP_FIRST'||x.result==='SL_FIRST'||x.result==='TIME_EXIT') && x.exit_at!==null && (x.result!=='TIME_EXIT'||x.net!==null);
  const shortSignals=group(raw.filter(r=>r.side==='SHORT')).filter(isCompleted);
  const longSignals=group(raw.filter(r=>r.side==='LONG')).filter(isCompleted);
  function replaySide(signals:Signal[]){
@@ -353,8 +372,12 @@ async function swingExecutableV2(env:any,u:URL){
    const tp=a.filter(s=>s.result==='TP_FIRST').length;
    const sl=a.filter(s=>s.result==='SL_FIRST').length;
    const tracking=trackingEligible.filter(s=>s.coin===name).length;
-   const resolved=tp+sl;
-   return {coin:name,entries:a.length,tp,sl,tracking,resolved,
+   const timeExit=a.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
+   const time_exit_win=timeExit.filter(s=>Number(s.net)>0).length;
+   const time_exit_loss=timeExit.filter(s=>Number(s.net)<0).length;
+   const time_exit_flat=timeExit.length-time_exit_win-time_exit_loss;
+   const resolved=tp+sl+timeExit.length;
+   return {coin:name,entries:a.length,tp,sl,time_exit_win,time_exit_loss,time_exit_flat,tracking,resolved,net_win_rate_pct:resolved?Number((100*(tp+time_exit_win)/resolved).toFixed(2)):null,
     win_rate_pct:resolved?Number((100*tp/resolved).toFixed(2)):null};
   }).sort((a,b)=>{
    if(a.win_rate_pct===null)return b.win_rate_pct===null?a.coin.localeCompare(b.coin):1;
@@ -373,11 +396,15 @@ async function swingExecutableV2(env:any,u:URL){
  const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
  const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:status==='TRACKING'?activeResearch:status?visible:[...visibleAll,...activeResearch];
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
+ const timed=visibleAll.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
+ const timeWin=timed.filter(s=>Number(s.net)>0).length,timeLoss=timed.filter(s=>Number(s.net)<0).length,timeFlat=timed.length-timeWin-timeLoss;
+ const netSum=visibleAll.reduce((n,s)=>n+(s.net===null?0:Number(s.net)),0);
+ const netDone=tp+sl+timed.length;
  const tracking=activeResearch.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'VERIFIED_48H_1H_OR_72H_4H_INCLUDED',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
   period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
-  stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+  stats:{total:visibleAll.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
   rows:selected.sort((a,b)=>b.signal_available_at-a.signal_available_at).slice((page-1)*limit,page*limit)};
@@ -394,7 +421,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
   try{
    if(u.pathname==='/api/swing/v19/filtered-short'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
-    return json(await swingExecutableV2(env,u));
+    return json(await cachedSwingReport(env,u));
    }
    if(u.pathname==='/api/swing/v19/history'){
     if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
