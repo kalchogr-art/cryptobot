@@ -421,15 +421,16 @@ async function swingEntryCounters(env:any,u:URL){
  const variant=u.searchParams.get('variant')==='B'?'B':'A';
  const mode=variant==='B'?'SHORT':(u.searchParams.get('mode')||'SHORT');
  if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
- const period=u.searchParams.get('period')==='total'?'total':'today';
+ const period='today' as const; // Eligible cards always show TODAY, regardless of replay period selector.
  const interval=u.searchParams.get('interval')||'';
  const coin=(u.searchParams.get('coin')||'').toUpperCase();
  if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
  if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
  // IMPORTANT: the source population MUST be identical to /api/swing/v19/history.
  // History uses signal_bar_open and swingTodayStartMs(), NOT signal_available_at.
- const start=period==='today'?swingTodayStartMs():0;
- const baseWhere=['signal_bar_open>=?'];const baseArgs:any[]=[start];
+ const start=swingTodayStartMs();
+ const end=Date.now(); // Exclude future-dated candles; same Sofia day as history.
+ const baseWhere=['signal_bar_open>=?','signal_bar_open<=?'];const baseArgs:any[]=[start,end];
  if(interval){baseWhere.push('interval=?');baseArgs.push(interval);}
  if(coin){baseWhere.push('coin=?');baseArgs.push(coin);}
  if(mode!=='ALL'){baseWhere.push('side=?');baseArgs.push(mode);}
@@ -464,7 +465,7 @@ async function swingEntryCounters(env:any,u:URL){
  // LIVE queue is a separate execution metric and never affects research eligibility.
  if(env.DB?.prepare){
   try{
-   const filters=['signal_available_at>=?'];const params:any[]=[start];
+   const filters=['signal_available_at>=?','signal_available_at<=?'];const params:any[]=[start,end];
    if(coin){filters.push('coin=?');params.push(coin);}
    if(mode!=='ALL'){filters.push('side=?');params.push(mode);}
    if(interval){filters.push('signal_key LIKE ?');params.push('%:'+interval+':%');}
@@ -473,7 +474,7 @@ async function swingEntryCounters(env:any,u:URL){
   }catch(e:any){liveError=String(e?.message||e);}
  }else liveError='MISSING_LIVE_DB_BINDING';
  return {success:true,read_only:true,variant,mode,period,coin,interval,
-  source:{table:'swing_context_signals',time_field:'signal_bar_open',start_ms:start,
+  source:{table:'swing_context_signals',time_field:'signal_bar_open',start_ms:start,end_ms:end,
    total:Number(population?.total||0),tracking:Number(population?.tracking||0)},
   eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),
   breakdown:{'1h':Number(row?.h1||0),'4h':Number(row?.h4||0),short:Number(row?.shorts||0),long:Number(row?.longs||0)},
