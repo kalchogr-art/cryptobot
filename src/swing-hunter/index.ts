@@ -1,5 +1,6 @@
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
+import {swingABDashboard} from './swing-ab-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
 import {entryResearchCoin} from './entry-research';
@@ -415,6 +416,7 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
  const env=_env as any;
  const u=new URL(req.url);
  if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
+ if(req.method==='GET'&&u.pathname==='/swing-hunter/ab')return new Response(swingABDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
  if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/api/swing/v19/filtered-short'].includes(u.pathname)){
   if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
   if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
