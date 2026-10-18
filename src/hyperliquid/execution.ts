@@ -3011,7 +3011,9 @@ export async function buildHyperliquidExecutionCandidate(
 // ===== SWING SHORT FILTERED V1 — dedicated fixed TP/SL execution =====
 const SWING_SHORT_STRATEGY='SWING_SHORT_FILTERED_V1';
 const SWING_LONG_STRATEGY='SWING_LONG_FILTERED_V1';
-const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_LONG_STRATEGY];
+const SWING_SHORT_B_STRATEGY='SWING_SHORT_DOUBLE_MIXED_B_V1';
+// Preserve the legacy SHORT strategy for monitoring/closing existing positions.
+const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_SHORT_B_STRATEGY,SWING_LONG_STRATEGY];
 const SWING_PATTERNS=new Set(['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
  'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT']);
 const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000;
@@ -3028,10 +3030,10 @@ function swingTelegramMeta(key:string,side:string,patterns:any){
  const names=Array.isArray(parsed)?parsed.map(String).join(', '):String(patterns??'');
  const match=/^SWING:(LONG|SHORT):[^:]+:(1h|4h):/.exec(key);
  return [
-  `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} · FILTERED</b>`,
+  `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} · ${side==='SHORT'?'DOUBLE MIXED B':'FILTERED'}</b>`,
   `🔎 Pattern: ${escapeTelegramHtml(names||'n/a')}`,
   `🕒 Timeframe: ${escapeTelegramHtml(match?.[2]??'n/a')}`,
-  `₿ BTC 1H: MIXED`,
+  `₿ BTC 1H: MIXED${side==='SHORT'?' · BTC 4H: MIXED':''}`, 
   `🆔 Signal: ${escapeTelegramHtml(key)}`
  ];
 }
@@ -3194,7 +3196,7 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const db=env.DB!,coin=String(row.coin).toUpperCase(),key=String(row.signal_key),now=Date.now();
  const side=String(row.side??'SHORT');
  if(side!=='LONG'&&side!=='SHORT')throw Error('INVALID_SWING_SIDE');
- const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_STRATEGY;
+ const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_B_STRATEGY;
  if(now>Number(row.expires_at)){await swingExpire(db,key,'EXPIRED_20M');return 'EXPIRED';}
  // Atomic per-coin reservation; no execution if SCALP ledger is unresolved.
  const claim=await db.prepare(`INSERT OR IGNORE INTO swing_coin_owners
@@ -3330,6 +3332,8 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   if(side==='SHORT'?!SWING_PATTERNS.has(pattern):side==='LONG'?pattern!=='TRIANGLE_UP':true)continue;
   let c:any;try{c=JSON.parse(String(item.context_json));}catch{continue;}
   if(c?.btcDirection?.timeframes?.['1h']?.direction!=='MIXED')continue;
+  // Variant B only for SHORT. LONG retains its original BTC 1H MIXED rule.
+  if(side==='SHORT'&&c?.btcDirection?.timeframes?.['4h']?.direction!=='MIXED')continue;
   // One candidate per coin, side, interval and candle. Coin ownership is global at execution.
   const key=`SWING:${side}:${item.coin}:${item.interval}:${item.signal_bar_open}`;
   if(!groups.has(key))groups.set(key,{...item,patterns:new Set<string>()});
@@ -3350,11 +3354,28 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const liveEnabled=SWING_TRADING_ENABLED;
  if(!liveEnabled) return {ok:true,live:false,reason:'SWING_LIVE_DISABLED_COLLECTION_ACTIVE',eligible_groups:groups.size, due_count:(due.results??[]).length,orders_sent:0};
  const unsafe:any=await db.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
-  WHERE strategy_version IN (?,?) AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
+  WHERE strategy_version IN (?,?,?) AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`)
   .bind(...SWING_STRATEGIES).first();
  if(Number(unsafe?.n??0)>0)return {ok:false,live:false,reason:'UNRESOLVED_SWING_PROTECTION_BLOCKS_NEW_ENTRIES',unresolved:Number(unsafe.n),orders_sent:0};
  const entered=[];
- for(const row of due.results??[])entered.push({coin:row.coin,result:await swingEnter(env,row)});
+ for(const row of due.results??[]){
+  if(String(row.side)==='SHORT'){
+   // Revalidate persisted WAITING_POSITION records from the previous strategy.
+   // Fail closed if the original D1 context is missing, inconsistent, or no longer B-eligible.
+   let eligible=false;
+   try{
+    const verify:any=await (env.SWING_DB??db).prepare(`SELECT COUNT(*) AS n FROM swing_context_signals
+     WHERE coin=? AND interval=? AND side='SHORT' AND signal_bar_open=?
+       AND pattern IN ('DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF','VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT')
+       AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+       AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`)
+       .bind(row.coin,swingMaxHoldMs(String(row.signal_key))===SWING_HOLD_1H_MS?'1h':'4h',row.signal_bar_open).first();
+    eligible=Number(verify?.n??0)>0;
+   }catch{}
+   if(!eligible){await swingExpire(db,String(row.signal_key),'REJECTED_VARIANT_B_DOUBLE_MIXED');entered.push({coin:row.coin,result:'REJECTED_VARIANT_B'});continue;}
+  }
+  entered.push({coin:row.coin,result:await swingEnter(env,row)});
+ }
  return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length};
 }
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
@@ -3363,7 +3384,7 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  // Recover only previously failed Swing protection, after full live exchange verification.
  // A failed or ambiguous check keeps the global entry lock in place.
  const failed:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
-  WHERE strategy_version IN (?,?) AND status='TPSL_FAILED_AFTER_RETRIES'
+  WHERE strategy_version IN (?,?,?) AND status='TPSL_FAILED_AFTER_RETRIES'
   ORDER BY updated_at LIMIT 20`).bind(...SWING_STRATEGIES).all();
  const reconciliation:any[]=[];
  for(const failedRow of failed.results??[]){
@@ -3375,7 +3396,7 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
   }
  }
  const rows:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
-  WHERE strategy_version IN (?,?) AND status IN ('ENTRY_FILLED','PROTECTED','MAX_HOLD_CLOSING')
+  WHERE strategy_version IN (?,?,?) AND status IN ('ENTRY_FILLED','PROTECTED','MAX_HOLD_CLOSING')
   ORDER BY entry_filled_at LIMIT 20`).bind(...SWING_STRATEGIES).all();
  const events:any[]=[];
  for(const row of rows.results??[]){
