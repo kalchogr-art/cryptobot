@@ -1,4 +1,4 @@
-/** Swing Hunter A/B Research Dashboard — DISPLAY ONLY.
+/** Swing Hunter A?/B Research Dashboard — DISPLAY ONLY.
  * Historical snapshot provided from D1 replay, NOT live API or execution.
  * No orders, no writes, no changes to existing dashboard.
  */
