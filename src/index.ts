@@ -1,5 +1,14 @@
-import { runSwingShortLive, monitorSwingShortLive } from "./hyperliquid/execution";
-import { handleSwingHunterRequest } from "./swing-hunter/index";
+// SWING HUNTER — ALL DASHBOARD ROUTES
+// READ ONLY — LIVE STRATEGY UNCHANGED
+
+if (
+  url.pathname === "/swing-hunter" ||
+  url.pathname.startsWith("/swing-hunter/") ||
+  url.pathname === "/api/swing" ||
+  url.pathname.startsWith("/api/swing/")
+) {
+  return handleSwingHunterRequest(request, env);
+}
 import { scanAndLog as swingScanAndLog, settleSignals as swingSettleSignals } from "./swing-hunter/signal-logger";
             import { updateMLShadowLearning, getMLShadowStatus } from "./ml/shadow-learning";
             import { getHyperliquidAccountReadOnly } from "./hyperliquid/account";
