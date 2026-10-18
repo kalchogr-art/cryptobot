@@ -1,76 +1,544 @@
-/** Swing Hunter monitor with integrated SHORT research panel. */
-export function swingMonitorDashboard(): string {
- return `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Swing Hunter • Monitor</title><style>
-:root{color-scheme:dark;font-family:system-ui,Arial;background:#090f1d;color:#e8efff}*{box-sizing:border-box}body{margin:0;padding:18px;max-width:1400px;margin:auto}h1{font-size:26px;margin:0}h2{font-size:17px;margin:0 0 12px}small,.muted{color:#92a4c1}.top,.filters{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.top{margin-bottom:18px}.filters{justify-content:flex-start;margin:14px 0}.panel,.metric{background:#121e32;border:1px solid #273a54;border-radius:14px;padding:16px}.panel{margin:14px 0}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0}.metric strong{display:block;font-size:26px;margin-top:8px}input,select,button{background:#1a2b43;color:#e8efff;border:1px solid #3a506c;border-radius:8px;padding:10px}button{cursor:pointer;background:#275fa5}button:disabled{opacity:.45;cursor:default}.tablewrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:850px}th,td{padding:10px;border-bottom:1px solid #26384e;text-align:left;font-size:13px}th{color:#a9bdd6}.long,.good{color:#61d6ac}.short,.bad{color:#ff8c99}.pill{border-radius:20px;padding:4px 8px;background:#253650;white-space:nowrap}.detail{white-space:pre-wrap;overflow:auto;max-height:440px;font-size:12px}#message,#fs-message{margin:10px 0;color:#ffc86a;min-height:22px}.nowrap{white-space:nowrap}.page-numbers{display:flex;flex-wrap:wrap;gap:5px;align-items:center}.page-numbers button{min-width:36px;padding:7px 9px}.page-numbers button.active{background:#71b5ff;color:#071425;font-weight:700}.page-numbers span{color:#92a4c1;padding:0 4px}details{margin:10px 0}@media(max-width:700px){body{padding:12px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}h1{font-size:21px}}
-</style></head><body>
-<div class="top"><div><h1>SWING HUNTER <span style="color:#71b5ff">MONITOR</span></h1><small>Research signals • LIVE сделките се отчитат отделно</small></div><div id="updated" class="muted">Не са заредени данни</div></div>
-<section class="panel"><h2>Достъп до мониторинга</h2><div class="filters"><input id="token" type="password" placeholder="SWING_ADMIN_TOKEN" autocomplete="off" style="flex:1;min-width:180px"><button id="connect">Свържи</button><button id="refresh">Обнови</button></div><small>Токенът се пази само в паметта на страницата; не се записва в URL или localStorage.</small><div id="message"></div></section>
-<div class="cards"><div class="metric"><small>Всички сигнали в D1</small><strong id="total">—</strong></div><div class="metric"><small>TRACKING</small><strong id="tracking">—</strong></div><div class="metric"><small>RESOLVED</small><strong id="resolved">—</strong></div><div class="metric"><small>LONG / SHORT</small><strong id="sides">—</strong></div></div>
-<section class="panel"><h2>Записани патерни и резултати</h2><div class="filters"><label>Период <select id="period"><option value="today">Днес (София)</option><option value="total">Общо (всички дни)</option></select></label><select id="side"><option value="">Всички посоки</option><option>LONG</option><option>SHORT</option></select><select id="tf"><option value="">Всички TF</option><option>1h</option><option>4h</option><option>1d</option></select><select id="status"><option value="">Всички статуси</option><option>TRACKING</option><option>RESOLVED</option></select><input id="coin" maxlength="10" placeholder="Монета, напр. BTC"></div><small>Филтрите се прилагат върху цялата D1 база, по 20 записа на страница.</small><div class="filters"><button id="prev">← Предишна</button><span id="pageInfo" class="muted">Страница —</span><div id="page-numbers" class="page-numbers"></div><button id="next">Следваща →</button></div><div class="tablewrap"><table><thead><tr><th>Време (София)</th><th>Монета</th><th>TF</th><th>Патерн</th><th>Посока</th><th>Цена</th><th>Статус</th><th>Филтри / TP-SL</th></tr></thead><tbody id="rows"><tr><td colspan="8">Свържи се, за да заредиш данни.</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Подробности за избрания сигнал</h2><div id="detail" class="muted">Избери „Виж“ от таблицата.</div></section>
-<section class="panel"><div class="top"><h2 id="fs-title">SWING LONG + SHORT · FILTERED</h2><label>Посока <select id="fs-mode" aria-label="Избор на посока"><option value="ALL" selected>Общо LONG + SHORT</option><option value="SHORT">Само SHORT</option><option value="LONG">Само LONG</option></select></label></div><small id="fs-description">SHORT: 6 патерна · LONG: TRIANGLE_UP · BTC 1H = MIXED · 1H/4H · TP 2% / SL 1% (хипотетични)</small><div class="cards"><div class="metric"><small>Replay входове (приключили)</small><strong id="fs-total">—</strong></div><div class="metric"><small>TRACKING</small><strong id="fs-tracking">—</strong></div><div class="metric"><small>TP / SL / TIME EXIT</small><strong id="fs-outcomes">—</strong></div><div class="metric"><small>Net Win rate</small><strong id="fs-rate">—</strong></div></div>
-<div class="cards" aria-label="SWING отделни броячи"><div class="metric"><small>Допустими сигнали</small><strong id="fs-eligible">—</strong></div><div class="metric"><small>TRACKING (допустими)</small><strong id="fs-eligible-tracking">—</strong></div><div class="metric"><small>LIVE OPEN (входове)</small><strong id="fs-live-open">—</strong></div><div class="metric"><small>LIVE EXPIRED</small><strong id="fs-live-expired">—</strong></div></div><small id="fs-counters-note" class="muted">LIVE OPEN = входове, маркирани OPEN в опашката; не е текущ брой позиции на борсата. SHORT LIVE е вариант B.</small><div class="filters"><label>Период <select id="fs-period"><option value="today">Днес (София)</option><option value="total">Общо (всички дни)</option></select></label><select id="fs-tf"><option value="">1H + 4H</option><option value="1h">1H</option><option value="4h">4H</option></select><select id="fs-status"><option value="">Всички резултати</option><option value="TRACKING">TRACKING</option><option value="TP_FIRST">TP</option><option value="SL_FIRST">SL</option><option value="TIME_EXIT">TIME EXIT</option><option value="AMBIGUOUS">AMBIGUOUS</option><option value="PENDING">PENDING</option><option value="CONFLICT">CONFLICT</option></select><input id="fs-coin" maxlength="10" placeholder="Монета"><button id="fs-refresh">Обнови сигналите</button><button id="fs-coins-open" type="button">📊 Статистика по монети</button></div><small>Един активен сигнал на монета за всяка посока поотделно (1H + 4H). Историческите SKIP сигнали не се броят. Резултатите са хипотетични.</small><div id="fs-coins-modal" role="dialog" aria-modal="true" aria-label="Статистика по монети" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.8);padding:14px;overflow:auto"><div style="max-width:1000px;margin:5vh auto;background:#121e32;border:1px solid #3a506c;border-radius:14px;padding:18px"><div class="top"><div><h2>📊 SWING · Статистика по монети</h2><label>Посока <select id="fs-coins-mode"><option value="ALL">Общо LONG + SHORT</option><option value="SHORT">Само SHORT</option><option value="LONG">Само LONG</option></select></label><small>Подредени по win rate · Само допустими входове · TP 2% / SL 1%</small></div><button id="fs-coins-close" type="button">✕ Затвори</button></div><div id="fs-coins-message" class="muted">Зареждане…</div><div class="tablewrap"><table><thead><tr><th>#</th><th>Монета</th><th>Входове</th><th>TP</th><th>SL</th><th>TIME +</th><th>TIME −</th><th>TRACKING</th><th>Приключили</th><th>Win rate</th></tr></thead><tbody id="fs-coins-rows"></tbody></table></div></div></div><div id="fs-message"></div><div id="fs-time-exits" class="muted" style="margin:8px 0">TIME EXIT: —</div><div id="fs-source" class="muted" style="font-size:12px;margin-bottom:10px">Източник D1: очаква зареждане.</div><div class="tablewrap"><table><thead><tr><th>Време София</th><th>Монета</th><th>TF</th><th>Потвърждения</th><th>Патерни</th><th>Entry</th><th>RSI</th><th>Rel. volume</th><th>Резултат</th><th>Net %</th></tr></thead><tbody id="fs-rows"><tr><td colspan="10">Свържи се, за да заредиш данни.</td></tr></tbody></table></div><div class="filters"><button id="fs-prev">← Предишна</button><span id="fs-pages" class="muted">Страница —</span><div id="fs-page-numbers" class="page-numbers"></div><button id="fs-next">Следваща →</button></div></section>
+import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
+import {swingMonitorDashboard} from './swing-monitor-dashboard';
+import {swingABDashboard} from './swing-ab-dashboard';
+import {tpFirstTouchCoin} from './tp-first-touch';
+import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
+import {entryResearchCoin} from './entry-research';
+import {chartLearningCoin,chartLearningMarket} from './chart-pattern-learning';
+import {fetchClosed,quality,COINS} from './ohlcv';
+import type {Interval} from './types';
+import {decide} from './decision-engine';
+import {shadowProjection} from './shadow-trades';
+import {dashboard} from './dashboard';
+import {scanMarket} from './scanner';
+import {replayCoin} from './replay';
+import {researchCoin,compareCoin} from './research';
+import {healthReport} from './stability';
+import {outcomeCoin} from './outcomes';
+import {auditCoin} from './accuracy-audit';
+import {unifiedCoin,unifiedMarket} from './unified-backtest';
+import {detectCatalog,CATALOG_IDS} from './pattern-catalog';
+import {intelligenceCoin,intelligenceMarket,intelligenceDashboard} from './pattern-intelligence';
 
-<section class="panel" id="variant-b-panel"><div class="top"><h2>SWING SHORT · VARIANT B · DOUBLE MIXED</h2><span class="pill">D1 · динамично · READ ONLY</span></div>
-<small>6 SHORT патерна · BTC 1H = MIXED + BTC 4H = MIXED · TP 2% / SL 1% · 1H/4H · хипотетичен replay, не реални сделки.</small>
-<div class="cards"><div class="metric"><small>Replay входове (приключили)</small><strong id="vb-total">—</strong></div><div class="metric"><small>TRACKING</small><strong id="vb-tracking">—</strong></div><div class="metric"><small>TP / SL / TIME EXIT</small><strong id="vb-outcomes">—</strong></div><div class="metric"><small>Net Win rate</small><strong id="vb-rate">—</strong></div></div>
-<div class="cards" aria-label="SWING отделни броячи"><div class="metric"><small>Допустими сигнали</small><strong id="vb-eligible">—</strong></div><div class="metric"><small>TRACKING (допустими)</small><strong id="vb-eligible-tracking">—</strong></div><div class="metric"><small>LIVE OPEN (входове)</small><strong id="vb-live-open">—</strong></div><div class="metric"><small>LIVE EXPIRED</small><strong id="vb-live-expired">—</strong></div></div><small id="vb-counters-note" class="muted">LIVE OPEN = входове, маркирани OPEN в опашката; не е текущ брой позиции на борсата. SHORT LIVE е вариант B.</small>
-<div class="filters"><label>Период <select id="vb-period"><option value="today">Днес (София)</option><option value="total">Общо (всички дни)</option></select></label><select id="vb-tf"><option value="">1H + 4H</option><option value="1h">1H</option><option value="4h">4H</option></select><select id="vb-status"><option value="">Всички резултати</option><option value="TRACKING">TRACKING</option><option value="TP_FIRST">TP</option><option value="SL_FIRST">SL</option><option value="TIME_EXIT">TIME EXIT</option><option value="AMBIGUOUS">AMBIGUOUS</option><option value="PENDING">PENDING</option><option value="CONFLICT">CONFLICT</option><option value="SKIPPED_ALREADY_OPEN">SKIPPED</option></select><input id="vb-coin" maxlength="10" placeholder="Монета"><button id="vb-refresh">Обнови сигналите</button><button id="vb-coins-open">📊 Статистика по монети</button></div>
-<small>Независим replay за B: една SHORT позиция на монета между 1H и 4H. Не променя LIVE или D1.</small><div id="vb-message" style="margin:10px 0;color:#ffc86a"></div><div id="vb-time" class="muted"></div><div id="vb-source" class="muted"></div>
-<div class="tablewrap"><table><thead><tr><th>Време София</th><th>Монета</th><th>TF</th><th>Потвърждения</th><th>Патерни</th><th>Entry</th><th>RSI</th><th>Rel. volume</th><th>Резултат</th><th>Net %</th></tr></thead><tbody id="vb-rows"><tr><td colspan="10">Свържи се, за да заредиш данни.</td></tr></tbody></table></div><div class="filters"><button id="vb-prev">← Предишна</button><span id="vb-pages" class="muted">Страница —</span><div id="vb-numbers" class="page-numbers"></div><button id="vb-next">Следваща →</button></div>
-<div id="vb-modal" role="dialog" aria-modal="true" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.8);padding:14px;overflow:auto"><div style="max-width:1000px;margin:5vh auto;background:#121e32;border:1px solid #3a506c;border-radius:14px;padding:18px"><div class="top"><h2>📊 VARIANT B · Статистика по монети</h2><button id="vb-close">✕ Затвори</button></div><div id="vb-coins-msg" class="muted"></div><div class="tablewrap"><table><thead><tr><th>Монета</th><th>Входове</th><th>TP</th><th>SL</th><th>TIME +</th><th>TIME −</th><th>TRACKING</th><th>Приключили</th><th>Win rate</th></tr></thead><tbody id="vb-coins"></tbody></table></div></div></div></section>
+// Signal collection resumed; existing D1 records are retained.
+const NEW_SIGNALS_ENABLED = true;
 
-<script>(function(){'use strict';
-var token='',page=1,pages=1,busy=false,coinBusy=false;
-var e=function(id){return document.getElementById('vb-'+id)};
-function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
-function fmt(v,d){var n=Number(v);return v==null||!Number.isFinite(n)?'—':n.toLocaleString('en-US',{maximumFractionDigits:d==null?7:d})}
-var df=new Intl.DateTimeFormat('bg-BG',{timeZone:'Europe/Sofia',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});
-function tm(v){var n=Number(v),d=Number.isFinite(n)&&n>0?new Date(n):new Date(v);return isNaN(d.getTime())?'—':df.format(d)}
-async function req(q){var r=await fetch('/api/swing/v19/filtered-short?'+q,{headers:{'x-swing-token':token},cache:'no-store'}),j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);return j}
-function nums(){var s=new Set([1,pages]);for(var i=Math.max(1,page-2);i<=Math.min(pages,page+2);i++)s.add(i);e('numbers').innerHTML=Array.from(s).sort(function(a,b){return a-b}).map(function(n){return '<button data-page="'+n+'"'+(n===page?' class="active"':'')+'>'+n+'</button>'}).join('')}
-async function load(){if(!token){e('message').textContent='Свържи се чрез SWING_ADMIN_TOKEN горе.';return}if(busy)return;busy=true;e('message').textContent='Зареждане…';try{var q=new URLSearchParams({variant:'B',mode:'SHORT',limit:'10',page:String(page),period:e('period').value});if(e('tf').value)q.set('interval',e('tf').value);if(e('status').value)q.set('status',e('status').value);if(e('coin').value.trim())q.set('coin',e('coin').value.trim().toUpperCase());var j=await req(q),a=j.stats||{};page=j.page||1;pages=j.pages||1;e('total').textContent=a.total||0;e('tracking').textContent=a.tracking||0;e('outcomes').textContent=(a.tp||0)+' / '+(a.sl||0)+' / '+(a.time_exit||0);var done=(a.tp||0)+(a.sl||0)+(a.time_exit||0);e('rate').textContent=done?(100*((a.tp||0)+(a.time_exit_win||0))/done).toFixed(1)+'%':'—';e('time').textContent='TIME EXIT: 🟢 '+(a.time_exit_win||0)+' · 🔴 '+(a.time_exit_loss||0)+' · ⚪ '+(a.time_exit_flat||0)+' · Хипотетичен NET сбор '+fmt(a.net_pct_sum,3)+'%';e('rows').innerHTML=(j.rows||[]).map(function(x){var cls=x.result==='TP_FIRST'?'good':x.result==='SL_FIRST'?'bad':'';return '<tr><td>'+esc(tm(x.signal_bar_open))+'</td><td><b>'+esc(x.coin)+'</b></td><td>'+esc(x.interval)+'</td><td>'+esc(x.confirmations)+'</td><td>'+esc(x.patterns)+'</td><td>'+esc(fmt(x.entry_price))+'</td><td>'+esc(fmt(x.rsi,2))+'</td><td>'+esc(fmt(x.relative_volume,3))+'</td><td class="'+cls+'">'+esc(x.result)+'</td><td>'+esc(fmt(x.net,3))+'</td></tr>'}).join('')||'<tr><td colspan="10">Няма сигнали по условията.</td></tr>';e('pages').textContent='Страница '+page+' / '+pages;e('prev').disabled=page<=1;e('next').disabled=page>=pages;nums();e('message').textContent='Вариант B · D1 · replay входове '+(a.total||0)+' · пропуснати '+(a.skipped||0)+' · неясни '+(a.uncertain||0);e('source').textContent='D1 записи: '+(j.source?.total??'—')+' · B SHORT съвпадения: '+(j.source?.matching_short??'—')+' · Исторически OHLC, не реален P/L.'}catch(err){e('message').textContent='API грешка: '+err.message}finally{busy=false;loadCounters()}}
-async function loadCounters(){if(!token)return;try{var q=new URLSearchParams({variant:'B',mode:'SHORT',period:e('period').value});if(e('tf').value)q.set('interval',e('tf').value);if(e('coin').value.trim())q.set('coin',e('coin').value.trim().toUpperCase());var j=await reqCounters(q);e('eligible').textContent=j.eligible_signals;e('eligible-tracking').textContent=j.tracking;e('live-open').textContent=j.live?j.live.opened:'—';e('live-expired').textContent=j.live?j.live.expired:'—';e('counters-note').textContent='Допустими: SWING_DB · LIVE: опашка на B · '+(j.live_error||'OPEN не означава текуща борсова позиция');}catch(err){e('counters-note').textContent='Грешка при броячите: '+err.message;}}
-async function reqCounters(q){var r=await fetch('/api/swing/v19/entry-counters?'+q,{headers:{'x-swing-token':token},cache:'no-store'}),j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);return j}
-async function coins(){if(!token)return;if(coinBusy)return;coinBusy=true;e('coins-msg').textContent='Зареждане…';try{var q=new URLSearchParams({variant:'B',mode:'SHORT',breakdown:'coins',period:e('period').value});if(e('tf').value)q.set('interval',e('tf').value);var j=await req(q);e('coins').innerHTML=(j.coins||[]).map(function(x){return '<tr><td>'+esc(x.coin)+'</td><td>'+x.entries+'</td><td class="good">'+x.tp+'</td><td class="bad">'+x.sl+'</td><td>'+x.time_exit_win+'</td><td>'+x.time_exit_loss+'</td><td>'+x.tracking+'</td><td>'+x.resolved+'</td><td>'+fmt(x.net_win_rate_pct,1)+'%</td></tr>'}).join('');e('coins-msg').textContent='Монети: '+(j.coins||[]).length}catch(err){e('coins-msg').textContent='Грешка: '+err.message}finally{coinBusy=false}}
-e('refresh').onclick=load;e('prev').onclick=function(){if(page>1){page--;load()}};e('next').onclick=function(){if(page<pages){page++;load()}};e('numbers').onclick=function(ev){var b=ev.target.closest('button[data-page]');if(b){page=Number(b.dataset.page);load()}};['period','tf','status','coin'].forEach(function(k){e(k).addEventListener('change',function(){page=1;load()})});e('coins-open').onclick=function(){e('modal').style.display='block';coins()};e('close').onclick=function(){e('modal').style.display='none'};e('modal').onclick=function(ev){if(ev.target===this)this.style.display='none'};
-var connect=document.getElementById('connect');connect.addEventListener('click',function(){token=document.getElementById('token').value.trim();/* token input is cleared by existing listener, use shared interception below */setTimeout(load,100);},true);
-var origFetch=window.fetch; /* Capture token from existing authenticated API calls, never persist it. */
-window.fetch=function(input,init){var url=String(input);if(url.indexOf('/api/swing/v19/')===0&&init&&init.headers&&init.headers['x-swing-token'])token=init.headers['x-swing-token'];return origFetch.apply(this,arguments)};
-setInterval(function(){if(token&&!document.hidden)load()},120000);
-})();</script>
-<script>
-(function(){'use strict';
-var token='',records=[],page=1,pages=1,fsPage=1,fsPages=1,busy=false,fsBusy=false;
-var el=function(k){return document.getElementById(k)};
-function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function fmt(v,d){if(v==null||v==='')return '—';var n=Number(v);return Number.isFinite(n)?n.toLocaleString('en-US',{maximumFractionDigits:d==null?7:d}):'—'}
-var sofiaFormatter=new Intl.DateTimeFormat('bg-BG',{timeZone:'Europe/Sofia',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',hour12:false});function time(v){var n=Number(v),d=Number.isFinite(n)&&n>0?new Date(n):new Date(v);return isNaN(d.getTime())?'—':sofiaFormatter.format(d)}
-function filters(x){var c=x.context||{};return ['btcDirection','fearGreed','macroEvents','multiTimeframe','supportResistance','volume','indicators','liquiditySpread'].map(function(k){return k+': '+((c[k]||{}).status||'—')}).join(' | ')}
-async function request(url){var r=await fetch(url,{headers:{'x-swing-token':token},cache:'no-store'}),j=await r.json();if(!r.ok||!j.success)throw Error(j.error||'HTTP '+r.status);return j}
-function renderPageNumbers(target,current,total){
- var set=new Set([1,total]);for(var i=Math.max(1,current-2);i<=Math.min(total,current+2);i++)set.add(i);
- var nums=Array.from(set).sort(function(a,b){return a-b}),html='',last=0;
- nums.forEach(function(n){if(n-last>1)html+='<span>…</span>';html+='<button type="button" data-page="'+n+'"'+(n===current?' class="active" aria-current="page"':'')+'>'+n+'</button>';last=n});
- el(target).innerHTML=html;
+const json=(x:unknown,status=200)=>new Response(JSON.stringify(x,null,2),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}});
+
+async function resolvedCount(env:any){
+ if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
+ const row=await env.SWING_DB.prepare("SELECT COUNT(*) AS resolved FROM swing_context_signals WHERE status='RESOLVED'").first();
+ return {success:true,module:'SWING_RESOLVED_COUNT',read_only:true,resolved:Number(row?.resolved||0)};
 }
-function render(){el('rows').innerHTML=records.length?records.map(function(x,i){var sc=x.outcome&&x.outcome.scenarios||[],tp=sc.filter(function(z){return z.status==='TP_FIRST'}).length,sl=sc.filter(function(z){return z.status==='SL_FIRST'}).length;return '<tr><td>'+esc(time(x.signal_bar_open))+'</td><td><b>'+esc(x.coin)+'</b></td><td>'+esc(x.interval)+'</td><td>'+esc(x.pattern)+'</td><td class="'+(x.side==='LONG'?'long':'short')+'">'+esc(x.side)+'</td><td>'+esc(fmt(x.reference_price??x.entry_price))+'</td><td><span class="pill">'+esc(x.status)+'</span></td><td><button data-i="'+i+'">Виж</button> <small>'+(sc.length?'TP: '+tp+' · SL: '+sl:'8 филтъра')+'</small></td></tr>'}).join(''):'<tr><td colspan="8">Няма записи.</td></tr>';el('pageInfo').textContent='Страница '+page+' / '+pages;el('prev').disabled=page<=1;el('next').disabled=page>=pages;renderPageNumbers('page-numbers',page,pages)}
-async function load(){if(!token){el('message').textContent='Въведи SWING_ADMIN_TOKEN.';return}if(busy)return;busy=true;try{var q=new URLSearchParams({limit:'20',page:String(page),period:el('period').value});if(el('side').value)q.set('side',el('side').value);if(el('tf').value)q.set('interval',el('tf').value);if(el('status').value)q.set('status',el('status').value);if(el('coin').value.trim())q.set('coin',el('coin').value.trim().toUpperCase());var j=await request('/api/swing/v19/history?'+q),a=j.stats||{};records=j.rows||[];page=j.page||1;pages=j.pages||1;el('total').textContent=a.total||0;el('tracking').textContent=a.tracking||0;el('resolved').textContent=a.resolved||0;el('sides').textContent=(a.longs||0)+' / '+(a.shorts||0);render();el('message').textContent='Заредени '+records.length+' от '+j.filteredTotal;el('updated').textContent='Обновено: '+new Date().toLocaleTimeString('bg-BG',{timeZone:'Europe/Sofia'})}catch(e){el('message').textContent='Грешка: '+e.message}finally{busy=false}}
-function updateSwingMode(){var mode=el('fs-mode').value;el('fs-title').textContent=mode==='ALL'?'SWING LONG + SHORT · FILTERED':mode==='LONG'?'SWING LONG · FILTERED':'SWING SHORT · FILTERED';el('fs-description').textContent=(mode==='ALL'?'SHORT: 6 патерна · LONG: TRIANGLE_UP':mode==='LONG'?'Само LONG · TRIANGLE_UP':'Само SHORT · 6 патерна')+' · BTC 1H = MIXED · 1H/4H · TP 2% / SL 1% (хипотетични)'}
-async function loadShort(){if(!token){el('fs-message').textContent='Първо се свържи с токена горе.';return}if(fsBusy)return;fsBusy=true;el('fs-message').textContent='Зареждане…';try{var q=new URLSearchParams({limit:'10',page:String(fsPage),period:el('fs-period').value,mode:el('fs-mode').value});if(el('fs-tf').value)q.set('interval',el('fs-tf').value);if(el('fs-status').value)q.set('status',el('fs-status').value);if(el('fs-coin').value.trim())q.set('coin',el('fs-coin').value.trim().toUpperCase());var t0=performance.now();var j=await request('/api/swing/v19/filtered-short?'+q),a=j.stats||{};fsPage=j.page||1;fsPages=j.pages||1;el('fs-total').textContent=a.total||0;el('fs-tracking').textContent=a.tracking||0;el('fs-outcomes').textContent=(a.tp||0)+' / '+(a.sl||0)+' / '+(a.time_exit||0);var done=(a.tp||0)+(a.sl||0)+(a.time_exit_win||0)+(a.time_exit_loss||0)+(a.time_exit_flat||0);el('fs-rate').textContent=done?(100*((a.tp||0)+(a.time_exit_win||0))/done).toFixed(1)+'%':'—';el('fs-time-exits').textContent='TIME EXIT: 🟢 '+(a.time_exit_win||0)+' · 🔴 '+(a.time_exit_loss||0)+' · ⚪ '+(a.time_exit_flat||0)+' · Хипотетичен NET сбор: '+(a.net_pct_sum==null?'—':fmt(a.net_pct_sum,3)+'%')+' (не е реален P/L)';el('fs-rows').innerHTML=(j.rows||[]).map(function(x){var cls=x.result==='TP_FIRST'?'good':x.result==='SL_FIRST'?'bad':x.result==='TIME_EXIT'?(Number(x.net)>0?'good':Number(x.net)<0?'bad':''):'';return '<tr><td>'+esc(time(x.signal_bar_open))+'</td><td><b>'+esc(x.coin)+'</b></td><td>'+esc(x.interval)+'</td><td>'+esc(x.confirmations)+'</td><td>'+esc(x.patterns)+'</td><td>'+esc(fmt(x.entry_price))+'</td><td>'+esc(fmt(x.rsi,2))+'</td><td>'+esc(fmt(x.relative_volume,3))+'</td><td class="'+cls+'">'+esc(x.result)+'</td><td>'+esc(fmt(x.net,3))+'</td></tr>'}).join('')||'<tr><td colspan="10">Няма сигнали по условията.</td></tr>';el('fs-pages').textContent='Страница '+fsPage+' / '+fsPages;el('fs-prev').disabled=fsPage<=1;el('fs-next').disabled=fsPage>=fsPages;renderPageNumbers('fs-page-numbers',fsPage,fsPages);el('fs-message').textContent='API '+Math.round(performance.now()-t0)+' ms · Исторически replay входове: '+a.total+' · Пропуснати: '+a.skipped+' · Неясен изход: '+a.uncertain+' · Исторически OHLC модел (не реални сделки)';var src=j.source||{};el('fs-source').textContent='D1 история: '+(src.total??'—')+' записа · SHORT '+(src.shorts??'—')+' · LONG '+(src.longs??'—')+' · BTC MIXED '+(src.mixed??'—')+' · съвпадения SHORT '+(src.matching_short??'—')+' / LONG '+(src.matching_long??'—')+' · първи '+time(src.first_signal_ms)+' София · последен '+time(src.last_signal_ms)+' София';if(!a.total&&src.total>0)el('fs-message').textContent+=' · Няма допустими записи за текущите филтри; виж диагностиката на D1 по-долу.'}catch(e){el('fs-message').textContent='API грешка: '+e.message;el('fs-source').textContent='Няма потвърдени данни от D1 — проверете SWING_DB binding и API.'}finally{fsBusy=false;loadCounters()}}
-async function loadCounters(){if(!token)return;try{var q=new URLSearchParams({variant:'A',mode:el('fs-mode').value,period:el('fs-period').value});if(el('fs-tf').value)q.set('interval',el('fs-tf').value);if(el('fs-coin').value.trim())q.set('coin',el('fs-coin').value.trim().toUpperCase());var j=await request('/api/swing/v19/entry-counters?'+q);el('fs-eligible').textContent=j.eligible_signals;el('fs-eligible-tracking').textContent=j.tracking;el('fs-live-open').textContent=j.live?j.live.opened:'—';el('fs-live-expired').textContent=j.live?j.live.expired:'—';el('fs-counters-note').textContent='Допустими: A research · LIVE SHORT: B execution (различни филтри). '+(j.live_error||'OPEN = отворен вход в опашката, не текуща борсова позиция');}catch(err){el('fs-counters-note').textContent='Грешка при броячите: '+err.message;}}
-var coinModalBusy=false;
-async function loadCoinLeaderboard(){if(!token){el('fs-message').textContent='Първо се свържи с токена горе.';return}if(coinModalBusy)return;coinModalBusy=true;el('fs-coins-message').textContent='Зареждане…';try{var q=new URLSearchParams({breakdown:'coins',period:el('fs-period').value,mode:el('fs-mode').value});if(el('fs-tf').value)q.set('interval',el('fs-tf').value);var j=await request('/api/swing/v19/filtered-short?'+q);var coins=j.coins||[];el('fs-coins-rows').innerHTML=coins.map(function(x,i){return '<tr><td>'+String(i+1)+'</td><td><b>'+esc(x.coin)+'</b></td><td>'+x.entries+'</td><td class="good">'+x.tp+'</td><td class="bad">'+x.sl+'</td><td>'+x.tracking+'</td><td>'+x.resolved+'</td><td><b>'+(x.win_rate_pct==null?'—':fmt(x.win_rate_pct,1)+'%')+'</b></td></tr>'}).join('');el('fs-coins-message').textContent='Монети: '+coins.length+' · Период: '+(j.period==='today'?'Днес':'Всички дни')+' · При равен процент предимство има монетата с повече приключили сигнали.'}catch(e){el('fs-coins-message').textContent='Грешка: '+e.message}finally{coinModalBusy=false}}
-el('fs-coins-open').onclick=function(){el('fs-coins-mode').value=el('fs-mode').value;el('fs-coins-modal').style.display='block';loadCoinLeaderboard()};
-el('fs-coins-mode').onchange=function(){el('fs-mode').value=this.value;updateSwingMode();fsPage=1;loadShort();loadCoinLeaderboard()};
-el('fs-coins-close').onclick=function(){el('fs-coins-modal').style.display='none'};
-el('fs-coins-modal').onclick=function(e){if(e.target===this)this.style.display='none'};
-document.addEventListener('keydown',function(e){if(e.key==='Escape')el('fs-coins-modal').style.display='none'});
-el('page-numbers').onclick=function(e){var b=e.target.closest('button[data-page]');if(b&&!busy){page=Number(b.dataset.page);load()}};el('fs-page-numbers').onclick=function(e){var b=e.target.closest('button[data-page]');if(b&&!fsBusy){fsPage=Number(b.dataset.page);loadShort()}};
-el('connect').onclick=function(){token=el('token').value.trim();el('token').value='';page=fsPage=1;loadShort().then(function(){load()})};el('refresh').onclick=function(){loadShort().then(function(){load()})};el('fs-refresh').onclick=loadShort;
-el('prev').onclick=function(){if(page>1&&!busy){page--;load()}};el('next').onclick=function(){if(page<pages&&!busy){page++;load()}};el('fs-prev').onclick=function(){if(fsPage>1&&!fsBusy){fsPage--;loadShort()}};el('fs-next').onclick=function(){if(fsPage<fsPages&&!fsBusy){fsPage++;loadShort()}};
-['period','side','tf','status','coin'].forEach(function(k){el(k).addEventListener('change',function(){page=1;load()})});el('fs-mode').addEventListener('change',function(){updateSwingMode();fsPage=1;loadShort();if(el('fs-coins-modal').style.display==='block'){el('fs-coins-mode').value=this.value;loadCoinLeaderboard()}});['fs-period','fs-tf','fs-status','fs-coin'].forEach(function(k){el(k).addEventListener('change',function(){fsPage=1;loadShort()})});
-el('rows').onclick=function(e){var b=e.target.closest('button[data-i]');if(!b)return;var x=records[Number(b.dataset.i)];if(!x)return;el('detail').innerHTML='<b>'+esc(x.coin)+' · '+esc(x.pattern)+' · '+esc(x.side)+'</b><details open><summary>8 филтъра</summary><pre class="detail">'+esc(filters(x))+'</pre></details><details open><summary>Контекст</summary><pre class="detail">'+esc(JSON.stringify(x.context||{},null,2))+'</pre></details><details><summary>TP/SL сценарии (хипотетични)</summary><pre class="detail">'+esc(JSON.stringify(x.outcome||{status:'PENDING'},null,2))+'</pre></details>'};
-setInterval(function(){if(token&&!document.hidden){loadShort()}},120000);
-})();</script></body></html>`;
+
+// Today is the current calendar day in Europe/Sofia; all-time retains the complete archive.
+function swingTodayStartMs():number {
+ const now=new Date();
+ const date=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).format(now);
+ const [year,month,day]=date.split('-').map(Number);
+ const localMidnight=Date.UTC(year,month-1,day);
+ const fmt=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+ let candidate=localMidnight-2*3600000;
+ for(let i=0;i<3;i++){
+  const parts=Object.fromEntries(fmt.formatToParts(new Date(candidate)).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));
+  const represented=Date.UTC(parts.year,parts.month-1,parts.day,parts.hour,parts.minute);
+  candidate+=localMidnight-represented;
+ }
+ return candidate;
+}
+function swingPeriod(u:URL):'today'|'total' {
+ const period=u.searchParams.get('period')||'total';
+ if(period!=='today'&&period!=='total')throw Error('INVALID_PERIOD');
+ return period;
+}
+
+async function swingHistory(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
+ const clamp=(v:string|null,d:number,min:number,max:number)=>{const n=Number(v);return v!==null&&Number.isFinite(n)?Math.max(min,Math.min(max,Math.floor(n))):d};
+ const limit=clamp(u.searchParams.get('limit'),100,1,100);
+ const page=clamp(u.searchParams.get('page'),1,1,100000);
+ const period=swingPeriod(u);
+ const side=u.searchParams.get('side')||'';
+ const status=u.searchParams.get('status')||'';
+ const interval=u.searchParams.get('interval')||'';
+ const coin=(u.searchParams.get('coin')||'').trim().toUpperCase();
+ if(side&&!['LONG','SHORT'].includes(side))throw new Error('INVALID_SIDE');
+ if(status&&!['TRACKING','RESOLVED'].includes(status))throw new Error('INVALID_STATUS');
+ if(interval&&!['1h','4h','1d'].includes(interval))throw new Error('INVALID_INTERVAL');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw new Error('INVALID_COIN');
+ const where:string[]=[],args:any[]=[];
+ if(period==='today'){where.push('signal_bar_open>=?');args.push(swingTodayStartMs())}
+ if(side){where.push('side=?');args.push(side)}
+ if(status){where.push('status=?');args.push(status)}
+ if(interval){where.push('interval=?');args.push(interval)}
+ if(coin){where.push('coin LIKE ?');args.push('%'+coin+'%')}
+ const w=where.length?' WHERE '+where.join(' AND '):'';
+ const d=env.SWING_DB;
+ const [totalRow,statsRow]=await Promise.all([
+  d.prepare('SELECT COUNT(*) AS n FROM swing_context_signals'+w).bind(...args).first(),
+  d.prepare(`SELECT COUNT(*) AS total,
+   COALESCE(SUM(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END),0) AS tracking,
+   COALESCE(SUM(CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END),0) AS resolved,
+   COALESCE(SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END),0) AS longs,
+   COALESCE(SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END),0) AS shorts
+   FROM swing_context_signals${period==='today'?' WHERE signal_bar_open>='+swingTodayStartMs():''}`).first()
+ ]);
+ const total=Number(totalRow?.n||0),pages=Math.max(1,Math.ceil(total/limit));
+ const actualPage=Math.min(page,pages),offset=(actualPage-1)*limit;
+ const result=await d.prepare('SELECT * FROM swing_context_signals'+w+' ORDER BY signal_bar_open DESC,id DESC LIMIT ? OFFSET ?').bind(...args,limit,offset).all();
+ const parse=(v:any)=>{if(typeof v!=='string'||!v)return null;try{return JSON.parse(v)}catch{return null}};
+ return {success:true,module:'SWING_HISTORY_V1_9_5',read_only:true,trading:false,
+  stats:{total:Number(statsRow?.total||0),tracking:Number(statsRow?.tracking||0),resolved:Number(statsRow?.resolved||0),longs:Number(statsRow?.longs||0),shorts:Number(statsRow?.shorts||0)},
+  period,filteredTotal:total,page:actualPage,pages,limit,
+  rows:(result.results||[]).map((r:any)=>({...r,context:parse(r.context_json),outcome:parse(r.outcome_json),context_json:undefined,outcome_json:undefined}))};
+}
+
+
+// One SHORT opportunity per coin + interval + signal candle.
+// The existing D1 table and LONG records are not modified.
+async function filteredShortHistory(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw new Error('MISSING_SWING_DB_BINDING');
+ const numberParam=(key:string,def:number,min:number,max:number)=>{
+  const v=u.searchParams.get(key),n=Number(v);
+  return v!==null&&Number.isInteger(n)?Math.max(min,Math.min(max,n)):def;
+ };
+ const page=numberParam('page',1,1,100000),limit=numberParam('limit',50,1,100);
+ const period=swingPeriod(u);
+ const interval=u.searchParams.get('interval')||'';
+ const status=u.searchParams.get('status')||'';
+ const confirmations=u.searchParams.get('confirmations')||'';
+ const coin=(u.searchParams.get('coin')||'').trim().toUpperCase();
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(status&&!['TRACKING','TP_FIRST','SL_FIRST','TIME_EXIT','AMBIGUOUS','PENDING','CONFLICT'].includes(status))throw Error('INVALID_STATUS');
+ if(confirmations&&!['1','2','3'].includes(confirmations))throw Error('INVALID_CONFIRMATIONS');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ const args:any[]=[];
+ const wheres:string[]=[];
+ if(interval){wheres.push('interval=?');args.push(interval)}
+ if(coin){wheres.push('coin=?');args.push(coin)}
+ const having:string[]=[];
+ if(status){having.push('result=?');args.push(status)}
+ if(confirmations){having.push(confirmations==='3'?'confirmations>=3':'confirmations=?');if(confirmations!=='3')args.push(Number(confirmations))}
+ const base=`WITH base AS (
+ SELECT s.coin,s.interval,s.signal_bar_open,s.pattern,s.status,
+        s.reference_price,s.entry_price,
+        json_extract(s.context_json,'$.indicators.rsi14') AS rsi,
+        json_extract(s.context_json,'$.volume.relativeVolume') AS relative_volume,
+        (SELECT json_extract(j.value,'$.status')
+           FROM json_each(s.outcome_json,'$.scenarios') j
+          WHERE CAST(json_extract(j.value,'$.tp') AS REAL)=2
+            AND CAST(json_extract(j.value,'$.sl') AS REAL)=1 LIMIT 1) AS scenario_result,
+        (SELECT CAST(json_extract(j.value,'$.hypotheticalNetPct') AS REAL)
+           FROM json_each(s.outcome_json,'$.scenarios') j
+          WHERE CAST(json_extract(j.value,'$.tp') AS REAL)=2
+            AND CAST(json_extract(j.value,'$.sl') AS REAL)=1 LIMIT 1) AS scenario_net
+ FROM swing_context_signals s
+ WHERE s.side='SHORT' AND s.interval IN ('1h','4h')
+   AND s.pattern IN ('DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
+     'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT')
+   AND json_extract(s.context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
+   ${period==='today'?'AND s.signal_bar_open>='+swingTodayStartMs():''}
+), grouped AS (
+ SELECT coin,interval,signal_bar_open,
+        COUNT(DISTINCT pattern) AS confirmations,
+        GROUP_CONCAT(DISTINCT pattern) AS patterns,
+        ROUND(AVG(COALESCE(reference_price,entry_price)),8) AS entry_price,
+        ROUND(AVG(CAST(rsi AS REAL)),2) AS rsi,
+        ROUND(AVG(CAST(relative_volume AS REAL)),3) AS relative_volume,
+        CASE WHEN SUM(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END)>0 THEN 'TRACKING'
+             WHEN COUNT(DISTINCT COALESCE(scenario_result,'PENDING'))>1 THEN 'CONFLICT'
+             ELSE COALESCE(MAX(scenario_result),'PENDING') END AS result,
+        ROUND(AVG(scenario_net),4) AS net
+ FROM base GROUP BY coin,interval,signal_bar_open
+), selected AS (
+ SELECT * FROM grouped
+ ${wheres.length?'WHERE '+wheres.join(' AND '):''}
+), filtered AS (
+ SELECT * FROM selected
+ ${having.length?'WHERE '+having.join(' AND '):''}
+)`;
+ const d=env.SWING_DB;
+ const [stats,rows]=await Promise.all([
+  d.prepare(base+` SELECT COUNT(*) AS total,
+   SUM(CASE WHEN result='TRACKING' THEN 1 ELSE 0 END) AS tracking,
+   SUM(CASE WHEN result='TP_FIRST' THEN 1 ELSE 0 END) AS tp,
+   SUM(CASE WHEN result='SL_FIRST' THEN 1 ELSE 0 END) AS sl
+   FROM filtered`).bind(...args).first(),
+  d.prepare(base+` SELECT * FROM filtered ORDER BY signal_bar_open DESC,coin,interval LIMIT ? OFFSET ?`)
+   .bind(...args,limit,(page-1)*limit).all()
+ ]);
+ const total=Number(stats?.total||0);
+ return {success:true,module:'SWING_FILTERED_SHORT_V1',read_only:true,trading:false,
+  period,filters:{side:'SHORT',btc_1h:'MIXED',tp:2,sl:1},
+  stats:{total,tracking:Number(stats?.tracking||0),tp:Number(stats?.tp||0),sl:Number(stats?.sl||0)},
+  filteredTotal:total,page,pages:Math.max(1,Math.ceil(total/limit)),limit,rows:rows.results||[]};
+}
+
+/** SWING SHORT EXECUTABLE V2 — read-only portfolio replay.
+ * One open SHORT per coin across 1h and 4h. Never places orders.
+ * Historical OHLC first-touch time is known only to the end of its 1h bar.
+ * Uncertain exits block re-entry; no invented closure timestamps.
+ */
+const PATTERNS = ['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF','VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT'];
+const HOUR = 3600000;
+type Outcome = 'TP_FIRST'|'SL_FIRST'|'TIME_EXIT'|'AMBIGUOUS'|'TRACKING'|'PENDING'|'CONFLICT';
+type Signal = {coin:string;interval:string;signal_bar_open:number;signal_available_at:number;patterns:string[];confirmations:number;entry_price:number|null;rsi:number|null;relative_volume:number|null;result:Outcome;net:number|null;exit_bar_open:number|null;exit_at:number|null;exit_precision:string;};
+function number(x:any):number|null {const n=Number(x);return x===null||x===undefined||!Number.isFinite(n)?null:n;}
+function parseReplayJson(x:any):any {try{return typeof x==='string'?JSON.parse(x):x||null;}catch{return null;}}
+function toMs(x:any):number|null {if(typeof x==='number'&&Number.isFinite(x))return x;if(typeof x==='string'){const n=Date.parse(x);return Number.isFinite(n)?n:null;}return null;}
+function todaySofia():number {
+ const now=new Date(),parts=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
+ const p:any={};for(const x of parts)if(x.type!=='literal')p[x.type]=Number(x.value);
+ const midnight=Date.UTC(p.year,p.month-1,p.day);
+ let guess=midnight-2*HOUR;
+ for(let i=0;i<3;i++){
+  const q:any={};for(const x of new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(guess)))if(x.type!=='literal')q[x.type]=Number(x.value);
+  guess+=midnight-Date.UTC(q.year,q.month-1,q.day,q.hour,q.minute);
+ }
+ return guess;
+}
+function scenario(r:any){const o=parseReplayJson(r.outcome_json);return (o?.scenarios||[]).find((x:any)=>Number(x.tp)===2&&Number(x.sl)===1)||null;}
+function group(rows:any[]):Signal[] {
+ const groups=new Map<string,any[]>();
+ for(const r of rows){const k=[r.coin,r.interval,r.signal_bar_open].join('|');const a=groups.get(k)||[];a.push(r);groups.set(k,a);}
+ const result:Signal[]=[];
+ for(const a of groups.values()){
+  const first=a[0],states=a.map(r=>r.status==='TRACKING'?'TRACKING':scenario(r)?.status||'PENDING');
+  const state:Outcome=states.includes('TRACKING')?'TRACKING':new Set(states).size>1?'CONFLICT':states[0] as Outcome;
+  const touches=a.map(scenario).map(s=>toMs(s?.firstTouchBarOpen));
+  const entryTimes=a.map(r=>number(r.signal_available_at)).filter((v):v is number=>v!==null);
+  const prices=a.map(r=>number(r.reference_price??r.entry_price)).filter((v):v is number=>v!==null);
+  const contexts=a.map(r=>parseReplayJson(r.context_json));
+  const avg=(vals:(number|null)[])=>{const valid=vals.filter((v):v is number=>v!==null);return valid.length?valid.reduce((x,y)=>x+y,0)/valid.length:null;};
+  const bar=states.every(s=>s===state)&&touches.every(t=>t!==null&&t===touches[0])?touches[0]:null;
+  // TIME_EXIT: do not guess exit timestamp from resolved_at (settlement processing time).
+  // First-touch: conservatively unlock only after the entire touched hourly candle.
+  const completeTimeExit=state==='TIME_EXIT' && a.every(r=>{
+    const o=parseReplayJson(r.outcome_json);
+    const expected=r.interval==='1h'?48:r.interval==='4h'?72:0;
+    return o?.windowComplete===true && Number(o.horizonHours)===expected &&
+      scenario(r)?.status==='TIME_EXIT' && Number.isFinite(Number(scenario(r)?.hypotheticalNetPct));
+  });
+  const resolved=(state==='TP_FIRST'||state==='SL_FIRST')&&bar!==null;
+  const timeoutAt=completeTimeExit ? Number(first.signal_bar_open)+(first.interval==='1h'?48:72)*HOUR : null;
+  const net=avg(a.map(r=>number(scenario(r)?.hypotheticalNetPct)));
+  result.push({coin:String(first.coin),interval:String(first.interval),signal_bar_open:Number(first.signal_bar_open),
+   signal_available_at:entryTimes.length?Math.max(...entryTimes):Number(first.signal_bar_open)+(first.interval==='4h'?4:1)*HOUR,
+   patterns:[...new Set(a.map(r=>String(r.pattern)))],confirmations:new Set(a.map(r=>r.pattern)).size,
+   entry_price:avg(prices),rsi:avg(contexts.map(c=>number(c?.indicators?.rsi14))),
+   relative_volume:avg(contexts.map(c=>number(c?.volume?.relativeVolume))),
+   result:state,net,exit_bar_open:resolved?bar:null,
+   exit_at:resolved?bar!+HOUR:(timeoutAt!==null&&timeoutAt>(entryTimes.length?Math.max(...entryTimes):0)?timeoutAt:null),
+   exit_precision:resolved?'CONSERVATIVE_END_OF_1H_BAR':timeoutAt!==null?'VERIFIED_WINDOW_COMPLETE_TIME_EXIT':'UNKNOWN_BLOCKS_REENTRY'});
+ }
+ return result.sort((a,b)=>a.signal_available_at-b.signal_available_at||a.coin.localeCompare(b.coin)||a.interval.localeCompare(b.interval));
+}
+const swingReportCache=new Map<string,{expires:number,promise:Promise<any>}>();
+function cachedSwingReport(env:any,u:URL):Promise<any>{
+ const key=u.searchParams.toString();const now=Date.now();
+ const existing=swingReportCache.get(key);
+ if(existing&&existing.expires>now)return existing.promise;
+ const promise=swingExecutableV2(env,u);
+ swingReportCache.set(key,{expires:now+60000,promise});
+ promise.catch(()=>{if(swingReportCache.get(key)?.promise===promise)swingReportCache.delete(key)});
+ if(swingReportCache.size>32){for(const [k,v] of swingReportCache){if(v.expires<=now||swingReportCache.size>32)swingReportCache.delete(k)}}
+ return promise;
+}
+async function swingExecutableV2(env:any,u:URL){
+ const variant=u.searchParams.get('variant')||'A';
+ if(!['A','B'].includes(variant))throw Error('INVALID_VARIANT');
+ const mode=variant==='B'?'SHORT':u.searchParams.get('mode')||'ALL';
+ if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
+ if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
+ const allowed=['period','page','limit','coin','interval','status','breakdown','mode','variant'];
+ for(const key of u.searchParams.keys())if(!allowed.includes(key))throw Error('UNSUPPORTED_FILTER_'+key);
+ const period=u.searchParams.get('period')||'total';if(!['total','today'].includes(period))throw Error('INVALID_PERIOD');
+ const coin=(u.searchParams.get('coin')||'').toUpperCase(),interval=u.searchParams.get('interval')||'',status=u.searchParams.get('status')||'';
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(status&&!['TRACKING','TP_FIRST','SL_FIRST','TIME_EXIT','AMBIGUOUS','PENDING','CONFLICT','SKIPPED_ALREADY_OPEN'].includes(status))throw Error('INVALID_STATUS');
+ const bounded=(key:string,def:number,max:number)=>{const n=Number(u.searchParams.get(key));return Number.isInteger(n)&&n>0?Math.min(n,max):def;};
+ const page=bounded('page',1,100000),limit=bounded('limit',50,100);
+ // IMPORTANT: replay the FULL history first. Filtering by date/coin/TF before replay changes eligibility.
+ // D1 all() can be truncated by row limits: use keyset paging with deterministic id ordering.
+ const d=env.SWING_DB;const raw:any[]=[];let lastId=0;
+ for(let batch=0;batch<200;batch++){
+  const res=await d.prepare(`SELECT id,side,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
+   FROM swing_context_signals WHERE id>? AND interval IN ('1h','4h')
+   AND ((side='SHORT' AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
+     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''})
+     OR (side='LONG' AND pattern='TRIANGLE_UP'
+     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))
+   ORDER BY id ASC LIMIT 500`).bind(lastId,...PATTERNS).all();
+  const rows=res.results||[];raw.push(...rows);if(rows.length<500)break;
+  lastId=Number(rows[rows.length-1].id);
+  if(batch===199)throw Error('REPLAY_ROW_LIMIT_REACHED_REFUSING_PARTIAL_STATISTICS');
+ }
+ // Independent position locks for LONG and SHORT. No database changes.
+ // Historical report: only completed TP/SL with a verified first-touch exit.
+ // Exclude incomplete records BEFORE overlap replay so they never lock a coin.
+ const isCompleted=(x:Signal)=> (x.result==='TP_FIRST'||x.result==='SL_FIRST'||x.result==='TIME_EXIT') && x.exit_at!==null && (x.result!=='TIME_EXIT'||x.net!==null);
+ const shortSignals=group(raw.filter(r=>r.side==='SHORT')).filter(isCompleted);
+ const longSignals=variant==='B'?[]:group(raw.filter(r=>r.side==='LONG')).filter(isCompleted);
+ function replaySide(signals:Signal[]){
+  const active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
+  for(const signal of signals){
+   const old=active.get(signal.coin);
+   if(old&&(old.exit_at===null||signal.signal_available_at<old.exit_at)){
+    skipped.push({...signal,skip_reason:'SKIPPED_ALREADY_OPEN',blocked_by:old.signal_bar_open});continue;
+   }
+   accepted.push(signal);active.set(signal.coin,signal);
+  }
+  return {accepted,skipped};
+ }
+ const shortReplay=replaySide(shortSignals),longReplay=replaySide(longSignals);
+ // D1 TRACKING means ALL scenario variants are pending, not necessarily TP2/SL1.
+ // Inspect only the latest open research signal per coin and side. Read-only; never
+ // convert a research signal into an exchange position or modify D1 status.
+ const trackingShort=group(raw.filter(r=>r.side==='SHORT'&&r.status==='TRACKING')).filter(x=>x.result==='TRACKING');
+ const trackingLong=group(raw.filter(r=>r.side==='LONG'&&r.status==='TRACKING')).filter(x=>x.result==='TRACKING');
+ function newestByCoin(a:Signal[]):Signal[]{
+  const m=new Map<string,Signal>();
+  for(const x of a){const prev=m.get(x.coin);if(!prev||x.signal_available_at>prev.signal_available_at)m.set(x.coin,x);}
+  return [...m.values()];
+ }
+ const latestShort=newestByCoin(trackingShort),latestLong=newestByCoin(trackingLong);
+ const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
+ const checkedResearch: (Signal & {side:string;verification:string})[]=[];
+ const candleCache=new Map<string,any[]>();
+ const now=Date.now();
+ for(const x of liveResearch){
+  let result:Outcome='TRACKING',exit_at:number|null=null,exit_bar_open:number|null=null;
+  let verification='NOT_VERIFIED';
+  try{
+   // Avoid treating signals older than the available OHLC window as open.
+   if(now-x.signal_available_at>220*HOUR){verification='OHLC_WINDOW_TOO_OLD';}
+   else{
+    if(!candleCache.has(x.coin)){
+     const feed=await fetchClosed(x.coin,'1h',240);
+     if(!quality(feed).ready)throw Error('OHLC_NOT_READY');
+     candleCache.set(x.coin,feed.closed);
+    }
+    const all=candleCache.get(x.coin)!;
+    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=now).sort((a:any,b:any)=>a.t-b.t);
+    let expected=x.signal_available_at;
+    let contiguous=true;
+    for(const b of bars){if(b.t!==expected){contiguous=false;break;}expected+=HOUR;}
+    if(!contiguous||(bars.length===0&&now>=x.signal_available_at+HOUR))verification='MISSING_OHLC_BARS';
+    else if(x.entry_price===null||x.entry_price<=0)verification='INVALID_ENTRY';
+    else{
+     verification='OHLC_1H_TP2_SL1';
+     for(const b of bars){
+      const tp=x.side==='SHORT'?b.l<=x.entry_price*0.98:b.h>=x.entry_price*1.02;
+      const sl=x.side==='SHORT'?b.h>=x.entry_price*1.01:b.l<=x.entry_price*0.99;
+      if(tp||sl){
+       result=tp&&sl?'AMBIGUOUS':tp?'TP_FIRST':'SL_FIRST';
+       exit_bar_open=b.t;exit_at=b.t+HOUR;break;
+      }
+     }
+    }
+   }
+  }catch(e){verification='OHLC_FETCH_ERROR:'+String(e);}
+  checkedResearch.push({...x,side:x.side,result,
+   net:result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null,
+   exit_bar_open,exit_at,exit_precision:verification,verification});
+ }
+ const trackingOnly=checkedResearch.filter(x=>x.result==='TRACKING');
+ const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST');
+
+ // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
+ const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
+  MIN(signal_bar_open) AS first_signal_ms, MAX(signal_bar_open) AS last_signal_ms,
+  SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS shorts,
+  SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS longs,
+  SUM(CASE WHEN json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' THEN 1 ELSE 0 END) AS mixed
+  FROM swing_context_signals`).first();
+ const source={total:Number(sourceRow?.total||0),first_signal_ms:sourceRow?.first_signal_ms??null,
+  last_signal_ms:sourceRow?.last_signal_ms??null,shorts:Number(sourceRow?.shorts||0),
+  longs:Number(sourceRow?.longs||0),mixed:Number(sourceRow?.mixed||0),
+  matching_short:shortSignals.length,matching_long:longSignals.length};
+ const signals=mode==='SHORT'?shortSignals:mode==='LONG'?longSignals:[...shortSignals,...longSignals];
+ const accepted=mode==='SHORT'?shortReplay.accepted:mode==='LONG'?longReplay.accepted:[...shortReplay.accepted,...longReplay.accepted];
+ const skipped=mode==='SHORT'?shortReplay.skipped:mode==='LONG'?longReplay.skipped:[...shortReplay.skipped,...longReplay.skipped];
+ const breakdown=u.searchParams.get('breakdown')||'';
+ if(breakdown&&breakdown!=='coins')throw Error('INVALID_BREAKDOWN');
+ const start=period==='today'?todaySofia():-Infinity;
+ // Coin leaderboard is calculated from the SAME accepted replay, not raw duplicated signals.
+ // It intentionally ignores coin/status table filters; period and timeframe still apply.
+ if(breakdown==='coins'){
+  const tracked=['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','HYPE','ADA','LTC','BCH','AAVE','UNI','NEAR','OP','ARB','WIF','TRX'];
+  const eligible=accepted.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
+  const trackingEligible=trackingOnly.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval)&& (mode==='ALL'||s.side===mode));
+  const names=[...new Set([...tracked,...eligible.map(s=>s.coin),...trackingEligible.map(s=>s.coin)])];
+  const coins=names.map(name=>{
+   const a=eligible.filter(s=>s.coin===name);
+   const tp=a.filter(s=>s.result==='TP_FIRST').length;
+   const sl=a.filter(s=>s.result==='SL_FIRST').length;
+   const tracking=trackingEligible.filter(s=>s.coin===name).length;
+   const timeExit=a.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
+   const time_exit_win=timeExit.filter(s=>Number(s.net)>0).length;
+   const time_exit_loss=timeExit.filter(s=>Number(s.net)<0).length;
+   const time_exit_flat=timeExit.length-time_exit_win-time_exit_loss;
+   const resolved=tp+sl+timeExit.length;
+   return {coin:name,entries:a.length,tp,sl,time_exit_win,time_exit_loss,time_exit_flat,tracking,resolved,net_win_rate_pct:resolved?Number((100*(tp+time_exit_win)/resolved).toFixed(2)):null,
+    win_rate_pct:resolved?Number((100*tp/resolved).toFixed(2)):null};
+  }).sort((a,b)=>{
+   if(a.win_rate_pct===null)return b.win_rate_pct===null?a.coin.localeCompare(b.coin):1;
+   if(b.win_rate_pct===null)return -1;
+   return b.win_rate_pct-a.win_rate_pct||b.resolved-a.resolved||a.coin.localeCompare(b.coin);
+  });
+  return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',variant,mode,read_only:true,trading:false,
+   period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
+ }
+ const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const activeResearch=trackingOnly.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const closedResearch=recentlyResolved.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ // Completed research signals are reported separately; do not double-count them
+ // against historical accepted TP/SL, which uses a separate portfolio replay.
+ const visible=status==='TRACKING'?activeResearch:visibleAll.filter(s=>!status||s.result===status);
+ const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:status==='TRACKING'?activeResearch:status?visible:[...visibleAll,...activeResearch];
+ const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
+ const timed=visibleAll.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
+ const timeWin=timed.filter(s=>Number(s.net)>0).length,timeLoss=timed.filter(s=>Number(s.net)<0).length,timeFlat=timed.length-timeWin-timeLoss;
+ const netSum=visibleAll.reduce((n,s)=>n+(s.net===null?0:Number(s.net)),0);
+ const netDone=tp+sl+timed.length;
+ const tracking=activeResearch.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
+ return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',variant,mode,read_only:true,trading:false,
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'VERIFIED_48H_1H_OR_72H_4H_INCLUDED',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',tp:2,sl:1},
+  stats:{total:visibleAll.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+  all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
+  page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
+  rows:selected.sort((a,b)=>b.signal_available_at-a.signal_available_at).slice((page-1)*limit,page*limit)};
+}
+
+
+// SWING A/B dashboard counters: research eligibility and LIVE queue are distinct.
+// READ ONLY. No changes to signal generation, execution, or settlement.
+async function swingEntryCounters(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
+ const variant=u.searchParams.get('variant')==='B'?'B':'A';
+ const mode=variant==='B'?'SHORT':(u.searchParams.get('mode')||'SHORT');
+ if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
+ const period=u.searchParams.get('period')==='total'?'total':'today';
+ const interval=u.searchParams.get('interval')||'';
+ const coin=(u.searchParams.get('coin')||'').toUpperCase();
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ const start=period==='today'?todaySofia():0;
+ const clauses=["interval IN ('1h','4h')",'signal_available_at>=?'];
+ const args:any[]=[start];
+ if(interval){clauses.push('interval=?');args.push(interval);}
+ if(coin){clauses.push('coin=?');args.push(coin);}
+ if(mode!=='ALL'){clauses.push('side=?');args.push(mode);}
+ const patternParams=PATTERNS.map(()=>'?').join(',');
+ clauses.push(`((side='SHORT' AND pattern IN (${patternParams}) AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''}) OR (side='LONG' AND pattern='TRIANGLE_UP' AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))`);
+ args.push(...PATTERNS);
+ // Group patterns belonging to the same coin/side/timeframe/candle into one signal.
+ const sql=`WITH grouped AS (SELECT coin,side,interval,signal_bar_open,MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) AS tracking FROM swing_context_signals WHERE ${clauses.join(' AND ')} GROUP BY coin,side,interval,signal_bar_open) SELECT COUNT(*) AS eligible,COALESCE(SUM(tracking),0) AS tracking FROM grouped`;
+ const row:any=await env.SWING_DB.prepare(sql).bind(...args).first();
+ let live:any=null,liveError:string|null=null;
+ // Queue tracks actual B SHORT and unchanged LONG, not historical A SHORT.
+ if(env.DB?.prepare){
+  try{
+   const filters=['signal_available_at>=?'];const params:any[]=[start];
+   if(coin){filters.push('coin=?');params.push(coin);}
+   if(mode!=='ALL'){filters.push('side=?');params.push(mode);}
+   if(interval){filters.push('signal_key LIKE ?');params.push('%:'+interval+':%');}
+   const lr:any=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) AS opened,COALESCE(SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END),0) AS expired FROM swing_live_queue WHERE ${filters.join(' AND ')}`).bind(...params).first();
+   live={opened:Number(lr?.opened||0),expired:Number(lr?.expired||0),short_strategy:'B_DOUBLE_MIXED',meaning:'QUEUE_OPEN_ENTRIES_NOT_CURRENT_EXCHANGE_POSITIONS'};
+  }catch(e:any){liveError=String(e?.message||e);}
+ }else liveError='MISSING_LIVE_DB_BINDING';
+ return {success:true,read_only:true,variant,mode,period,coin,interval,eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),live,live_error:liveError};
+}
+
+export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
+ const env=_env as any;
+ const u=new URL(req.url);
+ if(req.method==='GET'&&u.pathname==='/api/swing/v19/entry-counters'){
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  try{return json(await swingEntryCounters(env,u));}catch(e:any){return json({success:false,error:String(e?.message||e)},502);}
+ }
+ if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
+ if(req.method==='GET'&&u.pathname==='/swing-hunter/ab')return new Response(swingABDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
+ if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/api/swing/v19/filtered-short'].includes(u.pathname)){
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  try{
+   if(u.pathname==='/api/swing/v19/filtered-short'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await cachedSwingReport(env,u));
+   }
+   if(u.pathname==='/api/swing/v19/history'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await swingHistory(env,u));
+   }
+   if(u.pathname==='/api/swing/v19/resolved-count'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await resolvedCount(env));
+   }
+   if(u.pathname==='/api/swing/v19/log'){
+    if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+    return json(await recentSignals(env,Number(u.searchParams.get('limit')||20),u.searchParams.get('side')||undefined));
+   }
+   if(req.method!=='POST')return json({success:false,error:'POST_REQUIRED'},405);
+   if(u.pathname==='/api/swing/v19/settle')return json(await settleSignals(env,Number(u.searchParams.get('limit')||12)));
+   if(!NEW_SIGNALS_ENABLED)return json({success:true,module:'SWING_HUNTER_V1_9_5',status:'SIGNAL_COLLECTION_PAUSED',new_signals_enabled:false,existing_signals_settlement_enabled:true,trading:false,signals_created:0});
+   return json(await scanAndLog(env,{interval:(u.searchParams.get('interval')||'1h') as Interval,offset:Number(u.searchParams.get('offset')||0),limit:Number(u.searchParams.get('limit')||3)}));
+  }catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}
+ }
+ if(req.method!=='GET')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+ if(u.pathname==='/swing-hunter/intelligence')return new Response(intelligenceDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
+ if(u.pathname==='/swing-hunter')return new Response(dashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store'}});
+ if(u.pathname==='/api/swing'||u.pathname==='/api/swing/status')return json({success:true,module:'SWING_HUNTER_V1_9_3',mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,scheduled:false,coins:COINS.length,routes:['/swing-hunter','/swing-hunter/monitor','/api/swing/status','/api/swing/ohlcv','/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow','/api/swing/dashboard','/api/swing/scan','/api/swing/replay','/api/swing/research','/api/swing/compare','/api/swing/health','/api/swing/outcomes','/api/swing/audit','/api/swing/unified','/api/swing/unified-market','/api/swing/catalog','/api/swing/intelligence','/api/swing/intelligence-market','/api/swing/chart-learning','/api/swing/chart-learning-market','/api/swing/entry-research','/api/swing/integrity-audit','/api/swing/tp-first-touch','/api/swing/tp-sl-first-touch','/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/swing-hunter/intelligence']});
+ if(u.pathname==='/api/swing/dashboard')return json({success:true,module:'SWING_HUNTER_V1_8_5',mode:'READ_ONLY',dashboard:'/swing-hunter'});
+ if(u.pathname==='/api/swing/health')return json(healthReport());
+ if(u.pathname==='/api/swing/catalog')return json({success:true,module:'SWING_HUNTER_V1_6_PATTERN_CATALOG',patternIds:CATALOG_IDS,patternsCount:CATALOG_IDS.length,notes:['20 directional detectors, not every conceivable market pattern','Signals include triggerPatterns and supportingPatterns','Research-only']});
+ if(u.pathname==='/api/swing/chart-learning-market'){try{return json(await chartLearningMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2),(u.searchParams.get('interval')||'4h') as Interval))}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}}
+ if(u.pathname==='/api/swing/intelligence-market'){try{return json(await intelligenceMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2)))}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}}
+ if(u.pathname==='/api/swing/unified-market'){try{return json(await unifiedMarket(Number(u.searchParams.get('offset')||0),Number(u.searchParams.get('limit')||2)))}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}}
+ if(u.pathname==='/api/swing/scan'){try{return json(await scanMarket())}catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}}
+ const coin=(u.searchParams.get('coin')||'BTC').toUpperCase();
+ if(!(COINS as readonly string[]).includes(coin))return json({success:false,error:'INVALID_COIN'},400);
+ try{
+  if(u.pathname==='/api/swing/tp-sl-first-touch')return json(await tpSlFirstTouchCoin(coin,(u.searchParams.get('interval')||'4h') as Interval,Number(u.searchParams.get('limit')??'10')));
+  if(u.pathname==='/api/swing/tp-first-touch')return json(await tpFirstTouchCoin(coin,(u.searchParams.get('interval')||'4h') as Interval,Number(u.searchParams.get('limit')||15)));
+  if(u.pathname==='/api/swing/entry-research'||u.pathname==='/api/swing/integrity-audit')return json(await entryResearchCoin(coin,(u.searchParams.get('interval')||'4h') as Interval,Number(u.searchParams.get('limit')||15)));
+  if(u.pathname==='/api/swing/chart-learning')return json(await chartLearningCoin(coin,(u.searchParams.get('interval')||'4h') as Interval,Number(u.searchParams.get('limit')||30)));
+  if(u.pathname==='/api/swing/intelligence')return json(await intelligenceCoin(coin));
+  if(u.pathname==='/api/swing/unified')return json(await unifiedCoin(coin));
+  if(u.pathname==='/api/swing/audit')return json(await auditCoin(coin));
+  if(u.pathname==='/api/swing/outcomes')return json(await outcomeCoin(coin));
+  if(u.pathname==='/api/swing/replay')return json(await replayCoin(coin));
+  if(u.pathname==='/api/swing/research')return json(await researchCoin(coin));
+  if(u.pathname==='/api/swing/compare')return json(await compareCoin(coin));
+  if(u.pathname==='/api/swing/ohlcv'){
+   const interval=(u.searchParams.get('interval')||'4h') as Interval;
+   const count=Number(u.searchParams.get('count')||100);
+   const x=await fetchClosed(coin,interval,count);
+   return json({success:true,mode:'READ_ONLY',d1_queries:0,...quality(x)});
+  }
+  if(!['/api/swing/analyze','/api/swing/structure','/api/swing/patterns','/api/swing/decision','/api/swing/shadow'].includes(u.pathname))return json({success:false,error:'NOT_FOUND'},404);
+  const [h1,h4,d1]=await Promise.all([fetchClosed(coin,'1h'),fetchClosed(coin,'4h'),fetchClosed(coin,'1d')]);
+  const qualities=[quality(h1),quality(h4),quality(d1)].map(({last3,...q})=>q);
+  if(u.pathname==='/api/swing/structure'){
+   const {structure}=await import('./market-structure');
+   return json({success:true,coin,quality:qualities,structure:{'1h':structure(h1.closed),'4h':structure(h4.closed),'1d':structure(d1.closed)}});
+  }
+  if(u.pathname==='/api/swing/patterns'){
+   const {structure}=await import('./market-structure');
+   return json({success:true,coin,quality:qualities,patterns:{'1h':detectCatalog(h1.closed,structure(h1.closed),'1h'),'4h':detectCatalog(h4.closed,structure(h4.closed),'4h')},catalogCount:CATALOG_IDS.length});
+  }
+  const candidate=decide(coin,h1,h4,d1);
+  if(u.pathname==='/api/swing/decision')return json({success:true,coin,quality:qualities,candidate});
+  if(u.pathname==='/api/swing/shadow')return json({success:true,coin,shadow:shadowProjection(candidate),note:'Projection only; no trade tracking or D1 writes'});
+  return json({success:true,mode:'SHADOW_READ_ONLY',trading:false,d1_queries:0,quality:qualities,candidate,shadow:shadowProjection(candidate)});
+ }catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}
+}
+export async function swingHunterScheduled(env:any,offset=0,interval:Interval='1h'){
+ const scan=NEW_SIGNALS_ENABLED?await scanAndLog(env,{offset,limit:3,interval}):{success:true,status:'SIGNAL_COLLECTION_PAUSED',signals_created:0};
+ const settlement=await settleSignals(env,8);
+ return {scan,settlement};
 }
