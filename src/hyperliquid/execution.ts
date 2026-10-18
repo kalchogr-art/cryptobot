@@ -3087,7 +3087,7 @@ function swingProtectionKind(o:any):'tp'|'sl'|null {
  const fields=[o?.orderType,o?.orderTypeName,o?.tpsl,o?.trigger?.tpsl,o?.order?.t?.trigger?.tpsl]
   .filter(v=>v!=null).map(v=>String(v).toLowerCase());
  if(fields.some(v=>v==='tp'||v.includes('take profit')||v.includes('takeprofit')))return 'tp';
- if(fields.some(v=>v==='sl'||v.includes('stop loss')||v.includes('stoploss')))return 'sl';
+ if(fields.some(v=>v==='sl'||v==='stop market'||v==='stop limit'||v.includes('stop loss')||v.includes('stoploss')))return 'sl';
  return null;
 }
 async function swingProtectionInventory(coin:string){
@@ -3098,6 +3098,58 @@ async function swingProtectionInventory(coin:string){
  const sl=same.filter((o:any)=>swingProtectionKind(o)==='sl');
  const unknown=same.filter((o:any)=>swingProtectionKind(o)===null);
  return {same,tp,sl,unknown};
+}
+// Reconcile exchange-native protection for an already filled Swing position.
+// READ ONLY on Hyperliquid: never creates, replaces or cancels orders.
+async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolean;reason:string}>{
+ const coin=String(row.coin??'').toUpperCase(),key=String(row.crossing_id??'');
+ const side=String(row.side??'').toUpperCase();
+ if(side!=='SHORT'&&side!=='LONG')return {ok:false,reason:'INVALID_LEDGER_SIDE'};
+ const position=await getOpenPositionForCoin(coin);
+ if(!position)return {ok:false,reason:'POSITION_NOT_OPEN_MANUAL_RECONCILIATION'};
+ const actual=Number(position.szi),expected=Number(row.entry_fill_size),entry=Number(row.entry_fill_price);
+ const qtyNear=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&b>0&&
+   Math.abs(a-b)<=Math.max(b*0.001,1e-9);
+ if(!Number.isFinite(entry)||entry<=0||!qtyNear(Math.abs(actual),expected)||
+    (side==='SHORT'&&actual>=0)||(side==='LONG'&&actual<=0))
+  return {ok:false,reason:'POSITION_SIDE_SIZE_OR_ENTRY_MISMATCH'};
+ const inventory=await swingProtectionInventory(coin);
+ if(inventory.same.length!==2||inventory.tp.length!==1||inventory.sl.length!==1||inventory.unknown.length!==0)
+  return {ok:false,reason:'PROTECTION_COUNT_OR_KIND_MISMATCH'};
+ const tp=inventory.tp[0],sl=inventory.sl[0];
+ const tpOid=swingProtectionOid(tp),slOid=swingProtectionOid(sl);
+ const trigger=(o:any)=>Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
+ const size=(o:any)=>Number(o.sz??o.size??o.origSz);
+ const priceNear=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&b>0&&
+   Math.abs(a-b)<=Math.max(b*0.0001,1e-10);
+ const targetTp=entry*(side==='SHORT'?0.98:1.02);
+ const targetSl=entry*(side==='SHORT'?1.01:0.99);
+ if(!tpOid||!slOid||tpOid===slOid||
+    !priceNear(trigger(tp),targetTp)||!priceNear(trigger(sl),targetSl)||
+    !qtyNear(size(tp),expected)||!qtyNear(size(sl),expected))
+  return {ok:false,reason:'PROTECTION_OID_TRIGGER_OR_SIZE_MISMATCH'};
+ const closeSide=side==='SHORT'?'B':'A';
+ for(const order of [tp,sl]){
+  // Fail closed if the exchange response does not prove these orders close the position.
+  if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||order.isTrigger!==true)
+   return {ok:false,reason:'PROTECTION_CLOSE_SIDE_REDUCE_ONLY_OR_TRIGGER_UNCONFIRMED'};
+ }
+ const saved:any=await db.prepare('SELECT * FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
+ if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid))
+  return {ok:false,reason:'SAVED_OID_CONFLICT_MANUAL_RECONCILIATION'};
+ // The current ledger status is checked before and during the guarded status update.
+ const current:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
+ if(String(current?.status)!=='TPSL_FAILED_AFTER_RETRIES')return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
+ await db.prepare(`INSERT OR IGNORE INTO swing_protection_orders
+  (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at) VALUES (?,?,?,?,?,?,?)`)
+  .bind(key,coin,tpOid,slOid,String(trigger(tp)),String(trigger(sl)),Date.now()).run();
+ const updated:any=await db.prepare(`UPDATE hyperliquid_execution_ledger
+  SET status='PROTECTED',last_error=NULL,updated_at=?
+  WHERE crossing_id=? AND status='TPSL_FAILED_AFTER_RETRIES'`).bind(Date.now(),key).run();
+ if(Number(updated.meta?.changes??0)!==1)return {ok:false,reason:'LEDGER_STATUS_UPDATE_NOT_APPLIED'};
+ await db.prepare(`UPDATE swing_live_queue SET status='OPEN',reason=NULL,updated_at=?
+  WHERE signal_key=? AND status='UNKNOWN'`).bind(Date.now(),key).run();
+ return {ok:true,reason:'EXCHANGE_PROTECTION_RECONCILED'};
 }
 async function swingOwned(db:any,coin:string,key:string,status:string){
  await db.prepare(`UPDATE swing_coin_owners SET status=?,updated_at=? WHERE coin=? AND owner=?`)
@@ -3301,6 +3353,20 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
  const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);
+ // Recover only previously failed Swing protection, after full live exchange verification.
+ // A failed or ambiguous check keeps the global entry lock in place.
+ const failed:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
+  WHERE strategy_version IN (?,?) AND status='TPSL_FAILED_AFTER_RETRIES'
+  ORDER BY updated_at LIMIT 20`).bind(...SWING_STRATEGIES).all();
+ const reconciliation:any[]=[];
+ for(const failedRow of failed.results??[]){
+  try{
+   const result=await swingReconcileFailedProtection(db,failedRow);
+   reconciliation.push({coin:failedRow.coin,...result});
+  }catch(err:any){
+   reconciliation.push({coin:failedRow.coin,ok:false,reason:String(err?.message??err)});
+  }
+ }
  const rows:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
   WHERE strategy_version IN (?,?) AND status IN ('ENTRY_FILLED','PROTECTED','MAX_HOLD_CLOSING')
   ORDER BY entry_filled_at LIMIT 20`).bind(...SWING_STRATEGIES).all();
@@ -3367,5 +3433,5 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    events.push({coin,error:String(err?.message??err)});
   }
  }
- return {ok:true,events};
+ return {ok:true,reconciliation,events};
 }
