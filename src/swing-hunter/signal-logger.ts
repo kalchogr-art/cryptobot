@@ -15,8 +15,8 @@ const TPS = [0.3, 0.5, 0.75, 1, 1.5, 2];
 const SLS = [0.3, 0.5, 0.75, 1, 1.5];
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-// New signals: 1H = 48 hours, 4H = 7 days. Historical RESOLVED rows stay untouched.
-const HORIZON_BY_INTERVAL: Record<'1h' | '4h', number> = { '1h': 48 * HOUR, '4h': 7 * DAY };
+// New signals: 1H = 48 hours, 4H = 72 hours. Historical RESOLVED rows stay untouched.
+const HORIZON_BY_INTERVAL: Record<'1h' | '4h', number> = { '1h': 48 * HOUR, '4h': 72 * HOUR };
 const RESEARCH_VERSION = 'SWING_HUNTER_V1_9_6_EXTENDED_HORIZON';
 const round = (n: number) => Number(n.toFixed(6));
 const pct = (side: string, entry: number, exit: number) =>
