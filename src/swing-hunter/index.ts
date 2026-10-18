@@ -32,7 +32,7 @@ async function resolvedCount(env:any){
  return {success:true,module:'SWING_RESOLVED_COUNT',read_only:true,resolved:Number(row?.resolved||0)};
 }
 
-// Today is the current cal.endar day in Europe/Sofia; all-time retains the complete archive.
+// Today is the current calendar day in Europe/Sofia; all-time retains the complete archive.
 function swingTodayStartMs():number {
  const now=new Date();
  const date=new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Sofia',year:'numeric',month:'2-digit',day:'2-digit'}).format(now);
@@ -391,24 +391,35 @@ async function swingExecutableV2(env:any,u:URL){
   return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',variant,mode,read_only:true,trading:false,
    period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
- const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const activeResearch=trackingOnly.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const closedResearch=recentlyResolved.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- // Completed research signals are reported separately; do not double-count them
- // against historical accepted TP/SL, which uses a separate portfolio replay.
- const visible=status==='TRACKING'?activeResearch:visibleAll.filter(s=>!status||s.result===status);
- const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:status==='TRACKING'?activeResearch:status?visible:[...visibleAll,...activeResearch];
+ // One D1-backed report cohort: completed replay entries + latest D1 research
+ // signals checked against 1H OHLC. The same cohort powers rows and counters.
+ // De-duplicate identical coin/TF/bar signals; never count each pattern as an entry.
+ const inScope=(s:Signal)=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval);
+ const key=(s:Signal)=>[s.coin,s.interval,s.signal_bar_open].join('|');
+ const combined=new Map<string,Signal>();
+ for(const s of accepted.filter(inScope))combined.set(key(s),s);
+ for(const s of [...closedResearch,...trackingOnly]){
+  if((mode!=='ALL'&&s.side!==mode)||!inScope(s))continue;
+  const k=key(s),prior=combined.get(k);
+  // Prefer verified TP/SL to a pending D1 TRACKING placeholder.
+  if(!prior||prior.result==='TRACKING'&&s.result!=='TRACKING')combined.set(k,s);
+ }
+ const visibleAll=[...combined.values()];
+ const skippedVisible=skipped.filter(inScope);
+ const visible=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visibleAll.filter(s=>!status||s.result===status);
+ const selected=visible;
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
  const timed=visibleAll.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
  const timeWin=timed.filter(s=>Number(s.net)>0).length,timeLoss=timed.filter(s=>Number(s.net)<0).length,timeFlat=timed.length-timeWin-timeLoss;
  const netSum=visibleAll.reduce((n,s)=>n+(s.net===null?0:Number(s.net)),0);
  const netDone=tp+sl+timed.length;
- const tracking=activeResearch.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
- return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',variant,mode,read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'VERIFIED_48H_1H_OR_72H_4H_INCLUDED',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
-  period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',tp:2,sl:1},
-  stats:{total:visibleAll.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+ const tracking=visibleAll.filter(s=>s.result==='TRACKING').length;
+ const uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING','TIME_EXIT'].includes(s.result)).length;
+ return {success:true,module:'SWING_DIRECTION_D1_UNIFIED_V4',variant,mode,read_only:true,trading:false,
+  methodology:{position_limit:'HISTORICAL_REPLAY_AND_LATEST_RESEARCH_MERGED',entry:'SIGNAL_AVAILABLE_AT',exit:'FIRST_TOUCH_1H',scope:'HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  period,source,tracking_diagnostics:{active:tracking,first_touch_resolved_not_yet_settled:closedResearch.length,source:'D1_CONTEXT_SIGNALS_AND_VERIFIED_OHLC'},
+  filters:{coin,interval,status,mode,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',tp:2,sl:1},
+  stats:{total:visibleAll.length,completed:tp+sl+timed.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
   rows:selected.sort((a,b)=>b.signal_available_at-a.signal_available_at).slice((page-1)*limit,page*limit)};
