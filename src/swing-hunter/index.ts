@@ -398,7 +398,7 @@ async function swingExecutableV2(env:any,u:URL){
  const key=(s:Signal)=>[s.coin,s.interval,s.signal_bar_open].join('|');
  const combined=new Map<string,Signal>();
  for(const s of accepted.filter(inScope))combined.set(key(s),s);
- for(const s of [...closedResearch,...trackingOnly]){
+ for(const s of [...recentlyResolved,...trackingOnly]){
   if((mode!=='ALL'&&s.side!==mode)||!inScope(s))continue;
   const k=key(s),prior=combined.get(k);
   // Prefer verified TP/SL to a pending D1 TRACKING placeholder.
@@ -417,7 +417,7 @@ async function swingExecutableV2(env:any,u:URL){
  const uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING','TIME_EXIT'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_D1_UNIFIED_V4',variant,mode,read_only:true,trading:false,
   methodology:{position_limit:'HISTORICAL_REPLAY_AND_LATEST_RESEARCH_MERGED',entry:'SIGNAL_AVAILABLE_AT',exit:'FIRST_TOUCH_1H',scope:'HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
-  period,source,tracking_diagnostics:{active:tracking,first_touch_resolved_not_yet_settled:closedResearch.length,source:'D1_CONTEXT_SIGNALS_AND_VERIFIED_OHLC'},
+  period,source,tracking_diagnostics:{active:tracking,first_touch_resolved_not_yet_settled:recentlyResolved.length,source:'D1_CONTEXT_SIGNALS_AND_VERIFIED_OHLC'},
   filters:{coin,interval,status,mode,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',tp:2,sl:1},
   stats:{total:visibleAll.length,completed:tp+sl+timed.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
