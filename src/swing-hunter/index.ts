@@ -245,10 +245,12 @@ function cachedSwingReport(env:any,u:URL):Promise<any>{
  return promise;
 }
 async function swingExecutableV2(env:any,u:URL){
- const mode=u.searchParams.get('mode')||'ALL';
+ const variant=u.searchParams.get('variant')||'A';
+ if(!['A','B'].includes(variant))throw Error('INVALID_VARIANT');
+ const mode=variant==='B'?'SHORT':u.searchParams.get('mode')||'ALL';
  if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
  if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
- const allowed=['period','page','limit','coin','interval','status','breakdown','mode'];
+ const allowed=['period','page','limit','coin','interval','status','breakdown','mode','variant'];
  for(const key of u.searchParams.keys())if(!allowed.includes(key))throw Error('UNSUPPORTED_FILTER_'+key);
  const period=u.searchParams.get('period')||'total';if(!['total','today'].includes(period))throw Error('INVALID_PERIOD');
  const coin=(u.searchParams.get('coin')||'').toUpperCase(),interval=u.searchParams.get('interval')||'',status=u.searchParams.get('status')||'';
@@ -264,7 +266,7 @@ async function swingExecutableV2(env:any,u:URL){
   const res=await d.prepare(`SELECT id,side,coin,interval,pattern,status,signal_bar_open,signal_available_at,reference_price,entry_price,context_json,outcome_json
    FROM swing_context_signals WHERE id>? AND interval IN ('1h','4h')
    AND ((side='SHORT' AND pattern IN (${PATTERNS.map(()=>'?').join(',')})
-     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED')
+     AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''})
      OR (side='LONG' AND pattern='TRIANGLE_UP'
      AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))
    ORDER BY id ASC LIMIT 500`).bind(lastId,...PATTERNS).all();
@@ -277,7 +279,7 @@ async function swingExecutableV2(env:any,u:URL){
  // Exclude incomplete records BEFORE overlap replay so they never lock a coin.
  const isCompleted=(x:Signal)=> (x.result==='TP_FIRST'||x.result==='SL_FIRST'||x.result==='TIME_EXIT') && x.exit_at!==null && (x.result!=='TIME_EXIT'||x.net!==null);
  const shortSignals=group(raw.filter(r=>r.side==='SHORT')).filter(isCompleted);
- const longSignals=group(raw.filter(r=>r.side==='LONG')).filter(isCompleted);
+ const longSignals=variant==='B'?[]:group(raw.filter(r=>r.side==='LONG')).filter(isCompleted);
  function replaySide(signals:Signal[]){
   const active=new Map<string,Signal>(),accepted:Signal[]=[],skipped:(Signal&{skip_reason:string;blocked_by:number})[]=[];
   for(const signal of signals){
@@ -385,7 +387,7 @@ async function swingExecutableV2(env:any,u:URL){
    if(b.win_rate_pct===null)return -1;
    return b.win_rate_pct-a.win_rate_pct||b.resolved-a.resolved||a.coin.localeCompare(b.coin);
   });
-  return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',mode,read_only:true,trading:false,
+  return {success:true,module:'SWING_DIRECTION_COIN_LEADERBOARD_V2',variant,mode,read_only:true,trading:false,
    period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
@@ -402,9 +404,9 @@ async function swingExecutableV2(env:any,u:URL){
  const netSum=visibleAll.reduce((n,s)=>n+(s.net===null?0:Number(s.net)),0);
  const netDone=tp+sl+timed.length;
  const tracking=activeResearch.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
- return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
+ return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',variant,mode,read_only:true,trading:false,
   methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'VERIFIED_48H_1H_OR_72H_4H_INCLUDED',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
-  period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
+  period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',btc_4h:variant==='B'?'MIXED':'ANY',tp:2,sl:1},
   stats:{total:visibleAll.length,tracking,tp,sl,time_exit:timed.length,time_exit_win:timeWin,time_exit_loss:timeLoss,time_exit_flat:timeFlat,net_pct_sum:Number(netSum.toFixed(5)),net_win_rate_pct:netDone?Number((100*(tp+timeWin)/netDone).toFixed(2)):null,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
