@@ -270,17 +270,61 @@ async function swingExecutableV2(env:any,u:URL){
   return {accepted,skipped};
  }
  const shortReplay=replaySide(shortSignals),longReplay=replaySide(longSignals);
- // TRACKING is a separate read-only view. Never feed it into historical TP/SL replay.
- // Do not let unresolved records lock later historical signals.
- const trackingShort=group(raw.filter(r=>r.side==='SHORT'&&r.status==='TRACKING')).filter(r=>r.result==='TRACKING');
- const trackingLong=group(raw.filter(r=>r.side==='LONG'&&r.status==='TRACKING')).filter(r=>r.result==='TRACKING');
- function latestTracking(signals:Signal[]){
+ // D1 TRACKING means ALL scenario variants are pending, not necessarily TP2/SL1.
+ // Inspect only the latest open research signal per coin and side. Read-only; never
+ // convert a research signal into an exchange position or modify D1 status.
+ const trackingShort=group(raw.filter(r=>r.side==='SHORT'&&r.status==='TRACKING')).filter(x=>x.result==='TRACKING');
+ const trackingLong=group(raw.filter(r=>r.side==='LONG'&&r.status==='TRACKING')).filter(x=>x.result==='TRACKING');
+ function newestByCoin(a:Signal[]):Signal[]{
   const m=new Map<string,Signal>();
-  for(const r of signals){const prev=m.get(r.coin);if(!prev||r.signal_available_at>prev.signal_available_at)m.set(r.coin,r);}
+  for(const x of a){const prev=m.get(x.coin);if(!prev||x.signal_available_at>prev.signal_available_at)m.set(x.coin,x);}
   return [...m.values()];
  }
- const trackingShortLatest=latestTracking(trackingShort),trackingLongLatest=latestTracking(trackingLong);
- // These are D1 signal states, NOT verified open Hyperliquid positions.
+ const latestShort=newestByCoin(trackingShort),latestLong=newestByCoin(trackingLong);
+ const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
+ const checkedResearch: (Signal & {side:string;verification:string})[]=[];
+ const candleCache=new Map<string,any[]>();
+ const now=Date.now();
+ for(const x of liveResearch){
+  let result:Outcome='TRACKING',exit_at:number|null=null,exit_bar_open:number|null=null;
+  let verification='NOT_VERIFIED';
+  try{
+   // Avoid treating signals older than the available OHLC window as open.
+   if(now-x.signal_available_at>220*HOUR){verification='OHLC_WINDOW_TOO_OLD';}
+   else{
+    if(!candleCache.has(x.coin)){
+     const feed=await fetchClosed(x.coin,'1h',240);
+     if(!quality(feed).ready)throw Error('OHLC_NOT_READY');
+     candleCache.set(x.coin,feed.closed);
+    }
+    const all=candleCache.get(x.coin)!;
+    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=now).sort((a:any,b:any)=>a.t-b.t);
+    let expected=x.signal_available_at;
+    let contiguous=true;
+    for(const b of bars){if(b.t!==expected){contiguous=false;break;}expected+=HOUR;}
+    if(!contiguous||(bars.length===0&&now>=x.signal_available_at+HOUR))verification='MISSING_OHLC_BARS';
+    else if(x.entry_price===null||x.entry_price<=0)verification='INVALID_ENTRY';
+    else{
+     verification='OHLC_1H_TP2_SL1';
+     for(const b of bars){
+      const tp=x.side==='SHORT'?b.l<=x.entry_price*0.98:b.h>=x.entry_price*1.02;
+      const sl=x.side==='SHORT'?b.h>=x.entry_price*1.01:b.l<=x.entry_price*0.99;
+      if(tp||sl){
+       result=tp&&sl?'AMBIGUOUS':tp?'TP_FIRST':'SL_FIRST';
+       exit_bar_open=b.t;exit_at=b.t+HOUR;break;
+      }
+     }
+    }
+   }
+  }catch(e){verification='OHLC_FETCH_ERROR:'+String(e);}
+  checkedResearch.push({...x,side:x.side,result,
+   net:result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null,
+   exit_bar_open,exit_at,exit_precision:verification,verification});
+ }
+ const trackingOnly=checkedResearch.filter(x=>x.result==='TRACKING');
+ const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST');
+
+ // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
  const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
   MIN(signal_bar_open) AS first_signal_ms, MAX(signal_bar_open) AS last_signal_ms,
   SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS shorts,
@@ -294,7 +338,6 @@ async function swingExecutableV2(env:any,u:URL){
  const signals=mode==='SHORT'?shortSignals:mode==='LONG'?longSignals:[...shortSignals,...longSignals];
  const accepted=mode==='SHORT'?shortReplay.accepted:mode==='LONG'?longReplay.accepted:[...shortReplay.accepted,...longReplay.accepted];
  const skipped=mode==='SHORT'?shortReplay.skipped:mode==='LONG'?longReplay.skipped:[...shortReplay.skipped,...longReplay.skipped];
- const tracking=mode==='SHORT'?trackingShortLatest:mode==='LONG'?trackingLongLatest:[...trackingShortLatest,...trackingLongLatest];
  const breakdown=u.searchParams.get('breakdown')||'';
  if(breakdown&&breakdown!=='coins')throw Error('INVALID_BREAKDOWN');
  const start=period==='today'?todaySofia():-Infinity;
@@ -303,15 +346,15 @@ async function swingExecutableV2(env:any,u:URL){
  if(breakdown==='coins'){
   const tracked=['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','HYPE','ADA','LTC','BCH','AAVE','UNI','NEAR','OP','ARB','WIF','TRX'];
   const eligible=accepted.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
-  const trackingEligible=tracking.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval));
-  const names=[...new Set([...tracked,...eligible.map(s=>s.coin)])];
+  const trackingEligible=trackingOnly.filter(s=>s.signal_available_at>=start&&(!interval||s.interval===interval)&& (mode==='ALL'||s.side===mode));
+  const names=[...new Set([...tracked,...eligible.map(s=>s.coin),...trackingEligible.map(s=>s.coin)])];
   const coins=names.map(name=>{
    const a=eligible.filter(s=>s.coin===name);
    const tp=a.filter(s=>s.result==='TP_FIRST').length;
    const sl=a.filter(s=>s.result==='SL_FIRST').length;
-   const trackingCount=trackingEligible.filter(s=>s.coin===name).length;
+   const tracking=trackingEligible.filter(s=>s.coin===name).length;
    const resolved=tp+sl;
-   return {coin:name,entries:a.length,tp,sl,tracking:trackingCount,resolved,
+   return {coin:name,entries:a.length,tp,sl,tracking,resolved,
     win_rate_pct:resolved?Number((100*tp/resolved).toFixed(2)):null};
   }).sort((a,b)=>{
    if(a.win_rate_pct===null)return b.win_rate_pct===null?a.coin.localeCompare(b.coin):1;
@@ -322,19 +365,22 @@ async function swingExecutableV2(env:any,u:URL){
    period,interval,source,methodology:'INDEPENDENT_ONE_ACTIVE_PER_COIN_PER_DIRECTION',coins};
  }
  const visibleAll=accepted.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const trackingVisible=tracking.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const visible=status==='TRACKING'?trackingVisible:status?visibleAll.filter(s=>s.result===status):[...visibleAll,...trackingVisible].sort((a,b)=>b.signal_available_at-a.signal_available_at);
+ const activeResearch=trackingOnly.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ const closedResearch=recentlyResolved.filter(s=>(mode==='ALL'||s.side===mode)&&s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
+ // Completed research signals are reported separately; do not double-count them
+ // against historical accepted TP/SL, which uses a separate portfolio replay.
+ const visible=status==='TRACKING'?activeResearch:visibleAll.filter(s=>!status||s.result===status);
  const skippedVisible=skipped.filter(s=>s.signal_available_at>=start&&(!coin||s.coin===coin)&&(!interval||s.interval===interval));
- const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visible;
+ const selected=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:status==='TRACKING'?activeResearch:status?visible:[...visibleAll,...activeResearch];
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
- const trackingCount=trackingVisible.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
+ const tracking=activeResearch.length,uncertain=visibleAll.filter(s=>!['TP_FIRST','SL_FIRST','TRACKING'].includes(s.result)).length;
  return {success:true,module:'SWING_DIRECTION_EXECUTABLE_V3',mode,read_only:true,trading:false,
-  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS',tracking_source:'D1_SIGNAL_STATUS_NOT_VERIFIED_HYPERLIQUID'},
-  period,source,filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
-  stats:{total:visibleAll.length,tracking:trackingCount,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
+  methodology:{position_limit:'ONE_PER_COIN_PER_DIRECTION_ACROSS_1H_4H',entry:'SIGNAL_AVAILABLE_AT',exit:'END_OF_FIRST_TOUCH_1H_BAR_CONSERVATIVE',unknown_exit:'EXCLUDED_BEFORE_REPLAY',time_exit:'EXCLUDED_BEFORE_REPLAY',cost_pct:0.18,scope:'HISTORICAL_HYPOTHETICAL_NOT_EXCHANGE_FILLS'},
+  period,source,tracking_diagnostics:{active:activeResearch.length,first_touch_resolved_not_yet_settled:closedResearch.length,unverified:activeResearch.filter(s=>s.verification!=='OHLC_1H_TP2_SL1').length,source:'D1_RESEARCH_SIGNALS_OHLC_NOT_EXCHANGE_POSITIONS'},filters:{coin,interval,status,mode,btc_1h:'MIXED',tp:2,sl:1},
+  stats:{total:visibleAll.length,tracking,tp,sl,uncertain,skipped:skippedVisible.length,win_rate_pct:tp+sl?Number((100*tp/(tp+sl)).toFixed(2)):null},
   all_history:{eligible_signals:signals.length,accepted:accepted.length,skipped:skipped.length},
   page,pages:Math.max(1,Math.ceil(selected.length/limit)),filteredTotal:selected.length,limit,
-  rows:selected.slice((page-1)*limit,page*limit)};
+  rows:selected.sort((a,b)=>b.signal_available_at-a.signal_available_at).slice((page-1)*limit,page*limit)};
 }
 
 
