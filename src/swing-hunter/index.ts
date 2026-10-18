@@ -414,9 +414,53 @@ async function swingExecutableV2(env:any,u:URL){
 }
 
 
+// SWING A/B dashboard counters: research eligibility and LIVE queue are distinct.
+// READ ONLY. No changes to signal generation, execution, or settlement.
+async function swingEntryCounters(env:any,u:URL){
+ if(!env.SWING_DB?.prepare)throw Error('MISSING_SWING_DB_BINDING');
+ const variant=u.searchParams.get('variant')==='B'?'B':'A';
+ const mode=variant==='B'?'SHORT':(u.searchParams.get('mode')||'SHORT');
+ if(!['SHORT','LONG','ALL'].includes(mode))throw Error('INVALID_MODE');
+ const period=u.searchParams.get('period')==='total'?'total':'today';
+ const interval=u.searchParams.get('interval')||'';
+ const coin=(u.searchParams.get('coin')||'').toUpperCase();
+ if(interval&&!['1h','4h'].includes(interval))throw Error('INVALID_INTERVAL');
+ if(coin&&!/^[A-Z0-9_-]{1,10}$/.test(coin))throw Error('INVALID_COIN');
+ const start=period==='today'?todaySofia():0;
+ const clauses=["interval IN ('1h','4h')",'signal_available_at>=?'];
+ const args:any[]=[start];
+ if(interval){clauses.push('interval=?');args.push(interval);}
+ if(coin){clauses.push('coin=?');args.push(coin);}
+ if(mode!=='ALL'){clauses.push('side=?');args.push(mode);}
+ const patternParams=PATTERNS.map(()=>'?').join(',');
+ clauses.push(`((side='SHORT' AND pattern IN (${patternParams}) AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED' ${variant==='B'?`AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`:''}) OR (side='LONG' AND pattern='TRIANGLE_UP' AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'))`);
+ args.push(...PATTERNS);
+ // Group patterns belonging to the same coin/side/timeframe/candle into one signal.
+ const sql=`WITH grouped AS (SELECT coin,side,interval,signal_bar_open,MAX(CASE WHEN status='TRACKING' THEN 1 ELSE 0 END) AS tracking FROM swing_context_signals WHERE ${clauses.join(' AND ')} GROUP BY coin,side,interval,signal_bar_open) SELECT COUNT(*) AS eligible,COALESCE(SUM(tracking),0) AS tracking FROM grouped`;
+ const row:any=await env.SWING_DB.prepare(sql).bind(...args).first();
+ let live:any=null,liveError:string|null=null;
+ // Queue tracks actual B SHORT and unchanged LONG, not historical A SHORT.
+ if(env.DB?.prepare){
+  try{
+   const filters=['signal_available_at>=?'];const params:any[]=[start];
+   if(coin){filters.push('coin=?');params.push(coin);}
+   if(mode!=='ALL'){filters.push('side=?');params.push(mode);}
+   if(interval){filters.push('signal_key LIKE ?');params.push('%:'+interval+':%');}
+   const lr:any=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) AS opened,COALESCE(SUM(CASE WHEN status='EXPIRED' THEN 1 ELSE 0 END),0) AS expired FROM swing_live_queue WHERE ${filters.join(' AND ')}`).bind(...params).first();
+   live={opened:Number(lr?.opened||0),expired:Number(lr?.expired||0),short_strategy:'B_DOUBLE_MIXED',meaning:'QUEUE_OPEN_ENTRIES_NOT_CURRENT_EXCHANGE_POSITIONS'};
+  }catch(e:any){liveError=String(e?.message||e);}
+ }else liveError='MISSING_LIVE_DB_BINDING';
+ return {success:true,read_only:true,variant,mode,period,coin,interval,eligible_signals:Number(row?.eligible||0),tracking:Number(row?.tracking||0),live,live_error:liveError};
+}
+
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
+ if(req.method==='GET'&&u.pathname==='/api/swing/v19/entry-counters'){
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'SWING_ADMIN_TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  try{return json(await swingEntryCounters(env,u));}catch(e:any){return json({success:false,error:String(e?.message||e)},502);}
+ }
  if(req.method==='GET'&&u.pathname==='/swing-hunter/monitor')return new Response(swingMonitorDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
  if(req.method==='GET'&&u.pathname==='/swing-hunter/ab')return new Response(swingABDashboard(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
  if(['/api/swing/v19/scan','/api/swing/v19/settle','/api/swing/v19/log','/api/swing/v19/resolved-count','/api/swing/v19/history','/api/swing/v19/filtered-short'].includes(u.pathname)){
