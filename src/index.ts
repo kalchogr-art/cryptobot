@@ -14,7 +14,7 @@ import { scanAndLog as swingScanAndLog, settleSignals as swingSettleSignals } fr
             //
             // Coins: BTC / ETH / SOL / XRP / BNB / DOGE / AVAX / LINK / SUI / HYPE
             //
-            // FIXES / FEATURES:
+            // FIXES / FEATURjES:
             // - Closed candles used for historical volume/volatility/trend
             // - Live candle kept separately for live momentum
             // - 1m + 5m chart engine
