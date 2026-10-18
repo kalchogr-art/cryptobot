@@ -3014,7 +3014,14 @@ const SWING_LONG_STRATEGY='SWING_LONG_FILTERED_V1';
 const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_LONG_STRATEGY];
 const SWING_PATTERNS=new Set(['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
  'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT']);
-const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000; // No timed MARKET close for SWING
+const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000;
+// Swing holding periods are measured from the confirmed LIVE entry fill, not signal time.
+const SWING_HOLD_1H_MS=48*60*60_000;
+const SWING_HOLD_4H_MS=72*60*60_000;
+function swingMaxHoldMs(signalKey:string):number|null {
+ const tf=/^SWING:(?:LONG|SHORT):[^:]+:(1h|4h):/.exec(signalKey)?.[1];
+ return tf==='1h'?SWING_HOLD_1H_MS:tf==='4h'?SWING_HOLD_4H_MS:null;
+}
 // Telegram lifecycle for filtered SWING positions only (does not affect SCALP messages).
 function swingTelegramMeta(key:string,side:string,patterns:any){
  let parsed:any=[];try{parsed=JSON.parse(String(patterns??'[]'));}catch{}
@@ -3376,8 +3383,8 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
   try{
    const position=await getOpenPositionForCoin(coin);
    if(position){
-    // Fixed exchange-native TP/SL only. No 48h MARKET close.
-    // If protection disappears, lock new entries and alert; never blindly resubmit.
+    // Keep exchange-native TP/SL intact until an exchange-confirmed timed close.
+    // Missing/changed protection blocks new entries; never blindly resubmit.
     const inventory=await swingProtectionInventory(coin);
     const saved:any=await db.prepare(`SELECT * FROM swing_protection_orders WHERE signal_key=?`).bind(key).first();
     const confirmed=!!saved&&inventory.same.length===2&&inventory.tp.length===1&&inventory.sl.length===1&&
@@ -3389,6 +3396,39 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
         .bind(Date.now(),row.id).run();
       await sendTelegram(env,`🚨 SWING PROTECTION ALERT · ${escapeTelegramHtml(coin)} · ${escapeTelegramHtml(key)}\nTP/SL missing or changed. New SWING entries blocked. Check Hyperliquid manually.`).catch(()=>{});
       events.push({coin,status:'PROTECTION_ALERT_NO_AUTOMATIC_ORDER'});
+      continue;
+    }
+    // Only verified, protected positions are eligible for an automated timed exit.
+    // An ambiguous/failed IOC is never recorded as a closed trade.
+    const maxHold=swingMaxHoldMs(key);
+    const filledAt=Number(row.entry_filled_at);
+    if(maxHold!==null && Number.isFinite(filledAt) && filledAt>0 && Date.now()-filledAt>=maxHold){
+      if(!SWING_TRADING_ENABLED){events.push({coin,status:'TIME_EXIT_DUE_BUT_SWING_DISABLED'});continue;}
+      const secret=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+      if(!privateKeyFormatOk(secret))throw Error('SWING_TIME_EXIT_PRIVATE_KEY_INVALID');
+      const szi=Number(position.szi);
+      if(!Number.isFinite(szi)||szi===0)throw Error('SWING_TIME_EXIT_INVALID_POSITION_SIZE');
+      if((row.side==='LONG'&&szi<=0)||(row.side==='SHORT'&&szi>=0))throw Error('SWING_TIME_EXIT_POSITION_SIDE_MISMATCH');
+      // Mark intent before sending, for recovery after a worker interruption.
+      await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='MAX_HOLD_CLOSING',
+        last_error=NULL,updated_at=? WHERE id=? AND status IN ('ENTRY_FILLED','PROTECTED','MAX_HOLD_CLOSING')`)
+        .bind(Date.now(),row.id).run();
+      const close=await swingCloseMarket(coin,szi,secret);
+      const statuses=close?.json?.response?.data?.statuses;
+      const filled=close?.httpStatus>=200&&close.httpStatus<300&&close?.json?.status==='ok'&&
+        Array.isArray(statuses)&&statuses.some((x:any)=>x?.filled&&Number(x.filled.totalSz??x.filled.sz)>0);
+      // A partial fill is NOT a closed position; the next tick reconciles it.
+      const remaining=await getOpenPositionForCoin(coin);
+      if(remaining){
+        const reason=filled?'SWING_TIME_EXIT_PARTIAL_POSITION_REMAINS':'SWING_TIME_EXIT_IOC_NOT_FILLED';
+        await db.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
+          .bind(reason,Date.now(),row.id).run();
+        events.push({coin,status:reason});
+        continue;
+      }
+      // A flat exchange position will be reconciled with its actual close fill below
+      // on the next lifecycle run; do not fabricate an exit price or net P/L.
+      events.push({coin,status:'TIME_EXIT_FLAT_PENDING_FILL_RECONCILIATION'});
     }
     continue;
    }
@@ -3414,8 +3454,9 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const pnl=lifecyclePnlFromFills(fills,Number(row.entry_filled_at),Number(row.entry_fill_price),
      Number(exit.px),Number(row.entry_fill_size),side);
    if(pnl.netPnl==null)throw Error('NET_PNL_UNAVAILABLE');
-   const closeReason=(side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*1.02:Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
-    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*0.99:Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER_OR_MAX_HOLD';
+   const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
+    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*1.02:Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
+    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*0.99:Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER';
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
     close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=?`)
     .bind(Number(exit.time),closeReason,Number(exit.px),pnl.netPnl,Date.now(),row.id).run();
