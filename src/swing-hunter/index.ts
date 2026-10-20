@@ -1,3 +1,4 @@
+
 import { swingFilteredRead } from './swing-filter-cache';
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
@@ -304,16 +305,21 @@ async function swingExecutableV2(env:any,u:URL){
   return [...m.values()];
  }
  const latestShort=newestByCoin(trackingShort),latestLong=newestByCoin(trackingLong);
- const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
+  const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
  const checkedResearch: (Signal & {side:string;verification:string})[]=[];
  const candleCache=new Map<string,any[]>();
  const now=Date.now();
  for(const x of liveResearch){
   let result:Outcome='TRACKING',exit_at:number|null=null,exit_bar_open:number|null=null;
-  let verification='NOT_VERIFIED';
+  let verification='NOT_VERIFIED',net:number|null=null;
   try{
-   // Avoid treating signals older than the available OHLC window as open.
+   // Research horizon is 48h for 1h signals and 72h for 4h signals.
+   // This is independent of Hyperliquid LIVE position exits.
+   const horizon=x.interval==='1h'?48:72;
+   const deadline=x.signal_bar_open+horizon*HOUR;
+   const end=variant==='B'&&x.side==='SHORT'?Math.min(now,deadline):now;
    if(now-x.signal_available_at>220*HOUR){verification='OHLC_WINDOW_TOO_OLD';}
+   else if(x.entry_price===null||x.entry_price<=0){verification='INVALID_ENTRY';}
    else{
     if(!candleCache.has(x.coin)){
      const feed=await fetchClosed(x.coin,'1h',240);
@@ -321,12 +327,10 @@ async function swingExecutableV2(env:any,u:URL){
      candleCache.set(x.coin,feed.closed);
     }
     const all=candleCache.get(x.coin)!;
-    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=now).sort((a:any,b:any)=>a.t-b.t);
-    let expected=x.signal_available_at;
-    let contiguous=true;
+    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=end).sort((a:any,b:any)=>a.t-b.t);
+    let expected=x.signal_available_at,contiguous=true;
     for(const b of bars){if(b.t!==expected){contiguous=false;break;}expected+=HOUR;}
     if(!contiguous||(bars.length===0&&now>=x.signal_available_at+HOUR))verification='MISSING_OHLC_BARS';
-    else if(x.entry_price===null||x.entry_price<=0)verification='INVALID_ENTRY';
     else{
      verification='OHLC_1H_TP2_SL1';
      for(const b of bars){
@@ -334,18 +338,30 @@ async function swingExecutableV2(env:any,u:URL){
       const sl=x.side==='SHORT'?b.h>=x.entry_price*1.01:b.l<=x.entry_price*0.99;
       if(tp||sl){
        result=tp&&sl?'AMBIGUOUS':tp?'TP_FIRST':'SL_FIRST';
-       exit_bar_open=b.t;exit_at=b.t+HOUR;break;
+       exit_bar_open=b.t;exit_at=b.t+HOUR;
+       net=result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null;
+       break;
       }
      }
+     // Do not leave a fully observed research window in TRACKING forever.
+     // Require EVERY closed hourly candle up to the research deadline.
+     if(variant==='B'&&x.side==='SHORT'&&result==='TRACKING'&&now>=deadline&&expected===deadline&&bars.length>0){
+      const last=bars[bars.length-1];
+      const close=Number(last.c??last.close);
+      if(Number.isFinite(close)&&close>0){
+       result='TIME_EXIT';exit_at=deadline;exit_bar_open=last.t;
+       const gross=x.side==='SHORT'?(x.entry_price-close)/x.entry_price*100:(close-x.entry_price)/x.entry_price*100;
+       net=Number((gross-0.18).toFixed(5));
+       verification='VERIFIED_FULL_RESEARCH_WINDOW_TIME_EXIT';
+      }else verification='INVALID_FINAL_CLOSE';
+     }else if(variant==='B'&&x.side==='SHORT'&&result==='TRACKING'&&now>=deadline){verification='INCOMPLETE_RESEARCH_WINDOW';}
     }
    }
   }catch(e){verification='OHLC_FETCH_ERROR:'+String(e);}
-  checkedResearch.push({...x,side:x.side,result,
-   net:result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null,
-   exit_bar_open,exit_at,exit_precision:verification,verification});
+  checkedResearch.push({...x,side:x.side,result,net,exit_bar_open,exit_at,exit_precision:verification,verification});
  }
  const trackingOnly=checkedResearch.filter(x=>x.result==='TRACKING');
- const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST');
+ const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST'||x.result==='TIME_EXIT');
 
  // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
  const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
