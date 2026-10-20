@@ -1,5 +1,5 @@
 /** Swing Hunter V1.9.1 — D1 schema-compatible, research-only signal logger.
- * No trade execution, no changes to live strategies.
+ * No trade execution, n.o changes to live strategies.
  * Required D1 columns: id INTEGER PRIMARY KEY, coin, interval, pattern, side,
  * signal_bar_open, entry_price, context_json, status, created_at,
  * signal_available_at, reference_price, strength, outcome_json, resolved_at.
