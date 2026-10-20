@@ -7,7 +7,7 @@
 import type { Interval, Candle } from './types';
 import { COINS, fetchClosed, quality, STEP } from './ohlcv';
 import { structure } from './market-structure';
-import { detectCatalog } from './pattern-catalog';
+import { detectCatalog, detectClassicalCatalog, PatternCompareV2 } from './pattern-catalog';
 import { collectContext } from './context';
 
 const NEW_SIGNALS_ENABLED = true; // Resume collection, retain historical D1 rows.
@@ -77,8 +77,16 @@ export async function scanAndLog(
         continue;
       }
       const signal = candles.at(-1)!;
-      const hits = detectCatalog(candles, structure(candles), interval)
-        .filter(h => h.signalBarOpen === signal.t && (h.side === 'LONG' || h.side === 'SHORT'));
+      // One closed-bar snapshot for all four research versions.
+      // Preserve historical V1 IDs; namespace V2 IDs to avoid D1 collisions.
+      const market = structure(candles);
+      const hits = [
+        ...detectCatalog(candles, market, interval),
+        ...PatternCompareV2.detectCatalog(candles, market, interval).map(h => ({
+          ...h, id: `V2_${h.id}`, name: `V2 ${h.name}`
+        })),
+        ...detectClassicalCatalog(candles, market, interval)
+      ].filter(h => h.signalBarOpen === signal.t && (h.side === 'LONG' || h.side === 'SHORT'));
       if (!hits.length) {
         results.push({ coin, status: 'NO_PATTERN', bar: new Date(signal.t).toISOString() });
         continue;
