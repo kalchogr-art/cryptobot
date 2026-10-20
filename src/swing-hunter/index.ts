@@ -627,7 +627,10 @@ export function detectCatalog(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
  const high=hi(prior),low=lo(prior),vr=avgVolume(prior)>0?b.v/avgVolume(prior):0;
  const goodBull=bull(b)&&body(b)/span(b)>=0.45,goodBear=bear(b)&&body(b)/span(b)>=0.45;
  const closeLocationBull=(b.c-b.l)/span(b),closeLocationBear=(b.h-b.c)/span(b);
- const out:PatternHit[]=[];
+ const out:(PatternHit & {geometry?:any})[]=[];
+ let geom:any=null;
+ const pt=(i:number,price:number,label:string)=>({i,price,label});
+ const seg=(a:any,b:any,label:string)=>({a,b,label});
  const add=(ok:boolean,id:string,name:string,side:Side,strength:number,details:string)=>{
   if(ok)out.push({id,name,side,frame,strength:clamp(strength),confirmed:true,details,signalBarOpen:b.t});
  };
@@ -796,9 +799,13 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
  if(c.length<90||!s||!Number.isFinite(s.atr14)||s.atr14<=0)return [];
  const z=c.length-1,b=c[z],p=c[z-1],atr=s.atr14,prior=c.slice(z-20,z);
  const volumeRatio=avgVolume(prior)>0?b.v/avgVolume(prior):0;
- const out:PatternHit[]=[];
+ const out:(PatternHit & {geometry?:any})[]=[];
+ let geom:any=null;
+ const pt=(i:number,price:number,label:string)=>({i,price,label});
+ const seg=(a:any,b:any,label:string)=>({a,b,label});
  const add=(id:string,name:string,side:Side,ok:boolean,detail:string)=>{
-  if(ok)out.push({id,name,side,frame,strength:clamp(60+Math.min(20,volumeRatio*8)),confirmed:true,details:detail,signalBarOpen:b.t});
+  if(ok)out.push({id,name,side,frame,strength:clamp(60+Math.min(20,volumeRatio*8)),confirmed:true,details:detail,signalBarOpen:b.t,geometry:geom});
+  geom=null;
  };
  const highs=pivots(c,z-85,z-3,'H'),lows=pivots(c,z-85,z-3,'L');
  const crossDown=(level:number)=>bear(b)&&p.c>=level-0.06*atr&&b.c<level-0.10*atr&&body(b)/span(b)>=0.40;
@@ -821,6 +828,7 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
    const neckline=line(n1,n2,z);
    if(Math.abs(n2.px-n1.px)>2.5*atr||Math.abs(b.c-neckline)>2.7*atr)continue;
    if(!(isTop?crossDown(neckline):crossUp(neckline)))continue;
+   geom={points:[pt(a.i,a.px,'Ляво рамо'),pt(h.i,h.px,'Глава'),pt(r.i,r.px,'Дясно рамо'),pt(n1.i,n1.px,'Neckline A'),pt(n2.i,n2.px,'Neckline B'),pt(z,b.c,'Пробив')],lines:[seg(pt(n1.i,n1.px,''),pt(z,neckline,''),'Neckline')],start:a.i,end:z};
    found=true;desc='3 потвърдени pivots: ляво рамо '+a.i+', глава '+h.i+', дясно рамо '+r.i+'; пробив на neckline '+neckline.toFixed(5);
   }
   add(id,side==='SHORT'?'Глава и рамене':'Обърната глава и рамене',side as Side,found,desc);
@@ -839,6 +847,7 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
    const edge=side==='LONG'?hi(flag):lo(flag);
    if(!(side==='LONG'?crossUp(edge):crossDown(edge)))continue;
    if(volumeRatio<1.15)continue;
+   geom={points:[pt(z-len-8,pole[0].o,'Начало импулс'),pt(z-len-1,pole[pole.length-1].c,'Край импулс'),pt(z,b.c,'Пробив')],lines:[seg(pt(z-len-8,pole[0].o,''),pt(z-len-1,pole[pole.length-1].c,''),'Импулс'),seg(pt(z-len,edge,''),pt(z,edge,''),'Граница на флага')],start:z-len-8,end:z};
    found=true;desc='Импулс '+(impulse/atr).toFixed(2)+' ATR; корекция '+len+' свещи; пробив '+edge.toFixed(5)+'; обем '+volumeRatio.toFixed(2)+'×';
   }
   add(side==='LONG'?'BULL_FLAG':'BEAR_FLAG',side==='LONG'?'Бичи флаг':'Мечи флаг',side,found,desc);
@@ -857,6 +866,7 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
    if(width0<1.1*atr||width1<=0.15*atr||width1>0.8*width0)continue;
    const boundary=side==='SHORT'?line(l1,l2,z):line(h1,h2,z);
    if(!(side==='SHORT'?crossDown(boundary):crossUp(boundary)))continue;
+   geom={points:[pt(h1.i,h1.px,'Връх 1'),pt(h2.i,h2.px,'Връх 2'),pt(l1.i,l1.px,'Дъно 1'),pt(l2.i,l2.px,'Дъно 2'),pt(z,b.c,'Пробив')],lines:[seg(pt(h1.i,h1.px,''),pt(z,line(h1,h2,z),''),'Горна линия'),seg(pt(l1.i,l1.px,''),pt(z,line(l1,l2,z),''),'Долна линия')],start:Math.min(h1.i,l1.i),end:z};
    found=true;desc='Сходящи наклонени линии; ширина '+(width0/atr).toFixed(2)+' → '+(width1/atr).toFixed(2)+' ATR; пробив '+boundary.toFixed(5);
   }
   add(id,side==='SHORT'?'Възходящ клин':'Низходящ клин',side,found,desc);
@@ -877,6 +887,7 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
     const handleDepth=side==='LONG'?rim-lo(handle):hi(handle)-rim;
     if(handleDepth>depth*.55||handleDepth<0.15*atr)continue;
     if(!(side==='LONG'?crossUp(rim):crossDown(rim)))continue;
+    geom={points:[pt(z-handleLen-cupLen,rimL,'Ляв ръб'),pt(z-handleLen-cupLen+third+Math.floor(third/2),side==='LONG'?lo(middle):hi(middle),'Дъно/връх'),pt(z-handleLen-1,rimR,'Десен ръб'),pt(z-handleLen,handle[0].c,'Дръжка'),pt(z,b.c,'Пробив')],lines:[seg(pt(z-handleLen-cupLen,rim,''),pt(z,rim,''),'Ръб на чашата')],start:z-handleLen-cupLen,end:z};
     found=true;desc='Чаша '+cupLen+' свещи, дръжка '+handleLen+'; дълбочина '+(depth/atr).toFixed(2)+' ATR, пробив на ръба '+rim.toFixed(5);
    }
   }
@@ -893,6 +904,7 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
    const depth=side==='LONG'?neck-Math.max(a.px,b0.px,d.px):Math.min(a.px,b0.px,d.px)-neck;
    if(depth<1.2*atr||depth>10*atr)continue;
    if(!(side==='LONG'?crossUp(neck):crossDown(neck)))continue;
+   geom={points:[pt(a.i,a.px,'Ниво 1'),pt(b0.i,b0.px,'Ниво 2'),pt(d.i,d.px,'Ниво 3'),pt(z,b.c,'Пробив')],lines:[seg(pt(a.i,neck,''),pt(z,neck,''),'Neckline')],start:a.i,end:z};
    found=true;desc='Три близки '+(side==='LONG'?'дъна':'върха')+' на барове '+[a.i,b0.i,d.i].join(', ')+'; neckline '+neck.toFixed(5);
   }
   add(side==='LONG'?'TRIPLE_BOTTOM':'TRIPLE_TOP',side==='LONG'?'Тройно дъно':'Троен връх',side,found,desc);
@@ -915,7 +927,7 @@ async function swingPatternCompareData(u:URL){
  if(!q.ready)throw Error('OHLCV_NOT_READY');
  const bars=data.closed;
  const allIds=[...CATALOG_IDS,...PatternCompareV2.CLASSIC_IDS];
- const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null;v1Explanation:string;v2Explanation:string;v2Checks:{ok:boolean;label:string;value?:string}[]}[]}>=Object.fromEntries(allIds.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
+ const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null;v1Explanation:string;v2Explanation:string;v2Checks:{ok:boolean;label:string;value?:string}[];geometry?:any}[]}>=Object.fromEntries(allIds.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
  for(let i=64;i<bars.length;i++){
   const prefix=bars.slice(0,i+1),s=structure(prefix);
   const a=detectCatalog(prefix,s,frame),b=PatternCompareV2.detectCatalog(prefix,s,frame);
@@ -929,7 +941,7 @@ async function swingPatternCompareData(u:URL){
     const explain=PatternCompareV2.explainDecision(prefix,s,id,y||null);
     r.events.push({index:i,time:bars[i].t,v1:!!x,v2:!!y,v1Details:x?.details||null,v2Details:y?.details||null,
       v1Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?'Няма детектор във V1 — нов класически патерн във V3.':x?'V1 приема: '+x.details:'V1 отказва: конкретната формация не покрива всички условия на оригиналния детектор.',
-      v2Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?y?'V3 приема: '+y.details:'V3 не разпознава потвърдена формация по строгите правила.':explain.summary,v2Checks:PatternCompareV2.CLASSIC_IDS.includes(id as any)?[]:explain.checks});
+      v2Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?y?'V3 приема: '+y.details:'V3 не разпознава потвърдена формация по строгите правила.':explain.summary,v2Checks:PatternCompareV2.CLASSIC_IDS.includes(id as any)?[]:explain.checks,geometry:(y as any)?.geometry||null});
    }
   }
  }
@@ -962,8 +974,9 @@ $('pattern').innerHTML=ids.map(x=>'<option value="'+x+'">'+(labels[x]||x)+(label
 let result=null;
 function esc(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 function chart(target,ev,side){
- const arr=result.candles,start=Math.max(0,ev.index-48),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
- const min=Math.min(...c.map(x=>x.l)),max=Math.max(...c.map(x=>x.h)),range=Math.max(max-min,1e-9);
+ const arr=result.candles,g=side==='v2'?ev.geometry:null,start=Math.max(0,Math.min(ev.index-48,g?.start!=null?g.start-5:ev.index-48)),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
+ const allPrices=[...c.flatMap(x=>[x.l,x.h]),...(g?.points||[]).map(x=>x.price),...(g?.lines||[]).flatMap(x=>[x.a.price,x.b.price])];
+ const min=Math.min(...allPrices),max=Math.max(...allPrices),range=Math.max(max-min,1e-9);
  const w=850,h=370,left=55,right=15,top=18,bottom=34,plotW=w-left-right,plotH=h-top-bottom;
  const px=i=>left+(i+.5)*plotW/c.length,py=p=>top+(max-p)/range*plotH;
  const step=plotW/c.length;
@@ -974,13 +987,26 @@ function chart(target,ev,side){
  svg+='<rect x="'+(xPos-step*.29)+'" y="'+a+'" width="'+Math.max(2,step*.58)+'" height="'+Math.max(1.5,b-a)+'" fill="'+color+'"/>';
  if(start+i===ev.index)svg+='<line x1="'+xPos+'" y1="'+top+'" x2="'+xPos+'" y2="'+(h-bottom)+'" stroke="#facc15" stroke-dasharray="4 4" stroke-width="2"/>';
  });
+ // Draw the EXACT geometry selected by the detector at signal time.
+ if(g){
+  for(const line of g.lines||[]){
+   const x1=px(line.a.i-start),x2=px(line.b.i-start);
+   svg+='<line x1="'+x1+'" y1="'+py(line.a.price)+'" x2="'+x2+'" y2="'+py(line.b.price)+'" stroke="#38bdf8" stroke-width="2.5" stroke-dasharray="7 4"/>';
+  }
+  for(const point of g.points||[]){
+   const x=px(point.i-start),y=py(point.price),breakout=point.label==='Пробив';
+   svg+='<circle cx="'+x+'" cy="'+y+'" r="'+(breakout?6:5)+'" fill="'+(breakout?'#facc15':'#e879f9')+'" stroke="#fff" stroke-width="1"/>';
+   const ty=Math.max(14,Math.min(h-39,y-13));
+   svg+='<text x="'+x+'" y="'+ty+'" text-anchor="middle" fill="#fff" font-size="12" stroke="#0a1428" stroke-width="3" paint-order="stroke">'+esc(point.label)+'</text>';
+  }
+ }
  svg+='<text x="'+left+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[0].t).toISOString().slice(0,16)+' UTC</text>';
  svg+='<text x="'+(w-175)+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[c.length-1].t).toISOString().slice(0,16)+' UTC</text></svg>';
  $(target).innerHTML=svg;
  const classic=result.classicIds.includes($('pattern').value);
  const detected=side==='v1'?ev.v1:ev.v2;
  const desc=side==='v1'?ev.v1Explanation:ev.v2Explanation;
- $('detail'+(side==='v1'?1:2)).innerHTML='<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(side==='v1'&&classic?'НЯМА V1 ДЕТЕКТОР':detected?'РАЗПОЗНАТ':'НЕ Е РАЗПОЗНАТ')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>';
+ $('detail'+(side==='v1'?1:2)).innerHTML=(g?'<p style="color:#7dd3fc">Геометрия: '+g.points.length+' контролни точки · '+g.lines.length+' линии · жълто = пробив</p>':'')+'<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(side==='v1'&&classic?'НЯМА V1 ДЕТЕКТОР':detected?'РАЗПОЗНАТ':'НЕ Е РАЗПОЗНАТ')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>';
 }
 function render(){
  if(!result)return;
