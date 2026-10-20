@@ -391,3 +391,484 @@ export function detectClassicalCatalog(c: Candle[], s: Structure, frame: Frame):
   }
   return out;
 }
+
+// Original V2 comparison implementation, relocated without changing its criteria.
+export namespace PatternCompareV2 {
+ type Candle = import('./types').Candle;
+ type Structure = import('./types').Structure;
+
+
+/** Pattern Catalog V2: strict closed-bar, geometry-aware, research-only detectors.
+ * Drop-in replacement for pattern-catalog.ts. Does not execute trades or write D1.
+ * Each pattern is a deterministic definition, not a guarantee of future price movement.
+ */
+type PatternHit = {
+  id: string; name: string; side: 'LONG' | 'SHORT'; frame: '1h' | '4h';
+  strength: number; confirmed: boolean; details: string; signalBarOpen: number;
+};
+type Side = 'LONG' | 'SHORT';
+type Frame = '1h' | '4h';
+type Pivot = {i:number; px:number};
+const mean=(a:number[])=>a.length?a.reduce((s,v)=>s+v,0)/a.length:0;
+const hi=(a:Candle[])=>Math.max(...a.map(x=>x.h));
+const lo=(a:Candle[])=>Math.min(...a.map(x=>x.l));
+const clamp=(n:number)=>Math.max(1,Math.min(100,Math.round(n)));
+const body=(x:Candle)=>Math.abs(x.c-x.o);
+const span=(x:Candle)=>Math.max(x.h-x.l,1e-12);
+const bull=(x:Candle)=>x.c>x.o;
+const bear=(x:Candle)=>x.c<x.o;
+const upper=(x:Candle)=>x.h-Math.max(x.o,x.c);
+const lower=(x:Candle)=>Math.min(x.o,x.c)-x.l;
+const avgVolume=(c:Candle[])=>mean(c.map(x=>x.v));
+function ema(v:number[],period:number):number[]{
+ const a=Array(v.length).fill(NaN);if(v.length<period)return a;
+ let e=mean(v.slice(0,period));a[period-1]=e;
+ const k=2/(period+1);for(let i=period;i<v.length;i++){e=v[i]*k+e*(1-k);a[i]=e;}return a;
+}
+function pivot(c:Candle[],i:number,kind:'H'|'L',r=2):boolean{
+ if(i<r||i+r>=c.length)return false;
+ const px=kind==='H'?c[i].h:c[i].l;
+ for(let j=i-r;j<=i+r;j++)if(j!==i&&(kind==='H'?c[j].h>=px:c[j].l<=px))return false;
+ return true;
+}
+function pivots(c:Candle[],from:number,to:number,kind:'H'|'L',r=2):Pivot[]{
+ const a:Pivot[]=[];for(let i=Math.max(r,from);i<=Math.min(c.length-r-1,to);i++)
+  if(pivot(c,i,kind,r))a.push({i,px:kind==='H'?c[i].h:c[i].l});return a;
+}
+function line(a:Pivot,b:Pivot,i:number){return a.px+(b.px-a.px)*(i-a.i)/(b.i-a.i);}
+function slopeTrend(c:Candle[],side:Side,atr:number):boolean{
+ // Require actual multi-bar price progression, not just two opposite-colored bars.
+ const z=c.length-1, old=c.slice(z-12,z-6),recent=c.slice(z-6,z);
+ return side==='LONG'?mean(old.map(x=>x.c))-mean(recent.map(x=>x.c))>=0.35*atr
+  :mean(recent.map(x=>x.c))-mean(old.map(x=>x.c))>=0.35*atr;
+}
+function confirmedDouble(c:Candle[],atr:number,side:Side){
+ const z=c.length-1,kind=side==='LONG'?'L':'H';
+ const ps=pivots(c,z-45,z-3,kind);
+ for(let j=ps.length-1;j>0;j--){const b=ps[j];if(z-b.i<3||z-b.i>14)continue;
+  for(let k=j-1;k>=0;k--){const a=ps[k],gap=b.i-a.i;if(gap<5||gap>24)continue;
+   if(Math.abs(a.px-b.px)>atr*0.45)continue;
+   const between=c.slice(a.i+1,b.i),neck=side==='LONG'?hi(between):lo(between);
+   const depth=side==='LONG'?neck-Math.max(a.px,b.px):Math.min(a.px,b.px)-neck;
+   if(depth<1.5*atr||depth>10*atr)continue;
+   // The two extrema must have been formed after a meaningful preceding move.
+   const before=c.slice(Math.max(0,a.i-12),a.i);
+   if(before.length<6)continue;
+   const preceding=side==='LONG'?hi(before)-a.px:a.px-lo(before);
+   if(preceding<1.2*atr)continue;
+   const cur=c[z],prev=c[z-1],pad=0.08*atr;
+   if(c.slice(b.i+1,z).some(x=>side==='LONG'?x.c>neck+pad:x.c<neck-pad))continue;
+   const crossed=side==='LONG'?bull(cur)&&cur.c>neck+pad&&prev.c<=neck+pad
+    :bear(cur)&&cur.c<neck-pad&&prev.c>=neck-pad;
+   if(!crossed||body(cur)/span(cur)<0.4)continue;
+   // Reject an oversized breakout candle where entry is already far beyond the neckline.
+   if(Math.abs(cur.c-neck)>2.5*atr)continue;
+   return {a:a.i,b:b.i,neck,depth};
+  }
+ }return null;
+}
+function triangle(c:Candle[],atr:number,side:Side){
+ const z=c.length-1,hs=pivots(c,z-28,z-3,'H'),ls=pivots(c,z-28,z-3,'L');
+ if(hs.length<2||ls.length<2)return null;
+ // Try recent pairs, but require both trendlines to be supported by intervening candles.
+ for(let h=hs.length-1;h>=1;h--)for(let l=ls.length-1;l>=1;l--){
+  const h1=hs[h-1],h2=hs[h],l1=ls[l-1],l2=ls[l];
+  const start=Math.max(h1.i,l1.i),end=Math.min(h2.i,l2.i);
+  if(end-start<5||Math.abs(h2.i-l2.i)>10)continue;
+  const upperSlope=(h2.px-h1.px)/(h2.i-h1.i),lowerSlope=(l2.px-l1.px)/(l2.i-l1.i);
+  if(!(upperSlope<-0.015*atr&&lowerSlope>0.015*atr))continue;
+  const widthStart=line(h1,h2,start)-line(l1,l2,start);
+  const widthNow=line(h1,h2,z)-line(l1,l2,z);
+  if(widthStart<1.3*atr||widthNow<=0.2*atr||widthNow>=0.85*widthStart)continue;
+  const apex=(l1.px-h1.px+upperSlope*h1.i-lowerSlope*l1.i)/(upperSlope-lowerSlope);
+  if(!Number.isFinite(apex)||apex<z-2||apex>z+35)continue;
+  const first=Math.min(h1.i,l1.i),last=Math.max(h2.i,l2.i);
+  let breaches=0;for(let i=first+2;i<last;i++){
+   const top=line(h1,h2,i),bottom=line(l1,l2,i);
+   if(c[i].c>top+0.2*atr||c[i].c<bottom-0.2*atr)breaches++;
+  }if(breaches>1)continue;
+  const current=c[z],previous=c[z-1];
+  const boundary=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z);
+  const prevBoundary=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z-1);
+  const crossed=side==='LONG'?bull(current)&&current.c>boundary+0.1*atr&&previous.c<=prevBoundary+0.1*atr
+   :bear(current)&&current.c<boundary-0.1*atr&&previous.c>=prevBoundary-0.1*atr;
+  if(!crossed||body(current)/span(current)<0.5||Math.abs(current.c-boundary)>2.5*atr)continue;
+  return {h1:h1.i,h2:h2.i,l1:l1.i,l2:l2.i,boundary,apex};
+ }return null;
+}
+export function detectCatalog(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
+ if(c.length<65||!s||!Number.isFinite(s.atr14)||s.atr14<=0)return [];
+ if(!c.every(x=>[x.t,x.o,x.h,x.l,x.c,x.v].every(Number.isFinite)&&x.o>0&&x.c>0&&x.h>=Math.max(x.o,x.c,x.l)&&x.l<=Math.min(x.o,x.c)&&x.v>=0))return [];
+ for(let i=1;i<c.length;i++)if(c[i].t<=c[i-1].t)return [];
+ const z=c.length-1,b=c[z],p=c[z-1],q=c[z-2],atr=s.atr14;
+ const prior=c.slice(z-20,z),previous=c.slice(z-21,z-1);
+ const high=hi(prior),low=lo(prior),vr=avgVolume(prior)>0?b.v/avgVolume(prior):0;
+ const goodBull=bull(b)&&body(b)/span(b)>=0.45,goodBear=bear(b)&&body(b)/span(b)>=0.45;
+ const closeLocationBull=(b.c-b.l)/span(b),closeLocationBear=(b.h-b.c)/span(b);
+ const out:(PatternHit & {geometry?:any})[]=[];
+ let geom:any=null;
+ const pt=(i:number,price:number,label:string)=>({i,price,label});
+ const seg=(a:any,b:any,label:string)=>({a,b,label});
+ const add=(ok:boolean,id:string,name:string,side:Side,strength:number,details:string)=>{
+  if(ok)out.push({id,name,side,frame,strength:clamp(strength),confirmed:true,details,signalBarOpen:b.t});
+ };
+ // 1-2: Real break of a frozen 20-bar extreme, meaningful range, participation and follow-through close.
+ add(goodBull&&b.c>high+0.1*atr&&p.c<=high&&vr>=1.35&&closeLocationBull>=0.75&&
+     b.c-high<=2.5*atr,'RANGE_BREAKOUT','20-bar range breakout','LONG',60+8*vr,
+     `Break above ${high}; buffer 0.10 ATR; volume ${vr.toFixed(2)}x`);
+ add(goodBear&&b.c<low-0.1*atr&&p.c>=low&&vr>=1.35&&closeLocationBear>=0.75&&
+     low-b.c<=2.5*atr,'RANGE_BREAKDOWN','20-bar range breakdown','SHORT',60+8*vr,
+     `Break below ${low}; buffer 0.10 ATR; volume ${vr.toFixed(2)}x`);
+ // 3-4: Genuine level sweep and rejection; close well back inside the old range.
+ add(b.l<low-0.12*atr&&b.c>low+0.12*atr&&bull(b)&&lower(b)/span(b)>=0.5&&
+     closeLocationBull>=0.7&&body(b)>=0.12*atr,'LIQUIDITY_SWEEP_LOW','Support liquidity sweep','LONG',67+20*lower(b)/span(b),
+     `Pierced ${low}, rejected and closed back inside range`);
+ add(b.h>high+0.12*atr&&b.c<high-0.12*atr&&bear(b)&&upper(b)/span(b)>=0.5&&
+     closeLocationBear>=0.7&&body(b)>=0.12*atr,'LIQUIDITY_SWEEP_HIGH','Resistance liquidity sweep','SHORT',67+20*upper(b)/span(b),
+     `Pierced ${high}, rejected and closed back inside range`);
+ // 5-6: Strict engulfing + prior directional move + substantial candle + close location.
+ add(goodBull&&bear(p)&&b.o<=p.c&&b.c>=p.o&&body(b)>=1.1*body(p)&&
+     body(p)>=0.12*atr&&body(b)>=0.4*atr&&closeLocationBull>=0.75&&
+     slopeTrend(c,'LONG',atr),'BULL_ENGULF','Bullish engulfing after decline','LONG',68,
+     'Body engulfs prior bearish body after multi-bar decline');
+ add(goodBear&&bull(p)&&b.o>=p.c&&b.c<=p.o&&body(b)>=1.1*body(p)&&
+     body(p)>=0.12*atr&&body(b)>=0.4*atr&&closeLocationBear>=0.75&&
+     slopeTrend(c,'SHORT',atr),'BEAR_ENGULF','Bearish engulfing after advance','SHORT',68,
+     'Body engulfs prior bullish body after multi-bar advance');
+ // 7-8: Wick rejection at a local extreme following a genuine move, not arbitrary small bars.
+ const oldLow=lo(c.slice(z-10,z)),oldHigh=hi(c.slice(z-10,z));
+ add(lower(b)/span(b)>=0.6&&upper(b)/span(b)<=0.12&&body(b)/span(b)<=0.3&&
+     span(b)>=0.7*atr&&b.l<=oldLow+0.15*atr&&closeLocationBull>=0.72&&
+     slopeTrend(c,'LONG',atr),'HAMMER','Hammer after decline','LONG',60,
+     'Lower rejection at local low after measured decline');
+ add(upper(b)/span(b)>=0.6&&lower(b)/span(b)<=0.12&&body(b)/span(b)<=0.3&&
+     span(b)>=0.7*atr&&b.h>=oldHigh-0.15*atr&&closeLocationBear>=0.72&&
+     slopeTrend(c,'SHORT',atr),'SHOOTING_STAR','Shooting star after advance','SHORT',60,
+     'Upper rejection at local high after measured advance');
+ // 9-10: Two prior directional bars, a meaningful reversal close and actual earlier trend.
+ add(goodBull&&bear(p)&&bear(q)&&b.c>Math.max(p.h,q.h)+0.05*atr&&
+     body(b)>=0.6*atr&&vr>=1.15&&slopeTrend(c,'LONG',atr),
+     'MOMENTUM_REVERSAL_LONG','Momentum reversal after decline','LONG',67,
+     'Bullish close above two prior highs after established decline');
+ add(goodBear&&bull(p)&&bull(q)&&b.c<Math.min(p.l,q.l)-0.05*atr&&
+     body(b)>=0.6*atr&&vr>=1.15&&slopeTrend(c,'SHORT',atr),
+     'MOMENTUM_REVERSAL_SHORT','Momentum reversal after advance','SHORT',67,
+     'Bearish close below two prior lows after established advance');
+ // 11-12: Pullback into historical EMA20, confirmed trend slope and continuation.
+ const e=ema(c.map(x=>x.c),20),ePrev=e[z-1],eOld=e[z-5];
+ const emaReady=Number.isFinite(ePrev)&&Number.isFinite(eOld);
+ add(emaReady&&s.direction==='LONG'&&ePrev>eOld+0.15*atr&&
+     p.l<=ePrev+0.25*atr&&p.l>=ePrev-0.65*atr&&p.c>=ePrev-0.15*atr&&
+     goodBull&&b.c>p.h+0.05*atr&&b.c>ePrev&&vr>=1.05,
+     'EMA_PULLBACK_LONG','EMA20 trend pullback','LONG',67,
+     `Prior EMA20 ${ePrev}; upward EMA slope and confirmed continuation`);
+ add(emaReady&&s.direction==='SHORT'&&ePrev<eOld-0.15*atr&&
+     p.h>=ePrev-0.25*atr&&p.h<=ePrev+0.65*atr&&p.c<=ePrev+0.15*atr&&
+     goodBear&&b.c<p.l-0.05*atr&&b.c<ePrev&&vr>=1.05,
+     'EMA_PULLBACK_SHORT','EMA20 trend pullback','SHORT',67,
+     `Prior EMA20 ${ePrev}; downward EMA slope and confirmed continuation`);
+ // 13-14: Breakout on z-2, controlled retest on z-1, follow-through on z.
+ const breakout=c[z-2],frozenHigh=hi(c.slice(z-22,z-2)),frozenLow=lo(c.slice(z-22,z-2));
+ add(bull(breakout)&&breakout.c>frozenHigh+0.1*atr&&body(breakout)>=0.45*atr&&
+     p.l<=frozenHigh+0.15*atr&&p.l>=frozenHigh-0.35*atr&&p.c>=frozenHigh&&
+     goodBull&&b.c>p.h+0.05*atr&&vr>=1.1,
+     'BREAKOUT_RETEST_LONG','Breakout retest continuation','LONG',75,
+     `Break ${frozenHigh}; hold retest; bullish follow-through`);
+ add(bear(breakout)&&breakout.c<frozenLow-0.1*atr&&body(breakout)>=0.45*atr&&
+     p.h>=frozenLow-0.15*atr&&p.h<=frozenLow+0.35*atr&&p.c<=frozenLow&&
+     goodBear&&b.c<p.l-0.05*atr&&vr>=1.1,
+     'BREAKOUT_RETEST_SHORT','Breakdown retest continuation','SHORT',75,
+     `Break ${frozenLow}; hold retest; bearish follow-through`);
+ // 15-16: Two distinct pivot extrema, intervening neckline and decisive neckline cross.
+ const db=confirmedDouble(c,atr,'LONG'),dt=confirmedDouble(c,atr,'SHORT');
+ add(!!db&&vr>=1.15,'DOUBLE_BOTTOM','Confirmed W-bottom neckline break','LONG',76,
+     db?`Lows ${db.a}/${db.b}; neckline ${db.neck}; depth ${db.depth.toFixed(6)}`:'');
+ add(!!dt&&vr>=1.15,'DOUBLE_TOP','Confirmed M-top neckline break','SHORT',76,
+     dt?`Highs ${dt.a}/${dt.b}; neckline ${dt.neck}; depth ${dt.depth.toFixed(6)}`:'');
+ // 17-18: Geometric symmetric triangle, projected boundary breakout and valid apex.
+ const up=triangle(c,atr,'LONG'),down=triangle(c,atr,'SHORT');
+ add(!!up&&vr>=1.3,'TRIANGLE_UP','Symmetric triangle upside breakout','LONG',76,
+     up?`Upper trendline ${up.h1}/${up.h2}; lower ${up.l1}/${up.l2}; boundary ${up.boundary}`:'');
+ add(!!down&&vr>=1.3,'TRIANGLE_DOWN','Symmetric triangle downside breakout','SHORT',76,
+     down?`Upper trendline ${down.h1}/${down.h2}; lower ${down.l1}/${down.l2}; boundary ${down.boundary}`:'');
+ // 19-20: A distinct high-participation, high-body breakout variant.
+ add(s.direction==='LONG'&&goodBull&&b.c>high+0.12*atr&&p.c<=high&&
+     vr>=2&&body(b)/span(b)>=0.65&&closeLocationBull>=0.85&&b.c-high<=2.5*atr,
+     'VOLUME_EXPANSION_LONG','High-volume upside expansion','LONG',68+7*vr,
+     `High-volume ${vr.toFixed(2)}x breakout above ${high}`);
+ add(s.direction==='SHORT'&&goodBear&&b.c<low-0.12*atr&&p.c>=low&&
+     vr>=2&&body(b)/span(b)>=0.65&&closeLocationBear>=0.85&&low-b.c<=2.5*atr,
+     'VOLUME_EXPANSION_SHORT','High-volume downside expansion','SHORT',68+7*vr,
+     `High-volume ${vr.toFixed(2)}x breakdown below ${low}`);
+ return out;
+}
+
+// Explanations are calculated from the SAME closed candle prefix as the detector.
+// TRIANGLE_UP/DOWN replays V2's actual rejection gates in order.
+export function explainDecision(c:Candle[],s:Structure,id:string,hit:PatternHit|null):{summary:string;checks:{ok:boolean;label:string;value?:string}[]} {
+ const z=c.length-1,b=c[z],p=c[z-1],atr=s.atr14;
+ const prior=c.slice(z-20,z),vr=avgVolume(prior)>0?b.v/avgVolume(prior):0;
+ const checks:{ok:boolean;label:string;value?:string}[]=[];
+ const check=(ok:boolean,label:string,value?:string)=>{checks.push({ok,label,value});return ok;};
+ if(!Number.isFinite(atr)||atr<=0||c.length<65)return {summary:'Недостатъчно валидни данни за оценка.',checks:[]};
+ if(id==='TRIANGLE_DOWN'||id==='TRIANGLE_UP'){
+  const side:Side=id==='TRIANGLE_DOWN'?'SHORT':'LONG';
+  const hs=pivots(c,z-28,z-3,'H'),ls=pivots(c,z-28,z-3,'L');
+  if(!check(hs.length>=2&&ls.length>=2,'Поне два потвърдени локални върха и две дъна',`върхове ${hs.length}, дъна ${ls.length}`))
+   return {summary:'V2 отхвърля: няма достатъчно потвърдени pivot върхове/дъна за две трендлинии.',checks};
+  // V2 tests every eligible recent pair. Show the best-progressing pair and its exact first failing gate.
+  let best:{passed:number;checks:typeof checks;reason:string}|null=null;
+  for(let h=hs.length-1;h>=1;h--)for(let l=ls.length-1;l>=1;l--){
+   const local:typeof checks=[];
+   const gate=(ok:boolean,label:string,value?:string)=>{local.push({ok,label,value});return ok;};
+   const h1=hs[h-1],h2=hs[h],l1=ls[l-1],l2=ls[l];
+   const start=Math.max(h1.i,l1.i),end=Math.min(h2.i,l2.i);
+   let reason='';
+   if(!gate(end-start>=5&&Math.abs(h2.i-l2.i)<=10,'Достатъчно припокриване на линиите (≥5 свещи) и близки последни pivots',`overlap=${end-start}, gap=${Math.abs(h2.i-l2.i)}`))reason='Невалидна геометрия/разположение на pivot точките.';
+   const us=(h2.px-h1.px)/(h2.i-h1.i),lslope=(l2.px-l1.px)/(l2.i-l1.i);
+   if(!reason&&!gate(us<-0.015*atr&&lslope>0.015*atr,'Понижаващи се върхове И повишаващи се дъна',`upper=${(us/atr).toFixed(3)} ATR/bar, lower=${(lslope/atr).toFixed(3)} ATR/bar`))reason='Линиите не се свиват в симетричен триъгълник.';
+   const wStart=line(h1,h2,start)-line(l1,l2,start),wNow=line(h1,h2,z)-line(l1,l2,z);
+   if(!reason&&!gate(wStart>=1.3*atr&&wNow>0.2*atr&&wNow<0.85*wStart,'Валидно свиване на ширината',`start=${(wStart/atr).toFixed(2)} ATR, now=${(wNow/atr).toFixed(2)} ATR`))reason='Недостатъчно/прекомерно свиване или вече пресечени линии.';
+   const apex=(l1.px-h1.px+us*h1.i-lslope*l1.i)/(us-lslope);
+   if(!reason&&!gate(Number.isFinite(apex)&&apex>=z-2&&apex<=z+35,'Apex близо до пробива',`след ${(apex-z).toFixed(1)} свещи`))reason='Върхът на триъгълника е извън допустимия прозорец.';
+   const first=Math.min(h1.i,l1.i),last=Math.max(h2.i,l2.i);
+   let breaches=0;
+   for(let i=first+2;i<last;i++){const top=line(h1,h2,i),bottom=line(l1,l2,i);if(c[i].c>top+0.2*atr||c[i].c<bottom-0.2*atr)breaches++;}
+   if(!reason&&!gate(breaches<=1,'Максимум едно преждевременно нарушение на линиите',`нарушения ${breaches}`))reason='Има твърде много затваряния извън триъгълника преди пробива.';
+   const bound=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z),prevBound=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z-1);
+   const crossed=side==='LONG'?bull(b)&&b.c>bound+0.1*atr&&p.c<=prevBound+0.1*atr:bear(b)&&b.c<bound-0.1*atr&&p.c>=prevBound-0.1*atr;
+   if(!reason&&!gate(crossed,'Нов пробив с 0.10 ATR отвъд линията, потвърден със затваряне',`close=${b.c.toFixed(5)}, boundary=${bound.toFixed(5)}`))reason='Няма нов потвърден пробив отвъд трендлинията.';
+   if(!reason&&!gate(body(b)/span(b)>=0.5,'Тяло на пробивната свещ ≥50% от диапазона',`${(100*body(b)/span(b)).toFixed(1)}%`))reason='Пробивната свещ е твърде слаба.';
+   if(!reason&&!gate(Math.abs(b.c-bound)<=2.5*atr,'Пробивът не е прекомерно отдалечен (>2.5 ATR)',`${(Math.abs(b.c-bound)/atr).toFixed(2)} ATR`))reason='Пробивът е прекалено разтегнат.';
+   const passed=local.filter(x=>x.ok).length;
+   if(!best||passed>best.passed)best={passed,checks:local,reason};
+  }
+  if(best)checks.push(...best.checks);
+  check(vr>=1.3,'Обем при пробива ≥1.30× средния за предишните 20 свещи',`${vr.toFixed(2)}×`);
+  const firstFail=checks.find(x=>!x.ok);
+  return {summary:hit?'V2 приема: геометрията, пробивът и обемът покриват условията.':firstFail?'V2 отказва: '+firstFail.label+'.':'V2 отказва: няма комбинация от pivot линии, която изпълнява всички условия.',checks};
+ }
+ const trend=s.direction;
+ check(vr>=1.15,'Обем поне 1.15× (общ диагностичен ориентир, НЕ универсално правило)',vr.toFixed(2)+'×');
+ check(body(b)/span(b)>=0.45,'Тяло ≥45% от диапазона (ориентир, НЕ универсално правило)',(100*body(b)/span(b)).toFixed(1)+'%');
+ check(trend!=='NEUTRAL','Определена посока на пазарната структура',trend);
+ return {summary:hit?'Патернът е приет по точните правила на детектора: '+hit.details:'Не са изпълнени всички правила на V2. Показаните показатели са контекст, а НЕ пълен списък с причини за отказ.',checks};
+}
+
+const CATALOG_IDS=[
+ 'RANGE_BREAKOUT','RANGE_BREAKDOWN','LIQUIDITY_SWEEP_LOW','LIQUIDITY_SWEEP_HIGH',
+ 'BULL_ENGULF','BEAR_ENGULF','HAMMER','SHOOTING_STAR',
+ 'MOMENTUM_REVERSAL_LONG','MOMENTUM_REVERSAL_SHORT',
+ 'EMA_PULLBACK_LONG','EMA_PULLBACK_SHORT','BREAKOUT_RETEST_LONG','BREAKOUT_RETEST_SHORT',
+ 'DOUBLE_BOTTOM','DOUBLE_TOP','TRIANGLE_UP','TRIANGLE_DOWN',
+ 'VOLUME_EXPANSION_LONG','VOLUME_EXPANSION_SHORT'
+] as const;
+
+
+// V3 research-only: 10 classic geometric patterns. Strict closed-bar confirmation.
+export const CLASSIC_IDS = [
+ 'HEAD_SHOULDERS','INVERSE_HEAD_SHOULDERS',
+ 'BULL_FLAG','BEAR_FLAG',
+ 'RISING_WEDGE','FALLING_WEDGE',
+ 'CUP_HANDLE','INVERSE_CUP_HANDLE',
+ 'TRIPLE_TOP','TRIPLE_BOTTOM'
+] as const;
+export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
+ if(c.length<90||!s||!Number.isFinite(s.atr14)||s.atr14<=0)return [];
+ const z=c.length-1,b=c[z],p=c[z-1],atr=s.atr14,prior=c.slice(z-20,z);
+ const volumeRatio=avgVolume(prior)>0?b.v/avgVolume(prior):0;
+ const out:(PatternHit & {geometry?:any})[]=[];
+ let geom:any=null;
+ const pt=(i:number,price:number,label:string)=>({i,price,label});
+ const seg=(a:any,b:any,label:string)=>({a,b,label});
+ const add=(id:string,name:string,side:Side,ok:boolean,detail:string)=>{
+  if(ok)out.push({id,name,side,frame,strength:clamp(60+Math.min(20,volumeRatio*8)),confirmed:true,details:detail,signalBarOpen:b.t,geometry:geom});
+  geom=null;
+ };
+ const highs=pivots(c,z-85,z-3,'H'),lows=pivots(c,z-85,z-3,'L');
+ const crossDown=(level:number)=>bear(b)&&p.c>=level-0.06*atr&&b.c<level-0.10*atr&&body(b)/span(b)>=0.40;
+ const crossUp=(level:number)=>bull(b)&&p.c<=level+0.06*atr&&b.c>level+0.10*atr&&body(b)/span(b)>=0.40;
+ // Head and shoulders: three separated pivot peaks, middle highest, comparable shoulders, neckline breakout.
+ for(const [id,side,ps,opposite] of [
+  ['HEAD_SHOULDERS','SHORT',highs,lows],
+  ['INVERSE_HEAD_SHOULDERS','LONG',lows,highs]
+ ] as const){
+  let found=false,desc='';
+  for(let j=ps.length-1;j>=2&&!found;j--){
+   const a=ps[j-2],h=ps[j-1],r=ps[j];
+   if(r.i-a.i<14||r.i-a.i>72||h.i-a.i<5||r.i-h.i<5||z-r.i<2||z-r.i>18)continue;
+   const isTop=side==='SHORT';
+   if(isTop?!(h.px>a.px+0.7*atr&&h.px>r.px+0.7*atr):!(h.px<a.px-0.7*atr&&h.px<r.px-0.7*atr))continue;
+   if(Math.abs(a.px-r.px)>1.25*atr)continue;
+   const between1=opposite.filter(x=>x.i>a.i&&x.i<h.i),between2=opposite.filter(x=>x.i>h.i&&x.i<r.i);
+   if(!between1.length||!between2.length)continue;
+   const n1=between1[between1.length-1],n2=between2[0];
+   const neckline=line(n1,n2,z);
+   if(Math.abs(n2.px-n1.px)>2.5*atr||Math.abs(b.c-neckline)>2.7*atr)continue;
+   if(!(isTop?crossDown(neckline):crossUp(neckline)))continue;
+   geom={points:[pt(a.i,a.px,'Ляво рамо'),pt(h.i,h.px,'Глава'),pt(r.i,r.px,'Дясно рамо'),pt(n1.i,n1.px,'Neckline A'),pt(n2.i,n2.px,'Neckline B'),pt(z,b.c,'Пробив')],lines:[seg(pt(n1.i,n1.px,''),pt(z,neckline,''),'Neckline')],start:a.i,end:z};
+   found=true;desc='3 потвърдени pivots: ляво рамо '+a.i+', глава '+h.i+', дясно рамо '+r.i+'; пробив на neckline '+neckline.toFixed(5);
+  }
+  add(id,side==='SHORT'?'Глава и рамене':'Обърната глава и рамене',side as Side,found,desc);
+ }
+ // Flags: strong 8-bar impulse, then 5-14 bars of narrow countertrend channel, breakout.
+ for(const side of ['LONG','SHORT'] as const){
+  let found=false,desc='';
+  for(let len=5;len<=14&&!found;len++){
+   const flag=c.slice(z-len,z),pole=c.slice(z-len-8,z-len);
+   if(pole.length!==8||flag.length!==len)continue;
+   const impulse=pole[pole.length-1].c-pole[0].o;
+   if(side==='LONG'?impulse<3.5*atr:impulse>-3.5*atr)continue;
+   const f0=flag[0],fl=flag[flag.length-1],drift=fl.c-f0.c;
+   if(side==='LONG'?(drift>0.25*atr||drift<-2.3*atr):(drift<-0.25*atr||drift>2.3*atr))continue;
+   if(hi(flag)-lo(flag)>3.2*atr)continue;
+   const edge=side==='LONG'?hi(flag):lo(flag);
+   if(!(side==='LONG'?crossUp(edge):crossDown(edge)))continue;
+   if(volumeRatio<1.15)continue;
+   geom={points:[pt(z-len-8,pole[0].o,'Начало импулс'),pt(z-len-1,pole[pole.length-1].c,'Край импулс'),pt(z,b.c,'Пробив')],lines:[seg(pt(z-len-8,pole[0].o,''),pt(z-len-1,pole[pole.length-1].c,''),'Импулс'),seg(pt(z-len,edge,''),pt(z,edge,''),'Граница на флага')],start:z-len-8,end:z};
+   found=true;desc='Импулс '+(impulse/atr).toFixed(2)+' ATR; корекция '+len+' свещи; пробив '+edge.toFixed(5)+'; обем '+volumeRatio.toFixed(2)+'×';
+  }
+  add(side==='LONG'?'BULL_FLAG':'BEAR_FLAG',side==='LONG'?'Бичи флаг':'Мечи флаг',side,found,desc);
+ }
+ // Wedges: converging trendlines with both slopes pointing in same direction.
+ for(const [id,side,sign] of [['RISING_WEDGE','SHORT',1],['FALLING_WEDGE','LONG',-1]] as const){
+  let found=false,desc='';
+  const hs=highs.filter(x=>x.i>=z-42),ls=lows.filter(x=>x.i>=z-42);
+  for(let h=hs.length-1;h>=1&&!found;h--)for(let l=ls.length-1;l>=1&&!found;l--){
+   const h1=hs[h-1],h2=hs[h],l1=ls[l-1],l2=ls[l];
+   if(Math.abs(h2.i-l2.i)>12||Math.max(h1.i,l1.i)>Math.min(h2.i,l2.i)-4)continue;
+   const up=(h2.px-h1.px)/(h2.i-h1.i),down=(l2.px-l1.px)/(l2.i-l1.i);
+   if(sign===1?!(up>0.015*atr&&down>up+0.015*atr):!(down< -0.015*atr&&up<down-0.015*atr))continue;
+   const start=Math.max(h1.i,l1.i),width0=line(h1,h2,start)-line(l1,l2,start);
+   const width1=line(h1,h2,z)-line(l1,l2,z);
+   if(width0<1.1*atr||width1<=0.15*atr||width1>0.8*width0)continue;
+   const boundary=side==='SHORT'?line(l1,l2,z):line(h1,h2,z);
+   if(!(side==='SHORT'?crossDown(boundary):crossUp(boundary)))continue;
+   geom={points:[pt(h1.i,h1.px,'Връх 1'),pt(h2.i,h2.px,'Връх 2'),pt(l1.i,l1.px,'Дъно 1'),pt(l2.i,l2.px,'Дъно 2'),pt(z,b.c,'Пробив')],lines:[seg(pt(h1.i,h1.px,''),pt(z,line(h1,h2,z),''),'Горна линия'),seg(pt(l1.i,l1.px,''),pt(z,line(l1,l2,z),''),'Долна линия')],start:Math.min(h1.i,l1.i),end:z};
+   found=true;desc='Сходящи наклонени линии; ширина '+(width0/atr).toFixed(2)+' → '+(width1/atr).toFixed(2)+' ATR; пробив '+boundary.toFixed(5);
+  }
+  add(id,side==='SHORT'?'Възходящ клин':'Низходящ клин',side,found,desc);
+ }
+ // Cup & handle: rounded base / dome over 24-65 bars, shallow 4-12 bar handle and rim break.
+ for(const side of ['LONG','SHORT'] as const){
+  let found=false,desc='';
+  for(let handleLen=4;handleLen<=12&&!found;handleLen++){
+   for(let cupLen=24;cupLen<=65&&!found;cupLen+=3){
+    const cup=c.slice(z-handleLen-cupLen,z-handleLen),handle=c.slice(z-handleLen,z);
+    if(cup.length!==cupLen||handle.length!==handleLen)continue;
+    const third=Math.floor(cupLen/3),left=cup.slice(0,third),middle=cup.slice(third,2*third),right=cup.slice(2*third);
+    const rimL=mean(left.map(x=>x.c)),rimR=mean(right.map(x=>x.c));
+    if(Math.abs(rimL-rimR)>1.2*atr)continue;
+    const depth=side==='LONG'?Math.min(rimL,rimR)-lo(middle):hi(middle)-Math.max(rimL,rimR);
+    if(depth<2*atr||depth>12*atr)continue;
+    const rim=side==='LONG'?Math.max(hi(left),hi(right)):Math.min(lo(left),lo(right));
+    const handleDepth=side==='LONG'?rim-lo(handle):hi(handle)-rim;
+    if(handleDepth>depth*.55||handleDepth<0.15*atr)continue;
+    if(!(side==='LONG'?crossUp(rim):crossDown(rim)))continue;
+    geom={points:[pt(z-handleLen-cupLen,rimL,'Ляв ръб'),pt(z-handleLen-cupLen+third+Math.floor(third/2),side==='LONG'?lo(middle):hi(middle),'Дъно/връх'),pt(z-handleLen-1,rimR,'Десен ръб'),pt(z-handleLen,handle[0].c,'Дръжка'),pt(z,b.c,'Пробив')],lines:[seg(pt(z-handleLen-cupLen,rim,''),pt(z,rim,''),'Ръб на чашата')],start:z-handleLen-cupLen,end:z};
+    found=true;desc='Чаша '+cupLen+' свещи, дръжка '+handleLen+'; дълбочина '+(depth/atr).toFixed(2)+' ATR, пробив на ръба '+rim.toFixed(5);
+   }
+  }
+  add(side==='LONG'?'CUP_HANDLE':'INVERSE_CUP_HANDLE',side==='LONG'?'Чаша с дръжка':'Обърната чаша с дръжка',side,found,desc);
+ }
+ // Triple top/bottom: three separated pivot levels within 0.65 ATR, neckline confirmation.
+ for(const side of ['LONG','SHORT'] as const){
+  const ps=side==='LONG'?lows:highs;let found=false,desc='';
+  for(let j=ps.length-1;j>=2&&!found;j--){
+   const a=ps[j-2],b0=ps[j-1],d=ps[j];
+   if(b0.i-a.i<5||d.i-b0.i<5||d.i-a.i>62||z-d.i<2||z-d.i>18)continue;
+   if(Math.max(a.px,b0.px,d.px)-Math.min(a.px,b0.px,d.px)>0.65*atr)continue;
+   const between=c.slice(a.i+1,d.i),neck=side==='LONG'?hi(between):lo(between);
+   const depth=side==='LONG'?neck-Math.max(a.px,b0.px,d.px):Math.min(a.px,b0.px,d.px)-neck;
+   if(depth<1.2*atr||depth>10*atr)continue;
+   if(!(side==='LONG'?crossUp(neck):crossDown(neck)))continue;
+   geom={points:[pt(a.i,a.px,'Ниво 1'),pt(b0.i,b0.px,'Ниво 2'),pt(d.i,d.px,'Ниво 3'),pt(z,b.c,'Пробив')],lines:[seg(pt(a.i,neck,''),pt(z,neck,''),'Neckline')],start:a.i,end:z};
+   found=true;desc='Три близки '+(side==='LONG'?'дъна':'върха')+' на барове '+[a.i,b0.i,d.i].join(', ')+'; neckline '+neck.toFixed(5);
+  }
+  add(side==='LONG'?'TRIPLE_BOTTOM':'TRIPLE_TOP',side==='LONG'?'Тройно дъно':'Троен връх',side,found,desc);
+ }
+ return out;
+}
+
+}
+
+
+// V4 independent, conservative geometry audit of a V3 candidate. Research only.
+// Uses ONLY candles available at the detection bar, never future candles.
+export function strictClassicV4(id:string, geom:any, c:import('./types').Candle[], s:import('./types').Structure):{accepted:boolean;checks:{ok:boolean;label:string;value?:string}[];reason:string}{
+ const checks:{ok:boolean;label:string;value?:string}[]=[];
+ const check=(ok:boolean,label:string,value='')=>checks.push({ok,label,value});
+ if(!geom||!Array.isArray(geom.points)){return {accepted:false,checks:[{ok:false,label:'V3 geometry unavailable'}],reason:'NO_V3_GEOMETRY'};}
+ const z=c.length-1,atr=Math.max(s.atr14,1e-10),points=geom.points as {i:number;price:number;label:string}[];
+ const P=(name:string)=>points.find(p=>p.label===name);
+ const br=P('Пробив'),last=c[z],prev=c[z-1];
+ const isLong=['INVERSE_HEAD_SHOULDERS','BULL_FLAG','FALLING_WEDGE','CUP_HANDLE','TRIPLE_BOTTOM'].includes(id);
+ check(!!br&&br.i===z,'Пробивът е на текущата затворена свещ');
+ check(!!br&&(isLong?last.c>last.o:last.c<last.o),'Свещта на пробива е в правилната посока');
+ const lineAt=(a:any,b:any,i:number)=>a.price+(b.price-a.price)*(i-a.i)/(b.i-a.i||1);
+ if(id==='HEAD_SHOULDERS'||id==='INVERSE_HEAD_SHOULDERS'){
+  const a=P('Ляво рамо'),h=P('Глава'),r=P('Дясно рамо'),n1=P('Neckline A'),n2=P('Neckline B');
+  if(a&&h&&r&&n1&&n2){
+   check(a.i<h.i&&h.i<r.i,'Раменете и главата са хронологично подредени');
+   check(isLong?h.price<Math.min(a.price,r.price)-0.8*atr:h.price>Math.max(a.price,r.price)+0.8*atr,'Главата се отличава ясно');
+   check(Math.abs(a.price-r.price)<=0.9*atr,'Раменете са на близки нива');
+   const neck=lineAt(n1,n2,z),prior=lineAt(n1,n2,z-1);
+   check(Math.abs(n2.price-n1.price)<=1.2*atr,'Neckline не е прекалено наклонена');
+   check(z-r.i<=10,'Пробивът не е закъснял след дясното рамо');
+   check(isLong?(prev.c<=prior&&last.c>neck+0.1*atr):(prev.c>=prior&&last.c<neck-0.1*atr),'Реално пресичане на neckline при сигнала');
+  }else check(false,'Липсват точки за рамене/глава/neckline');
+ }else if(id==='BULL_FLAG'||id==='BEAR_FLAG'){
+  const a=P('Начало импулс'),b=P('Край импулс');
+  if(a&&b){
+   const flag=c.slice(b.i+1,z),pole=Math.abs(b.price-a.price);
+   const highs=flag.map(x=>x.h),lows=flag.map(x=>x.l);
+   const half=Math.max(2,Math.floor(flag.length/2));
+   const early=flag.slice(0,half),late=flag.slice(half);
+   const upperSlope=late.length&&early.length?(Math.max(...late.map(x=>x.h))-Math.max(...early.map(x=>x.h)))/Math.max(1,flag.length-half):NaN;
+   const lowerSlope=late.length&&early.length?(Math.min(...late.map(x=>x.l))-Math.min(...early.map(x=>x.l)))/Math.max(1,flag.length-half):NaN;
+   const retrace=flag.length?(isLong?b.price-Math.min(...lows):Math.max(...highs)-b.price)/Math.max(pole,1e-10):Infinity;
+   check(flag.length>=6,'Флагът съдържа поне 6 свещи');
+   check(retrace>=0.08&&retrace<=0.5,'Корекцията е 8–50% от импулса',retrace.toFixed(2));
+   check(isLong?(upperSlope<=0.12*atr&&lowerSlope<=0.12*atr):(upperSlope>=-0.12*atr&&lowerSlope>=-0.12*atr),'Каналът не се движи силно по посока на импулса');
+   check(Number.isFinite(upperSlope)&&Math.abs(upperSlope-lowerSlope)<=0.20*atr,'Двете граници имат сходен наклон');
+   const upper=Math.max(...highs),lower=Math.min(...lows);
+   check(isLong?last.c>upper+0.10*atr:last.c<lower-0.10*atr,'Пробив отвъд реалната граница на флага');
+  }else check(false,'Липсват точки за импулса');
+ }else if(id==='RISING_WEDGE'||id==='FALLING_WEDGE'){
+  const h1=P('Връх 1'),h2=P('Връх 2'),l1=P('Дъно 1'),l2=P('Дъно 2');
+  if(h1&&h2&&l1&&l2){
+   const sh=(h2.price-h1.price)/(h2.i-h1.i||1),sl=(l2.price-l1.price)/(l2.i-l1.i||1);
+   const width0=lineAt(h1,h2,Math.max(h1.i,l1.i))-lineAt(l1,l2,Math.max(h1.i,l1.i));
+   const widthZ=lineAt(h1,h2,z)-lineAt(l1,l2,z);
+   check(isLong?(sh<0&&sl<0):(sh>0&&sl>0),'Двете линии имат правилен наклон');
+   check(width0>0&&widthZ>0&&widthZ<width0*.7,'Клинът се стеснява с поне 30%');
+   check(Math.min(h2.i,l2.i)-Math.min(h1.i,l1.i)>=10,'Формацията обхваща поне 10 свещи');
+   const edge=isLong?lineAt(h1,h2,z):lineAt(l1,l2,z);
+   const prevEdge=isLong?lineAt(h1,h2,z-1):lineAt(l1,l2,z-1);
+   check(isLong?prev.c<=prevEdge&&last.c>edge+0.08*atr:prev.c>=prevEdge&&last.c<edge-0.08*atr,'Потвърден пробив на правилната линия');
+  }else check(false,'Липсват четири pivot точки');
+ }else if(id==='CUP_HANDLE'||id==='INVERSE_CUP_HANDLE'){
+  const a=P('Ляв ръб'),m=P('Дъно/връх'),r=P('Десен ръб'),h=P('Дръжка');
+  if(a&&m&&r&&h){
+   const total=r.i-a.i,midRatio=(m.i-a.i)/Math.max(1,total);
+   check(total>=24,'Чашата има достатъчна продължителност');
+   check(midRatio>=0.3&&midRatio<=0.7,'Дъното/върхът е в средната част, а не V-образно в края');
+   check(Math.abs(a.price-r.price)<=0.8*atr,'Двата ръба са на близки нива');
+   check(z-h.i>=3&&z-h.i<=12,'Дръжката има разумна продължителност');
+   const rim=isLong?Math.max(a.price,r.price):Math.min(a.price,r.price);
+   check(isLong?last.c>rim+0.1*atr:last.c<rim-0.1*atr,'Пробив отвъд ръба на чашата');
+  }else check(false,'Липсват точки за чашата и дръжката');
+ }else if(id==='TRIPLE_TOP'||id==='TRIPLE_BOTTOM'){
+  const levels=points.filter(p=>/^Ниво [123]$/.test(p.label)),line=geom.lines?.[0];
+  check(levels.length===3,'Три ясно определени върха/дъна');
+  if(levels.length===3){
+   check(levels[0].i<levels[1].i&&levels[1].i<levels[2].i,'Трите точки са последователни');
+   check(Math.max(...levels.map(x=>x.price))-Math.min(...levels.map(x=>x.price))<=0.5*atr,'Трите нива са достатъчно близки');
+   check(levels[2].i-levels[0].i>=15,'Формацията не е прекалено кратка');
+  }
+  if(line){const neck=line.a.price;check(isLong?prev.c<=neck&&last.c>neck+0.1*atr:prev.c>=neck&&last.c<neck-0.1*atr,'Потвърден пробив на neckline');}
+  else check(false,'Neckline липсва');
+ }
+ const failed=checks.filter(x=>!x.ok);
+ return {accepted:failed.length===0,checks,reason:failed.length?failed.map(x=>x.label).join('; '):'Всички V4 геометрични проверки са изпълнени'};
+}
