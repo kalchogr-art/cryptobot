@@ -977,10 +977,17 @@ function chart(target,ev,side){
  const arr=result.candles,g=side==='v2'?ev.geometry:null,start=Math.max(0,Math.min(ev.index-48,g?.start!=null?g.start-5:ev.index-48)),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
  const allPrices=[...c.flatMap(x=>[x.l,x.h]),...(g?.points||[]).map(x=>x.price),...(g?.lines||[]).flatMap(x=>[x.a.price,x.b.price])];
  const min=Math.min(...allPrices),max=Math.max(...allPrices),range=Math.max(max-min,1e-9);
- const w=850,h=370,left=55,right=15,top=18,bottom=34,plotW=w-left-right,plotH=h-top-bottom;
+ const w=850,h=400,left=55,right=15,top=68,bottom=34,plotW=w-left-right,plotH=h-top-bottom;
  const px=i=>left+(i+.5)*plotW/c.length,py=p=>top+(max-p)/range*plotH;
  const step=plotW/c.length;
- let svg='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="OHLCV candlestick chart">';
+ const id=$('pattern').value,classic=result.classicIds.includes(id);
+ const version=side==='v1'?'V1':classic?'V3':'V2';
+ const sideName=({'HEAD_SHOULDERS':'SHORT','INVERSE_HEAD_SHOULDERS':'LONG','BULL_FLAG':'LONG','BEAR_FLAG':'SHORT','RISING_WEDGE':'SHORT','FALLING_WEDGE':'LONG','CUP_HANDLE':'LONG','INVERSE_CUP_HANDLE':'SHORT','TRIPLE_TOP':'SHORT','TRIPLE_BOTTOM':'LONG'}[id]||((ev.v1Details||ev.v2Details||'').toUpperCase().includes('SHORT')?'SHORT':(ev.v1Details||ev.v2Details||'').toUpperCase().includes('LONG')?'LONG':'—'));
+ const date=new Date(ev.time).toISOString().replace('T',' ').slice(0,16)+' UTC';
+ let svg='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="'+esc(id)+' · '+esc(result.coin)+' · '+esc(result.interval)+' · '+version+'">';
+ svg+='<rect x="0" y="0" width="'+w+'" height="57" fill="#16253d"/>';
+ svg+='<text x="14" y="23" fill="#f8fafc" font-size="19" font-weight="bold">'+esc(id)+' · '+esc(result.coin)+' · '+esc(result.interval.toUpperCase())+' · '+version+'</text>';
+ svg+='<text x="14" y="46" fill="#a5b4fc" font-size="15">'+esc(sideName)+' · '+esc(date)+(side==='v1'&&classic?' · НЯМА V1 ДЕТЕКТОР':'')+'</text>';
  for(let k=0;k<=4;k++){const price=min+range*k/4,y=py(price);svg+='<line x1="'+left+'" y1="'+y+'" x2="'+(w-right)+'" y2="'+y+'" stroke="#24314b"/><text x="3" y="'+(y+4)+'" fill="#94a3b8" font-size="11">'+price.toFixed(price>100?1:4)+'</text>';}
  c.forEach((x,i)=>{const xPos=px(i),up=x.c>=x.o,color=up?'#22c55e':'#ef4444',a=py(Math.max(x.o,x.c)),b=py(Math.min(x.o,x.c));
  svg+='<line x1="'+xPos+'" y1="'+py(x.h)+'" x2="'+xPos+'" y2="'+py(x.l)+'" stroke="'+color+'" stroke-width="1.5"/>';
