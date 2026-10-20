@@ -915,6 +915,112 @@ export function detectClassic(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
 }
 
 
+// V4 independent, conservative geometry audit of a V3 candidate. Research only.
+// Uses ONLY candles available at the detection bar, never future candles.
+function strictClassicV4(id:string, geom:any, c:import('./types').Candle[], s:import('./types').Structure):{accepted:boolean;checks:{ok:boolean;label:string;value?:string}[];reason:string}{
+ const checks:{ok:boolean;label:string;value?:string}[]=[];
+ const check=(ok:boolean,label:string,value='')=>checks.push({ok,label,value});
+ if(!geom||!Array.isArray(geom.points)){return {accepted:false,checks:[{ok:false,label:'V3 geometry unavailable'}],reason:'NO_V3_GEOMETRY'};}
+ const z=c.length-1,atr=Math.max(s.atr14,1e-10),points=geom.points as {i:number;price:number;label:string}[];
+ const P=(name:string)=>points.find(p=>p.label===name);
+ const br=P('Пробив'),last=c[z],prev=c[z-1];
+ const isLong=['INVERSE_HEAD_SHOULDERS','BULL_FLAG','FALLING_WEDGE','CUP_HANDLE','TRIPLE_BOTTOM'].includes(id);
+ check(!!br&&br.i===z,'Пробивът е на текущата затворена свещ');
+ check(!!br&&(isLong?last.c>last.o:last.c<last.o),'Свещта на пробива е в правилната посока');
+ const lineAt=(a:any,b:any,i:number)=>a.price+(b.price-a.price)*(i-a.i)/(b.i-a.i||1);
+ if(id==='HEAD_SHOULDERS'||id==='INVERSE_HEAD_SHOULDERS'){
+  const a=P('Ляво рамо'),h=P('Глава'),r=P('Дясно рамо'),n1=P('Neckline A'),n2=P('Neckline B');
+  if(a&&h&&r&&n1&&n2){
+   check(a.i<h.i&&h.i<r.i,'Раменете и главата са хронологично подредени');
+   check(isLong?h.price<Math.min(a.price,r.price)-0.8*atr:h.price>Math.max(a.price,r.price)+0.8*atr,'Главата се отличава ясно');
+   check(Math.abs(a.price-r.price)<=0.9*atr,'Раменете са на близки нива');
+   const neck=lineAt(n1,n2,z),prior=lineAt(n1,n2,z-1);
+   check(Math.abs(n2.price-n1.price)<=1.2*atr,'Neckline не е прекалено наклонена');
+   check(z-r.i<=10,'Пробивът не е закъснял след дясното рамо');
+   check(isLong?(prev.c<=prior&&last.c>neck+0.1*atr):(prev.c>=prior&&last.c<neck-0.1*atr),'Реално пресичане на neckline при сигнала');
+  }else check(false,'Липсват точки за рамене/глава/neckline');
+ }else if(id==='BULL_FLAG'||id==='BEAR_FLAG'){
+  const a=P('Начало импулс'),b=P('Край импулс');
+  if(a&&b){
+   const flag=c.slice(b.i+1,z),pole=Math.abs(b.price-a.price);
+   const highs=flag.map(x=>x.h),lows=flag.map(x=>x.l);
+   const half=Math.max(2,Math.floor(flag.length/2));
+   const early=flag.slice(0,half),late=flag.slice(half);
+   const upperSlope=late.length&&early.length?(Math.max(...late.map(x=>x.h))-Math.max(...early.map(x=>x.h)))/Math.max(1,flag.length-half):NaN;
+   const lowerSlope=late.length&&early.length?(Math.min(...late.map(x=>x.l))-Math.min(...early.map(x=>x.l)))/Math.max(1,flag.length-half):NaN;
+   const retrace=flag.length?(isLong?b.price-Math.min(...lows):Math.max(...highs)-b.price)/Math.max(pole,1e-10):Infinity;
+   check(flag.length>=6,'Флагът съдържа поне 6 свещи');
+   check(retrace>=0.08&&retrace<=0.5,'Корекцията е 8–50% от импулса',retrace.toFixed(2));
+   check(isLong?(upperSlope<=0.12*atr&&lowerSlope<=0.12*atr):(upperSlope>=-0.12*atr&&lowerSlope>=-0.12*atr),'Каналът не се движи силно по посока на импулса');
+   check(Number.isFinite(upperSlope)&&Math.abs(upperSlope-lowerSlope)<=0.20*atr,'Двете граници имат сходен наклон');
+   const upper=Math.max(...highs),lower=Math.min(...lows);
+   check(isLong?last.c>upper+0.10*atr:last.c<lower-0.10*atr,'Пробив отвъд реалната граница на флага');
+  }else check(false,'Липсват точки за импулса');
+ }else if(id==='RISING_WEDGE'||id==='FALLING_WEDGE'){
+  const h1=P('Връх 1'),h2=P('Връх 2'),l1=P('Дъно 1'),l2=P('Дъно 2');
+  if(h1&&h2&&l1&&l2){
+   const sh=(h2.price-h1.price)/(h2.i-h1.i||1),sl=(l2.price-l1.price)/(l2.i-l1.i||1);
+   const width0=lineAt(h1,h2,Math.max(h1.i,l1.i))-lineAt(l1,l2,Math.max(h1.i,l1.i));
+   const widthZ=lineAt(h1,h2,z)-lineAt(l1,l2,z);
+   check(isLong?(sh<0&&sl<0):(sh>0&&sl>0),'Двете линии имат правилен наклон');
+   check(width0>0&&widthZ>0&&widthZ<width0*.7,'Клинът се стеснява с поне 30%');
+   check(Math.min(h2.i,l2.i)-Math.min(h1.i,l1.i)>=10,'Формацията обхваща поне 10 свещи');
+   const edge=isLong?lineAt(h1,h2,z):lineAt(l1,l2,z);
+   const prevEdge=isLong?lineAt(h1,h2,z-1):lineAt(l1,l2,z-1);
+   check(isLong?prev.c<=prevEdge&&last.c>edge+0.08*atr:prev.c>=prevEdge&&last.c<edge-0.08*atr,'Потвърден пробив на правилната линия');
+  }else check(false,'Липсват четири pivot точки');
+ }else if(id==='CUP_HANDLE'||id==='INVERSE_CUP_HANDLE'){
+  const a=P('Ляв ръб'),m=P('Дъно/връх'),r=P('Десен ръб'),h=P('Дръжка');
+  if(a&&m&&r&&h){
+   const total=r.i-a.i,midRatio=(m.i-a.i)/Math.max(1,total);
+   check(total>=24,'Чашата има достатъчна продължителност');
+   check(midRatio>=0.3&&midRatio<=0.7,'Дъното/върхът е в средната част, а не V-образно в края');
+   check(Math.abs(a.price-r.price)<=0.8*atr,'Двата ръба са на близки нива');
+   check(z-h.i>=3&&z-h.i<=12,'Дръжката има разумна продължителност');
+   const rim=isLong?Math.max(a.price,r.price):Math.min(a.price,r.price);
+   check(isLong?last.c>rim+0.1*atr:last.c<rim-0.1*atr,'Пробив отвъд ръба на чашата');
+  }else check(false,'Липсват точки за чашата и дръжката');
+ }else if(id==='TRIPLE_TOP'||id==='TRIPLE_BOTTOM'){
+  const levels=points.filter(p=>/^Ниво [123]$/.test(p.label)),line=geom.lines?.[0];
+  check(levels.length===3,'Три ясно определени върха/дъна');
+  if(levels.length===3){
+   check(levels[0].i<levels[1].i&&levels[1].i<levels[2].i,'Трите точки са последователни');
+   check(Math.max(...levels.map(x=>x.price))-Math.min(...levels.map(x=>x.price))<=0.5*atr,'Трите нива са достатъчно близки');
+   check(levels[2].i-levels[0].i>=15,'Формацията не е прекалено кратка');
+  }
+  if(line){const neck=line.a.price;check(isLong?prev.c<=neck&&last.c>neck+0.1*atr:prev.c>=neck&&last.c<neck-0.1*atr,'Потвърден пробив на neckline');}
+  else check(false,'Neckline липсва');
+ }
+ const failed=checks.filter(x=>!x.ok);
+ return {accepted:failed.length===0,checks,reason:failed.length?failed.map(x=>x.label).join('; '):'Всички V4 геометрични проверки са изпълнени'};
+}
+
+// For the original 20 patterns, reconstructed visual reference only.
+// These overlays are NOT internal pivot selections of the original V1/V2 algorithms.
+function researchOverlay(id:string,c:import('./types').Candle[],i:number):any{
+ const z=i,begin=Math.max(0,z-25),slice=c.slice(begin,z),b=c[z];
+ if(!slice.length||!b)return null;
+ const pt=(k:number,price:number,label:string)=>({i:k,price,label});
+ const points:any[]=[],lines:any[]=[];
+ const line=(a:any,d:any,label:string)=>lines.push({a,d,label});
+ const maxI=begin+slice.reduce((best,x,k)=>x.h>slice[best].h?k:best,0),minI=begin+slice.reduce((best,x,k)=>x.l<slice[best].l?k:best,0);
+ const high=c[maxI].h,low=c[minI].l;
+ if(/RANGE|BREAKOUT|BREAKDOWN|TRIANGLE|RETEST|LIQUIDITY/.test(id)){
+  const a=pt(begin,high,'Горна граница'),d=pt(begin,low,'Долна граница');
+  points.push(pt(maxI,high,'Локален връх'),pt(minI,low,'Локално дъно'));
+  line(a,pt(z,high,''),'Горна граница');line(d,pt(z,low,''),'Долна граница');
+ }else if(/DOUBLE_/.test(id)){
+  const kind=id==='DOUBLE_TOP'?'h':'l';const sorted=slice.map((x,k)=>({i:begin+k,price:kind==='h'?x.h:x.l})).sort((a,b)=>kind==='h'?b.price-a.price:a.price-b.price);
+  const a=sorted[0],d=sorted.find(x=>Math.abs(x.i-a.i)>=5)||sorted[1];
+  if(a&&d){points.push(pt(a.i,a.price,'Ниво 1'),pt(d.i,d.price,'Ниво 2'));line(pt(begin,kind==='h'?low:high,''),pt(z,kind==='h'?low:high,''),'Ориентир neckline');}
+ }else if(/ENGULF|HAMMER|SHOOTING_STAR|MOMENTUM|VOLUME/.test(id)){
+  points.push(pt(Math.max(0,z-1),c[Math.max(0,z-1)].c,'Предишна свещ'),pt(z,b.c,'Сигнал'));
+ }else if(/EMA_PULLBACK/.test(id)){
+  points.push(pt(minI,low,'Локално дъно'),pt(maxI,high,'Локален връх'),pt(z,b.c,'Сигнал'));
+ }else{points.push(pt(z,b.c,'Сигнал'));}
+ return {points,lines,start:begin,end:z,reconstructed:true};
+}
+
 // Isolated V1 vs V2 research comparison: one OHLCV fetch, no database access.
 async function swingPatternCompareData(u:URL){
  const coin=(u.searchParams.get('coin')||'BTC').toUpperCase();
@@ -927,7 +1033,7 @@ async function swingPatternCompareData(u:URL){
  if(!q.ready)throw Error('OHLCV_NOT_READY');
  const bars=data.closed;
  const allIds=[...CATALOG_IDS,...PatternCompareV2.CLASSIC_IDS];
- const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null;v1Explanation:string;v2Explanation:string;v2Checks:{ok:boolean;label:string;value?:string}[];geometry?:any}[]}>=Object.fromEntries(allIds.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
+ const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null;v1Explanation:string;v2Explanation:string;v2Checks:{ok:boolean;label:string;value?:string}[];geometry?:any;geometryV1?:any;geometryV2?:any;v4?:{accepted:boolean;checks:{ok:boolean;label:string;value?:string}[];reason:string}}[]}>=Object.fromEntries(allIds.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
  for(let i=64;i<bars.length;i++){
   const prefix=bars.slice(0,i+1),s=structure(prefix);
   const a=detectCatalog(prefix,s,frame),b=PatternCompareV2.detectCatalog(prefix,s,frame);
@@ -941,7 +1047,7 @@ async function swingPatternCompareData(u:URL){
     const explain=PatternCompareV2.explainDecision(prefix,s,id,y||null);
     r.events.push({index:i,time:bars[i].t,v1:!!x,v2:!!y,v1Details:x?.details||null,v2Details:y?.details||null,
       v1Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?'Няма детектор във V1 — нов класически патерн във V3.':x?'V1 приема: '+x.details:'V1 отказва: конкретната формация не покрива всички условия на оригиналния детектор.',
-      v2Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?y?'V3 приема: '+y.details:'V3 не разпознава потвърдена формация по строгите правила.':explain.summary,v2Checks:PatternCompareV2.CLASSIC_IDS.includes(id as any)?[]:explain.checks,geometry:(y as any)?.geometry||null});
+      v2Explanation:PatternCompareV2.CLASSIC_IDS.includes(id as any)?y?'V3 приема: '+y.details:'V3 не разпознава потвърдена формация по строгите правила.':explain.summary,v2Checks:PatternCompareV2.CLASSIC_IDS.includes(id as any)?[]:explain.checks,geometry:(y as any)?.geometry||null,geometryV1:x?researchOverlay(id,bars,i):null,geometryV2:y&&!PatternCompareV2.CLASSIC_IDS.includes(id as any)?researchOverlay(id,bars,i):null,v4:PatternCompareV2.CLASSIC_IDS.includes(id as any)&&y?strictClassicV4(id,(y as any).geometry,prefix,s):undefined});
    }
   }
  }
@@ -957,12 +1063,12 @@ h1{font-size:22px;margin:0 0 6px}p{color:#94a3b8}select,button{background:#17233
 svg{width:100%;height:auto;background:#0a1428;border-radius:6px}.summary{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
 .tag{padding:8px 12px;background:#17233b;border-radius:8px}#status{min-height:20px;color:#a5b4fc}
 @media(max-width:850px){.grid{grid-template-columns:1fr}}
-</style></head><body><h1>SWING HUNTER · V1 vs V2 + класически V3</h1>
-<p>Еднакви реални затворени OHLCV свещи · 20 V1/V2 + 10 нови класически V3 патерна · само диагностика, без D1 или търговия.</p>
+</style></head><body><h1>SWING HUNTER · V1 ↔ V2 / V3 ↔ V4</h1>
+<p>Еднакви реални затворени OHLCV свещи · 20 V1/V2 + 10 класически V3/V4 патерна · само диагностика, без D1 или търговия.</p>
 <div class="controls"><select id="coin"></select><select id="frame"><option value="1h">1H</option><option value="4h">4H</option></select><select id="pattern"></select><select id="case"></select><button id="load">Зареди</button></div>
 <div id="status"></div><details class="panel" style="margin:12px 0"><summary><b>Кои формации са по-полезни за крипто?</b></summary><p>Няма универсално „най-добър“ патерн. За крипто 1H/4H си струва да тестваме отделно: liquidity sweep + reclaim (лов на ликвидност и връщане), breakout + retest с обем, trend pullback в силен тренд, range deviation / failed breakout и volatility squeeze → expansion. Сегашният каталог включва част от тях, но няма изрични модели за failed breakout, squeeze с ATR/volatility regime, multi-timeframe confluence или OI/funding контекст. Това са кандидати за отделна V3, НЕ доказано печеливши сигнали. Не променяме V1/V2 или LIVE.</p></details><div class="summary" id="summary"></div>
-<div class="grid"><section class="panel"><h2>V1 · оригинален</h2><div id="chart1"></div><div id="detail1"></div></section>
-<section class="panel"><h2>V2 · подобрен / V3 · класически</h2><div id="chart2"></div><div id="detail2"></div></section></div>
+<div class="grid"><section class="panel"><h2 id="leftTitle">V1 · оригинален</h2><div id="chart1"></div><div id="detail1"></div></section>
+<section class="panel"><h2 id="rightTitle">V2 · подобрен</h2><div id="chart2"></div><div id="detail2"></div></section></div>
 <p>Важно: графиките показват разпознаване на формации, а не доказана прогностична точност.</p>
 <script>
 const coins=${JSON.stringify(COINS)};
@@ -970,31 +1076,31 @@ const ids=${JSON.stringify([...CATALOG_IDS,...PatternCompareV2.CLASSIC_IDS])};
 const $=id=>document.getElementById(id);
 $('coin').innerHTML=coins.map(x=>'<option>'+x+'</option>').join('');
 const labels={'HEAD_SHOULDERS':'Глава и рамене','INVERSE_HEAD_SHOULDERS':'Обърната глава и рамене','BULL_FLAG':'Бичи флаг','BEAR_FLAG':'Мечи флаг','RISING_WEDGE':'Възходящ клин','FALLING_WEDGE':'Низходящ клин','CUP_HANDLE':'Чаша с дръжка','INVERSE_CUP_HANDLE':'Обърната чаша с дръжка','TRIPLE_TOP':'Троен връх','TRIPLE_BOTTOM':'Тройно дъно'};
-$('pattern').innerHTML=ids.map(x=>'<option value="'+x+'">'+(labels[x]||x)+(labels[x]?' · V3':'')+'</option>').join('');
+$('pattern').innerHTML=ids.map(x=>'<option value="'+x+'">'+(labels[x]||x)+(labels[x]?' · V3 ↔ V4':' · V1 ↔ V2')+'</option>').join('');
 let result=null;
 function esc(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 function chart(target,ev,side){
- const arr=result.candles,g=side==='v2'?ev.geometry:null,start=Math.max(0,Math.min(ev.index-48,g?.start!=null?g.start-5:ev.index-48)),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
+ const arr=result.candles,classic=result.classicIds.includes($('pattern').value),g=classic?(side==='v2'?ev.geometry:null):(side==='v1'?ev.geometryV1:ev.geometryV2),start=Math.max(0,Math.min(ev.index-48,g?.start!=null?g.start-5:ev.index-48)),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
  const allPrices=[...c.flatMap(x=>[x.l,x.h]),...(g?.points||[]).map(x=>x.price),...(g?.lines||[]).flatMap(x=>[x.a.price,x.b.price])];
  const min=Math.min(...allPrices),max=Math.max(...allPrices),range=Math.max(max-min,1e-9);
  const w=850,h=400,left=55,right=15,top=68,bottom=34,plotW=w-left-right,plotH=h-top-bottom;
  const px=i=>left+(i+.5)*plotW/c.length,py=p=>top+(max-p)/range*plotH;
  const step=plotW/c.length;
- const id=$('pattern').value,classic=result.classicIds.includes(id);
- const version=side==='v1'?'V1':classic?'V3':'V2';
+ const id=$('pattern').value;
+ const version=side==='v1'?(classic?'V3':'V1'):(classic?'V4':'V2');
  const sideName=({'HEAD_SHOULDERS':'SHORT','INVERSE_HEAD_SHOULDERS':'LONG','BULL_FLAG':'LONG','BEAR_FLAG':'SHORT','RISING_WEDGE':'SHORT','FALLING_WEDGE':'LONG','CUP_HANDLE':'LONG','INVERSE_CUP_HANDLE':'SHORT','TRIPLE_TOP':'SHORT','TRIPLE_BOTTOM':'LONG'}[id]||((ev.v1Details||ev.v2Details||'').toUpperCase().includes('SHORT')?'SHORT':(ev.v1Details||ev.v2Details||'').toUpperCase().includes('LONG')?'LONG':'—'));
  const date=new Date(ev.time).toISOString().replace('T',' ').slice(0,16)+' UTC';
  let svg='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="'+esc(id)+' · '+esc(result.coin)+' · '+esc(result.interval)+' · '+version+'">';
  svg+='<rect x="0" y="0" width="'+w+'" height="57" fill="#16253d"/>';
  svg+='<text x="14" y="23" fill="#f8fafc" font-size="19" font-weight="bold">'+esc(id)+' · '+esc(result.coin)+' · '+esc(result.interval.toUpperCase())+' · '+version+'</text>';
- svg+='<text x="14" y="46" fill="#a5b4fc" font-size="15">'+esc(sideName)+' · '+esc(date)+(side==='v1'&&classic?' · НЯМА V1 ДЕТЕКТОР':'')+'</text>';
+ svg+='<text x="14" y="46" fill="#a5b4fc" font-size="15">'+esc(sideName)+' · '+esc(date)+(side==='v1'&&classic?' · V3 BASELINE':'')+'</text>';
  for(let k=0;k<=4;k++){const price=min+range*k/4,y=py(price);svg+='<line x1="'+left+'" y1="'+y+'" x2="'+(w-right)+'" y2="'+y+'" stroke="#24314b"/><text x="3" y="'+(y+4)+'" fill="#94a3b8" font-size="11">'+price.toFixed(price>100?1:4)+'</text>';}
  c.forEach((x,i)=>{const xPos=px(i),up=x.c>=x.o,color=up?'#22c55e':'#ef4444',a=py(Math.max(x.o,x.c)),b=py(Math.min(x.o,x.c));
  svg+='<line x1="'+xPos+'" y1="'+py(x.h)+'" x2="'+xPos+'" y2="'+py(x.l)+'" stroke="'+color+'" stroke-width="1.5"/>';
  svg+='<rect x="'+(xPos-step*.29)+'" y="'+a+'" width="'+Math.max(2,step*.58)+'" height="'+Math.max(1.5,b-a)+'" fill="'+color+'"/>';
  if(start+i===ev.index)svg+='<line x1="'+xPos+'" y1="'+top+'" x2="'+xPos+'" y2="'+(h-bottom)+'" stroke="#facc15" stroke-dasharray="4 4" stroke-width="2"/>';
  });
- // Draw the EXACT geometry selected by the detector at signal time.
+ // Classic V3: exact points. V1/V2: clearly labeled independent research reconstruction.
  if(g){
   for(const line of g.lines||[]){
    const x1=px(line.a.i-start),x2=px(line.b.i-start);
@@ -1010,23 +1116,25 @@ function chart(target,ev,side){
  svg+='<text x="'+left+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[0].t).toISOString().slice(0,16)+' UTC</text>';
  svg+='<text x="'+(w-175)+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[c.length-1].t).toISOString().slice(0,16)+' UTC</text></svg>';
  $(target).innerHTML=svg;
- const detected=side==='v1'?ev.v1:ev.v2;
- const desc=side==='v1'?ev.v1Explanation:ev.v2Explanation;
- $('detail'+(side==='v1'?1:2)).innerHTML=(g?'<p style="color:#7dd3fc">Геометрия: '+g.points.length+' контролни точки · '+g.lines.length+' линии · жълто = пробив</p>':'')+'<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(side==='v1'&&classic?'НЯМА V1 ДЕТЕКТОР':detected?'РАЗПОЗНАТ':'НЕ Е РАЗПОЗНАТ')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>';
+ const detected=classic?(side==='v1'?ev.v2:!!ev.v4?.accepted):(side==='v1'?ev.v1:ev.v2);
+ const desc=classic?(side==='v1'?ev.v2Explanation:(ev.v4?.reason||'V4: V3 did not identify a candidate')):(side==='v1'?ev.v1Explanation:ev.v2Explanation);
+ $('detail'+(side==='v1'?1:2)).innerHTML=(g?'<p style="color:#7dd3fc">Геометрия: '+g.points.length+' точки · '+g.lines.length+' линии'+(g.reconstructed?' · РЕКОНСТРУКЦИЯ (не оригиналните pivot точки)':' · реални точки от V3')+'</p>':'')+'<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(detected?'РАЗПОЗНАТ / ПРИЕТ':'НЕ Е РАЗПОЗНАТ / ОТХВЪРЛЕН')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>'+(classic&&side==='v2'&&ev.v4?'<ul>'+ev.v4.checks.map(x=>'<li style="color:'+(x.ok?'#86efac':'#fca5a5')+'">'+(x.ok?'✓ ':'✗ ')+esc(x.label)+'</li>').join('')+'</ul>':'');
 }
 function render(){
  if(!result)return;
  const id=$('pattern').value,p=result.patterns[id];
- $('summary').innerHTML=(result.classicIds.includes(id)?['V3 разпознавания: '+p.v2,'Нов класически патерн · няма V1 еквивалент']:['V1: '+p.v1,'V2: '+p.v2,'И двата: '+p.both,'Само V1: '+p.v1Only,'Само V2: '+p.v2Only]).map(x=>'<div class="tag">'+esc(x)+'</div>').join('');
+ $('leftTitle').textContent=result.classicIds.includes(id)?'V3 · оригинален класически':'V1 · оригинален';
+ $('rightTitle').textContent=result.classicIds.includes(id)?'V4 · строг геометричен валидатор':'V2 · подобрен';
+ $('summary').innerHTML=(result.classicIds.includes(id)?['V3 разпознавания: '+p.v2,'V4 приети: '+p.events.filter(x=>x.v4?.accepted).length,'V4 отхвърлени: '+p.events.filter(x=>x.v4&&!x.v4.accepted).length]:['V1: '+p.v1,'V2: '+p.v2,'И двата: '+p.both,'Само V1: '+p.v1Only,'Само V2: '+p.v2Only]).map(x=>'<div class="tag">'+esc(x)+'</div>').join('');
  const ev=p.events,prev=$('case').value;
- $('case').innerHTML=ev.map((x,i)=>'<option value="'+i+'">'+new Date(x.time).toISOString().slice(0,16)+' · '+(x.v1&&x.v2?'BOTH':x.v1?'V1 ONLY':'V2 ONLY')+'</option>').join('');
+ $('case').innerHTML=ev.map((x,i)=>'<option value="'+i+'">'+new Date(x.time).toISOString().slice(0,16)+' · '+(result.classicIds.includes(id)?(x.v4?.accepted?'V3 + V4':'V3 ONLY'):(x.v1&&x.v2?'BOTH':x.v1?'V1 ONLY':'V2 ONLY'))+'</option>').join('');
  if(!ev.length){$('chart1').textContent='Няма потвърдени разпознавания за този патерн в избраните 400 свещи.';$('chart2').textContent='Няма разпознавания.';$('detail1').textContent='';$('detail2').textContent='';return;}
  $('case').value=prev&&Number(prev)<ev.length?prev:String(ev.length-1);
  draw();
 }
 function draw(){const p=result.patterns[$('pattern').value],ev=p.events[Number($('case').value)];if(!ev)return;chart('chart1',ev,'v1');chart('chart2',ev,'v2');}
 async function load(){
- $('status').textContent='Извличане на 400 свещи и сравняване на V1/V2…';$('load').disabled=true;
+ $('status').textContent='Извличане на 400 свещи и сравняване на V1/V2 или V3/V4…';$('load').disabled=true;
  try{
  const u='/api/swing/pattern-compare-data?coin='+encodeURIComponent($('coin').value)+'&interval='+encodeURIComponent($('frame').value);
  const response=await fetch(u,{cache:'no-store'}),data=await response.json();
