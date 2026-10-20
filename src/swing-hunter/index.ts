@@ -1002,7 +1002,7 @@ function researchOverlay(id:string,c:import('./types').Candle[],i:number):any{
  if(!slice.length||!b)return null;
  const pt=(k:number,price:number,label:string)=>({i:k,price,label});
  const points:any[]=[],lines:any[]=[];
- const line=(a:any,d:any,label:string)=>lines.push({a,d,label});
+ const line=(a:any,b:any,label:string)=>lines.push({a,b,label});
  const maxI=begin+slice.reduce((best,x,k)=>x.h>slice[best].h?k:best,0),minI=begin+slice.reduce((best,x,k)=>x.l<slice[best].l?k:best,0);
  const high=c[maxI].h,low=c[minI].l;
  if(/RANGE|BREAKOUT|BREAKDOWN|TRIANGLE|RETEST|LIQUIDITY/.test(id)){
@@ -1081,7 +1081,7 @@ let result=null;
 function esc(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 function chart(target,ev,side){
  const arr=result.candles,classic=result.classicIds.includes($('pattern').value),g=classic?(side==='v2'?ev.geometry:null):(side==='v1'?ev.geometryV1:ev.geometryV2),start=Math.max(0,Math.min(ev.index-48,g?.start!=null?g.start-5:ev.index-48)),end=Math.min(arr.length,ev.index+9),c=arr.slice(start,end);
- const allPrices=[...c.flatMap(x=>[x.l,x.h]),...(g?.points||[]).map(x=>x.price),...(g?.lines||[]).flatMap(x=>[x.a.price,x.b.price])];
+ const allPrices=[...c.flatMap(x=>[x.l,x.h]),...(g?.points||[]).map(x=>x.price),...(g?.lines||[]).filter(x=>x?.a&&x?.b).flatMap(x=>[x.a.price,x.b.price])];
  const min=Math.min(...allPrices),max=Math.max(...allPrices),range=Math.max(max-min,1e-9);
  const w=850,h=400,left=55,right=15,top=68,bottom=34,plotW=w-left-right,plotH=h-top-bottom;
  const px=i=>left+(i+.5)*plotW/c.length,py=p=>top+(max-p)/range*plotH;
@@ -1102,7 +1102,7 @@ function chart(target,ev,side){
  });
  // Classic V3: exact points. V1/V2: clearly labeled independent research reconstruction.
  if(g){
-  for(const line of g.lines||[]){
+  for(const line of (g.lines||[]).filter(x=>x?.a&&x?.b)){
    const x1=px(line.a.i-start),x2=px(line.b.i-start);
    svg+='<line x1="'+x1+'" y1="'+py(line.a.price)+'" x2="'+x2+'" y2="'+py(line.b.price)+'" stroke="#38bdf8" stroke-width="2.5" stroke-dasharray="7 4"/>';
   }
