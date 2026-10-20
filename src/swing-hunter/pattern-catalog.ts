@@ -1,6 +1,6 @@
 import type { Candle, Structure } from './types';
 
-/** Research-only pattern catalog. No trading/execution dependencies. */
+/** Research-only pa.ttern catalog. No trading/execution dependencies. */
 export type PatternHit = {
   id: string; name: string; side: 'LONG' | 'SHORT'; frame: '1h' | '4h';
   strength: number; confirmed: boolean; details: string; signalBarOpen: number;
