@@ -22,7 +22,7 @@ import {unifiedCoin,unifiedMarket} from './unified-backtest';
 import {detectCatalog,CATALOG_IDS} from './pattern-catalog';
 import {intelligenceCoin,intelligenceMarket,intelligenceDashboard} from './pattern-intelligence';
 
-// Signal collection resumed; existing D1 records are retained.
+// Signal collection resumed; existinjg D1 records are retained.
 const NEW_SIGNALS_ENABLED = true;
 
 const json=(x:unknown,status=200)=>new Response(JSON.stringify(x,null,2),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}});
