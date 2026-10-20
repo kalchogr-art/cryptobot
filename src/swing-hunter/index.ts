@@ -721,6 +721,59 @@ export function detectCatalog(c:Candle[],s:Structure,frame:Frame):PatternHit[]{
      `High-volume ${vr.toFixed(2)}x breakdown below ${low}`);
  return out;
 }
+
+// Explanations are calculated from the SAME closed candle prefix as the detector.
+// TRIANGLE_UP/DOWN replays V2's actual rejection gates in order.
+export function explainDecision(c:Candle[],s:Structure,id:string,hit:PatternHit|null):{summary:string;checks:{ok:boolean;label:string;value?:string}[]} {
+ const z=c.length-1,b=c[z],p=c[z-1],atr=s.atr14;
+ const prior=c.slice(z-20,z),vr=avgVolume(prior)>0?b.v/avgVolume(prior):0;
+ const checks:{ok:boolean;label:string;value?:string}[]=[];
+ const check=(ok:boolean,label:string,value?:string)=>{checks.push({ok,label,value});return ok;};
+ if(!Number.isFinite(atr)||atr<=0||c.length<65)return {summary:'Недостатъчно валидни данни за оценка.',checks:[]};
+ if(id==='TRIANGLE_DOWN'||id==='TRIANGLE_UP'){
+  const side:Side=id==='TRIANGLE_DOWN'?'SHORT':'LONG';
+  const hs=pivots(c,z-28,z-3,'H'),ls=pivots(c,z-28,z-3,'L');
+  if(!check(hs.length>=2&&ls.length>=2,'Поне два потвърдени локални върха и две дъна',`върхове ${hs.length}, дъна ${ls.length}`))
+   return {summary:'V2 отхвърля: няма достатъчно потвърдени pivot върхове/дъна за две трендлинии.',checks};
+  // V2 tests every eligible recent pair. Show the best-progressing pair and its exact first failing gate.
+  let best:{passed:number;checks:typeof checks;reason:string}|null=null;
+  for(let h=hs.length-1;h>=1;h--)for(let l=ls.length-1;l>=1;l--){
+   const local:typeof checks=[];
+   const gate=(ok:boolean,label:string,value?:string)=>{local.push({ok,label,value});return ok;};
+   const h1=hs[h-1],h2=hs[h],l1=ls[l-1],l2=ls[l];
+   const start=Math.max(h1.i,l1.i),end=Math.min(h2.i,l2.i);
+   let reason='';
+   if(!gate(end-start>=5&&Math.abs(h2.i-l2.i)<=10,'Достатъчно припокриване на линиите (≥5 свещи) и близки последни pivots',`overlap=${end-start}, gap=${Math.abs(h2.i-l2.i)}`))reason='Невалидна геометрия/разположение на pivot точките.';
+   const us=(h2.px-h1.px)/(h2.i-h1.i),lslope=(l2.px-l1.px)/(l2.i-l1.i);
+   if(!reason&&!gate(us<-0.015*atr&&lslope>0.015*atr,'Понижаващи се върхове И повишаващи се дъна',`upper=${(us/atr).toFixed(3)} ATR/bar, lower=${(lslope/atr).toFixed(3)} ATR/bar`))reason='Линиите не се свиват в симетричен триъгълник.';
+   const wStart=line(h1,h2,start)-line(l1,l2,start),wNow=line(h1,h2,z)-line(l1,l2,z);
+   if(!reason&&!gate(wStart>=1.3*atr&&wNow>0.2*atr&&wNow<0.85*wStart,'Валидно свиване на ширината',`start=${(wStart/atr).toFixed(2)} ATR, now=${(wNow/atr).toFixed(2)} ATR`))reason='Недостатъчно/прекомерно свиване или вече пресечени линии.';
+   const apex=(l1.px-h1.px+us*h1.i-lslope*l1.i)/(us-lslope);
+   if(!reason&&!gate(Number.isFinite(apex)&&apex>=z-2&&apex<=z+35,'Apex близо до пробива',`след ${(apex-z).toFixed(1)} свещи`))reason='Върхът на триъгълника е извън допустимия прозорец.';
+   const first=Math.min(h1.i,l1.i),last=Math.max(h2.i,l2.i);
+   let breaches=0;
+   for(let i=first+2;i<last;i++){const top=line(h1,h2,i),bottom=line(l1,l2,i);if(c[i].c>top+0.2*atr||c[i].c<bottom-0.2*atr)breaches++;}
+   if(!reason&&!gate(breaches<=1,'Максимум едно преждевременно нарушение на линиите',`нарушения ${breaches}`))reason='Има твърде много затваряния извън триъгълника преди пробива.';
+   const bound=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z),prevBound=line(side==='LONG'?h1:l1,side==='LONG'?h2:l2,z-1);
+   const crossed=side==='LONG'?bull(b)&&b.c>bound+0.1*atr&&p.c<=prevBound+0.1*atr:bear(b)&&b.c<bound-0.1*atr&&p.c>=prevBound-0.1*atr;
+   if(!reason&&!gate(crossed,'Нов пробив с 0.10 ATR отвъд линията, потвърден със затваряне',`close=${b.c.toFixed(5)}, boundary=${bound.toFixed(5)}`))reason='Няма нов потвърден пробив отвъд трендлинията.';
+   if(!reason&&!gate(body(b)/span(b)>=0.5,'Тяло на пробивната свещ ≥50% от диапазона',`${(100*body(b)/span(b)).toFixed(1)}%`))reason='Пробивната свещ е твърде слаба.';
+   if(!reason&&!gate(Math.abs(b.c-bound)<=2.5*atr,'Пробивът не е прекомерно отдалечен (>2.5 ATR)',`${(Math.abs(b.c-bound)/atr).toFixed(2)} ATR`))reason='Пробивът е прекалено разтегнат.';
+   const passed=local.filter(x=>x.ok).length;
+   if(!best||passed>best.passed)best={passed,checks:local,reason};
+  }
+  if(best)checks.push(...best.checks);
+  check(vr>=1.3,'Обем при пробива ≥1.30× средния за предишните 20 свещи',`${vr.toFixed(2)}×`);
+  const firstFail=checks.find(x=>!x.ok);
+  return {summary:hit?'V2 приема: геометрията, пробивът и обемът покриват условията.':firstFail?'V2 отказва: '+firstFail.label+'.':'V2 отказва: няма комбинация от pivot линии, която изпълнява всички условия.',checks};
+ }
+ const trend=s.direction;
+ check(vr>=1.15,'Обем поне 1.15× (общ диагностичен ориентир, НЕ универсално правило)',vr.toFixed(2)+'×');
+ check(body(b)/span(b)>=0.45,'Тяло ≥45% от диапазона (ориентир, НЕ универсално правило)',(100*body(b)/span(b)).toFixed(1)+'%');
+ check(trend!=='NEUTRAL','Определена посока на пазарната структура',trend);
+ return {summary:hit?'Патернът е приет по точните правила на детектора: '+hit.details:'Не са изпълнени всички правила на V2. Показаните показатели са контекст, а НЕ пълен списък с причини за отказ.',checks};
+}
+
 const CATALOG_IDS=[
  'RANGE_BREAKOUT','RANGE_BREAKDOWN','LIQUIDITY_SWEEP_LOW','LIQUIDITY_SWEEP_HIGH',
  'BULL_ENGULF','BEAR_ENGULF','HAMMER','SHOOTING_STAR',
@@ -744,7 +797,7 @@ async function swingPatternCompareData(u:URL){
  const q=quality(data);
  if(!q.ready)throw Error('OHLCV_NOT_READY');
  const bars=data.closed;
- const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null}[]}>=Object.fromEntries(CATALOG_IDS.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
+ const byId:Record<string,{v1:number;v2:number;both:number;v1Only:number;v2Only:number;events:{index:number;time:number;v1:boolean;v2:boolean;v1Details:string|null;v2Details:string|null;v1Explanation:string;v2Explanation:string;v2Checks:{ok:boolean;label:string;value?:string}[]}[]}>=Object.fromEntries(CATALOG_IDS.map(id=>[id,{v1:0,v2:0,both:0,v1Only:0,v2Only:0,events:[]}]));
  for(let i=64;i<bars.length;i++){
   const prefix=bars.slice(0,i+1),s=structure(prefix);
   const a=detectCatalog(prefix,s,frame),b=PatternCompareV2.detectCatalog(prefix,s,frame);
@@ -753,7 +806,12 @@ async function swingPatternCompareData(u:URL){
    const x=aa.get(id),y=bb.get(id),r=byId[id];
    if(x)r.v1++;if(y)r.v2++;if(x&&y)r.both++;
    if(x&&!y)r.v1Only++;if(y&&!x)r.v2Only++;
-   if(x||y)r.events.push({index:i,time:bars[i].t,v1:!!x,v2:!!y,v1Details:x?.details||null,v2Details:y?.details||null});
+   if(x||y){
+    const explain=PatternCompareV2.explainDecision(prefix,s,id,y||null);
+    r.events.push({index:i,time:bars[i].t,v1:!!x,v2:!!y,v1Details:x?.details||null,v2Details:y?.details||null,
+      v1Explanation:x?'V1 приема: '+x.details:'V1 отказва: конкретната формация не покрива всички условия на оригиналния детектор.',
+      v2Explanation:explain.summary,v2Checks:explain.checks});
+   }
   }
  }
  return {success:true,mode:'READ_ONLY',trading:false,d1_queries:0,coin,interval:frame,quality:q,patterns:byId,candles:bars.map(x=>({t:x.t,o:x.o,h:x.h,l:x.l,c:x.c,v:x.v})),note:'Detection agreement is not predictive accuracy.'};
@@ -771,7 +829,7 @@ svg{width:100%;height:auto;background:#0a1428;border-radius:6px}.summary{display
 </style></head><body><h1>SWING HUNTER · Pattern V1 vs V2</h1>
 <p>Еднакви реални затворени OHLCV свещи · 20 патерна · само диагностика, без D1 или търговия.</p>
 <div class="controls"><select id="coin"></select><select id="frame"><option value="1h">1H</option><option value="4h">4H</option></select><select id="pattern"></select><select id="case"></select><button id="load">Зареди</button></div>
-<div id="status"></div><div class="summary" id="summary"></div>
+<div id="status"></div><details class="panel" style="margin:12px 0"><summary><b>Кои формации са по-полезни за крипто?</b></summary><p>Няма универсално „най-добър“ патерн. За крипто 1H/4H си струва да тестваме отделно: liquidity sweep + reclaim (лов на ликвидност и връщане), breakout + retest с обем, trend pullback в силен тренд, range deviation / failed breakout и volatility squeeze → expansion. Сегашният каталог включва част от тях, но няма изрични модели за failed breakout, squeeze с ATR/volatility regime, multi-timeframe confluence или OI/funding контекст. Това са кандидати за отделна V3, НЕ доказано печеливши сигнали. Не променяме V1/V2 или LIVE.</p></details><div class="summary" id="summary"></div>
 <div class="grid"><section class="panel"><h2>V1 · оригинален</h2><div id="chart1"></div><div id="detail1"></div></section>
 <section class="panel"><h2>V2 · подобрен</h2><div id="chart2"></div><div id="detail2"></div></section></div>
 <p>Важно: графиките показват разпознаване на формации, а не доказана прогностична точност.</p>
@@ -800,7 +858,7 @@ function chart(target,ev,side){
  svg+='<text x="'+(w-175)+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[c.length-1].t).toISOString().slice(0,16)+' UTC</text></svg>';
  $(target).innerHTML=svg;
  const detected=side==='v1'?ev.v1:ev.v2;
- const desc=side==='v1'?ev.v1Details:ev.v2Details;
+ const desc=side==='v1'?ev.v1Explanation:ev.v2Explanation;
  $('detail'+(side==='v1'?1:2)).innerHTML='<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(detected?'РАЗПОЗНАТ':'НЕ Е РАЗПОЗНАТ')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>';
 }
 function render(){
