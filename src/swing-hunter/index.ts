@@ -1010,7 +1010,6 @@ function chart(target,ev,side){
  svg+='<text x="'+left+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[0].t).toISOString().slice(0,16)+' UTC</text>';
  svg+='<text x="'+(w-175)+'" y="'+(h-8)+'" fill="#94a3b8" font-size="12">'+new Date(c[c.length-1].t).toISOString().slice(0,16)+' UTC</text></svg>';
  $(target).innerHTML=svg;
- const classic=result.classicIds.includes($('pattern').value);
  const detected=side==='v1'?ev.v1:ev.v2;
  const desc=side==='v1'?ev.v1Explanation:ev.v2Explanation;
  $('detail'+(side==='v1'?1:2)).innerHTML=(g?'<p style="color:#7dd3fc">Геометрия: '+g.points.length+' контролни точки · '+g.lines.length+' линии · жълто = пробив</p>':'')+'<p style="color:'+(detected?'#4ade80':'#fca5a5')+'">'+(side==='v1'&&classic?'НЯМА V1 ДЕТЕКТОР':detected?'РАЗПОЗНАТ':'НЕ Е РАЗПОЗНАТ')+'</p><p>'+esc(desc||'Няма сигнал по правилата на този детектор')+'</p>';
