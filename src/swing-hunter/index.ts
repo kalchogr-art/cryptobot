@@ -1,7 +1,7 @@
-
 import { swingFilteredRead } from './swing-filter-cache';
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
+import {handleSwingLiveMonitor} from './swing-live-monitor';
 import {swingABDashboard} from './swing-ab-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
@@ -305,21 +305,16 @@ async function swingExecutableV2(env:any,u:URL){
   return [...m.values()];
  }
  const latestShort=newestByCoin(trackingShort),latestLong=newestByCoin(trackingLong);
-  const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
+ const liveResearch=[...latestShort.map(x=>({...x,side:'SHORT'})),...latestLong.map(x=>({...x,side:'LONG'}))];
  const checkedResearch: (Signal & {side:string;verification:string})[]=[];
  const candleCache=new Map<string,any[]>();
  const now=Date.now();
  for(const x of liveResearch){
   let result:Outcome='TRACKING',exit_at:number|null=null,exit_bar_open:number|null=null;
-  let verification='NOT_VERIFIED',net:number|null=null;
+  let verification='NOT_VERIFIED';
   try{
-   // Research horizon is 48h for 1h signals and 72h for 4h signals.
-   // This is independent of Hyperliquid LIVE position exits.
-   const horizon=x.interval==='1h'?48:72;
-   const deadline=x.signal_bar_open+horizon*HOUR;
-   const end=variant==='B'&&x.side==='SHORT'?Math.min(now,deadline):now;
+   // Avoid treating signals older than the available OHLC window as open.
    if(now-x.signal_available_at>220*HOUR){verification='OHLC_WINDOW_TOO_OLD';}
-   else if(x.entry_price===null||x.entry_price<=0){verification='INVALID_ENTRY';}
    else{
     if(!candleCache.has(x.coin)){
      const feed=await fetchClosed(x.coin,'1h',240);
@@ -327,10 +322,12 @@ async function swingExecutableV2(env:any,u:URL){
      candleCache.set(x.coin,feed.closed);
     }
     const all=candleCache.get(x.coin)!;
-    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=end).sort((a:any,b:any)=>a.t-b.t);
-    let expected=x.signal_available_at,contiguous=true;
+    const bars=all.filter((b:any)=>b.t>=x.signal_available_at&&b.t+HOUR<=now).sort((a:any,b:any)=>a.t-b.t);
+    let expected=x.signal_available_at;
+    let contiguous=true;
     for(const b of bars){if(b.t!==expected){contiguous=false;break;}expected+=HOUR;}
     if(!contiguous||(bars.length===0&&now>=x.signal_available_at+HOUR))verification='MISSING_OHLC_BARS';
+    else if(x.entry_price===null||x.entry_price<=0)verification='INVALID_ENTRY';
     else{
      verification='OHLC_1H_TP2_SL1';
      for(const b of bars){
@@ -338,30 +335,18 @@ async function swingExecutableV2(env:any,u:URL){
       const sl=x.side==='SHORT'?b.h>=x.entry_price*1.01:b.l<=x.entry_price*0.99;
       if(tp||sl){
        result=tp&&sl?'AMBIGUOUS':tp?'TP_FIRST':'SL_FIRST';
-       exit_bar_open=b.t;exit_at=b.t+HOUR;
-       net=result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null;
-       break;
+       exit_bar_open=b.t;exit_at=b.t+HOUR;break;
       }
      }
-     // Do not leave a fully observed research window in TRACKING forever.
-     // Require EVERY closed hourly candle up to the research deadline.
-     if(variant==='B'&&x.side==='SHORT'&&result==='TRACKING'&&now>=deadline&&expected===deadline&&bars.length>0){
-      const last=bars[bars.length-1];
-      const close=Number(last.c??last.close);
-      if(Number.isFinite(close)&&close>0){
-       result='TIME_EXIT';exit_at=deadline;exit_bar_open=last.t;
-       const gross=x.side==='SHORT'?(x.entry_price-close)/x.entry_price*100:(close-x.entry_price)/x.entry_price*100;
-       net=Number((gross-0.18).toFixed(5));
-       verification='VERIFIED_FULL_RESEARCH_WINDOW_TIME_EXIT';
-      }else verification='INVALID_FINAL_CLOSE';
-     }else if(variant==='B'&&x.side==='SHORT'&&result==='TRACKING'&&now>=deadline){verification='INCOMPLETE_RESEARCH_WINDOW';}
     }
    }
   }catch(e){verification='OHLC_FETCH_ERROR:'+String(e);}
-  checkedResearch.push({...x,side:x.side,result,net,exit_bar_open,exit_at,exit_precision:verification,verification});
+  checkedResearch.push({...x,side:x.side,result,
+   net:result==='TP_FIRST'?1.82:result==='SL_FIRST'?-1.18:null,
+   exit_bar_open,exit_at,exit_precision:verification,verification});
  }
  const trackingOnly=checkedResearch.filter(x=>x.result==='TRACKING');
- const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST'||x.result==='TIME_EXIT');
+ const recentlyResolved=checkedResearch.filter(x=>x.result==='TP_FIRST'||x.result==='SL_FIRST');
 
  // Data-source diagnostic: distinguish empty DB, missing regime, and empty replay.
  const sourceRow=await d.prepare(`SELECT COUNT(*) AS total,
@@ -423,7 +408,25 @@ async function swingExecutableV2(env:any,u:URL){
  const visibleAll=[...combined.values()];
  const skippedVisible=skipped.filter(inScope);
  const visible=status==='SKIPPED_ALREADY_OPEN'?skippedVisible:visibleAll.filter(s=>!status||s.result===status);
- const selected=visible;
+ // LIVE exchange overlay for Variant B display ONLY. Research cohorts, filters,
+ // replay results and statistics remain unchanged. Match exact crossing_id.
+ // A missing/unavailable LIVE DB must never be mistaken for a closed position.
+ const pageRows=visible.slice().sort((a,b)=>b.signal_available_at-a.signal_available_at).slice((page-1)*limit,page*limit);
+ let liveByCrossing=new Map<string,{status:string;close_reason:string|null}>();
+ if(variant==='B' && env.DB?.prepare && pageRows.length){
+  const ids=pageRows.map(s=>`SWING:SHORT:${s.coin}:${s.interval}:${s.signal_bar_open}`);
+  try{
+   const result=await env.DB.prepare(`SELECT crossing_id,status,close_reason
+     FROM hyperliquid_execution_ledger WHERE crossing_id IN (${ids.map(()=>'?').join(',')})`)
+    .bind(...ids).all();
+   liveByCrossing=new Map((result.results||[]).map((r:any)=>[String(r.crossing_id),
+    {status:String(r.status),close_reason:r.close_reason==null?null:String(r.close_reason)}]));
+  }catch(e){console.warn('SWING_LIVE_OVERLAY_UNAVAILABLE',String(e));}
+ }
+ const selected=variant==='B'?pageRows.map(s=>{
+  const live=liveByCrossing.get(`SWING:SHORT:${s.coin}:${s.interval}:${s.signal_bar_open}`);
+  return {...s,live_status:live?.status??null,live_close_reason:live?.close_reason??null};
+ }):pageRows;
  const tp=visibleAll.filter(s=>s.result==='TP_FIRST').length,sl=visibleAll.filter(s=>s.result==='SL_FIRST').length;
  const timed=visibleAll.filter(s=>s.result==='TIME_EXIT'&&s.net!==null);
  const timeWin=timed.filter(s=>Number(s.net)>0).length,timeLoss=timed.filter(s=>Number(s.net)<0).length,timeFlat=timed.length-timeWin-timeLoss;
@@ -513,6 +516,9 @@ async function swingEntryCounters(env:any,u:URL){
 export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise<Response>{
  const env=_env as any;
  const u=new URL(req.url);
+ // LIVE monitor routes are read-only and independent from research.
+ const liveMonitorResponse=await handleSwingLiveMonitor(req,env);
+ if(liveMonitorResponse)return liveMonitorResponse;
  if(req.method==='GET'&&u.pathname==='/api/swing/v19/materialized'){
   if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'TOKEN_NOT_CONFIGURED'},503);
   if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
