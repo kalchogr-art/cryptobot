@@ -3016,6 +3016,61 @@ const SWING_SHORT_B_STRATEGY='SWING_SHORT_DOUBLE_MIXED_B_V1';
 const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_SHORT_B_STRATEGY,SWING_LONG_STRATEGY];
 const SWING_PATTERNS=new Set(['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
  'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT']);
+// Historical 1H LONG selections: market regime -> pattern -> TP/SL (percent).
+// No change to SHORT or 4H. These are research-derived, not guaranteed returns.
+const SWING_LONG_1H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
+ LONG_REGIME:{
+  V3_CUP_HANDLE:{tp:2,sl:1.5},V3_BULL_FLAG:{tp:2,sl:1},
+  MOMENTUM_REVERSAL_LONG:{tp:2,sl:0.75},V3_TRIPLE_BOTTOM:{tp:0.5,sl:0.5},
+  HAMMER:{tp:2,sl:0.3}
+ },
+ SHORT_REGIME:{
+  TRIANGLE_UP:{tp:2,sl:0.75},V3_FALLING_WEDGE:{tp:1.5,sl:1.5},
+  V2_BULL_ENGULF:{tp:0.75,sl:1.5},RANGE_BREAKOUT:{tp:2,sl:1.5},
+  LIQUIDITY_SWEEP_LOW:{tp:2,sl:0.3}
+ },
+ NEUTRAL:{EMA_PULLBACK_LONG:{tp:1,sl:1}}
+};
+// Derive regime using only 1H signals in the 24 *completed* preceding hours
+// that had actually been created by the signal's availability timestamp.
+// Fail closed if timestamps are unavailable or ambiguous.
+async function swingLongRegimeAt(db:any,at:number):Promise<string|null>{
+ if(!Number.isFinite(at)||at<=0)return null;
+ const hour=Math.floor(at/3600000)*3600000;
+ const result:any=await db.prepare(`SELECT
+ SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS longs,
+ SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS shorts
+ FROM swing_context_signals
+ WHERE interval='1h' AND side IN ('LONG','SHORT')
+ AND signal_available_at>=? AND signal_available_at<?
+ AND created_at IS NOT NULL AND unixepoch(created_at) IS NOT NULL
+ AND unixepoch(created_at)*1000<=?`)
+ .bind(hour-24*3600000,hour,at).first();
+ const l=Number(result?.longs??0),sh=Number(result?.shorts??0),total=l+sh;
+ if(total<10)return null;
+ if(l/total>=0.60)return 'LONG_REGIME';
+ if(sh/total>=0.60)return 'SHORT_REGIME';
+ return 'NEUTRAL';
+}
+function swingLongPick(regime:string,patterns:string[]):{pattern:string;tp:number;sl:number}|null{
+ const rules=SWING_LONG_1H_RULES[regime];if(!rules)return null;
+ // Stable selection for simultaneous patterns: first in explicit ranked rule order.
+ for(const [pattern,params] of Object.entries(rules))
+  if(patterns.includes(pattern))return {pattern,...params};
+ return null;
+}
+async function swingLongQueueRule(db:any,row:any):Promise<{pattern:string;tp:number;sl:number;regime:string}|null>{
+ if(String(row.side)!=='LONG')return null;
+ if(!/^SWING:LONG:[^:]+:1h:/.test(String(row.signal_key)))return null;
+ const at=Number(row.signal_available_at);
+ const regime=await swingLongRegimeAt(db,at);
+ if(!regime)return null;
+ let patterns:string[]=[];
+ try{const v=JSON.parse(String(row.patterns_json));if(Array.isArray(v))patterns=v.map(String);}catch{}
+ const picked=swingLongPick(regime,patterns);
+ if(!picked)return null;
+ return {...picked,regime};
+}
 const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000;
 // Swing holding periods are measured from the confirmed LIVE entry fill, not signal time.
 const SWING_HOLD_1H_MS=48*60*60_000;
@@ -3033,7 +3088,7 @@ function swingTelegramMeta(key:string,side:string,patterns:any){
   `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} · ${side==='SHORT'?'DOUBLE MIXED B':'FILTERED'}</b>`,
   `🔎 Pattern: ${escapeTelegramHtml(names||'n/a')}`,
   `🕒 Timeframe: ${escapeTelegramHtml(match?.[2]??'n/a')}`,
-  `₿ BTC 1H: MIXED${side==='SHORT'?' · BTC 4H: MIXED':''}`, 
+  side==='SHORT'?'₿ BTC 1H: MIXED · BTC 4H: MIXED':'📈 LONG 1H: regime-based TP/SL',
   `🆔 Signal: ${escapeTelegramHtml(key)}`
  ];
 }
@@ -3046,8 +3101,8 @@ function swingEntryTelegram(a:{coin:string;side:string;key:string;patterns:any;p
   `💰 Margin target: $${CONFIG.BASE_MARGIN_USD.toFixed(2)}`,
   `⚙️ ${CONFIG.IS_CROSS?'CROSS':'ISOLATED'} ${a.leverage}x (asset cap applied)`,
   `📊 Filled notional: $${(a.px*a.sz).toFixed(4)}`,
-  `🟢 TP +2%: ${escapeTelegramHtml(a.tp)}`,
-  `🔴 SL −1%: ${escapeTelegramHtml(a.sl)}`,
+  `🟢 TP: ${escapeTelegramHtml(a.tp)}`,
+  `🔴 SL: ${escapeTelegramHtml(a.sl)}`,
   `🛡 Protection: ${a.protectedOk?'CONFIRMED':'UNCONFIRMED — CHECK EXCHANGE'}`,
   ...(!a.protectedOk?[`⚠️ ${escapeTelegramHtml(a.reason)}`]:[]),
   `🕐 ${new Date().toISOString()}`].join('\n');
@@ -3081,6 +3136,10 @@ async function swingSchema(db:any){
  const columns:any=await db.prepare('PRAGMA table_info(swing_live_queue)').all();
  if(!(columns.results??[]).some((c:any)=>c.name==='side'))
   await db.prepare("ALTER TABLE swing_live_queue ADD COLUMN side TEXT NOT NULL DEFAULT 'SHORT'").run();
+ for(const [name,type] of [['market_regime','TEXT'],['selected_pattern','TEXT'],['tp_pct','REAL'],['sl_pct','REAL']]){
+  if(!(columns.results??[]).some((c:any)=>c.name===name))
+   await db.prepare(`ALTER TABLE swing_live_queue ADD COLUMN ${name} ${type}`).run();
+ }
 }
 // Persist confirmed protection order identifiers; no blind TP/SL resubmission.
 async function swingProtectionSchema(db:any){
@@ -3131,8 +3190,12 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  const size=(o:any)=>Number(o.sz??o.size??o.origSz);
  const priceNear=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&b>0&&
    Math.abs(a-b)<=Math.max(b*0.0001,1e-10);
- const targetTp=entry*(side==='SHORT'?0.98:1.02);
- const targetSl=entry*(side==='SHORT'?1.01:0.99);
+ const q:any=await db.prepare('SELECT tp_pct,sl_pct FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+ const tpPct=side==='LONG'?Number(q?.tp_pct??2):2;
+ const slPct=side==='LONG'?Number(q?.sl_pct??1):1;
+ if(!(tpPct>0&&slPct>0))return {ok:false,reason:'INVALID_SAVED_TPSL'};
+ const targetTp=entry*(side==='SHORT'?1-tpPct/100:1+tpPct/100);
+ const targetSl=entry*(side==='SHORT'?1+slPct/100:1-slPct/100);
  if(!tpOid||!slOid||tpOid===slOid||
     !priceNear(trigger(tp),targetTp)||!priceNear(trigger(sl),targetSl)||
     !qtyNear(size(tp),expected)||!qtyNear(size(sl),expected))
@@ -3197,6 +3260,7 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const side=String(row.side??'SHORT');
  if(side!=='LONG'&&side!=='SHORT')throw Error('INVALID_SWING_SIDE');
  const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_B_STRATEGY;
+ if(side==='LONG'&&!(Number(row.tp_pct)>0&&Number(row.sl_pct)>0))throw Error('MISSING_LONG_REGIME_TPSL');
  if(now>Number(row.expires_at)){await swingExpire(db,key,'EXPIRED_20M');return 'EXPIRED';}
  // Atomic per-coin reservation; no execution if SCALP ledger is unresolved.
  const claim=await db.prepare(`INSERT OR IGNORE INTO swing_coin_owners
@@ -3278,7 +3342,10 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    entry_fill_price=?,entry_fill_size=?,entry_oid=?,entry_filled_at=?,updated_at=? WHERE crossing_id=?`)
    .bind(px,sz,String(fill.oid??''),Date.now(),Date.now(),key).run();
   await swingOwned(db,coin,key,'OPEN');
-  const tp=priceToWire(px*(side==='LONG'?1.02:0.98),decimals),sl=priceToWire(px*(side==='LONG'?0.99:1.01),decimals),wire=toWire(sz,decimals);
+  const tpPct=side==='LONG'?Number(row.tp_pct):2;
+  const slPct=side==='LONG'?Number(row.sl_pct):1;
+  const tp=priceToWire(px*(side==='LONG'?1+tpPct/100:1-tpPct/100),decimals),
+   sl=priceToWire(px*(side==='LONG'?1-slPct/100:1+slPct/100),decimals),wire=toWire(sz,decimals);
   const protection={type:'order',orders:[
    {a,b:side==='SHORT',p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}},
    {a,b:side==='SHORT',p:sl,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:sl,tpsl:'sl'}}}
@@ -3351,11 +3418,15 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const groups=new Map<string,any>();
  for(const item of signals.results??[]){
   const side=String(item.side),pattern=String(item.pattern);
-  if(side==='SHORT'?!SWING_PATTERNS.has(pattern):side==='LONG'?pattern!=='TRIANGLE_UP':true)continue;
-  let c:any;try{c=JSON.parse(String(item.context_json));}catch{continue;}
-  if(c?.btcDirection?.timeframes?.['1h']?.direction!=='MIXED')continue;
-  // Variant B only for SHORT. LONG retains its original BTC 1H MIXED rule.
-  if(side==='SHORT'&&c?.btcDirection?.timeframes?.['4h']?.direction!=='MIXED')continue;
+  if(side==='SHORT'?!SWING_PATTERNS.has(pattern):side==='LONG'?item.interval!=='1h':true)continue;
+  if(side==='LONG'){
+   // No BTC MIXED requirement for LONG. Select pattern only after regime classification.
+   if(!Object.values(SWING_LONG_1H_RULES).some(r=>pattern in r))continue;
+  }else{
+   let c:any;try{c=JSON.parse(String(item.context_json));}catch{continue;}
+   if(c?.btcDirection?.timeframes?.['1h']?.direction!=='MIXED')continue;
+   if(c?.btcDirection?.timeframes?.['4h']?.direction!=='MIXED')continue;
+  }
   // One candidate per coin, side, interval and candle. Coin ownership is global at execution.
   const key=`SWING:${side}:${item.coin}:${item.interval}:${item.signal_bar_open}`;
   if(!groups.has(key))groups.set(key,{...item,patterns:new Set<string>()});
@@ -3363,11 +3434,22 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  }
  for(const [key,item] of groups){
   if(!Number.isFinite(Number(item.reference_price))||Number(item.reference_price)<=0)continue;
+  let rule:any=null;
+  if(item.side==='LONG'){
+   const regime=await swingLongRegimeAt(env.SWING_DB??db,Number(item.signal_available_at));
+   if(!regime)continue;
+   const selected=swingLongPick(regime,[...item.patterns]);
+   if(!selected)continue;
+   rule={...selected,regime};
+  }
   await db.prepare(`INSERT OR IGNORE INTO swing_live_queue
    (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at)
    VALUES (?,?,?,?,?,?,?,'WAITING_POSITION',?,?,?)`)
    .bind(key,item.coin,item.side,item.signal_available_at,item.signal_bar_open,item.reference_price,
     JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now).run();
+  if(rule)await db.prepare(`UPDATE swing_live_queue SET market_regime=?,selected_pattern=?,tp_pct=?,sl_pct=?
+   WHERE signal_key=? AND status='WAITING_POSITION' AND market_regime IS NULL`)
+   .bind(rule.regime,rule.pattern,rule.tp,rule.sl,key).run();
  }
  await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',
   reason=CASE WHEN reason IS NULL OR reason='' THEN '20M_TIMEOUT'
@@ -3383,6 +3465,16 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  if(Number(unsafe?.n??0)>0)return {ok:false,live:false,reason:'UNRESOLVED_SWING_PROTECTION_BLOCKS_NEW_ENTRIES',unresolved:Number(unsafe.n),orders_sent:0};
  const entered=[];
  for(const row of due.results??[]){
+  if(String(row.side)==='LONG'){
+   const rule=await swingLongQueueRule(env.SWING_DB??db,row);
+   if(!rule||String(row.market_regime)!==rule.regime||
+      String(row.selected_pattern)!==rule.pattern||
+      Number(row.tp_pct)!==rule.tp||Number(row.sl_pct)!==rule.sl){
+    await swingExpire(db,String(row.signal_key),'REJECTED_LONG_REGIME_RULE_MISMATCH');
+    entered.push({coin:row.coin,result:'REJECTED_LONG_REGIME_RULE_MISMATCH'});
+    continue;
+   }
+  }
   if(String(row.side)==='SHORT'){
    // Revalidate persisted WAITING_POSITION records from the previous strategy.
    // Fail closed if the original D1 context is missing, inconsistent, or no longer B-eligible.
@@ -3499,9 +3591,12 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const pnl=lifecyclePnlFromFills(fills,Number(row.entry_filled_at),Number(row.entry_fill_price),
      Number(exit.px),Number(row.entry_fill_size),side);
    if(pnl.netPnl==null)throw Error('NET_PNL_UNAVAILABLE');
+   const savedRule:any=await db.prepare('SELECT tp_pct,sl_pct FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+   const tpPct=side==='LONG'?Number(savedRule?.tp_pct??2):2;
+   const slPct=side==='LONG'?Number(savedRule?.sl_pct??1):1;
    const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
-    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*1.02:Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
-    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*0.99:Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER';
+    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
+    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER';
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
     close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=?`)
     .bind(Number(exit.time),closeReason,Number(exit.px),pnl.netPnl,Date.now(),row.id).run();
