@@ -10,7 +10,7 @@ import { structure } from './market-structure';
 import { detectCatalog, detectClassicalCatalog, PatternCompareV2 } from './pattern-catalog';
 import { collectContext } from './context';
 
-const NEW_SIGNALS_ENABLED = false; // Resume collection, retain historical D1 rows.
+const NEW_SIGNALS_ENABLED = true; // Resume collection, retain historical D1 rows.
 const TPS = [0.3, 0.5, 0.75, 1, 1.5, 2];
 const SLS = [0.3, 0.5, 0.75, 1, 1.5];
 const HOUR = 3_600_000;
