@@ -3014,8 +3014,39 @@ const SWING_LONG_STRATEGY='SWING_LONG_FILTERED_V1';
 const SWING_SHORT_B_STRATEGY='SWING_SHORT_DOUBLE_MIXED_B_V1';
 // Preserve the legacy SHORT strategy for monitoring/closing existing positions.
 const SWING_STRATEGIES=[SWING_SHORT_STRATEGY,SWING_SHORT_B_STRATEGY,SWING_LONG_STRATEGY];
-const SWING_PATTERNS=new Set(['DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF',
- 'VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT']);
+// SHORT legacy pattern allowlist removed: only the researched 1H regime rules apply.
+const SWING_SHORT_1H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
+ LONG_REGIME:{
+  RANGE_BREAKDOWN:{tp:2,sl:1.5},BREAKOUT_RETEST_SHORT:{tp:2,sl:1.5},
+  DOUBLE_TOP:{tp:2,sl:1},V2_BEAR_ENGULF:{tp:2,sl:1.5},
+  V2_SHOOTING_STAR:{tp:2,sl:1.5}
+ },
+ SHORT_REGIME:{
+  SHOOTING_STAR:{tp:1.5,sl:1.5},BREAKOUT_RETEST_SHORT:{tp:2,sl:1.5},
+  LIQUIDITY_SWEEP_HIGH:{tp:1.5,sl:1},TRIANGLE_DOWN:{tp:2,sl:1.5},
+  EMA_PULLBACK_SHORT:{tp:2,sl:1.5}
+ },
+ NEUTRAL:{
+  V2_DOUBLE_TOP:{tp:2,sl:0.75},DOUBLE_TOP:{tp:2,sl:1.5},
+  V3_INVERSE_CUP_HANDLE:{tp:2,sl:0.5},VOLUME_EXPANSION_SHORT:{tp:2,sl:1.5},
+  RANGE_BREAKDOWN:{tp:2,sl:1.5}
+ }
+};
+// Selected 4H SHORT rules from resolved hypothetical scenarios.
+// SHORT_REGIME intentionally has no 4H SHORT entries (all ranked averages negative).
+const SWING_SHORT_4H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
+ LONG_REGIME:{
+  MOMENTUM_REVERSAL_SHORT:{tp:2,sl:0.3},
+  BEAR_ENGULF:{tp:2,sl:1},
+  LIQUIDITY_SWEEP_HIGH:{tp:2,sl:1.5}
+ },
+ NEUTRAL:{
+  EMA_PULLBACK_SHORT:{tp:2,sl:1.5},
+  TRIANGLE_DOWN:{tp:2,sl:1.5},
+  MOMENTUM_REVERSAL_SHORT:{tp:2,sl:1.5},
+  BEAR_ENGULF:{tp:0.5,sl:1}
+ }
+};
 // Historical 1H LONG selections: market regime -> pattern -> TP/SL (percent).
 // No change to SHORT or 4H. These are research-derived, not guaranteed returns.
 const SWING_LONG_1H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
@@ -3030,6 +3061,12 @@ const SWING_LONG_1H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
   LIQUIDITY_SWEEP_LOW:{tp:2,sl:0.3}
  },
  NEUTRAL:{EMA_PULLBACK_LONG:{tp:1,sl:1}}
+};
+// Selected 4H LONG reversal only. Other 4H LONG patterns remain disabled.
+// Historical hypothetical outcomes: LONG 5/6 TP, SHORT 15/18 TP; each cohort spans one day.
+const SWING_LONG_4H_RULES:Record<string,Record<string,{tp:number;sl:number}>>={
+ LONG_REGIME:{MOMENTUM_REVERSAL_LONG:{tp:2,sl:1}},
+ SHORT_REGIME:{MOMENTUM_REVERSAL_LONG:{tp:1.5,sl:1.5}}
 };
 // Derive regime using only 1H signals in the 24 *completed* preceding hours
 // that had actually been created by the signal's availability timestamp.
@@ -3052,8 +3089,8 @@ async function swingLongRegimeAt(db:any,at:number):Promise<string|null>{
  if(sh/total>=0.60)return 'SHORT_REGIME';
  return 'NEUTRAL';
 }
-function swingLongPick(regime:string,patterns:string[]):{pattern:string;tp:number;sl:number}|null{
- const rules=SWING_LONG_1H_RULES[regime];if(!rules)return null;
+function swingLongPick(regime:string,patterns:string[],interval:'1h'|'4h'):{pattern:string;tp:number;sl:number}|null{
+ const rules=(interval==='4h'?SWING_LONG_4H_RULES:SWING_LONG_1H_RULES)[regime];if(!rules)return null;
  // Stable selection for simultaneous patterns: first in explicit ranked rule order.
  for(const [pattern,params] of Object.entries(rules))
   if(patterns.includes(pattern))return {pattern,...params};
@@ -3061,15 +3098,31 @@ function swingLongPick(regime:string,patterns:string[]):{pattern:string;tp:numbe
 }
 async function swingLongQueueRule(db:any,row:any):Promise<{pattern:string;tp:number;sl:number;regime:string}|null>{
  if(String(row.side)!=='LONG')return null;
- if(!/^SWING:LONG:[^:]+:1h:/.test(String(row.signal_key)))return null;
+ const interval=String(row.signal_key).split(':')[3];
+ if(interval!=='1h'&&interval!=='4h')return null;
  const at=Number(row.signal_available_at);
  const regime=await swingLongRegimeAt(db,at);
  if(!regime)return null;
  let patterns:string[]=[];
  try{const v=JSON.parse(String(row.patterns_json));if(Array.isArray(v))patterns=v.map(String);}catch{}
- const picked=swingLongPick(regime,patterns);
+ const picked=swingLongPick(regime,patterns,interval as '1h'|'4h');
  if(!picked)return null;
  return {...picked,regime};
+}
+function swingShortPick(regime:string,patterns:string[],interval:'1h'|'4h'):{pattern:string;tp:number;sl:number}|null{
+ const rules=(interval==='4h'?SWING_SHORT_4H_RULES:SWING_SHORT_1H_RULES)[regime];if(!rules)return null;
+ for(const [pattern,params] of Object.entries(rules))
+  if(patterns.includes(pattern))return {pattern,...params};
+ return null;
+}
+async function swingShortQueueRule(db:any,row:any):Promise<{pattern:string;tp:number;sl:number;regime:string}|null>{
+ if(String(row.side)!=='SHORT')return null;
+ const interval=String(row.signal_key).split(':')[3];
+ if(interval!=='1h'&&interval!=='4h')return null;
+ const regime=await swingLongRegimeAt(db,Number(row.signal_available_at));if(!regime)return null;
+ let patterns:string[]=[];
+ try{const v=JSON.parse(String(row.patterns_json));if(Array.isArray(v))patterns=v.map(String);}catch{}
+ const picked=swingShortPick(regime,patterns,interval as '1h'|'4h');return picked?{...picked,regime}:null;
 }
 const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000;
 // Swing holding periods are measured from the confirmed LIVE entry fill, not signal time.
@@ -3080,38 +3133,38 @@ function swingMaxHoldMs(signalKey:string):number|null {
  return tf==='1h'?SWING_HOLD_1H_MS:tf==='4h'?SWING_HOLD_4H_MS:null;
 }
 // Telegram lifecycle for filtered SWING positions only (does not affect SCALP messages).
-function swingTelegramMeta(key:string,side:string,patterns:any){
- let parsed:any=[];try{parsed=JSON.parse(String(patterns??'[]'));}catch{}
- const names=Array.isArray(parsed)?parsed.map(String).join(', '):String(patterns??'');
- const match=/^SWING:(LONG|SHORT):[^:]+:(1h|4h):/.exec(key);
+function swingTelegramMeta(key:string,side:string,meta:{regime?:any;pattern?:any;tpPct?:any;slPct?:any}){
+ const tf=/^SWING:(?:LONG|SHORT):[^:]+:(1h|4h):/.exec(key)?.[1]??'n/a';
+ const pct=(v:any)=>v!=null&&v!==''&&Number.isFinite(Number(v))&&Number(v)>0?`${Number(v)}%`:'n/a';
  return [
-  `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} · ${side==='SHORT'?'DOUBLE MIXED B':'FILTERED'}</b>`,
-  `🔎 Pattern: ${escapeTelegramHtml(names||'n/a')}`,
-  `🕒 Timeframe: ${escapeTelegramHtml(match?.[2]??'n/a')}`,
-  side==='SHORT'?'₿ BTC 1H: MIXED · BTC 4H: MIXED':'📈 LONG 1H: regime-based TP/SL',
+  `📊 Strategy: <b>SWING ${escapeTelegramHtml(side)} ${escapeTelegramHtml(tf.toUpperCase())}</b>`,
+  `🌍 Market regime: ${escapeTelegramHtml(meta.regime??'n/a')}`,
+  `🔎 Selected pattern: ${escapeTelegramHtml(meta.pattern??'n/a')}`,
+  `🎯 TP target: ${escapeTelegramHtml(pct(meta.tpPct))}`,
+  `🛑 SL limit: ${escapeTelegramHtml(pct(meta.slPct))}`,
   `🆔 Signal: ${escapeTelegramHtml(key)}`
  ];
 }
-function swingEntryTelegram(a:{coin:string;side:string;key:string;patterns:any;px:number;sz:number;leverage:number;tp:string;sl:string;protectedOk:boolean;reason:string;}){
+function swingEntryTelegram(a:{coin:string;side:string;key:string;regime:any;pattern:any;tpPct:any;slPct:any;px:number;sz:number;leverage:number;tp:string;sl:string;protectedOk:boolean;reason:string;}){
  return [a.protectedOk?'🟢 <b>SWING LIVE ENTRY · PROTECTED</b>':'🚨 <b>SWING LIVE ENTRY · PROTECTION NOT CONFIRMED</b>',
   '',`🪙 <b>${escapeTelegramHtml(a.coin)}</b> · ${a.side==='LONG'?'📈 LONG':'📉 SHORT'}`,
-  ...swingTelegramMeta(a.key,a.side,a.patterns),
+  ...swingTelegramMeta(a.key,a.side,{regime:a.regime,pattern:a.pattern,tpPct:a.tpPct,slPct:a.slPct}),
   `🎯 Fill: ${escapeTelegramHtml(a.px)}`,
   `📦 Size: ${escapeTelegramHtml(a.sz)}`,
   `💰 Margin target: $${CONFIG.BASE_MARGIN_USD.toFixed(2)}`,
   `⚙️ ${CONFIG.IS_CROSS?'CROSS':'ISOLATED'} ${a.leverage}x (asset cap applied)`,
   `📊 Filled notional: $${(a.px*a.sz).toFixed(4)}`,
-  `🟢 TP: ${escapeTelegramHtml(a.tp)}`,
-  `🔴 SL: ${escapeTelegramHtml(a.sl)}`,
+  `🟢 TP price: ${escapeTelegramHtml(a.tp)}`,
+  `🔴 SL price: ${escapeTelegramHtml(a.sl)}`,
   `🛡 Protection: ${a.protectedOk?'CONFIRMED':'UNCONFIRMED — CHECK EXCHANGE'}`,
   ...(!a.protectedOk?[`⚠️ ${escapeTelegramHtml(a.reason)}`]:[]),
   `🕐 ${new Date().toISOString()}`].join('\n');
 }
-function swingExitTelegram(a:{coin:string;side:string;key:string;patterns:any;entry:number;exit:number;sz:number;reason:string;gross:any;fees:any;net:any;heldMs:number}){
+function swingExitTelegram(a:{coin:string;side:string;key:string;regime:any;pattern:any;tpPct:any;slPct:any;entry:number;exit:number;sz:number;reason:string;gross:any;fees:any;net:any;heldMs:number}){
  const fmt=(v:any)=>v==null||!Number.isFinite(Number(v))?'n/a':'$'+Number(v).toFixed(4);
  return [`🏁 <b>SWING LIVE EXIT · ${escapeTelegramHtml(a.reason)}</b>`,'',
   `🪙 <b>${escapeTelegramHtml(a.coin)}</b> · ${a.side==='LONG'?'📈 LONG':'📉 SHORT'}`,
-  ...swingTelegramMeta(a.key,a.side,a.patterns),
+  ...swingTelegramMeta(a.key,a.side,{regime:a.regime,pattern:a.pattern,tpPct:a.tpPct,slPct:a.slPct}),
   `🎯 Entry: ${escapeTelegramHtml(a.entry)}`,
   `🏁 Exit: ${escapeTelegramHtml(a.exit)}`,
   `📦 Size: ${escapeTelegramHtml(a.sz)}`,
@@ -3121,7 +3174,6 @@ function swingExitTelegram(a:{coin:string;side:string;key:string;patterns:any;en
   `⏱ Held: ${Math.max(0,Math.round(a.heldMs/60000))} min`,
   `🕐 ${new Date().toISOString()}`].join('\n');
 }
-
 
 async function swingSchema(db:any){
  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_coin_owners(
@@ -3190,9 +3242,9 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  const size=(o:any)=>Number(o.sz??o.size??o.origSz);
  const priceNear=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&b>0&&
    Math.abs(a-b)<=Math.max(b*0.0001,1e-10);
- const q:any=await db.prepare('SELECT tp_pct,sl_pct FROM swing_live_queue WHERE signal_key=?').bind(key).first();
- const tpPct=side==='LONG'?Number(q?.tp_pct??2):2;
- const slPct=side==='LONG'?Number(q?.sl_pct??1):1;
+ const q:any=await db.prepare('SELECT tp_pct,sl_pct,market_regime,selected_pattern FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+ const tpPct=Number(q?.tp_pct);
+ const slPct=Number(q?.sl_pct);
  if(!(tpPct>0&&slPct>0))return {ok:false,reason:'INVALID_SAVED_TPSL'};
  const targetTp=entry*(side==='SHORT'?1-tpPct/100:1+tpPct/100);
  const targetSl=entry*(side==='SHORT'?1+slPct/100:1-slPct/100);
@@ -3260,7 +3312,7 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const side=String(row.side??'SHORT');
  if(side!=='LONG'&&side!=='SHORT')throw Error('INVALID_SWING_SIDE');
  const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_B_STRATEGY;
- if(side==='LONG'&&!(Number(row.tp_pct)>0&&Number(row.sl_pct)>0))throw Error('MISSING_LONG_REGIME_TPSL');
+ if(!(Number(row.tp_pct)>0&&Number(row.sl_pct)>0))throw Error('MISSING_SWING_REGIME_TPSL');
  if(now>Number(row.expires_at)){await swingExpire(db,key,'EXPIRED_20M');return 'EXPIRED';}
  // Atomic per-coin reservation; no execution if SCALP ledger is unresolved.
  const claim=await db.prepare(`INSERT OR IGNORE INTO swing_coin_owners
@@ -3342,8 +3394,8 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    entry_fill_price=?,entry_fill_size=?,entry_oid=?,entry_filled_at=?,updated_at=? WHERE crossing_id=?`)
    .bind(px,sz,String(fill.oid??''),Date.now(),Date.now(),key).run();
   await swingOwned(db,coin,key,'OPEN');
-  const tpPct=side==='LONG'?Number(row.tp_pct):2;
-  const slPct=side==='LONG'?Number(row.sl_pct):1;
+  const tpPct=Number(row.tp_pct);
+  const slPct=Number(row.sl_pct);
   const tp=priceToWire(px*(side==='LONG'?1+tpPct/100:1-tpPct/100),decimals),
    sl=priceToWire(px*(side==='LONG'?1-slPct/100:1+slPct/100),decimals),wire=toWire(sz,decimals);
   const protection={type:'order',orders:[
@@ -3387,8 +3439,8 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   await db.prepare(`UPDATE swing_live_queue SET status=?,updated_at=?,reason=? WHERE signal_key=?`)
    .bind(protectedOk?'OPEN':'UNKNOWN',Date.now(),protectedOk?null:protectionReason,key).run();
   // Send only after the actual fill and protection reconciliation are persisted.
-  await sendTelegram(env,swingEntryTelegram({coin,side,key,patterns:row.patterns_json,
-   px,sz,leverage,tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
+  await sendTelegram(env,swingEntryTelegram({coin,side,key,regime:row.market_regime,pattern:row.selected_pattern,
+   tpPct:row.tp_pct,slPct:row.sl_pct,px,sz,leverage,tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
   return protectedOk?'PROTECTED':'TPSL_UNCONFIRMED';
  }catch(err:any){
   const reason=String(err?.message??err);
@@ -3418,14 +3470,14 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const groups=new Map<string,any>();
  for(const item of signals.results??[]){
   const side=String(item.side),pattern=String(item.pattern);
-  if(side==='SHORT'?!SWING_PATTERNS.has(pattern):side==='LONG'?item.interval!=='1h':true)continue;
+  if(!['LONG','SHORT'].includes(side)||!['1h','4h'].includes(String(item.interval)))continue;
   if(side==='LONG'){
    // No BTC MIXED requirement for LONG. Select pattern only after regime classification.
-   if(!Object.values(SWING_LONG_1H_RULES).some(r=>pattern in r))continue;
+   const eligibleRules=item.interval==='4h'?SWING_LONG_4H_RULES:SWING_LONG_1H_RULES;
+   if(!Object.values(eligibleRules).some(r=>pattern in r))continue;
   }else{
-   let c:any;try{c=JSON.parse(String(item.context_json));}catch{continue;}
-   if(c?.btcDirection?.timeframes?.['1h']?.direction!=='MIXED')continue;
-   if(c?.btcDirection?.timeframes?.['4h']?.direction!=='MIXED')continue;
+   const eligibleRules=item.interval==='4h'?SWING_SHORT_4H_RULES:SWING_SHORT_1H_RULES;
+   if(!Object.values(eligibleRules).some(r=>pattern in r))continue;
   }
   // One candidate per coin, side, interval and candle. Coin ownership is global at execution.
   const key=`SWING:${side}:${item.coin}:${item.interval}:${item.signal_bar_open}`;
@@ -3435,10 +3487,12 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  for(const [key,item] of groups){
   if(!Number.isFinite(Number(item.reference_price))||Number(item.reference_price)<=0)continue;
   let rule:any=null;
-  if(item.side==='LONG'){
+  {
    const regime=await swingLongRegimeAt(env.SWING_DB??db,Number(item.signal_available_at));
    if(!regime)continue;
-   const selected=swingLongPick(regime,[...item.patterns]);
+   const selected=item.side==='LONG'
+    ?swingLongPick(regime,[...item.patterns],String(item.interval) as '1h'|'4h')
+    :swingShortPick(regime,[...item.patterns],String(item.interval) as '1h'|'4h');
    if(!selected)continue;
    rule={...selected,regime};
   }
@@ -3476,19 +3530,14 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
    }
   }
   if(String(row.side)==='SHORT'){
-   // Revalidate persisted WAITING_POSITION records from the previous strategy.
-   // Fail closed if the original D1 context is missing, inconsistent, or no longer B-eligible.
-   let eligible=false;
-   try{
-    const verify:any=await (env.SWING_DB??db).prepare(`SELECT COUNT(*) AS n FROM swing_context_signals
-     WHERE coin=? AND interval=? AND side='SHORT' AND signal_bar_open=?
-       AND pattern IN ('DOUBLE_TOP','RANGE_BREAKDOWN','BEAR_ENGULF','VOLUME_EXPANSION_SHORT','MOMENTUM_REVERSAL_SHORT','EMA_PULLBACK_SHORT')
-       AND json_extract(context_json,'$.btcDirection.timeframes."1h".direction')='MIXED'
-       AND json_extract(context_json,'$.btcDirection.timeframes."4h".direction')='MIXED'`)
-       .bind(row.coin,swingMaxHoldMs(String(row.signal_key))===SWING_HOLD_1H_MS?'1h':'4h',row.signal_bar_open).first();
-    eligible=Number(verify?.n??0)>0;
-   }catch{}
-   if(!eligible){await swingExpire(db,String(row.signal_key),'REJECTED_VARIANT_B_DOUBLE_MIXED');entered.push({coin:row.coin,result:'REJECTED_VARIANT_B'});continue;}
+   const rule=await swingShortQueueRule(env.SWING_DB??db,row);
+   if(!rule||String(row.market_regime)!==rule.regime||
+      String(row.selected_pattern)!==rule.pattern||
+      Number(row.tp_pct)!==rule.tp||Number(row.sl_pct)!==rule.sl){
+    await swingExpire(db,String(row.signal_key),'REJECTED_SHORT_REGIME_RULE_MISMATCH');
+    entered.push({coin:row.coin,result:'REJECTED_SHORT_REGIME_RULE_MISMATCH'});
+    continue;
+   }
   }
   entered.push({coin:row.coin,result:await swingEnter(env,row)});
  }
@@ -3591,20 +3640,20 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const pnl=lifecyclePnlFromFills(fills,Number(row.entry_filled_at),Number(row.entry_fill_price),
      Number(exit.px),Number(row.entry_fill_size),side);
    if(pnl.netPnl==null)throw Error('NET_PNL_UNAVAILABLE');
-   const savedRule:any=await db.prepare('SELECT tp_pct,sl_pct FROM swing_live_queue WHERE signal_key=?').bind(key).first();
-   const tpPct=side==='LONG'?Number(savedRule?.tp_pct??2):2;
-   const slPct=side==='LONG'?Number(savedRule?.sl_pct??1):1;
+   const savedRule:any=await db.prepare('SELECT tp_pct,sl_pct,market_regime,selected_pattern FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+   const tpPct=Number(savedRule?.tp_pct);
+   const slPct=Number(savedRule?.sl_pct);
    const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
-    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*0.98)?'TP':
-    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*1.01)?'SL':'OTHER';
+    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*(1-tpPct/100))?'TP':
+    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*(1+slPct/100))?'SL':'OTHER';
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
     close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=?`)
     .bind(Number(exit.time),closeReason,Number(exit.px),pnl.netPnl,Date.now(),row.id).run();
    await db.prepare(`UPDATE swing_live_queue SET status='CLOSED',updated_at=? WHERE signal_key=?`).bind(Date.now(),key).run();
    await db.prepare(`DELETE FROM swing_coin_owners WHERE coin=? AND owner=?`).bind(coin,key).run();
    // Exit notification only after confirmed flat, close fill, and durable CLOSED state.
-   await sendTelegram(env,swingExitTelegram({coin,side,key,patterns:row.setup_name,
-    entry:Number(row.entry_fill_price),exit:Number(exit.px),sz:Number(row.entry_fill_size),
+   await sendTelegram(env,swingExitTelegram({coin,side,key,regime:savedRule?.market_regime,pattern:savedRule?.selected_pattern,
+    tpPct:savedRule?.tp_pct,slPct:savedRule?.sl_pct,entry:Number(row.entry_fill_price),exit:Number(exit.px),sz:Number(row.entry_fill_size),
     reason:closeReason,gross:pnl.grossPnl,fees:pnl.fees,net:pnl.netPnl,
     heldMs:Number(exit.time)-Number(row.entry_filled_at)})).catch(()=>{});
    events.push({coin,status:'CLOSED',net_pnl:pnl.netPnl});
