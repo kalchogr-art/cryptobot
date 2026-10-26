@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 // ============================================================
 // HYPERLIQUID SIGNAL EXECUTION V2.13.1 — LONG SCALE-OUT LIFECYCLE FILL FIX
+// SWING VARIANT A: New queued Swing trades TP +0.5% / SL -1.0%; existing positions unchanged; atomic exit notification claim.
 // V2.17.2: FIX BTC5M/BTC10M progressive + 3m lifecycle allowlists, diagnostic and batch priority.
 // V2.17.1: BTC5M/BTC10M strategy metadata support; BTC1M/BTC3M/BTC5M/BTC10M share the proven Progressive + 3M fallback lifecycle.
 // V2.17.0: BTC3M LIVE strategy metadata support; BTC1M + BTC3M share the proven Progressive + 3M fallback lifecycle.
@@ -3503,7 +3504,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
     JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now).run();
   if(rule)await db.prepare(`UPDATE swing_live_queue SET market_regime=?,selected_pattern=?,tp_pct=?,sl_pct=?
    WHERE signal_key=? AND status='WAITING_POSITION' AND market_regime IS NULL`)
-   .bind(rule.regime,rule.pattern,rule.tp,rule.sl,key).run();
+   .bind(rule.regime,rule.pattern,0.5,1.0,key).run();
  }
  await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',
   reason=CASE WHEN reason IS NULL OR reason='' THEN '20M_TIMEOUT'
@@ -3646,9 +3647,11 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
     (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*(1-tpPct/100))?'TP':
     (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*(1+slPct/100))?'SL':'OTHER';
-   await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
-    close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=?`)
+   // Atomic close claim: overlapping runs must not send duplicate exit Telegram messages.
+   const closeClaim:any=await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
+    close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=? AND status!='CLOSED' AND closed_at IS NULL`)
     .bind(Number(exit.time),closeReason,Number(exit.px),pnl.netPnl,Date.now(),row.id).run();
+   if(Number(closeClaim.meta?.changes??0)!==1)continue;
    await db.prepare(`UPDATE swing_live_queue SET status='CLOSED',updated_at=? WHERE signal_key=?`).bind(Date.now(),key).run();
    await db.prepare(`DELETE FROM swing_coin_owners WHERE coin=? AND owner=?`).bind(coin,key).run();
    // Exit notification only after confirmed flat, close fill, and durable CLOSED state.
