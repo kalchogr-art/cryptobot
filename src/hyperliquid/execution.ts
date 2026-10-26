@@ -3126,6 +3126,22 @@ async function swingShortQueueRule(db:any,row:any):Promise<{pattern:string;tp:nu
  const picked=swingShortPick(regime,patterns,interval as '1h'|'4h');return picked?{...picked,regime}:null;
 }
 const SWING_MAX_WAIT=20*60_000, SWING_RETRY=2*60_000;
+// New Swing entries only. Legacy positions keep their exchange-native TP/SL.
+const SWING_PROGRESSIVE_MODE='PROGRESSIVE_V1';
+const SWING_PROGRESSIVE_TRIGGER=0.50;
+const SWING_PROGRESSIVE_GAP=0.10;
+const SWING_PROGRESSIVE_STEP=0.10;
+const SWING_PROGRESSIVE_INITIAL_SL=1.0;
+function swingIsProgressive(row:any){return String(row?.exit_mode??'')===SWING_PROGRESSIVE_MODE;}
+function swingProgressiveTarget(peak:number):number|null{
+ if(!Number.isFinite(peak)||peak+1e-9<SWING_PROGRESSIVE_TRIGGER)return null;
+ const steps=Math.max(0,Math.floor((peak-SWING_PROGRESSIVE_TRIGGER+1e-9)/SWING_PROGRESSIVE_STEP));
+ return roundTo(SWING_PROGRESSIVE_TRIGGER+steps*SWING_PROGRESSIVE_STEP-SWING_PROGRESSIVE_GAP,6);
+}
+function swingReturnPct(side:string,entry:number,price:number){
+ return (side==='LONG'?(price/entry-1):(1-price/entry))*100;
+}
+
 // Swing holding periods are measured from the confirmed LIVE entry fill, not signal time.
 const SWING_HOLD_1H_MS=48*60*60_000;
 const SWING_HOLD_4H_MS=72*60*60_000;
@@ -3161,14 +3177,25 @@ function swingEntryTelegram(a:{coin:string;side:string;key:string;regime:any;pat
   ...(!a.protectedOk?[`⚠️ ${escapeTelegramHtml(a.reason)}`]:[]),
   `🕐 ${new Date().toISOString()}`].join('\n');
 }
-function swingExitTelegram(a:{coin:string;side:string;key:string;regime:any;pattern:any;tpPct:any;slPct:any;entry:number;exit:number;sz:number;reason:string;gross:any;fees:any;net:any;heldMs:number}){
+function swingExitTelegram(a:{coin:string;side:string;key:string;regime:any;pattern:any;tpPct:any;slPct:any;entry:number;exit:number;sz:number;reason:string;gross:any;fees:any;net:any;heldMs:number;mode?:string;peak?:number|null;locked?:number|null}){
  const fmt=(v:any)=>v==null||!Number.isFinite(Number(v))?'n/a':'$'+Number(v).toFixed(4);
+ const realized=swingReturnPct(a.side,a.entry,a.exit);
+ const margin=Number(a.entry)*Number(a.sz)/CONFIG.TARGET_LEVERAGE;
+ const netRoi=margin>0&&Number.isFinite(Number(a.net))?Number(a.net)/margin*100:null;
  return [`🏁 <b>SWING LIVE EXIT · ${escapeTelegramHtml(a.reason)}</b>`,'',
   `🪙 <b>${escapeTelegramHtml(a.coin)}</b> · ${a.side==='LONG'?'📈 LONG':'📉 SHORT'}`,
   ...swingTelegramMeta(a.key,a.side,{regime:a.regime,pattern:a.pattern,tpPct:a.tpPct,slPct:a.slPct}),
   `🎯 Entry: ${escapeTelegramHtml(a.entry)}`,
   `🏁 Exit: ${escapeTelegramHtml(a.exit)}`,
   `📦 Size: ${escapeTelegramHtml(a.sz)}`,
+  `📈 Реален изход (цена): ${Number.isFinite(realized)?realized.toFixed(4)+'%':'n/a'}`,
+  `💹 NET % върху номинала: ${a.net!=null&&a.entry*a.sz>0?(Number(a.net)/(a.entry*a.sz)*100).toFixed(4)+'%':'n/a'}`,
+  `📊 NET ROI върху ориентировъчен маржин: ${netRoi!==null?netRoi.toFixed(3)+'%':'n/a'}`,
+  ...(a.mode===SWING_PROGRESSIVE_MODE?[
+   `🔒 Progressive: trigger +0.50%, gap 0.10%`,
+   `🚀 Най-висока наблюдавана печалба: ${a.peak!=null?Number(a.peak).toFixed(3)+'%':'n/a'}`,
+   `🛡 Последно потвърден SL: ${a.locked!=null?Number(a.locked).toFixed(3)+'%':'n/a'}`
+  ]:[]),
   `💵 Gross P/L: ${fmt(a.gross)}`,
   `💸 Fees: ${fmt(a.fees)}`,
   `💰 NET P/L: ${fmt(a.net)}`,
@@ -3189,7 +3216,7 @@ async function swingSchema(db:any){
  const columns:any=await db.prepare('PRAGMA table_info(swing_live_queue)').all();
  if(!(columns.results??[]).some((c:any)=>c.name==='side'))
   await db.prepare("ALTER TABLE swing_live_queue ADD COLUMN side TEXT NOT NULL DEFAULT 'SHORT'").run();
- for(const [name,type] of [['market_regime','TEXT'],['selected_pattern','TEXT'],['tp_pct','REAL'],['sl_pct','REAL']]){
+ for(const [name,type] of [['market_regime','TEXT'],['selected_pattern','TEXT'],['tp_pct','REAL'],['sl_pct','REAL'],['exit_mode',"TEXT NOT NULL DEFAULT 'FIXED_TPSL'"]]){
   if(!(columns.results??[]).some((c:any)=>c.name===name))
    await db.prepare(`ALTER TABLE swing_live_queue ADD COLUMN ${name} ${type}`).run();
  }
@@ -3199,6 +3226,10 @@ async function swingProtectionSchema(db:any){
  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_protection_orders(
   signal_key TEXT PRIMARY KEY,coin TEXT NOT NULL,tp_oid TEXT NOT NULL,sl_oid TEXT NOT NULL,
   tp_px TEXT NOT NULL,sl_px TEXT NOT NULL,confirmed_at INTEGER NOT NULL)`).run();
+ const cols:any=await db.prepare('PRAGMA table_info(swing_protection_orders)').all();
+ for(const [name,type] of [['mode',"TEXT NOT NULL DEFAULT 'FIXED_TPSL'"],['peak_pct','REAL'],['locked_pct','REAL'],['progressive_claimed_at','INTEGER']]){
+  if(!(cols.results??[]).some((c:any)=>c.name===name))await db.prepare(`ALTER TABLE swing_protection_orders ADD COLUMN ${name} ${type}`).run();
+ }
 }
 function swingProtectionOid(o:any):string|null {
  const id=o?.oid??o?.orderId;
@@ -3224,6 +3255,8 @@ async function swingProtectionInventory(coin:string){
 // READ ONLY on Hyperliquid: never creates, replaces or cancels orders.
 async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolean;reason:string}>{
  const coin=String(row.coin??'').toUpperCase(),key=String(row.crossing_id??'');
+ const mode:any=await db.prepare('SELECT exit_mode FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+ if(swingIsProgressive(mode))return {ok:false,reason:'PROGRESSIVE_MANUAL_RECONCILIATION_REQUIRED'};
  const side=String(row.side??'').toUpperCase();
  if(side!=='SHORT'&&side!=='LONG')return {ok:false,reason:'INVALID_LEDGER_SIDE'};
  const position=await getOpenPositionForCoin(coin);
@@ -3399,8 +3432,9 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   const slPct=Number(row.sl_pct);
   const tp=priceToWire(px*(side==='LONG'?1+tpPct/100:1-tpPct/100),decimals),
    sl=priceToWire(px*(side==='LONG'?1-slPct/100:1+slPct/100),decimals),wire=toWire(sz,decimals);
+  const progressive=swingIsProgressive(row);
   const protection={type:'order',orders:[
-   {a,b:side==='SHORT',p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}},
+   ...(!progressive?[{a,b:side==='SHORT',p:tp,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:tp,tpsl:'tp'}}}]:[]),
    {a,b:side==='SHORT',p:sl,s:wire,r:true,t:{trigger:{isMarket:true,triggerPx:sl,tpsl:'sl'}}}
   ],grouping:'na'};
   // Never trust only the intended price: detect ALL existing TP/SL orders for the coin.
@@ -3423,15 +3457,15 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
       const px=(o:any)=>Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
       const qty=(o:any)=>Number(o.sz??o.size??o.origSz);
       const near=(a:number,b:number)=>Number.isFinite(a)&&Math.abs(a-b)<=Math.max(b*0.0001,1e-10);
-      const sizesOk=[tpOrder,slOrder].every(o=>o&&Number.isFinite(qty(o))&&Math.abs(qty(o)-sz)<=Math.max(sz*0.001,1e-9));
-      if(verified.same.length===2&&verified.tp.length===1&&verified.sl.length===1&&
-         verified.unknown.length===0&&near(px(tpOrder),Number(tp))&&near(px(slOrder),Number(sl))&&
-         sizesOk&&swingProtectionOid(tpOrder)&&swingProtectionOid(slOrder)){
+      const sizesOk=(progressive?[slOrder]:[tpOrder,slOrder]).every(o=>o&&Number.isFinite(qty(o))&&Math.abs(qty(o)-sz)<=Math.max(sz*0.001,1e-9));
+      if(verified.same.length===(progressive?1:2)&&verified.tp.length===(progressive?0:1)&&verified.sl.length===1&&
+         verified.unknown.length===0&&(progressive||near(px(tpOrder),Number(tp)))&&near(px(slOrder),Number(sl))&&
+         sizesOk&&(progressive||swingProtectionOid(tpOrder))&&swingProtectionOid(slOrder)){
         await db.prepare(`INSERT INTO swing_protection_orders
-          (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at) VALUES (?,?,?,?,?,?,?)`)
-          .bind(key,coin,swingProtectionOid(tpOrder),swingProtectionOid(slOrder),tp,sl,Date.now()).run();
+          (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at,mode) VALUES (?,?,?,?,?,?,?,?)`)
+          .bind(key,coin,progressive?'NONE':swingProtectionOid(tpOrder),swingProtectionOid(slOrder),progressive?'NONE':tp,sl,Date.now(),progressive?SWING_PROGRESSIVE_MODE:'FIXED_TPSL').run();
         protectedOk=true;
-        protectionReason='CONFIRMED_ONE_TP_ONE_SL';
+        protectionReason=progressive?'CONFIRMED_ONE_INITIAL_SL':'CONFIRMED_ONE_TP_ONE_SL';
       }else protectionReason='PROTECTION_COUNT_PRICE_SIZE_OR_OID_MISMATCH_MANUAL_RECONCILIATION';
     }catch(e:any){protectionReason='PROTECTION_RECONCILIATION_FAILED:'+String(e?.message??e);}
   }
@@ -3441,7 +3475,7 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
    .bind(protectedOk?'OPEN':'UNKNOWN',Date.now(),protectedOk?null:protectionReason,key).run();
   // Send only after the actual fill and protection reconciliation are persisted.
   await sendTelegram(env,swingEntryTelegram({coin,side,key,regime:row.market_regime,pattern:row.selected_pattern,
-   tpPct:row.tp_pct,slPct:row.sl_pct,px,sz,leverage,tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
+   tpPct:progressive?'PROGRESSIVE':row.tp_pct,slPct:row.sl_pct,px,sz,leverage,tp:progressive?'NO FIXED TP · Progressive from +0.50%':tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
   return protectedOk?'PROTECTED':'TPSL_UNCONFIRMED';
  }catch(err:any){
   const reason=String(err?.message??err);
@@ -3498,10 +3532,10 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
    rule={...selected,regime};
   }
   await db.prepare(`INSERT OR IGNORE INTO swing_live_queue
-   (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at)
-   VALUES (?,?,?,?,?,?,?,'WAITING_POSITION',?,?,?)`)
+   (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at,exit_mode)
+   VALUES (?,?,?,?,?,?,?,'WAITING_POSITION',?,?,?,?)`)
    .bind(key,item.coin,item.side,item.signal_available_at,item.signal_bar_open,item.reference_price,
-    JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now).run();
+    JSON.stringify([...item.patterns]),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now,SWING_PROGRESSIVE_MODE).run();
   if(rule)await db.prepare(`UPDATE swing_live_queue SET market_regime=?,selected_pattern=?,tp_pct=?,sl_pct=?
    WHERE signal_key=? AND status='WAITING_POSITION' AND market_regime IS NULL`)
    .bind(rule.regime,rule.pattern,0.5,1.0,key).run();
@@ -3524,7 +3558,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
    const rule=await swingLongQueueRule(env.SWING_DB??db,row);
    if(!rule||String(row.market_regime)!==rule.regime||
       String(row.selected_pattern)!==rule.pattern||
-      Number(row.tp_pct)!==rule.tp||Number(row.sl_pct)!==rule.sl){
+      (swingIsProgressive(row)?Number(row.sl_pct)!==1:Number(row.tp_pct)!==0.5||Number(row.sl_pct)!==1.0)){
     await swingExpire(db,String(row.signal_key),'REJECTED_LONG_REGIME_RULE_MISMATCH');
     entered.push({coin:row.coin,result:'REJECTED_LONG_REGIME_RULE_MISMATCH'});
     continue;
@@ -3534,7 +3568,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
    const rule=await swingShortQueueRule(env.SWING_DB??db,row);
    if(!rule||String(row.market_regime)!==rule.regime||
       String(row.selected_pattern)!==rule.pattern||
-      Number(row.tp_pct)!==rule.tp||Number(row.sl_pct)!==rule.sl){
+      (swingIsProgressive(row)?Number(row.sl_pct)!==1:Number(row.tp_pct)!==0.5||Number(row.sl_pct)!==1.0)){
     await swingExpire(db,String(row.signal_key),'REJECTED_SHORT_REGIME_RULE_MISMATCH');
     entered.push({coin:row.coin,result:'REJECTED_SHORT_REGIME_RULE_MISMATCH'});
     continue;
@@ -3543,6 +3577,71 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   entered.push({coin:row.coin,result:await swingEnter(env,row)});
  }
  return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length};
+}
+// Swing progressive: use FAST's add -> exchange visibility -> cancel old sequence.
+// Only new PROGRESSIVE_V1 rows. Never modify legacy bracket positions.
+async function swingAdvanceProgressive(env:HyperliquidExecutionEnv,row:any,position:any,saved:any){
+ const db=env.DB!,coin=String(row.coin).toUpperCase(),side=String(row.side),key=String(row.crossing_id);
+ const entry=Number(row.entry_fill_price),szi=Number(position.szi);
+ if(!(entry>0&&Number.isFinite(szi)&&Math.abs(szi)>0))throw Error('SWING_PROGRESSIVE_POSITION_INVALID');
+ const raw=await postInfo({type:'metaAndAssetCtxs'});
+ const universe=raw?.[0]?.universe??[],ctx=raw?.[1]??[];
+ const asset=universe.findIndex((x:any)=>String(x.name).toUpperCase()===coin);
+ if(asset<0)throw Error('SWING_PROGRESSIVE_ASSET_NOT_FOUND');
+ const decimals=Number(universe[asset].szDecimals),market=Number(ctx[asset]?.midPx??ctx[asset]?.markPx);
+ if(!(market>0))throw Error('SWING_PROGRESSIVE_MARKET_MISSING');
+ const observed=swingReturnPct(side,entry,market);
+ const peak=Math.max(Number.isFinite(Number(saved.peak_pct))?Number(saved.peak_pct):observed,observed);
+ // Record observed maximum even if no protective change is needed.
+ await db.prepare(`UPDATE swing_protection_orders SET peak_pct=MAX(COALESCE(peak_pct,-999),?) WHERE signal_key=? AND mode=?`)
+  .bind(peak,key,SWING_PROGRESSIVE_MODE).run();
+ const target=swingProgressiveTarget(peak);
+ if(target===null||target<=Number(saved.locked_pct??-999)+1e-8)return {status:'TRACKING',peak_pct:peak,locked_pct:saved.locked_pct};
+ // Do not place a stop already crossed by the CURRENT market price.
+ const stopWire=priceToWire(entry*(side==='LONG'?1+target/100:1-target/100),decimals);
+ const stop=Number(stopWire);
+ if((side==='LONG'&&market<=stop)||(side==='SHORT'&&market>=stop))return {status:'PRICE_ALREADY_REVERSED',peak_pct:peak,target_pct:target};
+ // Atomic single-writer claim across overlapping cron runs; stale claims require manual review.
+ const claim:any=await db.prepare(`UPDATE swing_protection_orders SET progressive_claimed_at=?
+  WHERE signal_key=? AND mode=? AND progressive_claimed_at IS NULL AND sl_oid=?`)
+  .bind(Date.now(),key,SWING_PROGRESSIVE_MODE,String(saved.sl_oid)).run();
+ if(Number(claim?.meta?.changes??0)!==1)return {status:'PROGRESSIVE_BUSY'};
+ let mayHaveSent=false;
+ try{
+  const current=await swingProtectionInventory(coin);
+  if(current.same.length!==1||current.sl.length!==1||current.tp.length!==0||
+     swingProtectionOid(current.sl[0])!==String(saved.sl_oid))throw Error('SWING_PROGRESSIVE_OLD_STOP_NOT_UNIQUE');
+  const secret=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  if(!privateKeyFormatOk(secret))throw Error('SWING_PROGRESSIVE_KEY_INVALID');
+  const order={a:asset,b:side==='SHORT',p:stopWire,s:toWire(Math.abs(szi),decimals),r:true,
+   t:{trigger:{isMarket:true,triggerPx:stopWire,tpsl:'sl'}}};
+  mayHaveSent=true;
+  const add=await sendLifecycleSignedAction({type:'order',orders:[order],grouping:'na'},secret);
+  const status=add?.json?.response?.data?.statuses?.[0];
+  const newOid=responseOrderOid(status);
+  if(!(add.httpStatus>=200&&add.httpStatus<300&&add.json?.status==='ok'&&!status?.error&&newOid!==null))
+   throw Error('SWING_PROGRESSIVE_ADD_NOT_CONFIRMED');
+  const after=await swingProtectionInventory(coin);
+  if(after.sl.length!==2||after.tp.length!==0||after.unknown.length!==0||
+     !after.sl.some((o:any)=>swingProtectionOid(o)===String(newOid))||
+     !after.sl.some((o:any)=>swingProtectionOid(o)===String(saved.sl_oid)))
+   throw Error('SWING_PROGRESSIVE_NEW_STOP_NOT_VISIBLE');
+  const cancel=await sendLifecycleSignedAction({type:'cancel',cancels:[{a:asset,o:Number(saved.sl_oid)}]},secret);
+  if(!(cancel.httpStatus>=200&&cancel.httpStatus<300&&cancel.json?.status==='ok'))
+   throw Error('SWING_PROGRESSIVE_OLD_STOP_CANCEL_NOT_CONFIRMED');
+  const final=await swingProtectionInventory(coin);
+  if(final.same.length!==1||final.sl.length!==1||swingProtectionOid(final.sl[0])!==String(newOid))
+   throw Error('SWING_PROGRESSIVE_FINAL_ORDER_MISMATCH');
+  await db.prepare(`UPDATE swing_protection_orders SET sl_oid=?,sl_px=?,locked_pct=?,confirmed_at=?,progressive_claimed_at=NULL
+   WHERE signal_key=? AND mode=? AND sl_oid=?`)
+   .bind(String(newOid),stopWire,target,Date.now(),key,SWING_PROGRESSIVE_MODE,String(saved.sl_oid)).run();
+  return {status:'LOCK_CONFIRMED',peak_pct:peak,locked_pct:target,stop_price:stopWire};
+ }catch(err:any){
+  // Once a request may have reached the exchange, never blindly retry it.
+  // Leave the claim and block new Swing entries pending manual reconciliation.
+  if(!mayHaveSent)await db.prepare(`UPDATE swing_protection_orders SET progressive_claimed_at=NULL WHERE signal_key=?`).bind(key).run();
+  throw err;
+ }
 }
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
@@ -3574,9 +3673,13 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
     // Missing/changed protection blocks new entries; never blindly resubmit.
     const inventory=await swingProtectionInventory(coin);
     const saved:any=await db.prepare(`SELECT * FROM swing_protection_orders WHERE signal_key=?`).bind(key).first();
-    const confirmed=!!saved&&inventory.same.length===2&&inventory.tp.length===1&&inventory.sl.length===1&&
-      swingProtectionOid(inventory.tp[0])===String(saved.tp_oid)&&
-      swingProtectionOid(inventory.sl[0])===String(saved.sl_oid);
+    const progressive=String(saved?.mode??'')===SWING_PROGRESSIVE_MODE;
+    const confirmed=!!saved&&(progressive
+      ?inventory.same.length===1&&inventory.tp.length===0&&inventory.sl.length===1&&
+       swingProtectionOid(inventory.sl[0])===String(saved.sl_oid)&&saved.progressive_claimed_at==null
+      :inventory.same.length===2&&inventory.tp.length===1&&inventory.sl.length===1&&
+       swingProtectionOid(inventory.tp[0])===String(saved.tp_oid)&&
+       swingProtectionOid(inventory.sl[0])===String(saved.sl_oid));
     if(!confirmed){
       await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='TPSL_FAILED_AFTER_RETRIES',
         last_error='SWING_PROTECTION_MISSING_OR_CHANGED_MANUAL_RECONCILIATION',updated_at=? WHERE id=?`)
@@ -3584,6 +3687,18 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
       await sendTelegram(env,`🚨 SWING PROTECTION ALERT · ${escapeTelegramHtml(coin)} · ${escapeTelegramHtml(key)}\nTP/SL missing or changed. New SWING entries blocked. Check Hyperliquid manually.`).catch(()=>{});
       events.push({coin,status:'PROTECTION_ALERT_NO_AUTOMATIC_ORDER'});
       continue;
+    }
+    if(progressive){
+     try{
+      const result=await swingAdvanceProgressive(env,row,position,saved);
+      events.push({coin,status:'PROGRESSIVE',...result});
+     }catch(e:any){
+      await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='TPSL_FAILED_AFTER_RETRIES',last_error=?,updated_at=? WHERE id=?`)
+       .bind('SWING_PROGRESSIVE_REQUIRES_RECONCILIATION:'+String(e?.message??e),Date.now(),row.id).run();
+      await sendTelegram(env,`🚨 SWING PROGRESSIVE ALERT · ${escapeTelegramHtml(coin)}\n${escapeTelegramHtml(String(e?.message??e))}\nCheck live SL orders manually. New Swing entries blocked.`).catch(()=>{});
+      events.push({coin,status:'PROGRESSIVE_ALERT_MANUAL_RECONCILIATION'});
+      continue;
+     }
     }
     // Only verified, protected positions are eligible for an automated timed exit.
     // An ambiguous/failed IOC is never recorded as a closed trade.
@@ -3641,10 +3756,12 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const pnl=lifecyclePnlFromFills(fills,Number(row.entry_filled_at),Number(row.entry_fill_price),
      Number(exit.px),Number(row.entry_fill_size),side);
    if(pnl.netPnl==null)throw Error('NET_PNL_UNAVAILABLE');
-   const savedRule:any=await db.prepare('SELECT tp_pct,sl_pct,market_regime,selected_pattern FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+   const savedRule:any=await db.prepare('SELECT tp_pct,sl_pct,market_regime,selected_pattern,exit_mode FROM swing_live_queue WHERE signal_key=?').bind(key).first();
+   const savedProtection:any=await db.prepare('SELECT mode,peak_pct,locked_pct FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
    const tpPct=Number(savedRule?.tp_pct);
    const slPct=Number(savedRule?.sl_pct);
    const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
+    String(savedProtection?.mode)===SWING_PROGRESSIVE_MODE?'PROGRESSIVE_EXIT':
     (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*(1-tpPct/100))?'TP':
     (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*(1+slPct/100))?'SL':'OTHER';
    // Atomic close claim: overlapping runs must not send duplicate exit Telegram messages.
@@ -3658,7 +3775,7 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    await sendTelegram(env,swingExitTelegram({coin,side,key,regime:savedRule?.market_regime,pattern:savedRule?.selected_pattern,
     tpPct:savedRule?.tp_pct,slPct:savedRule?.sl_pct,entry:Number(row.entry_fill_price),exit:Number(exit.px),sz:Number(row.entry_fill_size),
     reason:closeReason,gross:pnl.grossPnl,fees:pnl.fees,net:pnl.netPnl,
-    heldMs:Number(exit.time)-Number(row.entry_filled_at)})).catch(()=>{});
+    heldMs:Number(exit.time)-Number(row.entry_filled_at),mode:savedProtection?.mode,peak:savedProtection?.peak_pct,locked:savedProtection?.locked_pct})).catch(()=>{});
    events.push({coin,status:'CLOSED',net_pnl:pnl.netPnl});
   }catch(err:any){
    await db.prepare(`UPDATE hyperliquid_execution_ledger SET last_error=?,updated_at=? WHERE id=?`)
