@@ -3768,10 +3768,12 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    const savedProtection:any=await db.prepare('SELECT mode,peak_pct,locked_pct FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
    const tpPct=Number(savedRule?.tp_pct);
    const slPct=Number(savedRule?.sl_pct);
-   const closeReason=String(row.status)==='MAX_HOLD_CLOSING'?'TIME_EXIT':
-    String(savedProtection?.mode)===SWING_PROGRESSIVE_MODE?'PROGRESSIVE_EXIT':
-    (side==='LONG'?Number(exit.px)>=Number(row.entry_fill_price)*(1+tpPct/100):Number(exit.px)<=Number(row.entry_fill_price)*(1-tpPct/100))?'TP':
-    (side==='LONG'?Number(exit.px)<=Number(row.entry_fill_price)*(1-slPct/100):Number(exit.px)>=Number(row.entry_fill_price)*(1+slPct/100))?'SL':'OTHER';
+   // Swing exit classification uses the actual NET result after fees.
+   // Progressive stop orders are protective order mechanics, not an outcome class.
+   // Every confirmed profitable exit is TP; every confirmed losing exit is SL.
+   // A precisely flat result remains BE (neither a win nor a loss).
+   const netResult = Number(pnl.netPnl);
+   const closeReason = netResult > 0 ? 'TP' : netResult < 0 ? 'SL' : 'BE';
    // Atomic close claim: overlapping runs must not send duplicate exit Telegram messages.
    const closeClaim:any=await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='CLOSED',closed_at=?,
     close_reason=?,exit_price=?,realized_pnl=?,updated_at=? WHERE id=? AND status!='CLOSED' AND closed_at IS NULL`)
