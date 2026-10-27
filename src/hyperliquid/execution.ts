@@ -3222,6 +3222,40 @@ async function swingSchema(db:any){
  }
 }
 // Persist confirmed protection order identifiers; no blind TP/SL resubmission.
+// Swing Progressive audit is observational only. Logging failures never block live protection.
+async function swingProgressiveAuditSchema(db:any){
+ await db.prepare(`CREATE TABLE IF NOT EXISTS swing_progressive_history(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_key TEXT NOT NULL,coin TEXT NOT NULL,side TEXT NOT NULL,
+  detected_at INTEGER NOT NULL,confirmed_at INTEGER,
+  entry_price REAL NOT NULL,market_price REAL NOT NULL,
+  observed_pct REAL NOT NULL,peak_pct REAL NOT NULL,
+  old_locked_pct REAL,target_locked_pct REAL,
+  old_sl_price REAL,new_sl_price REAL,
+  old_sl_oid TEXT,new_sl_oid TEXT,
+  event TEXT NOT NULL,error TEXT
+ )`).run();
+ await db.prepare('CREATE INDEX IF NOT EXISTS idx_swing_progressive_history_key ON swing_progressive_history(signal_key,detected_at)').run();
+}
+async function swingProgressiveAudit(db:any,data:any):Promise<number|null>{
+ try{
+  const result:any=await db.prepare(`INSERT INTO swing_progressive_history
+   (signal_key,coin,side,detected_at,confirmed_at,entry_price,market_price,
+    observed_pct,peak_pct,old_locked_pct,target_locked_pct,old_sl_price,new_sl_price,
+    old_sl_oid,new_sl_oid,event,error)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+   .bind(data.key,data.coin,data.side,data.at, data.confirmedAt??null,
+    data.entry,data.market,data.observed,data.peak,data.oldLocked??null,
+    data.target??null,data.oldSl??null,data.newSl??null,
+    data.oldOid??null,data.newOid??null,data.event,data.error??null).run();
+  return Number(result?.meta?.last_row_id??0)||null;
+ }catch{return null;}
+}
+async function swingProgressiveAuditUpdate(db:any,id:number|null,event:string,extras:any={}){
+ if(id===null)return;
+ try{await db.prepare(`UPDATE swing_progressive_history SET event=?,confirmed_at=?,new_sl_oid=?,error=? WHERE id=?`)
+  .bind(event,extras.confirmedAt??null,extras.newOid??null,extras.error??null,id).run();}catch{}
+}
 async function swingProtectionSchema(db:any){
  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_protection_orders(
   signal_key TEXT PRIMARY KEY,coin TEXT NOT NULL,tp_oid TEXT NOT NULL,sl_oid TEXT NOT NULL,
@@ -3604,16 +3638,20 @@ async function swingAdvanceProgressive(env:HyperliquidExecutionEnv,row:any,posit
  await db.prepare(`UPDATE swing_protection_orders SET peak_pct=MAX(COALESCE(peak_pct,-999),?) WHERE signal_key=? AND mode=?`)
   .bind(peak,key,SWING_PROGRESSIVE_MODE).run();
  const target=swingProgressiveTarget(peak);
+ const auditBase={key,coin,side,at:Date.now(),entry,market,observed,peak,
+  oldLocked:Number(saved.locked_pct??0),oldSl:Number(saved.sl_px),oldOid:String(saved.sl_oid),
+  target,newSl:target===null?null:Number(priceToWire(entry*(side==='LONG'?1+target/100:1-target/100),decimals))};
+ const auditId=await swingProgressiveAudit(db,{...auditBase,event:target===null||target<=Number(saved.locked_pct??-999)+1e-8?'OBSERVED_NO_STEP':'STEP_DETECTED'});
  if(target===null||target<=Number(saved.locked_pct??-999)+1e-8)return {status:'TRACKING',peak_pct:peak,locked_pct:saved.locked_pct};
  // Do not place a stop already crossed by the CURRENT market price.
  const stopWire=priceToWire(entry*(side==='LONG'?1+target/100:1-target/100),decimals);
  const stop=Number(stopWire);
- if((side==='LONG'&&market<=stop)||(side==='SHORT'&&market>=stop))return {status:'PRICE_ALREADY_REVERSED',peak_pct:peak,target_pct:target};
+ if((side==='LONG'&&market<=stop)||(side==='SHORT'&&market>=stop)){await swingProgressiveAuditUpdate(db,auditId,'PRICE_ALREADY_REVERSED');return {status:'PRICE_ALREADY_REVERSED',peak_pct:peak,target_pct:target};}
  // Atomic single-writer claim across overlapping cron runs; stale claims require manual review.
  const claim:any=await db.prepare(`UPDATE swing_protection_orders SET progressive_claimed_at=?
   WHERE signal_key=? AND mode=? AND progressive_claimed_at IS NULL AND sl_oid=?`)
   .bind(Date.now(),key,SWING_PROGRESSIVE_MODE,String(saved.sl_oid)).run();
- if(Number(claim?.meta?.changes??0)!==1)return {status:'PROGRESSIVE_BUSY'};
+ if(Number(claim?.meta?.changes??0)!==1){await swingProgressiveAuditUpdate(db,auditId,'PROGRESSIVE_BUSY');return {status:'PROGRESSIVE_BUSY'};}
  let mayHaveSent=false;
  try{
   const current=await swingProtectionInventory(coin);
@@ -3643,17 +3681,19 @@ async function swingAdvanceProgressive(env:HyperliquidExecutionEnv,row:any,posit
   await db.prepare(`UPDATE swing_protection_orders SET sl_oid=?,sl_px=?,locked_pct=?,confirmed_at=?,progressive_claimed_at=NULL
    WHERE signal_key=? AND mode=? AND sl_oid=?`)
    .bind(String(newOid),stopWire,target,Date.now(),key,SWING_PROGRESSIVE_MODE,String(saved.sl_oid)).run();
+  await swingProgressiveAuditUpdate(db,auditId,'LOCK_CONFIRMED',{confirmedAt:Date.now(),newOid:String(newOid)});
   return {status:'LOCK_CONFIRMED',peak_pct:peak,locked_pct:target,stop_price:stopWire};
  }catch(err:any){
   // Once a request may have reached the exchange, never blindly retry it.
   // Leave the claim and block new Swing entries pending manual reconciliation.
+  await swingProgressiveAuditUpdate(db,auditId,'LOCK_ERROR',{error:String(err?.message??err)});
   if(!mayHaveSent)await db.prepare(`UPDATE swing_protection_orders SET progressive_claimed_at=NULL WHERE signal_key=?`).bind(key).run();
   throw err;
  }
 }
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
- const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);
+ const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);await swingProgressiveAuditSchema(db).catch(()=>{});
  // Recover only previously failed Swing protection, after full live exchange verification.
  // A failed or ambiguous check keeps the global entry lock in place.
  const failed:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
