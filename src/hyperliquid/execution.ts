@@ -3256,7 +3256,7 @@ async function swingProtectionInventory(coin:string){
 async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolean;reason:string}>{
  const coin=String(row.coin??'').toUpperCase(),key=String(row.crossing_id??'');
  const mode:any=await db.prepare('SELECT exit_mode FROM swing_live_queue WHERE signal_key=?').bind(key).first();
- if(swingIsProgressive(mode))return {ok:false,reason:'PROGRESSIVE_MANUAL_RECONCILIATION_REQUIRED'};
+ const progressive=swingIsProgressive(mode);
  const side=String(row.side??'').toUpperCase();
  if(side!=='SHORT'&&side!=='LONG')return {ok:false,reason:'INVALID_LEDGER_SIDE'};
  const position=await getOpenPositionForCoin(coin);
@@ -3268,10 +3268,13 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
     (side==='SHORT'&&actual>=0)||(side==='LONG'&&actual<=0))
   return {ok:false,reason:'POSITION_SIDE_SIZE_OR_ENTRY_MISMATCH'};
  const inventory=await swingProtectionInventory(coin);
- if(inventory.same.length!==2||inventory.tp.length!==1||inventory.sl.length!==1||inventory.unknown.length!==0)
+ // A progressive position has exactly ONE exchange-native SL and NO TP.
+ // Never submit a replacement here: this reconciliation is exchange READ ONLY.
+ if(inventory.same.length!==(progressive?1:2)||inventory.tp.length!==(progressive?0:1)||
+    inventory.sl.length!==1||inventory.unknown.length!==0)
   return {ok:false,reason:'PROTECTION_COUNT_OR_KIND_MISMATCH'};
- const tp=inventory.tp[0],sl=inventory.sl[0];
- const tpOid=swingProtectionOid(tp),slOid=swingProtectionOid(sl);
+ const tp=progressive?null:inventory.tp[0],sl=inventory.sl[0];
+ const tpOid=progressive?'NONE':swingProtectionOid(tp),slOid=swingProtectionOid(sl);
  const trigger=(o:any)=>Number(o.triggerPx??o.trigger?.triggerPx??o.triggerPrice);
  const size=(o:any)=>Number(o.sz??o.size??o.origSz);
  const priceNear=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&b>0&&
@@ -3279,28 +3282,33 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  const q:any=await db.prepare('SELECT tp_pct,sl_pct,market_regime,selected_pattern FROM swing_live_queue WHERE signal_key=?').bind(key).first();
  const tpPct=Number(q?.tp_pct);
  const slPct=Number(q?.sl_pct);
- if(!(tpPct>0&&slPct>0))return {ok:false,reason:'INVALID_SAVED_TPSL'};
+ if(!(slPct>0)||(!progressive&&!(tpPct>0)))return {ok:false,reason:'INVALID_SAVED_TPSL'};
  const targetTp=entry*(side==='SHORT'?1-tpPct/100:1+tpPct/100);
  const targetSl=entry*(side==='SHORT'?1+slPct/100:1-slPct/100);
- if(!tpOid||!slOid||tpOid===slOid||
-    !priceNear(trigger(tp),targetTp)||!priceNear(trigger(sl),targetSl)||
-    !qtyNear(size(tp),expected)||!qtyNear(size(sl),expected))
+ const saved:any=await db.prepare('SELECT * FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
+ if(saved&&String(saved.mode)!==(progressive?SWING_PROGRESSIVE_MODE:'FIXED_TPSL'))
+  return {ok:false,reason:'SAVED_PROTECTION_MODE_CONFLICT'};
+ // For an existing progressive record the last confirmed SL is the reference.
+ // For an unconfirmed initial SL the entry's -1% price is the reference.
+ const expectedSl=progressive&&saved?Number(saved.sl_px):targetSl;
+ if(!slOid||!priceNear(trigger(sl),expectedSl)||!qtyNear(size(sl),expected)||
+    (!progressive&&(!tpOid||tpOid===slOid||!priceNear(trigger(tp),targetTp)||!qtyNear(size(tp),expected))))
   return {ok:false,reason:'PROTECTION_OID_TRIGGER_OR_SIZE_MISMATCH'};
  const closeSide=side==='SHORT'?'B':'A';
- for(const order of [tp,sl]){
+ for(const order of (progressive?[sl]:[tp,sl])){
   // Fail closed if the exchange response does not prove these orders close the position.
   if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||order.isTrigger!==true)
    return {ok:false,reason:'PROTECTION_CLOSE_SIDE_REDUCE_ONLY_OR_TRIGGER_UNCONFIRMED'};
  }
- const saved:any=await db.prepare('SELECT * FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
- if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid))
+ if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid||saved.progressive_claimed_at!=null))
   return {ok:false,reason:'SAVED_OID_CONFLICT_MANUAL_RECONCILIATION'};
  // The current ledger status is checked before and during the guarded status update.
  const current:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
  if(String(current?.status)!=='TPSL_FAILED_AFTER_RETRIES')return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
  await db.prepare(`INSERT OR IGNORE INTO swing_protection_orders
-  (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at) VALUES (?,?,?,?,?,?,?)`)
-  .bind(key,coin,tpOid,slOid,String(trigger(tp)),String(trigger(sl)),Date.now()).run();
+  (signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,confirmed_at,mode) VALUES (?,?,?,?,?,?,?,?)`)
+  .bind(key,coin,tpOid,slOid,progressive?'NONE':String(trigger(tp)),String(trigger(sl)),
+        Date.now(),progressive?SWING_PROGRESSIVE_MODE:'FIXED_TPSL').run();
  const updated:any=await db.prepare(`UPDATE hyperliquid_execution_ledger
   SET status='PROTECTED',last_error=NULL,updated_at=?
   WHERE crossing_id=? AND status='TPSL_FAILED_AFTER_RETRIES'`).bind(Date.now(),key).run();
