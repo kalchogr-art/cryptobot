@@ -3351,6 +3351,68 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
   WHERE signal_key=? AND status='UNKNOWN'`).bind(Date.now(),key).run();
  return {ok:true,reason:'EXCHANGE_PROTECTION_RECONCILED'};
 }
+// V2.16.6 — SWING PRE-ENTRY REVERSAL AUDIT (READ-ONLY, NEVER BLOCKS AN ENTRY).
+// Capture 1m CLOSED candle momentum after a confirmed live fill. This is an
+// observational snapshot, not a historical backtest or a trading filter.
+async function swingPreEntryAudit(env:HyperliquidExecutionEnv, row:any, fillPx:number){
+ const db=env.DB!;
+ const key=String(row.signal_key), coin=String(row.coin).toUpperCase();
+ const side=String(row.side), now=Date.now();
+ try{
+  await db.prepare(`CREATE TABLE IF NOT EXISTS swing_pre_entry_audit (
+    signal_key TEXT PRIMARY KEY, coin TEXT NOT NULL, side TEXT NOT NULL,
+    pattern TEXT, regime TEXT, signal_at INTEGER, captured_at INTEGER NOT NULL,
+    reference_price REAL, fill_price REAL, signal_to_fill_pct REAL,
+    close_1m REAL, return_5m_pct REAL, return_15m_pct REAL,
+    return_60m_pct REAL, last_3_candles_direction TEXT,
+    against_signal_5m_pct REAL, against_signal_15m_pct REAL,
+    snapshot_status TEXT NOT NULL, snapshot_error TEXT
+  )`).run();
+  // Hyperliquid candleSnapshot: request last 75 minutes; use only CLOSED 1m candles.
+  const candles:any=await postInfo({type:'candleSnapshot',req:{coin,interval:'1m',
+    startTime:now-75*60_000,endTime:now}});
+  if(!Array.isArray(candles))throw Error('CANDLE_RESPONSE_NOT_ARRAY');
+  const closed=candles.filter((c:any)=>Number(c?.t)>=0 &&
+    Number(c?.T??(Number(c.t)+60_000))<=now && Number(c?.c)>0)
+    .sort((a:any,b:any)=>Number(a.t)-Number(b.t));
+  if(closed.length<61)throw Error('INSUFFICIENT_CLOSED_1M_CANDLES:'+closed.length);
+  const latest=closed[closed.length-1], lastT=Number(latest.t);
+  if(now-lastT>180_000)throw Error('STALE_CANDLE_DATA');
+  const close=Number(latest.c);
+  // Select last closed candle at/before the target timestamp; reject large gaps.
+  const back=(minutes:number)=>{
+    const target=lastT-minutes*60_000;
+    const c=[...closed].reverse().find((x:any)=>Number(x.t)<=target);
+    if(!c||target-Number(c.t)>90_000)throw Error('MISSING_'+minutes+'M_BASELINE');
+    return Number(c.c);
+  };
+  const r5=(close/back(5)-1)*100, r15=(close/back(15)-1)*100,
+    r60=(close/back(60)-1)*100;
+  const dirs=closed.slice(-3).map((c:any)=>Number(c.c)>Number(c.o)?'UP':
+    Number(c.c)<Number(c.o)?'DOWN':'FLAT').join(',');
+  const against=(v:number)=>side==='LONG'?-v:v;
+  await db.prepare(`INSERT OR IGNORE INTO swing_pre_entry_audit
+    (signal_key,coin,side,pattern,regime,signal_at,captured_at,
+     reference_price,fill_price,signal_to_fill_pct,close_1m,
+     return_5m_pct,return_15m_pct,return_60m_pct,last_3_candles_direction,
+     against_signal_5m_pct,against_signal_15m_pct,snapshot_status)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OK')`)
+   .bind(key,coin,side,String(row.selected_pattern??''),String(row.market_regime??''),
+    Number(row.signal_available_at)||null,now,Number(row.reference_price)||null,fillPx,
+    Number(row.reference_price)>0?(fillPx/Number(row.reference_price)-1)*100:null,
+    close,r5,r15,r60,dirs,against(r5),against(r15)).run();
+ }catch(e:any){
+  // Fail open: audit errors must never affect an already-filled live trade.
+  try{await db.prepare(`INSERT OR IGNORE INTO swing_pre_entry_audit
+   (signal_key,coin,side,pattern,regime,signal_at,captured_at,reference_price,
+    fill_price,snapshot_status,snapshot_error)
+   VALUES (?,?,?,?,?,?,?,?,?,'ERROR',?)`)
+   .bind(key,coin,side,String(row.selected_pattern??''),String(row.market_regime??''),
+    Number(row.signal_available_at)||null,now,Number(row.reference_price)||null,
+    fillPx,String(e?.message??e).slice(0,300)).run();}catch{}
+ }
+}
+
 async function swingOwned(db:any,coin:string,key:string,status:string){
  await db.prepare(`UPDATE swing_coin_owners SET status=?,updated_at=? WHERE coin=? AND owner=?`)
   .bind(status,Date.now(),coin,key).run();
@@ -3518,6 +3580,8 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   // Send only after the actual fill and protection reconciliation are persisted.
   await sendTelegram(env,swingEntryTelegram({coin,side,key,regime:row.market_regime,pattern:row.selected_pattern,
    tpPct:progressive?'PROGRESSIVE':row.tp_pct,slPct:row.sl_pct,px,sz,leverage,tp:progressive?'NO FIXED TP · Progressive from +0.50%':tp,sl,protectedOk,reason:protectionReason})).catch(()=>{});
+  // Audit only after protection and notification; never changes order decisions.
+  await swingPreEntryAudit(env,row,px).catch(()=>{});
   return protectedOk?'PROTECTED':'TPSL_UNCONFIRMED';
  }catch(err:any){
   const reason=String(err?.message??err);
