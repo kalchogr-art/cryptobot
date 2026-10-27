@@ -3755,9 +3755,117 @@ async function swingAdvanceProgressive(env:HyperliquidExecutionEnv,row:any,posit
   throw err;
  }
 }
+
+// SWING POST-ENTRY PATH AUDIT V1 — OBSERVATION ONLY.
+// Records actual candle-path excursion at 3/5/10m and full path until exit.
+// Does not change entries, protection, orders, or trading parameters.
+async function swingPostEntryPathAudit(env:HyperliquidExecutionEnv):Promise<void>{
+ const db=env.DB;if(!db)return;
+ await db.prepare(`CREATE TABLE IF NOT EXISTS swing_post_entry_path_audit(
+  signal_key TEXT PRIMARY KEY, coin TEXT, side TEXT, entry_px REAL,
+  entry_at INTEGER, last_checked_at INTEGER, closed_at INTEGER,
+  mfe_3m_pct REAL, mae_3m_pct REAL, end_3m_pct REAL,
+  mfe_5m_pct REAL, mae_5m_pct REAL, end_5m_pct REAL,
+  mfe_10m_pct REAL, mae_10m_pct REAL, end_10m_pct REAL,
+  mfe_total_pct REAL, mae_total_pct REAL, end_total_pct REAL,
+  first_positive_minute INTEGER, first_negative_minute INTEGER,
+  sampled_candles INTEGER, result TEXT, net_pnl REAL,
+  status TEXT, error TEXT
+ )`).run();
+ const res:any=await db.prepare(`SELECT l.crossing_id AS signal_key,l.coin,l.side,
+ l.entry_fill_price AS entry_px,l.entry_filled_at AS entry_at,
+ l.closed_at,l.close_reason,l.realized_pnl,
+ a.mfe_3m_pct,a.mfe_5m_pct,a.mfe_10m_pct,a.closed_at AS audit_closed_at
+ FROM hyperliquid_execution_ledger l
+ LEFT JOIN swing_post_entry_path_audit a ON a.signal_key=l.crossing_id
+ WHERE l.crossing_id LIKE 'SWING:%' AND l.entry_fill_price>0
+ AND l.entry_filled_at IS NOT NULL
+ AND (a.signal_key IS NULL OR (l.closed_at IS NULL AND (a.mfe_3m_pct IS NULL OR a.mfe_5m_pct IS NULL OR a.mfe_10m_pct IS NULL))
+ OR (l.closed_at IS NOT NULL AND a.closed_at IS NULL))
+ AND l.entry_filled_at > ?
+ ORDER BY l.entry_filled_at DESC LIMIT 12`).bind(Date.now()-36*3600_000).all();
+ for(const row of (res.results??[])){
+  const key=String(row.signal_key),coin=String(row.coin).toUpperCase();
+  const side=String(row.side).toUpperCase(),entry=Number(row.entry_px);
+  const entryAt=Number(row.entry_at);
+  if(!Number.isFinite(entryAt)||entryAt<=0||!Number.isFinite(entry)||entry<=0)continue;
+  const now=Date.now(), closedAt=Number(row.closed_at)||null;
+  const end=Math.min(now,closedAt??now,entryAt+75*60_000);
+  if(end<entryAt+3*60_000)continue;
+  try{
+   const raw:any=await postInfo({type:'candleSnapshot',req:{
+    coin,interval:'1m',startTime:entryAt-60_000,endTime:end+60_000}});
+   if(!Array.isArray(raw))throw Error('INVALID_CANDLE_RESPONSE');
+   // Use candles fully closed by the requested horizon; never use future prices.
+   const candles=raw.filter((c:any)=>Number.isFinite(Number(c.t))&&
+    Number.isFinite(Number(c.T))&&Number(c.T)<=end&&Number(c.T)>entryAt&&
+    Number(c.h)>0&&Number(c.l)>0&&Number(c.c)>0)
+    .sort((a:any,b:any)=>Number(a.T)-Number(b.T));
+   if(!candles.length)throw Error('NO_POST_ENTRY_CANDLES');
+   const favorable=(px:number)=>side==='LONG'?(px/entry-1)*100:(entry/px-1)*100;
+   const path=(minutes:number)=>{
+    const limit=Math.min(end,entryAt+minutes*60_000);
+    const arr=candles.filter((c:any)=>Number(c.T)<=limit);
+    if(limit<entryAt+minutes*60_000||!arr.length)return null;
+    const highs=arr.map((c:any)=>Number(c.h)),lows=arr.map((c:any)=>Number(c.l));
+    const best=side==='LONG'?Math.max(...highs):Math.min(...lows);
+    const worst=side==='LONG'?Math.min(...lows):Math.max(...highs);
+    return {mfe:favorable(best),mae:favorable(worst),last:favorable(Number(arr[arr.length-1].c))};
+   };
+   const p3=path(3),p5=path(5),p10=path(10);
+   const highs=candles.map((c:any)=>Number(c.h)),lows=candles.map((c:any)=>Number(c.l));
+   const totalMfe=favorable(side==='LONG'?Math.max(...highs):Math.min(...lows));
+   const totalMae=favorable(side==='LONG'?Math.min(...lows):Math.max(...highs));
+   const firstPos=candles.find((c:any)=>favorable(side==='LONG'?Number(c.h):Number(c.l))>0);
+   const firstNeg=candles.find((c:any)=>favorable(side==='LONG'?Number(c.l):Number(c.h))<0);
+   const minute=(c:any)=>c?Math.max(1,Math.ceil((Number(c.T)-entryAt)/60_000)):null;
+   await db.prepare(`INSERT INTO swing_post_entry_path_audit
+    (signal_key,coin,side,entry_px,entry_at,last_checked_at,closed_at,
+     mfe_3m_pct,mae_3m_pct,end_3m_pct,mfe_5m_pct,mae_5m_pct,end_5m_pct,
+     mfe_10m_pct,mae_10m_pct,end_10m_pct,mfe_total_pct,mae_total_pct,
+     end_total_pct,first_positive_minute,first_negative_minute,
+     sampled_candles,result,net_pnl,status,error)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+    ON CONFLICT(signal_key) DO UPDATE SET
+     last_checked_at=excluded.last_checked_at,closed_at=excluded.closed_at,
+     mfe_3m_pct=COALESCE(excluded.mfe_3m_pct,mfe_3m_pct),
+     mae_3m_pct=COALESCE(excluded.mae_3m_pct,mae_3m_pct),
+     end_3m_pct=COALESCE(excluded.end_3m_pct,end_3m_pct),
+     mfe_5m_pct=COALESCE(excluded.mfe_5m_pct,mfe_5m_pct),
+     mae_5m_pct=COALESCE(excluded.mae_5m_pct,mae_5m_pct),
+     end_5m_pct=COALESCE(excluded.end_5m_pct,end_5m_pct),
+     mfe_10m_pct=COALESCE(excluded.mfe_10m_pct,mfe_10m_pct),
+     mae_10m_pct=COALESCE(excluded.mae_10m_pct,mae_10m_pct),
+     end_10m_pct=COALESCE(excluded.end_10m_pct,end_10m_pct),
+     mfe_total_pct=excluded.mfe_total_pct,mae_total_pct=excluded.mae_total_pct,
+     end_total_pct=excluded.end_total_pct,
+     first_positive_minute=excluded.first_positive_minute,
+     first_negative_minute=excluded.first_negative_minute,
+     sampled_candles=excluded.sampled_candles,result=excluded.result,
+     net_pnl=excluded.net_pnl,status=excluded.status,error=NULL`)
+    .bind(key,coin,side,entry,entryAt,now,closedAt,
+      p3?.mfe??null,p3?.mae??null,p3?.last??null,
+      p5?.mfe??null,p5?.mae??null,p5?.last??null,
+      p10?.mfe??null,p10?.mae??null,p10?.last??null,
+      totalMfe,totalMae,favorable(Number(candles[candles.length-1].c)),
+      minute(firstPos),minute(firstNeg),candles.length,
+      row.close_reason??null,row.realized_pnl??null,
+      closedAt?'CLOSED':'TRACKING').run();
+  }catch(e:any){
+   try{await db.prepare(`INSERT INTO swing_post_entry_path_audit
+    (signal_key,coin,side,entry_px,entry_at,last_checked_at,status,error)
+    VALUES (?,?,?,?,?,?,'ERROR',?)
+    ON CONFLICT(signal_key) DO UPDATE SET last_checked_at=excluded.last_checked_at,
+    status='ERROR',error=excluded.error`)
+    .bind(key,coin,side,entry,entryAt,now,String(e?.message??e).slice(0,250)).run();}catch{}
+  }
+ }
+}
+
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
  const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);await swingProgressiveAuditSchema(db).catch(()=>{});
+ await swingPostEntryPathAudit(env).catch(()=>{});
  // Recover only previously failed Swing protection, after full live exchange verification.
  // A failed or ambiguous check keeps the global entry lock in place.
  const failed:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
