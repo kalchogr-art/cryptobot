@@ -3,6 +3,7 @@ import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
 import {handleSwingLiveMonitor} from './swing-live-monitor';
 import {runSwingEarlyCycle} from './swing-early-scanner';
+import {runSwingEarlyExitCycle} from './swing-early-exit';
 import {swingABDashboard} from './swing-ab-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
@@ -685,6 +686,13 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
   try{return json(await runSwingEarlyCycle(env,offset,limit));}
   catch(e:any){return json({success:false,error:String(e?.message||e)},502)}
  }
+ // SHADOW-only manual EARLY EXIT cycle; never submits orders.
+ if(u.pathname==='/api/swing/early-exit/run'){
+  if(req.method!=='POST')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  try{return json(await runSwingEarlyExitCycle(env))}catch(e:any){return json({success:false,error:String(e?.message||e)},502)}
+ }
  // LIVE monitor routes are read-only and independent from research.
  const liveMonitorResponse=await handleSwingLiveMonitor(req,env);
  if(liveMonitorResponse)return liveMonitorResponse;
@@ -791,5 +799,6 @@ export async function swingHunterScheduled(env:any,offset=0,interval:Interval='1
  const early=await runSwingEarlyCycle(env,earlyBatch*5,5).catch((e:any)=>({
   success:false,mode:'SHADOW_ONLY',trading:false,error:String(e?.message||e)
  }));
- return {scan,settlement,early};
+ const earlyExit=await runSwingEarlyExitCycle(env).catch((e:any)=>({success:false,mode:'SHADOW_ONLY',trading:false,error:String(e?.message||e)}));
+ return {scan,settlement,early,earlyExit};
 }
