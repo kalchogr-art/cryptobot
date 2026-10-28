@@ -3445,6 +3445,116 @@ async function swingCloseMarket(coin:string,sz:number,secret:`0x${string}`){
    s:toWire(Math.abs(sz),decimals),r:true,t:{limit:{tif:'Ioc'}}}],grouping:'na'};
  return sendLifecycleSignedAction(action,secret);
 }
+// SWING ENTRY GUARD V1: only affects fresh Swing orders. All rejected candidates are durable.
+const SWING_GUARD_TP=0.5, SWING_GUARD_SL=1.0, SWING_GUARD_MAX_MS=12*3600000;
+async function swingGuardSchema(db:any){
+ await db.prepare(`CREATE TABLE IF NOT EXISTS swing_rejected_signals(
+ signal_key TEXT PRIMARY KEY,coin TEXT NOT NULL,side TEXT NOT NULL,interval TEXT,
+ pattern TEXT,market_regime TEXT,rejected_at INTEGER NOT NULL,entry_price REAL NOT NULL,
+ reasons_json TEXT NOT NULL,indicators_json TEXT NOT NULL,tp_pct REAL NOT NULL DEFAULT 0.5,
+ sl_pct REAL NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'TRACKING',
+ outcome_at INTEGER,exit_price REAL,minutes_to_outcome REAL,updated_at INTEGER NOT NULL,
+ last_checked_at INTEGER,observation_note TEXT)`).run();
+ await db.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_rejected_tracking ON swing_rejected_signals(status,rejected_at)`).run();
+}
+type SwingCandle={t:number;T:number;o:number;h:number;l:number;c:number};
+async function swingGuardCandles(coin:string,interval:string,start:number,end:number):Promise<SwingCandle[]>{
+ const r=await postInfo({type:'candleSnapshot',req:{coin,interval,startTime:start,endTime:end}});
+ if(!Array.isArray(r))throw Error('CANDLES_NOT_ARRAY');
+ return r.map((x:any)=>({t:Number(x.t),T:Number(x.T),o:Number(x.o),h:Number(x.h),l:Number(x.l),c:Number(x.c)}))
+ .filter((x:SwingCandle)=>[x.t,x.T,x.o,x.h,x.l,x.c].every(Number.isFinite)&&x.h>=x.l&&x.c>0)
+ .sort((a:SwingCandle,b:SwingCandle)=>a.t-b.t);
+}
+function swingGuardEma(prices:number[],period:number){
+ if(prices.length<period)return null;
+ let v=prices.slice(0,period).reduce((a,b)=>a+b,0)/period;
+ for(let i=period;i<prices.length;i++)v+=2/(period+1)*(prices[i]-v);
+ return v;
+}
+function swingGuardRsi(prices:number[],period=14){
+ if(prices.length<period+1)return null;
+ let up=0,down=0;
+ for(let i=1;i<=period;i++){const d=prices[i]-prices[i-1];up+=Math.max(d,0);down+=Math.max(-d,0);}
+ up/=period;down/=period;
+ for(let i=period+1;i<prices.length;i++){const d=prices[i]-prices[i-1];up=(up*(period-1)+Math.max(d,0))/period;down=(down*(period-1)+Math.max(-d,0))/period;}
+ return down===0?(up===0?50:100):100-100/(1+up/down);
+}
+async function swingGuardCheck(row:any,price:number,now:number){
+ const coin=String(row.coin).toUpperCase(),side=String(row.side),reasons:string[]=[],notes:string[]=[];
+ const candles=await swingGuardCandles(coin,'5m',now-3*3600000,now);
+ // Strictly completed 5-minute candles. No look-ahead and no stale indicators.
+ const closed=candles.filter(x=>x.T<=now&&x.T>now-3*3600000);
+ const last=closed[closed.length-1];
+ if(!last||now-last.T>7*60000||closed.length<25)reasons.push('INDICATORS_MISSING_OR_STALE');
+ const prices=closed.map(x=>x.c),rsi=swingGuardRsi(prices);
+ const prev=swingGuardRsi(prices.slice(0,-6));
+ // EMA50 requires >=50 completed bars: fetch separate history, do not estimate from 90m.
+ const history=await swingGuardCandles(coin,'5m',now-7*3600000,now);
+ const full=history.filter(x=>x.T<=now),hprices=full.map(x=>x.c);
+ const ema20=swingGuardEma(hprices,20),ema50=swingGuardEma(hprices,50);
+ const lastFull=full[full.length-1];
+ if(!lastFull||now-lastFull.T>7*60000||hprices.length<55||rsi===null||prev===null||ema20===null||ema50===null)
+  if(!reasons.includes('INDICATORS_MISSING_OR_STALE'))reasons.push('INDICATORS_MISSING_OR_STALE');
+ if(side==='SHORT'){
+  if(rsi!==null&&rsi<=30)reasons.push('SHORT_RSI_OVERSOLD');
+  if(rsi!==null&&prev!==null&&prev-rsi>=15)reasons.push('SHORT_RSI_DROP_15_IN_30M');
+  if(ema20!==null&&ema50!==null&&ema20>=ema50)reasons.push('SHORT_EMA20_GTE_EMA50');
+ }else if(side==='LONG'){
+  if(ema50!==null&&price<ema50)reasons.push('LONG_PRICE_BELOW_EMA50');
+ }
+ return {reasons,indicators:{rsi14_5m_wilder:rsi,rsi14_30m_ago:prev,rsi_drop_30m:rsi!==null&&prev!==null?prev-rsi:null,
+  ema20_5m:ema20,ema50_5m:ema50,price,latest_closed_5m:lastFull?.T??null,
+  source:'HYPERLIQUID_5M_COMPLETED_CANDLES',notes}};
+}
+async function swingGuardReject(db:any,row:any,price:number,check:any){
+ const now=Date.now(),key=String(row.signal_key);
+ await db.prepare(`INSERT OR IGNORE INTO swing_rejected_signals
+ (signal_key,coin,side,interval,pattern,market_regime,rejected_at,entry_price,reasons_json,indicators_json,tp_pct,sl_pct,status,updated_at)
+ VALUES (?,?,?,?,?,?,?,?,?,?,0.5,1,'TRACKING',?)`).bind(key,String(row.coin),String(row.side),
+ String(key.split(':')[3]||''),String(row.selected_pattern||''),String(row.market_regime||''),now,price,
+ JSON.stringify(check.reasons),JSON.stringify(check.indicators),now).run();
+ await db.prepare(`UPDATE swing_live_queue SET status='REJECTED',reason=?,updated_at=? WHERE signal_key=? AND status='WAITING_POSITION'`)
+ .bind(check.reasons.join('|'),now,key).run();
+}
+async function swingGuardTrack(env:HyperliquidExecutionEnv){
+ const db=env.DB!;const now=Date.now();
+ const q:any=await db.prepare(`SELECT * FROM swing_rejected_signals WHERE status='TRACKING'
+ ORDER BY COALESCE(last_checked_at,0) ASC LIMIT 12`).all();
+ let tracked=0,resolved=0;
+ for(const row of q.results??[]){
+  let start=Number(row.last_checked_at||row.rejected_at),expiry=Number(row.rejected_at)+SWING_GUARD_MAX_MS;
+  const end=Math.min(now,expiry);
+  try{
+   // Fetch from original rejected moment if no prior checkpoint; cap to 12h/720 candles.
+   const candles=await swingGuardCandles(String(row.coin),'1m',Math.max(Number(row.rejected_at)-60000,start-60000),end);
+   if(end<=start)continue;
+   if(!candles.length)throw Error('NO_CLOSED_TRACKING_CANDLES');
+   const entry=Number(row.entry_price),long=row.side==='LONG';
+   const tp=entry*(long?1.005:0.995),sl=entry*(long?0.99:1.01);
+   let outcome:string|null=null,at:number|null=null,exit:number|null=null,note:string|null=null;
+   const firstMinute=Math.floor(Number(row.rejected_at)/60000)*60000;
+   // A candle containing rejection includes pre-rejection movement: cannot infer ordering.
+   for(const c of candles){
+    if(c.T>end)continue;
+    if(c.t<firstMinute+60000){if((long?c.h>=tp:c.l<=tp)||(long?c.l<=sl:c.h>=sl)){
+      outcome='UNKNOWN';at=c.T;note='ENTRY_MINUTE_INTRABAR_ORDER_UNKNOWN';break;}continue;}
+    if(c.t>start+60000){outcome='UNKNOWN';at=c.t;note='MISSING_ONE_MINUTE_CANDLES';break;}
+    const hitTp=long?c.h>=tp:c.l<=tp,hitSl=long?c.l<=sl:c.h>=sl;
+    if(hitTp&&hitSl){outcome='UNKNOWN';at=c.T;note='TP_AND_SL_IN_SAME_1M_CANDLE';break;}
+    if(hitTp||hitSl){outcome=hitTp?'WOULD_TP':'WOULD_SL';at=c.T;exit=hitTp?tp:sl;break;}
+    start=c.T;
+   }
+   if(!outcome&&end>=expiry){outcome='UNKNOWN';at=end;note='12H_HORIZON_WITHOUT_FIRST_TOUCH';}
+   if(outcome){await db.prepare(`UPDATE swing_rejected_signals SET status=?,outcome_at=?,exit_price=?,minutes_to_outcome=?,observation_note=?,last_checked_at=?,updated_at=? WHERE signal_key=? AND status='TRACKING'`)
+    .bind(outcome,at,exit,at===null?null:(at-Number(row.rejected_at))/60000,note,end,now,row.signal_key).run();resolved++;}
+   else {await db.prepare(`UPDATE swing_rejected_signals SET last_checked_at=?,updated_at=? WHERE signal_key=? AND status='TRACKING'`)
+    .bind(end,now,row.signal_key).run();tracked++;}
+  }catch(e:any){await db.prepare(`UPDATE swing_rejected_signals SET observation_note=?,updated_at=? WHERE signal_key=?`)
+   .bind('TRACKER_ERROR:'+String(e?.message||e).slice(0,180),now,row.signal_key).run();}
+ }
+ return {tracked,resolved};
+}
+
 async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const db=env.DB!,coin=String(row.coin).toUpperCase(),key=String(row.signal_key),now=Date.now();
  const side=String(row.side??'SHORT');
@@ -3495,6 +3605,17 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   const decimals=Number(u[a].szDecimals),price=Number(ctx[a]?.midPx??ctx[a]?.markPx);
   if(!Number.isFinite(price)||price<=0)throw Error('MARKET_PRICE_MISSING');
   if(Math.abs(price/Number(row.reference_price)-1)>0.005)throw Error('PRICE_DEVIATION_OVER_0_5PCT');
+  // Entry protection is checked against live exchange price BEFORE leverage/order/ledger.
+  // Fail closed on missing/stale candles or exchange errors; never silently bypass.
+  let guard:any;
+  try{guard=await swingGuardCheck(row,price,Date.now());}
+  catch(e:any){guard={reasons:['INDICATORS_FETCH_FAILED'],indicators:{error:String(e?.message||e).slice(0,180),price}};}
+  if(guard.reasons.length){
+   await swingGuardReject(db,row,price,guard);
+   await db.prepare(`DELETE FROM swing_coin_owners WHERE coin=? AND owner=? AND status='RESERVED'`).bind(coin,key).run();
+   return 'REJECTED:'+guard.reasons.join('|');
+  }
+
   const secret=normalizePrivateKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   if(!privateKeyFormatOk(secret))throw Error('PRIVATE_KEY_INVALID');
   const targetNotional=CONFIG.BASE_MARGIN_USD*CONFIG.TARGET_LEVERAGE;
@@ -3600,7 +3721,8 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  const db=env.DB;if(!db)return {ok:false,reason:'DB_MISSING'};
  // Collect eligible signals even when real SWING trading is disabled.
  // The execution switch is checked only AFTER the D1 queue is populated.
- await swingSchema(db);await swingProtectionSchema(db);
+ await swingSchema(db);await swingProtectionSchema(db);await swingGuardSchema(db);
+ const rejectedTracking=await swingGuardTrack(env).catch((e:any)=>({error:String(e?.message||e)}));
  const now=Date.now();
  // Keep only newly available signals. Never backfill old research as live trades.
  const signals:any=await (env.SWING_DB??db).prepare(`SELECT coin,interval,side,signal_bar_open,
@@ -3682,7 +3804,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   }
   entered.push({coin:row.coin,result:await swingEnter(env,row)});
  }
- return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length};
+ return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length,rejected_tracking:rejectedTracking};
 }
 // Swing progressive: use FAST's add -> exchange visibility -> cancel old sequence.
 // Only new PROGRESSIVE_V1 rows. Never modify legacy bracket positions.
