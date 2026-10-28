@@ -2,6 +2,7 @@ import { swingFilteredRead } from './swing-filter-cache';
 import {scanAndLog,settleSignals,recentSignals} from './signal-logger';
 import {swingMonitorDashboard} from './swing-monitor-dashboard';
 import {handleSwingLiveMonitor} from './swing-live-monitor';
+import {runSwingEarlyCycle} from './swing-early-scanner';
 import {swingABDashboard} from './swing-ab-dashboard';
 import {tpFirstTouchCoin} from './tp-first-touch';
 import {tpSlFirstTouchCoin} from './tp-sl-first-touch';
@@ -672,6 +673,18 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
  if(req.method==='GET'&&u.pathname==='/swing-hunter/pattern-compare')return new Response(swingPatternComparePage(),{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'}});
  if(req.method==='GET'&&u.pathname==='/api/swing/pattern-compare-data'){try{return json(await swingPatternCompareData(u))}catch(e:any){return json({success:false,error:String(e?.message||e)},502)}}
 
+ // EARLY scanner: protected manual diagnostic, shadow-only; no order execution.
+ if(u.pathname==='/api/swing/early/run'){
+  if(req.method!=='POST')return json({success:false,error:'METHOD_NOT_ALLOWED'},405);
+  if(!env.SWING_ADMIN_TOKEN)return json({success:false,error:'TOKEN_NOT_CONFIGURED'},503);
+  if(req.headers.get('x-swing-token')!==env.SWING_ADMIN_TOKEN)return json({success:false,error:'UNAUTHORIZED'},401);
+  const offsetRaw=u.searchParams.get('offset'),limitRaw=u.searchParams.get('limit');
+  const offset=offsetRaw===null?0:Number(offsetRaw),limit=limitRaw===null?5:Number(limitRaw);
+  if(!Number.isInteger(offset)||offset<0||offset>19||!Number.isInteger(limit)||limit<1||limit>20||offset+limit>20)
+   return json({success:false,error:'INVALID_EARLY_BATCH'},400);
+  try{return json(await runSwingEarlyCycle(env,offset,limit));}
+  catch(e:any){return json({success:false,error:String(e?.message||e)},502)}
+ }
  // LIVE monitor routes are read-only and independent from research.
  const liveMonitorResponse=await handleSwingLiveMonitor(req,env);
  if(liveMonitorResponse)return liveMonitorResponse;
@@ -768,7 +781,15 @@ export async function handleSwingHunterRequest(req:Request,_env:unknown):Promise
  }catch(e){return json({success:false,error:e instanceof Error?e.message:String(e)},502)}
 }
 export async function swingHunterScheduled(env:any,offset=0,interval:Interval='1h'){
+ // Keep existing RESEARCH scanner and settlement behavior unchanged.
+ // EARLY is shadow-only, independently guarded; an EARLY failure cannot stop LIVE.
+ // At a 1-minute cron cadence, rotating 5 of 20 coins gives each coin a scan every 4 minutes.
+ // If the caller uses a slower cron, coverage will be correspondingly slower.
  const scan=NEW_SIGNALS_ENABLED?await scanAndLog(env,{offset,limit:3,interval}):{success:true,status:'SIGNAL_COLLECTION_PAUSED',signals_created:0};
  const settlement=await settleSignals(env,8);
- return {scan,settlement};
+ const earlyBatch=Math.floor(Date.now()/60000)%4;
+ const early=await runSwingEarlyCycle(env,earlyBatch*5,5).catch((e:any)=>({
+  success:false,mode:'SHADOW_ONLY',trading:false,error:String(e?.message||e)
+ }));
+ return {scan,settlement,early};
 }
