@@ -146,34 +146,43 @@ async function scanOne(env:Env,coin:string,interval:Frame,at:number){
 async function trackOne(env:Env,row:any,at:number){
  const d=db(env),entry=Number(row.entry_price),side=String(row.side),start=Number(row.first_seen_at);
  if(!Number.isFinite(entry)||entry<=0)return;
- const expiry=start+MAX_TRACK,until=Math.min(at,expiry);
+ const expiry=start+MAX_TRACK;
+ // Never ask for the currently forming minute: only complete UTC 1m bars.
+ const closedUntil=Math.floor(Math.min(at,expiry)/60000)*60000;
  const first=Math.floor(start/60000)*60000+60000;
- const from=Math.max(first,Number(row.tracking_checked_until||first));
- const untilPage=Math.min(until,from+MAX_1M_BARS_PER_RUN*60000);
- if(untilPage<=from)return;
- const rows=await candles(String(row.coin),'1m',from-60000,untilPage);
+ const saved=Number(row.tracking_checked_until);
+ const from=Math.max(first,Number.isFinite(saved)&&saved>0?saved:first);
+ const untilPage=Math.min(closedUntil,from+MAX_1M_BARS_PER_RUN*60000);
+ if(untilPage<=from){
+  if(at>=expiry)await d.prepare(`UPDATE swing_early_signals SET status='UNKNOWN',outcome_at=?,minutes_to_outcome=?,observation_note='EXPIRED_WITHOUT_PROVABLE_TOUCH' WHERE signal_key=? AND status='TRACKING'`).bind(expiry,(expiry-start)/60000,row.signal_key).run();
+  return;
+ }
+ const rows=await candles(String(row.coin),'1m',from,untilPage);
  const full=rows.filter(c=>c.t>=from&&c.t+60000<=untilPage);
  const tpPct=Number(row.tp_pct),slPct=Number(row.sl_pct);
  if(!(tpPct>0&&slPct>0))return;
  const tp=side==='LONG'?entry*(1+tpPct/100):entry*(1-tpPct/100);
  const sl=side==='LONG'?entry*(1-slPct/100):entry*(1+slPct/100);
  let status:string|null=null,price:number|null=null,time:number|null=null;
- // If there are more bars than can be safely inspected, wait for a separate tracking cycle.
- // No outcome may be inferred from partial coverage of earlier time.
- let expected=from;
+ let expected=from,missing=false;
  for(const c of full){
-  if(c.t!==expected){status='UNKNOWN';time=c.t;break;}
+  if(c.t<expected)continue;
+  if(c.t!==expected){missing=true;break;}
   expected+=60000;
   const hitTp=side==='LONG'?c.h>=tp:c.l<=tp;
   const hitSl=side==='LONG'?c.l<=sl:c.h>=sl;
   if(hitTp&&hitSl){status='UNKNOWN';time=c.t+60000;break;}
   if(hitTp||hitSl){status=hitTp?'WOULD_TP':'WOULD_SL';price=hitTp?tp:sl;time=c.t+60000;break;}
  }
- if(!status && expected<untilPage){status='UNKNOWN';time=expected;}
- if(!status && untilPage>=expiry){status='UNKNOWN';time=expiry;}
- if(!status)await d.prepare(`UPDATE swing_early_signals SET tracking_checked_until=? WHERE signal_key=? AND status='TRACKING'`).bind(expected,row.signal_key).run();
+ // A missing candle can be a temporary API lag. Retry it on later cycles;
+ // never skip the gap or falsely resolve a later touch as the first touch.
+ if(!status && expected<untilPage)missing=true;
+ if(!status && !missing && expected>from){
+  await d.prepare(`UPDATE swing_early_signals SET tracking_checked_until=? WHERE signal_key=? AND status='TRACKING'`).bind(expected,row.signal_key).run();
+ }
+ if(!status && at>=expiry){status='UNKNOWN';time=expiry;}
  if(status)await d.prepare(`UPDATE swing_early_signals SET status=?,outcome_at=?,exit_price=?,minutes_to_outcome=?,observation_note=? WHERE signal_key=? AND status='TRACKING'`)
-  .bind(status,time,price,time!==null?(time-start)/60000:null,status==='UNKNOWN'?'UNKNOWN_NO_PROVABLE_FIRST_TOUCH':'FIRST_TOUCH_1M',row.signal_key).run();
+  .bind(status,time,price,time!==null?(time-start)/60000:null,status==='UNKNOWN'?'UNKNOWN_AMBIGUOUS_OR_EXPIRED':'FIRST_TOUCH_1M',row.signal_key).run();
 }
 async function track(env:Env,at:number,limit=30){
  const q=await db(env).prepare(`SELECT signal_key,coin,side,entry_price,tp_pct,sl_pct,first_seen_at,tracking_checked_until FROM swing_early_signals WHERE status='TRACKING' ORDER BY first_seen_at ASC LIMIT ?`).bind(limit).all();
@@ -181,31 +190,40 @@ async function track(env:Env,at:number,limit=30){
  for(const row of q.results||[]){try{await trackOne(env,row,at);processed++;}catch(e:any){errors.push(String(row.signal_key)+':'+String(e?.message||e));}}
  return {processed,errors};
 }
-// Match actual LIVE queue entries; never label an unobserved LIVE entry as rejected.
-// A queue match means LIVE accepted a signal candidate, not necessarily that an order filled.
+// Queue rows are only LIVE signal candidates, never evidence of a filled order.
+// Reset old false positives created by the previous queue-based reconciliation.
+// Do NOT alter actual execution, orders or ledger records.
 async function reconcile(env:Env,at:number,limit=100){
  const d=db(env),liveDb=env.SWING_DB?.prepare?env.SWING_DB:d;
- const q=await d.prepare(`SELECT signal_key,coin,side,interval,pattern,signal_bar_open,first_seen_at
+ const reset=await d.prepare(`UPDATE swing_early_signals SET live_confirmed=0,
+  live_entry_price=NULL,live_blocked=NULL,live_checked_at=?,
+  observation_note='QUEUE_ONLY_NOT_EXECUTED'
+  WHERE signal_key LIKE 'EARLY_LIVE_V2:%' AND live_confirmed=1
+  AND observation_note LIKE 'LIVE_QUEUE_MATCH:%'`).bind(at).run();
+ const q=await d.prepare(`SELECT signal_key,coin,side,interval,pattern,signal_bar_open
  FROM swing_early_signals WHERE signal_key LIKE 'EARLY_LIVE_V2:%'
  AND (live_confirmed IS NULL OR live_confirmed=0)
  AND signal_bar_open + CASE interval WHEN '1h' THEN 3600000 ELSE 14400000 END <= ?
  ORDER BY signal_bar_open DESC LIMIT ?`).bind(at,limit).all();
- let matched=0,pending=0;const errors:string[]=[];
+ let queueCandidates=0,pending=0;const errors:string[]=[];
  for(const r of q.results||[]){
   try{
-   const rows=await liveDb.prepare(`SELECT signal_key,signal_available_at,reference_price,selected_pattern,status,market_regime
+   const rows=await liveDb.prepare(`SELECT selected_pattern,status
     FROM swing_live_queue WHERE coin=? AND side=? AND signal_bar_open=?
     ORDER BY signal_available_at ASC LIMIT 20`)
     .bind(r.coin,r.side,r.signal_bar_open).all();
    const match=(rows.results||[]).find((x:any)=>String(x.selected_pattern)===String(r.pattern));
    if(!match){pending++;continue;}
-   await d.prepare(`UPDATE swing_early_signals SET live_confirmed=1,live_blocked=0,
-    live_checked_at=?,live_entry_price=?,observation_note=? WHERE signal_key=?`)
-    .bind(at,match.reference_price,'LIVE_QUEUE_MATCH:'+String(match.status),r.signal_key).run();
-   matched++;
+   // A queue match is recorded for diagnostics only. No confirmed LIVE trade.
+   await d.prepare(`UPDATE swing_early_signals SET live_confirmed=0,
+    live_blocked=NULL,live_entry_price=NULL,live_checked_at=?,observation_note=?
+    WHERE signal_key=? AND (live_confirmed IS NULL OR live_confirmed=0)`)
+    .bind(at,'QUEUE_ONLY_NOT_EXECUTED:'+String(match.status),r.signal_key).run();
+   queueCandidates++;
   }catch(e:any){errors.push(String(r.signal_key)+':'+String(e?.message||e));}
  }
- return {matched,pending,errors};
+ return {queueCandidates,pending,resetFalseConfirmations:Number(reset.meta?.changes||0),errors,
+  notice:'Queue matches are NOT confirmed fills; live_confirmed stays false until a verified execution-ledger integration exists.'};
 }
 /** Call every 5m. Partition 20 coins in 4 batches of 5; run both frames per coin. */
 export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
@@ -217,5 +235,5 @@ export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
  }
  const tracking=await track(env,at).catch((e:any)=>({processed:0,errors:[String(e?.message||e)]}));
  const live=await reconcile(env,at).catch((e:any)=>({checked:0,errors:[String(e?.message||e)]}));
- return {success:errors.length===0&&tracking.errors.length===0&&live.errors.length===0,mode:'SHADOW_ONLY',trading:false,at,offset,coins,scanned,tracking,live,errors,notice:'LIVE FILTER CANDIDATES ONLY; queue match is confirmation, not fill; progressive simulation not implemented'};
+ return {success:errors.length===0&&tracking.errors.length===0&&live.errors.length===0,mode:'SHADOW_ONLY',trading:false,at,offset,coins,scanned,tracking,live,errors,notice:'LIVE FILTER CANDIDATES ONLY; queue match is NOT a filled trade; progressive simulation not implemented'};
 }
