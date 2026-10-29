@@ -1,7 +1,7 @@
 /** SWING EARLY V4 — predictive mirror of confirmed Swing signal selection.
  * Shadow only. Does not import execution, place orders, or change LIVE.
  * Replaces src/swing-hunter/swing-early-scanner.ts.
- * Uses dedicated swing_early_v4_watch / swing_early_v4_observations tables; legacy rows are untouched.
+ * Existing swing_early_signals table is reused; legacy rows are untouched.
  */
 import type {Candle} from './types';
 import {COINS,STEP} from './ohlcv';
@@ -73,11 +73,9 @@ function detect(bars:Candle[],frame:Frame){const market=structure(bars);return [
 // A watch is NOT a LIVE signal. Only a detector hit + LIVE rule is LIVE_ELIGIBLE.
 // Existing D1 rows are retained; a dedicated table keeps full observation history.
 const WATCH_PREFIX='EARLY_POTENTIAL_V4';
-const VERSION='SWING_EARLY_LIVE_PREDICTOR_V4.1.0';
+const VERSION='SWING_EARLY_LIVE_PREDICTOR_V4.0.0';
 const WATCH_WINDOW_MIN=20;
-const FINALIZE_GRACE_MIN=45;
-// A forming heuristic is only a watch, never a predicted LIVE selection.
-// Prediction credit requires the exact ranked LIVE detector to be eligible BEFORE close.
+const FINALIZE_GRACE_MIN=35;
 async function ensureSchema(env:Env){
  const d=db(env);
  await d.prepare(`CREATE TABLE IF NOT EXISTS swing_early_v4_watch (
@@ -168,7 +166,6 @@ async function scanOne(env:Env,coin:string,frame:Frame,at:number){
   return {coin,frame,status:'GAPPED_HISTORY'};
  const regime=await liveRegime(env,at);
  if(!regime)return {coin,frame,status:'REGIME_UNAVAILABLE'};
- // The same three detectors as signal-logger.ts, on a hypothetical close NOW.
  const hits=detect([...closed,forming],frame).filter(h=>h.signalBarOpen===barOpen);
  const active=new Map<string,{side:Side;pattern:string;phase:string;reason:string}>();
  for(const item of formingCandidates(closed,[forming],frame,regime))active.set(item.side+':'+item.pattern,item);
@@ -199,12 +196,14 @@ async function scanOne(env:Env,coin:string,frame:Frame,at:number){
    .bind(row.watch_key,at,remaining,forming.c,regime).run();disappeared++;
  }
  return {coin,frame,status:'OK',regime,remaining_minutes:Math.round(remaining*10)/10,
-  detected_patterns:hits.length,watching:recorded,disappeared,
-  eligible_candidates:[...active.values()].filter(x=>x.phase==='LIVE_ELIGIBLE').map(x=>({side:x.side,pattern:x.pattern})),
-  forming_candidates:[...active.values()].filter(x=>x.phase==='FORMING').map(x=>({side:x.side,pattern:x.pattern}))};
+  detected_patterns:hits.length,watching:recorded,disappeared};
 }
 async function reconcile(env:Env,at:number,limit=100){
  const d=db(env),sourceDb=signalsDb(env);
+ // The LIVE execution Worker writes candidates into its DB binding.
+ // EARLY DB must point to the SAME D1 database (or a replicated copy).
+ const candidateTable:any=await d.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='swing_live_candidates'`).first();
+ const candidateAuditAvailable=Number(candidateTable?.n??0)>0;
  const rows:any=await d.prepare(`SELECT * FROM swing_early_v4_watch
  WHERE finalized_at IS NULL AND signal_bar_open+CASE interval WHEN '1h' THEN 3600000 ELSE 14400000 END<=?
  ORDER BY signal_bar_open ASC LIMIT ?`).bind(at-FINALIZE_GRACE_MIN*60000,limit).all();
@@ -213,18 +212,34 @@ async function reconcile(env:Env,at:number,limit=100){
   const source:any=await sourceDb.prepare(`SELECT id FROM swing_context_signals
    WHERE coin=? AND interval=? AND side=? AND pattern=? AND signal_bar_open=? LIMIT 1`)
    .bind(row.coin,row.interval,row.side,row.pattern,row.signal_bar_open).first();
-  const queues:any=await d.prepare(`SELECT selected_pattern,status FROM swing_live_queue
-   WHERE coin=? AND side=? AND signal_bar_open=? ORDER BY signal_available_at DESC LIMIT 20`)
-   .bind(row.coin,row.side,row.signal_bar_open).all();
-  const queue=(queues.results??[]).find((q:any)=>String(q.selected_pattern??'')===String(row.pattern));
-  const selected=Boolean(queue);
+  const queue:any=await d.prepare(`SELECT selected_pattern,status FROM swing_live_queue
+   WHERE coin=? AND side=? AND signal_bar_open=? LIMIT 1`)
+   .bind(row.coin,row.side,row.signal_bar_open).first();
+  const candidate:any=candidateAuditAvailable?await d.prepare(`SELECT candidate_key,stage,reason,selected_pattern,patterns_json,market_regime,
+   first_seen_at,last_seen_at,reference_price,checks,live_signal_key
+   FROM swing_live_candidates WHERE coin=? AND side=? AND interval=? AND signal_bar_open=? LIMIT 1`)
+   .bind(row.coin,row.side,row.interval,row.signal_bar_open).first():null;
+  // Candidate rows group several detected patterns. The selected pattern is the
+  // authoritative per-pattern selection; a generic ELIGIBLE does not imply selection.
+  const candidateSelected=!!candidate && String(candidate.selected_pattern??'')===String(row.pattern)
+   && String(candidate.stage)==='LIVE_SELECTED';
+  const selected=String(queue?.selected_pattern??'')===String(row.pattern)||candidateSelected;
   const timelyEligible=Number(row.first_eligible_at)>0 && Number(row.first_eligible_at)<Number(row.signal_bar_open)+(row.interval==='1h'?HOUR:4*HOUR);
   const predicted=selected && timelyEligible;
   const phase=predicted?'LIVE_SELECTED':selected?'LIVE_SELECTED_WITHOUT_EARLY_ELIGIBILITY':source?'SOURCE_CONFIRMED':'NOT_CONFIRMED';
+  const candidateNote=candidate?{
+   live_candidate_key:candidate.candidate_key,live_candidate_stage:candidate.stage,
+   live_candidate_reason:candidate.reason,live_candidate_selected_pattern:candidate.selected_pattern,
+   live_candidate_regime:candidate.market_regime,live_candidate_checks:candidate.checks,
+   live_candidate_first_seen_at:candidate.first_seen_at,
+   live_candidate_last_seen_at:candidate.last_seen_at,
+   live_candidate_reference_price:candidate.reference_price,
+   live_candidate_signal_key:candidate.live_signal_key
+  }:null;
   await d.prepare(`UPDATE swing_early_v4_watch SET phase=?,live_source_confirmed=?,live_selected=?,
    live_queue_status=?,finalized_at=?,note=? WHERE watch_key=? AND finalized_at IS NULL`)
    .bind(phase,source?1:0,selected?1:0,queue?.status??null,at,
-    selected?'LIVE_QUEUE_SELECTED_NOT_PROOF_OF_FILL':source?'LOGGER_PATTERN_FOUND_NOT_LIVE_SELECTED':'NO_SOURCE_OR_LIVE_QUEUE_MATCH',row.watch_key).run();
+    JSON.stringify({reason:selected?'LIVE_QUEUE_SELECTED_NOT_PROOF_OF_FILL':source?'LOGGER_PATTERN_FOUND_NOT_LIVE_SELECTED':'NO_SOURCE_OR_LIVE_QUEUE_MATCH',candidate_audit_available:candidateAuditAvailable,candidate:candidateNote}),row.watch_key).run();
   if(predicted)predictedCount++;else if(source)sourceOnly++;else notConfirmed++;
  }catch(e:any){errors.push(String(row.watch_key)+':'+String(e?.message||e));}}
  // Count LIVE selections with no EARLY watch (denominator for prediction recall).
@@ -236,7 +251,7 @@ async function reconcile(env:Env,at:number,limit=100){
  AND w.first_eligible_at<q.signal_available_at)`)
  .bind(at-24*HOUR,at-FINALIZE_GRACE_MIN*60000).first();
  return {finalized:(rows.results??[]).length,predicted:predictedCount,sourceOnly,notConfirmed,
-  missedLiveSelectionsLast24h:Number(unmatched?.n??0),errors,
+  missedLiveSelectionsLast24h:Number(unmatched?.n??0),candidateAuditAvailable,errors,
   note:'LIVE_SELECTED is a selected queue signal, NOT a verified executed trade.'};
 }
 /** Existing scheduler calls this every minute with rotating batches of five. */
@@ -249,7 +264,17 @@ export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
   catch(e:any){errors.push(`${coin}/${frame}:${String(e?.message||e)}`);}
  }
  const live=await reconcile(env,at).catch((e:any)=>({errors:[String(e?.message||e)]}));
+ const candidateAudit=await (async()=>{
+  const d=db(env);
+  const table:any=await d.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='swing_live_candidates'`).first();
+  if(!Number(table?.n??0))return {available:false,error:'SWING_LIVE_CANDIDATES_TABLE_MISSING_IN_EARLY_DB',rows:[],stages:[]};
+  const rows:any=await d.prepare(`SELECT candidate_key,coin,side,interval,signal_bar_open,signal_available_at,
+   first_seen_at,last_seen_at,reference_price,patterns_json,market_regime,selected_pattern,
+   stage,reason,live_signal_key,checks FROM swing_live_candidates ORDER BY last_seen_at DESC LIMIT 250`).all();
+  const stages:any=await d.prepare(`SELECT stage,COUNT(*) AS total FROM swing_live_candidates GROUP BY stage`).all();
+  return {available:true,rows:rows.results??[],stages:stages.results??[]};
+ })().catch((e:any)=>({available:false,error:String(e?.message||e),rows:[],stages:[]}));
  return {success:errors.length===0&&live.errors.length===0,version:VERSION,mode:'SHADOW_ONLY',trading:false,
-  at,offset,coins,scanned,live,errors,
-  notice:'FORMING is heuristic, not guaranteed. LIVE_ELIGIBLE uses actual detectors + ranked rules. Queue selected is NOT a fill. No orders.'};
+  at,offset,coins,scanned,live,candidateAudit,errors,
+  notice:'EARLY reads actual LIVE candidate audit from its DB binding; FORMING remains heuristic. LIVE_SELECTED is not a fill. No orders.'};
 }
