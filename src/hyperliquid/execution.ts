@@ -3371,12 +3371,31 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  const saved:any=await db.prepare('SELECT * FROM swing_protection_orders WHERE signal_key=?').bind(key).first();
  if(saved&&String(saved.mode)!==(progressive?SWING_PROGRESSIVE_MODE:'FIXED_TPSL'))
   return {ok:false,reason:'SAVED_PROTECTION_MODE_CONFLICT'};
- // For an existing progressive record the last confirmed SL is the reference.
- // For an unconfirmed initial SL the entry's -1% price is the reference.
- const expectedSl=progressive&&saved?Number(saved.sl_px):targetSl;
- if(!slOid||!priceNear(trigger(sl),expectedSl)||!qtyNear(size(sl),expected)||
+ // Recovery may follow a successful exchange SL replacement whose confirmation
+ // timed out. Only accept the NEW price if the latest D1 audit proves that
+ // exact replacement was attempted from the currently saved SL.
+ const triggerSl=trigger(sl);
+ const audit:any=progressive?await db.prepare(`SELECT * FROM swing_progressive_history
+  WHERE signal_key=? AND new_sl_price IS NOT NULL
+  ORDER BY detected_at DESC,id DESC LIMIT 1`).bind(key).first():null;
+ const oldSl=progressive&&saved?Number(saved.sl_px):targetSl;
+ const originalSlMatches=priceNear(triggerSl,oldSl);
+ const attemptedNewSlMatches=progressive&&!!saved&&!!audit&&
+  String(audit.old_sl_oid)===String(saved.sl_oid)&&
+  priceNear(Number(audit.old_sl_price),Number(saved.sl_px))&&
+  priceNear(triggerSl,Number(audit.new_sl_price))&&
+  Number(audit.target_locked_pct)>=0&&
+  String(audit.side).toUpperCase()===side&&
+  String(audit.coin).toUpperCase()===coin&&
+  Number(audit.detected_at)>=Number(saved.confirmed_at??0)&&
+  (saved.progressive_claimed_at!=null || String(audit.event)==='LOCK_ERROR');
+ if(!slOid||!(originalSlMatches||attemptedNewSlMatches)||!qtyNear(size(sl),expected)||
     (!progressive&&(!tpOid||tpOid===slOid||!priceNear(trigger(tp),targetTp)||!qtyNear(size(tp),expected))))
   return {ok:false,reason:'PROTECTION_OID_TRIGGER_OR_SIZE_MISMATCH'};
+ // If the replacement was confirmed on exchange, its OID MUST differ from
+ // the old saved OID. Do not trust an ambiguous repricing of the same order.
+ if(attemptedNewSlMatches&&String(slOid)===String(saved.sl_oid))
+  return {ok:false,reason:'PROGRESSIVE_REPLACEMENT_OID_NOT_CHANGED'};
  const closeSide=side==='SHORT'?'B':'A';
  for(const order of (progressive?[sl]:[tp,sl])){
   // Fail closed if the exchange response does not prove these orders close the position.
@@ -3395,24 +3414,28 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
   if(!isReduceOnly)return {ok:false,reason:'PROTECTION_REDUCE_ONLY_NOT_CONFIRMED'};
   if(!triggerConfirmed)return {ok:false,reason:'PROTECTION_TRIGGER_NOT_CONFIRMED'};
  }
- // A failed progressive replace may leave a claim although the ORIGINAL SL
- // remains the sole live protection. Recover only after exchange verification.
- // Never clear a claim when a different/new order is present.
- if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid))
-  return {ok:false,reason:'SAVED_OID_CONFLICT_MANUAL_RECONCILIATION'};
+ // A new verified OID is allowed only for the audited progressive target.
+ if(saved&&String(saved.tp_oid)!==tpOid)
+  return {ok:false,reason:'SAVED_TP_OID_CONFLICT'};
+ if(saved&&String(saved.sl_oid)!==slOid&&!attemptedNewSlMatches)
+  return {ok:false,reason:'SAVED_SL_OID_CONFLICT_MANUAL_RECONCILIATION'};
  const ledgerBeforeClaim:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
  if(String(ledgerBeforeClaim?.status)!=='TPSL_FAILED_AFTER_RETRIES')
   return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
- if(saved?.progressive_claimed_at!=null){
-  if(!progressive)return {ok:false,reason:'NON_PROGRESSIVE_CLAIM_CONFLICT'};
-  const claimClear:any=await db.prepare(`UPDATE swing_protection_orders
-   SET progressive_claimed_at=NULL WHERE signal_key=? AND sl_oid=?
-   AND progressive_claimed_at=? AND mode=?`)
-   .bind(key,slOid,saved.progressive_claimed_at,SWING_PROGRESSIVE_MODE).run();
-  if(Number(claimClear?.meta?.changes??0)!==1)
-   return {ok:false,reason:'PROGRESSIVE_CLAIM_CHANGED_DURING_RECONCILIATION'};
+ if(saved){
+  // Compare-and-swap prevents overwriting an SL changed by another monitor.
+  // Write the exchange-confirmed order BEFORE clearing the failed ledger.
+  const changed:any=await db.prepare(`UPDATE swing_protection_orders
+   SET sl_oid=?,sl_px=?,locked_pct=?,progressive_claimed_at=NULL,confirmed_at=?
+   WHERE signal_key=? AND sl_oid=? AND sl_px=? AND mode=?
+   AND (progressive_claimed_at IS ? OR progressive_claimed_at=?)`)
+   .bind(slOid,String(triggerSl),attemptedNewSlMatches?Number(audit.target_locked_pct):saved.locked_pct,
+    Date.now(),key,String(saved.sl_oid),String(saved.sl_px),
+    progressive?SWING_PROGRESSIVE_MODE:'FIXED_TPSL',
+    saved.progressive_claimed_at??null,saved.progressive_claimed_at??null).run();
+  if(Number(changed?.meta?.changes??0)!==1)
+   return {ok:false,reason:'SAVED_PROTECTION_CHANGED_DURING_RECONCILIATION'};
  }
-
  // The current ledger status is checked before and during the guarded status update.
  const current:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
  if(String(current?.status)!=='TPSL_FAILED_AFTER_RETRIES')return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
