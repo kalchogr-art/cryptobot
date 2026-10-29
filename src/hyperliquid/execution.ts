@@ -299,18 +299,33 @@ async function signHyperliquidAction(
   };
 }
 
+// Read-only Hyperliquid /info guard. Never retries signed exchange writes.
+let infoRateLimitUntil = 0;
+const INFO_429_WAIT_MS = 2500;
 async function postInfo(body: Record<string, any>): Promise<any> {
-  const res = await fetch(INFO_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-  if (!res.ok) throw new Error(`INFO_HTTP_${res.status}: ${text.slice(0, 300)}`);
-  return JSON.parse(text);
+  // One bounded retry only; subsequent calls respect a shared in-isolate cooldown.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const wait = infoRateLimitUntil - Date.now();
+    if (wait > 0) await new Promise<void>(resolve => setTimeout(resolve, Math.min(wait, 8000)));
+    const res = await fetch(INFO_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const responseText = await res.text();
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const backoff = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 8000) : INFO_429_WAIT_MS * (attempt + 1);
+      infoRateLimitUntil = Math.max(infoRateLimitUntil, Date.now() + backoff);
+      if (attempt === 0) continue;
+      throw new Error(`INFO_HTTP_429: RATE_LIMITED_READ_ONLY (${String(body.type || 'unknown')})`);
+    }
+    if (!res.ok) throw new Error(`INFO_HTTP_${res.status}: ${responseText.slice(0, 300)}`);
+    return JSON.parse(responseText);
+  }
+  throw new Error('INFO_HTTP_429: RATE_LIMITED_READ_ONLY');
 }
-
 
 export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
@@ -4154,6 +4169,12 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
       const result=await swingAdvanceProgressive(env,row,position,saved);
       events.push({coin,status:'PROGRESSIVE',...result});
      }catch(e:any){
+      // /info 429 before any order change is a transient read failure, NOT missing SL.
+      // Keep the protected ledger row and the exchange-native SL untouched.
+      if(String(e?.message??e).includes('INFO_HTTP_429')){
+       events.push({coin,status:'PROGRESSIVE_RATE_LIMIT_RETRY_NEXT_CYCLE',error:String(e?.message??e)});
+       continue;
+      }
       await db.prepare(`UPDATE hyperliquid_execution_ledger SET status='TPSL_FAILED_AFTER_RETRIES',last_error=?,updated_at=? WHERE id=?`)
        .bind('SWING_PROGRESSIVE_REQUIRES_RECONCILIATION:'+String(e?.message??e),Date.now(),row.id).run();
       await sendTelegram(env,`🚨 SWING PROGRESSIVE ALERT · ${escapeTelegramHtml(coin)}\n${escapeTelegramHtml(String(e?.message??e))}\nCheck live SL orders manually. New Swing entries blocked.`).catch(()=>{});
