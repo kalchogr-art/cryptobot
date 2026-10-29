@@ -3313,7 +3313,22 @@ function swingProtectionKind(o:any):'tp'|'sl'|null {
 async function swingProtectionInventory(coin:string){
  const all=await postInfo({type:'frontendOpenOrders',user:MASTER_ACCOUNT});
  if(!Array.isArray(all))throw Error('SWING_ORDER_INVENTORY_UNAVAILABLE');
- const same=all.filter((o:any)=>String(o.coin??'').toUpperCase()===coin);
+ // The frontend endpoint can omit reduceOnly and encode SL type differently.
+ // Merge ONLY matching live OIDs from the standard openOrders endpoint;
+ // never infer a live order from D1 or from a historical order response.
+ const basic=await postInfo({type:'openOrders',user:MASTER_ACCOUNT});
+ if(!Array.isArray(basic))throw Error('SWING_BASIC_ORDER_INVENTORY_UNAVAILABLE');
+ const byOid=new Map<string,any>();
+ for(const order of basic){const oid=swingProtectionOid(order);if(oid)byOid.set(oid,order);}
+ const same=all.filter((o:any)=>String(o.coin??'').toUpperCase()===coin)
+  .map((o:any)=>{const other=byOid.get(swingProtectionOid(o)??'');return other?{
+   ...other,...o,
+   reduceOnly:o.reduceOnly??other.reduceOnly,
+   side:o.side??other.side,
+   sz:o.sz??other.sz,
+   triggerPx:o.triggerPx??other.triggerPx,
+   orderType:o.orderType??other.orderType,
+  }:o;});
  const tp=same.filter((o:any)=>swingProtectionKind(o)==='tp');
  const sl=same.filter((o:any)=>swingProtectionKind(o)==='sl');
  const unknown=same.filter((o:any)=>swingProtectionKind(o)===null);
@@ -3374,8 +3389,11 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
     (order.isTrigger!==false && Number.isFinite(triggerPx) && triggerPx>0 &&
      (orderType.includes('stop')||orderType.includes('take profit')||
       orderType.includes('takeprofit')||orderType==='sl'||orderType==='tp'));
-  if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||!triggerConfirmed)
-   return {ok:false,reason:'PROTECTION_CLOSE_SIDE_REDUCE_ONLY_OR_TRIGGER_UNCONFIRMED'};
+  const isReduceOnly=order.reduceOnly===true || order.reduceOnly==='true' || order.reduceOnly===1;
+  if(String(order.side??'').toUpperCase()!==closeSide)
+   return {ok:false,reason:'PROTECTION_CLOSE_SIDE_MISMATCH'};
+  if(!isReduceOnly)return {ok:false,reason:'PROTECTION_REDUCE_ONLY_NOT_CONFIRMED'};
+  if(!triggerConfirmed)return {ok:false,reason:'PROTECTION_TRIGGER_NOT_CONFIRMED'};
  }
  // A failed progressive replace may leave a claim although the ORIGINAL SL
  // remains the sole live protection. Recover only after exchange verification.
