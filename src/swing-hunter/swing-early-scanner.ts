@@ -1,3 +1,4 @@
+
 /** SWING EARLY V4 — predictive mirror of confirmed Swing signal selection.
  * Shadow only. Does not import execution, place orders, or change LIVE.
  * Replaces src/swing-hunter/swing-early-scanner.ts.
@@ -155,6 +156,57 @@ async function record(env:Env,item:{coin:string;frame:Frame;side:Side;pattern:st
  item.phase==='LIVE_ELIGIBLE'?1:0,item.reason).run();
  return key;
 }
+
+// CANDIDATES V3: pre-confirmation observation from forming bars.
+// The 35 LIVE rules are the only eligibility source. No execution or orders.
+async function candidateSchema(d:any){
+ await d.prepare(`CREATE TABLE IF NOT EXISTS swing_live_candidates (
+ candidate_key TEXT PRIMARY KEY,coin TEXT NOT NULL,side TEXT NOT NULL,interval TEXT NOT NULL,
+ signal_bar_open INTEGER NOT NULL,signal_available_at INTEGER NOT NULL,
+ first_seen_at INTEGER NOT NULL,last_seen_at INTEGER NOT NULL,reference_price REAL,
+ patterns_json TEXT NOT NULL,market_regime TEXT,selected_pattern TEXT,
+ stage TEXT NOT NULL,reason TEXT,live_signal_key TEXT,checks INTEGER NOT NULL DEFAULT 1)`).run();
+ await d.prepare(`CREATE TABLE IF NOT EXISTS swing_live_candidate_checks (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_key TEXT NOT NULL,checked_at INTEGER NOT NULL,
+ coin TEXT NOT NULL,side TEXT NOT NULL,interval TEXT NOT NULL,stage TEXT NOT NULL,
+ reason TEXT,market_regime TEXT,selected_pattern TEXT,reference_price REAL,
+ patterns_json TEXT NOT NULL)`).run();
+}
+async function recordPotentialCandidates(env:Env,coin:string,frame:Frame,barOpen:number,
+ at:number,price:number,regime:string,active:Map<string,{side:Side;pattern:string;phase:string;reason:string}>){
+ const d=db(env),step=STEP[frame];let count=0;
+ for(const side of ['LONG','SHORT'] as Side[]){
+  const rules=ruleTable(side,frame),allowed=new Set(Object.values(rules).flatMap(x=>Object.keys(x)));
+  const matches=[...active.values()].filter(x=>x.side===side&&allowed.has(x.pattern));
+  if(!matches.length)continue;
+  const patterns=[...new Set(matches.map(x=>x.pattern))];
+  const detected=matches.some(x=>x.phase==='LIVE_ELIGIBLE'||x.phase==='DETECTOR_HIT');
+  const stage=detected?'DETECTOR_HIT':'FORMING';
+  const reason=detected?'FORMING_BAR_DETECTOR_NOT_LIVE_CONFIRMED':'HEURISTIC_FORMING_NOT_LIVE_CONFIRMED';
+  const key=`SWING:${side}:${coin}:${frame}:${barOpen}`;
+  // Preserve execution's authoritative LIVE_SELECTED and later state.
+  await d.prepare(`INSERT INTO swing_live_candidates
+  (candidate_key,coin,side,interval,signal_bar_open,signal_available_at,first_seen_at,
+   last_seen_at,reference_price,patterns_json,market_regime,selected_pattern,stage,reason,checks)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,1)
+  ON CONFLICT(candidate_key) DO UPDATE SET
+   last_seen_at=excluded.last_seen_at,
+   reference_price=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.reference_price ELSE excluded.reference_price END,
+   patterns_json=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.patterns_json ELSE excluded.patterns_json END,
+   market_regime=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.market_regime ELSE excluded.market_regime END,
+   stage=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.stage ELSE excluded.stage END,
+   reason=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.reason ELSE excluded.reason END,
+   checks=swing_live_candidates.checks+1`)
+   .bind(key,coin,side,frame,barOpen,barOpen+step,at,at,price,JSON.stringify(patterns),regime,stage,reason).run();
+  await d.prepare(`INSERT INTO swing_live_candidate_checks
+  (candidate_key,checked_at,coin,side,interval,stage,reason,market_regime,selected_pattern,reference_price,patterns_json)
+  VALUES (?,?,?,?,?,?,?,?,NULL,?,?)`)
+   .bind(key,at,coin,side,frame,stage,reason,regime,price,JSON.stringify(patterns)).run();
+  count++;
+ }
+ return count;
+}
+
 async function scanOne(env:Env,coin:string,frame:Frame,at:number){
  const step=STEP[frame],barOpen=Math.floor(at/step)*step,remaining=(barOpen+step-at)/60000;
  // Scan the whole candle to detect forming patterns; label LIVE eligibility only
@@ -176,6 +228,8 @@ async function scanOne(env:Env,coin:string,frame:Frame,at:number){
    phase:remaining<=WATCH_WINDOW_MIN?'LIVE_ELIGIBLE':'DETECTOR_HIT',
    reason:remaining<=WATCH_WINDOW_MIN?'LIVE_DETECTOR_AND_RANKED_RULE_MATCH':'LIVE_DETECTOR_MATCH_EARLY_WINDOW_NOT_YET_OPEN'});
  }
+ // Write pre-confirmation LIVE-allowed candidates to the same D1 as LIVE Execution.
+ const candidateCount=await recordPotentialCandidates(env,coin,frame,barOpen,at,forming.c,regime,active);
  let recorded=0;const currentKeys=new Set<string>();
  for(const item of active.values()){
   const key=await record(env,{coin,frame,barOpen,at,regime,price:forming.c,remaining,...item});
@@ -196,7 +250,7 @@ async function scanOne(env:Env,coin:string,frame:Frame,at:number){
    .bind(row.watch_key,at,remaining,forming.c,regime).run();disappeared++;
  }
  return {coin,frame,status:'OK',regime,remaining_minutes:Math.round(remaining*10)/10,
-  detected_patterns:hits.length,watching:recorded,disappeared};
+  detected_patterns:hits.length,watching:recorded,candidateCount,disappeared};
 }
 async function reconcile(env:Env,at:number,limit=100){
  const d=db(env),sourceDb=signalsDb(env);
@@ -258,7 +312,7 @@ async function reconcile(env:Env,at:number,limit=100){
 export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
  const at=Date.now(),start=Math.max(0,Math.floor(offset)),count=Math.max(1,Math.min(20,Math.floor(limit)));
  const coins=COINS.slice(start,start+count),scanned:any[]=[],errors:string[]=[];
- try{await ensureSchema(env);}catch(e:any){return {success:false,version:VERSION,mode:'SHADOW_ONLY',trading:false,error:'SCHEMA:'+String(e?.message||e)};}
+ try{await ensureSchema(env);await candidateSchema(db(env));}catch(e:any){return {success:false,version:VERSION,mode:'SHADOW_ONLY',trading:false,error:'SCHEMA:'+String(e?.message||e)};}
  for(const coin of coins)for(const frame of ['1h','4h'] as Frame[]){
   try{scanned.push(await scanOne(env,coin,frame,at));}
   catch(e:any){errors.push(`${coin}/${frame}:${String(e?.message||e)}`);}
