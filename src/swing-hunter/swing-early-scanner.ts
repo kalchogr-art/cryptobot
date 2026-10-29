@@ -4,7 +4,7 @@
  * Existing swing_early_signals table is reused; legacy rows are untouched.
  */
 import type {Candle} from './types';
-import {COINS,STEP} from './ohlcv';
+import {STEP} from './ohlcv';
 import {structure} from './market-structure';
 import {detectCatalog,PatternCompareV2,detectClassicalCatalog} from './pattern-catalog';
 
@@ -73,7 +73,7 @@ function detect(bars:Candle[],frame:Frame){const market=structure(bars);return [
 // A watch is NOT a LIVE signal. Only a detector hit + LIVE rule is LIVE_ELIGIBLE.
 // Existing D1 rows are retained; a dedicated table keeps full observation history.
 const WATCH_PREFIX='EARLY_POTENTIAL_V4';
-const VERSION='SWING_EARLY_CANDIDATE_CONSUMER_V5.2';
+const VERSION='SWING_EARLY_CANDIDATE_CONSUMER_V5.3_ALL_ACTIVE';
 const WATCH_WINDOW_MIN=20;
 const FINALIZE_GRACE_MIN=35;
 async function ensureSchema(env:Env){
@@ -268,14 +268,35 @@ async function reconcile(env:Env,at:number,limit=100){
   missedLiveSelectionsLast24h:Number(unmatched?.n??0),candidateAuditAvailable,errors,
   note:'LIVE_SELECTED is a selected queue signal, NOT a verified executed trade.'};
 }
-/** Existing scheduler calls this every minute with rotating batches of five. */
+/** Every scheduler tick consumes ALL active LIVE candidates, not a rotating coin batch.
+ * offset/limit remain accepted for compatibility with existing CRON and manual endpoint.
+ * This routine never writes swing_live_candidates or places orders.
+ */
 export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
- const at=Date.now(),start=Math.max(0,Math.floor(offset)),count=Math.max(1,Math.min(20,Math.floor(limit)));
- const coins=COINS.slice(start,start+count),scanned:any[]=[],errors:string[]=[];
+ const at=Date.now(),scanned:any[]=[],errors:string[]=[];
  try{await ensureSchema(env);}catch(e:any){return {success:false,version:VERSION,mode:'SHADOW_ONLY',trading:false,error:'SCHEMA:'+String(e?.message||e)};}
- for(const coin of coins)for(const frame of ['1h','4h'] as Frame[]){
+ const d=db(env);
+ let active:any[]=[];
+ try{
+  const q:any=await d.prepare(`SELECT DISTINCT coin,interval,signal_bar_open FROM swing_live_candidates
+   WHERE stage IN ('FORMING','DETECTOR_HIT','WAITING','ELIGIBLE','LIVE_SELECTED')
+   AND signal_bar_open>=? AND signal_bar_open<=?
+   ORDER BY signal_bar_open DESC,coin,interval LIMIT 300`).bind(at-4*HOUR-5*60000,at).all();
+  active=q.results||[];
+ }catch(e:any){errors.push('ACTIVE_CANDIDATES:'+String(e?.message||e));}
+ // Process each candidate's own candle only while that candle is still forming.
+ // Closed bars are reconciled below; they are not incorrectly marked DISAPPEARED.
+ const unique=new Set<string>();
+ for(const row of active){
+  const frame=String(row.interval) as Frame;
+  if(frame!=='1h'&&frame!=='4h')continue;
+  const coin=String(row.coin),barOpen=Number(row.signal_bar_open);
+  if(!Number.isFinite(barOpen)||at>=barOpen+STEP[frame]||at<barOpen)continue;
+  const key=coin+':'+frame+':'+barOpen;
+  if(unique.has(key))continue;
+  unique.add(key);
   try{scanned.push(await scanOne(env,coin,frame,at));}
-  catch(e:any){errors.push(`${coin}/${frame}:${String(e?.message||e)}`);}
+  catch(e:any){errors.push(key+':'+String(e?.message||e));}
  }
  const live=await reconcile(env,at).catch((e:any)=>({errors:[String(e?.message||e)]}));
  const candidateAudit=await (async()=>{
@@ -289,6 +310,6 @@ export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
   return {available:true,rows:rows.results??[],stages:stages.results??[]};
  })().catch((e:any)=>({available:false,error:String(e?.message||e),rows:[],stages:[]}));
  return {success:errors.length===0&&live.errors.length===0,version:VERSION,mode:'SHADOW_ONLY',trading:false,
-  at,offset,coins,scanned,live,candidateAudit,errors,
+  at,offset,limit,active_candidate_groups:active.length,scanned,live,candidateAudit,errors,
   notice:'EARLY only reads LIVE candidates and writes EARLY observation tables. LIVE_SELECTED is not a fill. No orders.'};
 }
