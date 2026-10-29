@@ -3352,8 +3352,21 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
   if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||order.isTrigger!==true)
    return {ok:false,reason:'PROTECTION_CLOSE_SIDE_REDUCE_ONLY_OR_TRIGGER_UNCONFIRMED'};
  }
- if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid||saved.progressive_claimed_at!=null))
+ // A failed progressive replace may leave a claim although the ORIGINAL SL
+ // remains the sole live protection. Recover only after exchange verification.
+ // Never clear a claim when a different/new order is present.
+ if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid))
   return {ok:false,reason:'SAVED_OID_CONFLICT_MANUAL_RECONCILIATION'};
+ if(saved?.progressive_claimed_at!=null){
+  if(!progressive)return {ok:false,reason:'NON_PROGRESSIVE_CLAIM_CONFLICT'};
+  const claimClear:any=await db.prepare(`UPDATE swing_protection_orders
+   SET progressive_claimed_at=NULL WHERE signal_key=? AND sl_oid=?
+   AND progressive_claimed_at=? AND mode=?`)
+   .bind(key,slOid,saved.progressive_claimed_at,SWING_PROGRESSIVE_MODE).run();
+  if(Number(claimClear?.meta?.changes??0)!==1)
+   return {ok:false,reason:'PROGRESSIVE_CLAIM_CHANGED_DURING_RECONCILIATION'};
+ }
+
  // The current ledger status is checked before and during the guarded status update.
  const current:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
  if(String(current?.status)!=='TPSL_FAILED_AFTER_RETRIES')return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
@@ -3922,11 +3935,17 @@ async function swingAdvanceProgressive(env:HyperliquidExecutionEnv,row:any,posit
   const newOid=responseOrderOid(status);
   if(!(add.httpStatus>=200&&add.httpStatus<300&&add.json?.status==='ok'&&!status?.error&&newOid!==null))
    throw Error('SWING_PROGRESSIVE_ADD_NOT_CONFIRMED');
-  const after=await swingProtectionInventory(coin);
-  if(after.sl.length!==2||after.tp.length!==0||after.unknown.length!==0||
-     !after.sl.some((o:any)=>swingProtectionOid(o)===String(newOid))||
-     !after.sl.some((o:any)=>swingProtectionOid(o)===String(saved.sl_oid)))
-   throw Error('SWING_PROGRESSIVE_NEW_STOP_NOT_VISIBLE');
+  // Exchange order visibility may lag the signed placement acknowledgement.
+  // Retry READ-ONLY inventory, without resubmitting or cancelling either SL.
+  let visible=false;
+  for(let attempt=0;attempt<5;attempt++){
+   if(attempt>0)await new Promise(resolve=>setTimeout(resolve,350*attempt));
+   const after=await swingProtectionInventory(coin);
+   if(after.sl.length===2&&after.tp.length===0&&after.unknown.length===0&&
+      after.sl.some((o:any)=>swingProtectionOid(o)===String(newOid))&&
+      after.sl.some((o:any)=>swingProtectionOid(o)===String(saved.sl_oid))){visible=true;break;}
+  }
+  if(!visible)throw Error('SWING_PROGRESSIVE_NEW_STOP_NOT_VISIBLE');
   const cancel=await sendLifecycleSignedAction({type:'cancel',cancels:[{a:asset,o:Number(saved.sl_oid)}]},secret);
   if(!(cancel.httpStatus>=200&&cancel.httpStatus<300&&cancel.json?.status==='ok'))
    throw Error('SWING_PROGRESSIVE_OLD_STOP_CANCEL_NOT_CONFIRMED');
