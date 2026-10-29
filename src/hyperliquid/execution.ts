@@ -327,6 +327,64 @@ async function postInfo(body: Record<string, any>): Promise<any> {
   throw new Error('INFO_HTTP_429: RATE_LIMITED_READ_ONLY');
 }
 
+// SWING Progressive diagnostics: strictly READ ONLY, no order submission or D1 mutation.
+export async function getSwingProgressiveDiagnostic(env:HyperliquidExecutionEnv):Promise<any>{
+ const started=Date.now();
+ const result:any={module:'SWING_PROGRESSIVE_DIAGNOSTIC',read_only:true,
+  trading_actions_sent:false,checked_at:new Date().toISOString(),
+  api:{},ledger:null,protection:null,history:[],assessment:[]};
+ if(!env.DB){result.assessment.push('D1_BINDING_MISSING');return result;}
+ try{
+  result.ledger=await env.DB.prepare(`SELECT id,crossing_id,coin,side,status,last_error,entry_fill_price,entry_fill_size,updated_at
+    FROM hyperliquid_execution_ledger WHERE id=1050`).first();
+  if(result.ledger){
+   result.protection=await env.DB.prepare(`SELECT signal_key,coin,tp_oid,sl_oid,tp_px,sl_px,mode,locked_pct,peak_pct,progressive_claimed_at,confirmed_at
+    FROM swing_protection_orders WHERE signal_key=?`).bind(result.ledger.crossing_id).first();
+   const h=await env.DB.prepare(`SELECT event,error,detected_at,confirmed_at,old_sl_oid,new_sl_oid,old_sl_price,new_sl_price,target_locked_pct
+    FROM swing_progressive_history WHERE signal_key=? ORDER BY id DESC LIMIT 5`).bind(result.ledger.crossing_id).all();
+   result.history=h?.results??[];
+  }else result.assessment.push('LEDGER_ROW_1050_NOT_FOUND');
+  const blocked=await env.DB.prepare(`SELECT COUNT(*) AS n FROM hyperliquid_execution_ledger
+   WHERE strategy_version LIKE 'SWING_%' AND status IN ('TPSL_FAILED_AFTER_RETRIES','PROTECTION_SUBMITTING','ENTRY_FILLED')`).first();
+  result.possible_entry_blockers=Number(blocked?.n??0);
+ }catch(e:any){result.d1_error=String(e?.message??e);}
+ // Exactly two exchange read requests; intentionally no automatic retries.
+ for(const [label,type] of [['positions','clearinghouseState'],['orders','frontendOpenOrders']] as const){
+  try{
+   const res=await fetch(INFO_URL,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({type,user:MASTER_ACCOUNT})});
+   const raw=await res.text();
+   const api:any={http_status:res.status,ok:res.ok,retry_after:res.headers.get('retry-after'),duration_ms:Date.now()-started};
+   if(res.ok){
+    const data=JSON.parse(raw);
+    if(label==='positions'){
+     const positions=Array.isArray(data?.assetPositions)?data.assetPositions:[];
+     const bnb=positions.map((x:any)=>x?.position??x).find((x:any)=>String(x?.coin??'').toUpperCase()==='BNB');
+     api.bnb_position=bnb?{coin:bnb.coin,szi:bnb.szi,entryPx:bnb.entryPx}:null;
+     api.position_count=positions.length;
+    }else{
+     const orders=Array.isArray(data)?data:[];
+     api.bnb_orders=orders.filter((o:any)=>String(o?.coin??'').toUpperCase()==='BNB')
+      .map((o:any)=>({oid:o.oid,coin:o.coin,side:o.side,sz:o.sz,triggerPx:o.triggerPx,
+        orderType:o.orderType,isTrigger:o.isTrigger,reduceOnly:o.reduceOnly}));
+     api.total_open_orders=orders.length;
+    }
+   }else api.error=raw.slice(0,200);
+   result.api[label]=api;
+   if(res.status===429)result.assessment.push('HYPERLIQUID_RATE_LIMIT_429_CONFIRMED');
+  }catch(e:any){result.api[label]={ok:false,error:String(e?.message??e)};}
+ }
+ if(result.ledger?.status==='TPSL_FAILED_AFTER_RETRIES')result.assessment.push('FAILED_LEDGER_STILL_BLOCKS_ENTRIES');
+ if(result.protection?.progressive_claimed_at!=null)result.assessment.push('STALE_PROGRESSIVE_CLAIM_PRESENT');
+ const orders=result.api.orders?.bnb_orders;
+ if(Array.isArray(orders)&&result.protection){
+  result.api.orders.saved_sl_oid_visible=orders.some((o:any)=>String(o.oid)===String(result.protection.sl_oid));
+  if(!result.api.orders.saved_sl_oid_visible)result.assessment.push('SAVED_STOP_OID_NOT_IN_OPEN_ORDERS');
+ }
+ result.duration_ms=Date.now()-started;
+ return result;
+}
+
 export async function getHyperliquidOrderWireAudit(limit = 500): Promise<any> {
   const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
 
