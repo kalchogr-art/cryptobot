@@ -3773,10 +3773,12 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   if(Object.values(eligibleRules).some((r:any)=>pattern in r)){if(group.eligiblePatterns.size===0){group.reference_price=item.reference_price;group.signal_available_at=item.signal_available_at;}group.eligiblePatterns.add(pattern);}
  }
  for(const [key,item] of groups){
-  const patterns=[...item.patterns] as string[],eligiblePatterns=[...item.eligiblePatterns] as string[];
-  const base={key,coin:String(item.coin),side:String(item.side),interval:String(item.interval),bar:Number(item.signal_bar_open),available:Number(item.signal_available_at),price:Number(item.reference_price),patterns};
+  const eligiblePatterns=[...item.eligiblePatterns] as string[];
+  // Audit only patterns present in the existing LIVE rule maps (all regimes).
+  // The LIVE selection algorithm below remains unchanged.
+  const base={key,coin:String(item.coin),side:String(item.side),interval:String(item.interval),bar:Number(item.signal_bar_open),available:Number(item.signal_available_at),price:Number(item.reference_price),patterns:eligiblePatterns};
+  if(!eligiblePatterns.length)continue;
   if(!Number.isFinite(base.price)||base.price<=0){await audit({...base,regime:null,selected:null,stage:'REJECTED',reason:'INVALID_REFERENCE_PRICE'});continue;}
-  if(!eligiblePatterns.length){await audit({...base,regime:null,selected:null,stage:'REJECTED',reason:'NO_ENABLED_PATTERN'});continue;}
   let regime:string|null=null;
   try{regime=await swingLongRegimeAt(env.SWING_DB??db,base.available);}catch(e:any){
    await audit({...base,regime:null,selected:null,stage:'ERROR',reason:'REGIME_QUERY_FAILED:'+String(e?.message||e)});throw e;
