@@ -3984,9 +3984,74 @@ async function swingPostEntryPathAudit(env:HyperliquidExecutionEnv):Promise<void
  }
 }
 
+// MANUAL CLOSE V1 — exchange-confirmed reconciliation for orphaned Swing ledger records.
+// No order submission/cancellation. Ambiguous fills or open orders leave the safety lock intact.
+async function swingReconcileManualCloses(env:HyperliquidExecutionEnv,db:any){
+ const pending:any=await db.prepare(`SELECT * FROM hyperliquid_execution_ledger
+  WHERE strategy_version IN (?,?,?) AND entry_filled_at IS NOT NULL
+  AND (status='TPSL_FAILED_AFTER_RETRIES' OR
+       (status='MANUALLY_CLOSED' AND (exit_price IS NULL OR realized_pnl IS NULL OR last_error!='SWING_MANUAL_CLOSE_TELEGRAM_SENT')))
+  ORDER BY entry_filled_at DESC LIMIT 20`).bind(...SWING_STRATEGIES).all();
+ const events:any[]=[];
+ for(const row of pending.results??[]){
+  const coin=String(row.coin??'').toUpperCase(),key=String(row.crossing_id??'');
+  try{
+   if(await getOpenPositionForCoin(coin)){events.push({coin,status:'STILL_OPEN_NO_MANUAL_RECONCILIATION'});continue;}
+   if((await getOpenOrdersForCoin(coin)).length){events.push({coin,status:'OPEN_ORDERS_REQUIRE_MANUAL_CHECK'});continue;}
+   const fills=await getRecentFillsForCoin(coin);
+   const after=fills.filter((f:any)=>Number(f.time)>=Number(row.entry_filled_at)-5000);
+   const exits=after.filter((f:any)=>String(f.dir??'').toLowerCase().includes('close'));
+   const expected=Number(row.entry_fill_size),entry=Number(row.entry_fill_price);
+   if(!(expected>0&&entry>0)||!exits.length){events.push({coin,status:'CLOSE_FILLS_NOT_VERIFIED'});continue;}
+   const sorted=exits.slice().sort((a:any,b:any)=>Number(a.time)-Number(b.time));
+   // Only one matching close fill is accepted; multiple/partial closes require manual audit.
+   if(sorted.length!==1||Math.abs(Number(sorted[0].sz)-expected)>Math.max(expected*0.001,1e-9)){
+    events.push({coin,status:'AMBIGUOUS_OR_PARTIAL_CLOSE_FILLS'});continue;
+   }
+   const exit=sorted[0],exitPx=Number(exit.px),exitAt=Number(exit.time);
+   if(!(exitPx>0&&exitAt>0)){events.push({coin,status:'INVALID_CLOSE_FILL'});continue;}
+   const side=String(row.side)==='LONG'?'LONG':'SHORT';
+   const pnl=lifecyclePnlFromFills(after,Number(row.entry_filled_at),entry,exitPx,expected,side);
+   if(pnl.netPnl===null){events.push({coin,status:'NET_PNL_UNAVAILABLE'});continue;}
+   const now=Date.now();
+   // Preserve already-recorded administrative close timestamp, but prefer exchange close time when unknown.
+   if(String(row.status)==='TPSL_FAILED_AFTER_RETRIES'){
+    const claim:any=await db.prepare(`UPDATE hyperliquid_execution_ledger SET
+     status='MANUALLY_CLOSED',closed_at=?,close_reason='MANUAL',exit_price=?,realized_pnl=?,
+     last_error='SWING_MANUAL_CLOSE_TELEGRAM_PENDING',updated_at=?
+     WHERE id=? AND status='TPSL_FAILED_AFTER_RETRIES' AND closed_at IS NULL`)
+     .bind(exitAt,exitPx,pnl.netPnl,now,row.id).run();
+    if(Number(claim.meta?.changes??0)!==1)continue;
+   }else{
+    await db.prepare(`UPDATE hyperliquid_execution_ledger SET
+     closed_at=COALESCE(closed_at,?),close_reason='MANUAL',exit_price=?,realized_pnl=?,updated_at=?
+     WHERE id=? AND status='MANUALLY_CLOSED'`)
+     .bind(exitAt,exitPx,pnl.netPnl,now,row.id).run();
+   }
+   await db.prepare(`UPDATE swing_live_queue SET status='CLOSED',reason='MANUALLY_CLOSED_EXCHANGE_FLAT',updated_at=? WHERE signal_key=?`).bind(now,key).run();
+   await db.prepare(`DELETE FROM swing_coin_owners WHERE coin=? AND owner=?`).bind(coin,key).run();
+   if(String(row.last_error)!=='SWING_MANUAL_CLOSE_TELEGRAM_SENT'){
+    const msg=[`🔵 <b>SWING MANUAL CLOSE · EXCHANGE VERIFIED</b>`,
+     `🪙 <b>${escapeTelegramHtml(coin)}</b> · ${escapeTelegramHtml(side)}`,
+     `🎯 Entry: ${escapeTelegramHtml(entry)}`,
+     `🏁 Exit: ${escapeTelegramHtml(exitPx)}`,
+     `📦 Size: ${escapeTelegramHtml(expected)}`,
+     `💰 NET P/L: $${Number(pnl.netPnl).toFixed(4)}`,
+     `📊 NET ROI (notional): ${(100*Number(pnl.netPnl)/(entry*expected)).toFixed(3)}%`,
+     `🆔 ${escapeTelegramHtml(key)}`].join('\n');
+    const sent=await sendTelegram(env,msg);
+    if(sent.sent){await db.prepare(`UPDATE hyperliquid_execution_ledger SET last_error='SWING_MANUAL_CLOSE_TELEGRAM_SENT',updated_at=? WHERE id=? AND status='MANUALLY_CLOSED'`).bind(Date.now(),row.id).run();}
+    events.push({coin,status:'MANUALLY_CLOSED',telegram_sent:sent.sent,net_pnl:pnl.netPnl});
+   }
+  }catch(err:any){events.push({coin,status:'MANUAL_RECONCILIATION_ERROR',error:String(err?.message??err)});}
+ }
+ return events;
+}
+
 export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  if(!env.DB)return {ok:false,reason:'DB_MISSING'};
  const db=env.DB;await swingSchema(db);await swingProtectionSchema(db);await swingProgressiveAuditSchema(db).catch(()=>{});
+ const manualCloseEvents=await swingReconcileManualCloses(env,db).catch((err:any)=>[{status:'MANUAL_RECONCILIATION_ERROR',error:String(err?.message??err)}]);
  await swingPostEntryPathAudit(env).catch(()=>{});
  // Recover only previously failed Swing protection, after full live exchange verification.
  // A failed or ambiguous check keeps the global entry lock in place.
@@ -4127,5 +4192,5 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
    events.push({coin,error:String(err?.message??err)});
   }
  }
- return {ok:true,reconciliation,events};
+ return {ok:true,reconciliation,manual_close_events:manualCloseEvents,events};
 }
