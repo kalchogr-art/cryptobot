@@ -3365,7 +3365,16 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  const closeSide=side==='SHORT'?'B':'A';
  for(const order of (progressive?[sl]:[tp,sl])){
   // Fail closed if the exchange response does not prove these orders close the position.
-  if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||order.isTrigger!==true)
+  // frontendOpenOrders can describe trigger orders through orderType/triggerPx
+  // without supplying the optional isTrigger boolean. Require positive trigger
+  // evidence and explicit reduceOnly=true; never infer protection from D1 alone.
+  const orderType=String(order.orderType??order.orderTypeName??'').toLowerCase();
+  const triggerPx=trigger(order);
+  const triggerConfirmed=order.isTrigger===true ||
+    (order.isTrigger!==false && Number.isFinite(triggerPx) && triggerPx>0 &&
+     (orderType.includes('stop')||orderType.includes('take profit')||
+      orderType.includes('takeprofit')||orderType==='sl'||orderType==='tp'));
+  if(String(order.side??'').toUpperCase()!==closeSide||order.reduceOnly!==true||!triggerConfirmed)
    return {ok:false,reason:'PROTECTION_CLOSE_SIDE_REDUCE_ONLY_OR_TRIGGER_UNCONFIRMED'};
  }
  // A failed progressive replace may leave a claim although the ORIGINAL SL
@@ -3373,6 +3382,9 @@ async function swingReconcileFailedProtection(db:any,row:any):Promise<{ok:boolea
  // Never clear a claim when a different/new order is present.
  if(saved&&(String(saved.tp_oid)!==tpOid||String(saved.sl_oid)!==slOid))
   return {ok:false,reason:'SAVED_OID_CONFLICT_MANUAL_RECONCILIATION'};
+ const ledgerBeforeClaim:any=await db.prepare('SELECT status FROM hyperliquid_execution_ledger WHERE crossing_id=?').bind(key).first();
+ if(String(ledgerBeforeClaim?.status)!=='TPSL_FAILED_AFTER_RETRIES')
+  return {ok:false,reason:'LEDGER_STATUS_CHANGED'};
  if(saved?.progressive_claimed_at!=null){
   if(!progressive)return {ok:false,reason:'NON_PROGRESSIVE_CLAIM_CONFLICT'};
   const claimClear:any=await db.prepare(`UPDATE swing_protection_orders
@@ -4166,7 +4178,7 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  for(const failedRow of failed.results??[]){
   try{
    const result=await swingReconcileFailedProtection(db,failedRow);
-   reconciliation.push({coin:failedRow.coin,...result});
+   reconciliation.push({coin:failedRow.coin,ledger_id:failedRow.id,...result});
   }catch(err:any){
    reconciliation.push({coin:failedRow.coin,ok:false,reason:String(err?.message??err)});
   }
