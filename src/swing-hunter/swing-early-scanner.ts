@@ -1,4 +1,3 @@
-
 /** SWING EARLY V4 — predictive mirror of confirmed Swing signal selection.
  * Shadow only. Does not import execution, place orders, or change LIVE.
  * Replaces src/swing-hunter/swing-early-scanner.ts.
@@ -74,7 +73,7 @@ function detect(bars:Candle[],frame:Frame){const market=structure(bars);return [
 // A watch is NOT a LIVE signal. Only a detector hit + LIVE rule is LIVE_ELIGIBLE.
 // Existing D1 rows are retained; a dedicated table keeps full observation history.
 const WATCH_PREFIX='EARLY_POTENTIAL_V4';
-const VERSION='SWING_EARLY_LIVE_PREDICTOR_V4.0.0';
+const VERSION='SWING_EARLY_CANDIDATE_CONSUMER_V5.2';
 const WATCH_WINDOW_MIN=20;
 const FINALIZE_GRACE_MIN=35;
 async function ensureSchema(env:Env){
@@ -157,100 +156,61 @@ async function record(env:Env,item:{coin:string;frame:Frame;side:Side;pattern:st
  return key;
 }
 
-// CANDIDATES V3: pre-confirmation observation from forming bars.
-// The 35 LIVE rules are the only eligibility source. No execution or orders.
-async function candidateSchema(d:any){
- await d.prepare(`CREATE TABLE IF NOT EXISTS swing_live_candidates (
- candidate_key TEXT PRIMARY KEY,coin TEXT NOT NULL,side TEXT NOT NULL,interval TEXT NOT NULL,
- signal_bar_open INTEGER NOT NULL,signal_available_at INTEGER NOT NULL,
- first_seen_at INTEGER NOT NULL,last_seen_at INTEGER NOT NULL,reference_price REAL,
- patterns_json TEXT NOT NULL,market_regime TEXT,selected_pattern TEXT,
- stage TEXT NOT NULL,reason TEXT,live_signal_key TEXT,checks INTEGER NOT NULL DEFAULT 1)`).run();
- await d.prepare(`CREATE TABLE IF NOT EXISTS swing_live_candidate_checks (
- id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_key TEXT NOT NULL,checked_at INTEGER NOT NULL,
- coin TEXT NOT NULL,side TEXT NOT NULL,interval TEXT NOT NULL,stage TEXT NOT NULL,
- reason TEXT,market_regime TEXT,selected_pattern TEXT,reference_price REAL,
- patterns_json TEXT NOT NULL)`).run();
+// EARLY is a read-only consumer of LIVE candidates. The LIVE execution
+// worker owns swing_live_candidates and its check history.
+function candidatePatterns(raw:unknown):string[]{
+ try { const x=typeof raw==='string'?JSON.parse(raw):raw;
+  return Array.isArray(x)?x.filter((p):p is string=>typeof p==='string'):[];
+ } catch {return [];}
 }
-async function recordPotentialCandidates(env:Env,coin:string,frame:Frame,barOpen:number,
- at:number,price:number,regime:string,active:Map<string,{side:Side;pattern:string;phase:string;reason:string}>){
- const d=db(env),step=STEP[frame];let count=0;
- for(const side of ['LONG','SHORT'] as Side[]){
-  const rules=ruleTable(side,frame),allowed=new Set(Object.values(rules).flatMap(x=>Object.keys(x)));
-  const matches=[...active.values()].filter(x=>x.side===side&&allowed.has(x.pattern));
-  if(!matches.length)continue;
-  const patterns=[...new Set(matches.map(x=>x.pattern))];
-  const detected=matches.some(x=>x.phase==='LIVE_ELIGIBLE'||x.phase==='DETECTOR_HIT');
-  const stage=detected?'DETECTOR_HIT':'FORMING';
-  const reason=detected?'FORMING_BAR_DETECTOR_NOT_LIVE_CONFIRMED':'HEURISTIC_FORMING_NOT_LIVE_CONFIRMED';
-  const key=`SWING:${side}:${coin}:${frame}:${barOpen}`;
-  // Preserve execution's authoritative LIVE_SELECTED and later state.
-  await d.prepare(`INSERT INTO swing_live_candidates
-  (candidate_key,coin,side,interval,signal_bar_open,signal_available_at,first_seen_at,
-   last_seen_at,reference_price,patterns_json,market_regime,selected_pattern,stage,reason,checks)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,1)
-  ON CONFLICT(candidate_key) DO UPDATE SET
-   last_seen_at=excluded.last_seen_at,
-   reference_price=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.reference_price ELSE excluded.reference_price END,
-   patterns_json=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.patterns_json ELSE excluded.patterns_json END,
-   market_regime=CASE WHEN swing_live_candidates.stage='LIVE_SELECTED' THEN swing_live_candidates.market_regime ELSE excluded.market_regime END,
-   stage=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.stage ELSE excluded.stage END,
-   reason=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.reason ELSE excluded.reason END,
-   checks=swing_live_candidates.checks+1`)
-   .bind(key,coin,side,frame,barOpen,barOpen+step,at,at,price,JSON.stringify(patterns),regime,stage,reason).run();
-  await d.prepare(`INSERT INTO swing_live_candidate_checks
-  (candidate_key,checked_at,coin,side,interval,stage,reason,market_regime,selected_pattern,reference_price,patterns_json)
-  VALUES (?,?,?,?,?,?,?,?,NULL,?,?)`)
-   .bind(key,at,coin,side,frame,stage,reason,regime,price,JSON.stringify(patterns)).run();
-  count++;
- }
- return count;
-}
-
 async function scanOne(env:Env,coin:string,frame:Frame,at:number){
- const step=STEP[frame],barOpen=Math.floor(at/step)*step,remaining=(barOpen+step-at)/60000;
- // Scan the whole candle to detect forming patterns; label LIVE eligibility only
- // during the final 20 minutes, when the forecast is most actionable.
- const bars=await fetchBars(coin,frame,at);
- const closed=bars.filter(c=>c.t<barOpen).slice(-160),forming=bars.find(c=>c.t===barOpen);
- if(!forming||closed.length<65)return {coin,frame,status:'NOT_READY'};
- if(closed.some((c,i)=>i>0&&c.t-closed[i-1].t!==step)||closed.at(-1)!.t+step!==barOpen)
-  return {coin,frame,status:'GAPPED_HISTORY'};
- const regime=await liveRegime(env,at);
- if(!regime)return {coin,frame,status:'REGIME_UNAVAILABLE'};
- const hits=detect([...closed,forming],frame).filter(h=>h.signalBarOpen===barOpen);
- const active=new Map<string,{side:Side;pattern:string;phase:string;reason:string}>();
- for(const item of formingCandidates(closed,[forming],frame,regime))active.set(item.side+':'+item.pattern,item);
- // Exact LIVE selection is based on all detected patterns and ranked LIVE rules.
- for(const side of ['LONG','SHORT'] as Side[]){
-  const selected=choose(regime,side,frame,hits.filter(h=>h.side===side).map(h=>h.id));
-  if(selected)active.set(side+':'+selected.pattern,{side,pattern:selected.pattern,
-   phase:remaining<=WATCH_WINDOW_MIN?'LIVE_ELIGIBLE':'DETECTOR_HIT',
-   reason:remaining<=WATCH_WINDOW_MIN?'LIVE_DETECTOR_AND_RANKED_RULE_MATCH':'LIVE_DETECTOR_MATCH_EARLY_WINDOW_NOT_YET_OPEN'});
+ const d=db(env),step=STEP[frame],barOpen=Math.floor(at/step)*step;
+ const remaining=(barOpen+step-at)/60000;
+ const query=await d.prepare(`SELECT candidate_key,coin,side,interval,signal_bar_open,
+  first_seen_at,last_seen_at,reference_price,patterns_json,market_regime,
+  selected_pattern,stage,reason FROM swing_live_candidates
+  WHERE coin=? AND interval=? AND signal_bar_open=?
+  AND stage IN ('FORMING','DETECTOR_HIT','WAITING','ELIGIBLE','LIVE_SELECTED')
+  ORDER BY first_seen_at ASC`).bind(coin,frame,barOpen).all();
+ const candidates:any[]=query.results||[];
+ const currentKeys=new Set<string>();let recorded=0,skipped=0;
+ for(const candidate of candidates){
+  const side=String(candidate.side).toUpperCase() as Side;
+  const regime=String(candidate.market_regime||'');
+  if(!['LONG','SHORT'].includes(side)||!regime){skipped++;continue;}
+  const allowed=ruleTable(side,frame)[regime]||{};
+  const patterns=candidatePatterns(candidate.patterns_json);
+  const selected=String(candidate.selected_pattern||'');
+  if(selected&&!patterns.includes(selected))patterns.push(selected);
+  for(const pattern of patterns){
+   if(!Object.prototype.hasOwnProperty.call(allowed,pattern)){skipped++;continue;}
+   const stage=String(candidate.stage||'');
+   const selectedHere=stage==='LIVE_SELECTED'&&selected===pattern;
+   const phase=selectedHere?'LIVE_ELIGIBLE':stage==='ELIGIBLE'&&selected===pattern?'LIVE_ELIGIBLE':
+    stage==='DETECTOR_HIT'?'DETECTOR_HIT':'FORMING';
+   const price=Number(candidate.reference_price);
+   if(!Number.isFinite(price)||price<=0){skipped++;continue;}
+   const key=await record(env,{coin,frame,side,pattern,barOpen,at,regime,price,
+    remaining,phase,reason:'SOURCE_LIVE_CANDIDATE:'+stage+':'+String(candidate.reason||'')});
+   currentKeys.add(key);recorded++;
+  }
  }
- // Write pre-confirmation LIVE-allowed candidates to the same D1 as LIVE Execution.
- const candidateCount=await recordPotentialCandidates(env,coin,frame,barOpen,at,forming.c,regime,active);
- let recorded=0;const currentKeys=new Set<string>();
- for(const item of active.values()){
-  const key=await record(env,{coin,frame,barOpen,at,regime,price:forming.c,remaining,...item});
-  currentKeys.add(key);recorded++;
- }
- // Explicitly record disappearances instead of leaving stale WATCHING rows.
- const previous:any=await db(env).prepare(`SELECT watch_key FROM swing_early_v4_watch
+ // Preserve disappearance history when a candidate is no longer present.
+ const previous:any=await d.prepare(`SELECT watch_key FROM swing_early_v4_watch
   WHERE coin=? AND interval=? AND signal_bar_open=? AND finalized_at IS NULL AND last_checked_at<?`)
   .bind(coin,frame,barOpen,at).all();
  let disappeared=0;
- for(const row of previous.results??[]){
+ for(const row of previous.results||[]){
   if(currentKeys.has(String(row.watch_key)))continue;
-  await db(env).prepare(`UPDATE swing_early_v4_watch SET phase='DISAPPEARED',last_checked_at=?,note='PATTERN_NOT_PRESENT_AT_LAST_SCAN'
+  await d.prepare(`UPDATE swing_early_v4_watch SET phase='DISAPPEARED',last_checked_at=?,note='LIVE_CANDIDATE_NOT_ACTIVE'
    WHERE watch_key=? AND finalized_at IS NULL`).bind(at,row.watch_key).run();
-  await db(env).prepare(`INSERT OR IGNORE INTO swing_early_v4_observations
+  await d.prepare(`INSERT OR IGNORE INTO swing_early_v4_observations
    (watch_key,observed_at,phase,remaining_minutes,reference_price,regime,detector_hit,note)
-   VALUES (?,?,'DISAPPEARED',?,?,?,0,'PATTERN_NOT_PRESENT_AT_LAST_SCAN')`)
-   .bind(row.watch_key,at,remaining,forming.c,regime).run();disappeared++;
+   VALUES (?,?,'DISAPPEARED',?,NULL,NULL,0,'LIVE_CANDIDATE_NOT_ACTIVE')`)
+   .bind(row.watch_key,at,remaining).run();disappeared++;
  }
- return {coin,frame,status:'OK',regime,remaining_minutes:Math.round(remaining*10)/10,
-  detected_patterns:hits.length,watching:recorded,candidateCount,disappeared};
+ return {coin,frame,status:'OK',source:'swing_live_candidates',candidates:candidates.length,
+  watching:recorded,skipped,disappeared};
 }
 async function reconcile(env:Env,at:number,limit=100){
  const d=db(env),sourceDb=signalsDb(env);
@@ -312,7 +272,7 @@ async function reconcile(env:Env,at:number,limit=100){
 export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
  const at=Date.now(),start=Math.max(0,Math.floor(offset)),count=Math.max(1,Math.min(20,Math.floor(limit)));
  const coins=COINS.slice(start,start+count),scanned:any[]=[],errors:string[]=[];
- try{await ensureSchema(env);await candidateSchema(db(env));}catch(e:any){return {success:false,version:VERSION,mode:'SHADOW_ONLY',trading:false,error:'SCHEMA:'+String(e?.message||e)};}
+ try{await ensureSchema(env);}catch(e:any){return {success:false,version:VERSION,mode:'SHADOW_ONLY',trading:false,error:'SCHEMA:'+String(e?.message||e)};}
  for(const coin of coins)for(const frame of ['1h','4h'] as Frame[]){
   try{scanned.push(await scanOne(env,coin,frame,at));}
   catch(e:any){errors.push(`${coin}/${frame}:${String(e?.message||e)}`);}
@@ -330,5 +290,5 @@ export async function runSwingEarlyCycle(env:Env,offset=0,limit=5){
  })().catch((e:any)=>({available:false,error:String(e?.message||e),rows:[],stages:[]}));
  return {success:errors.length===0&&live.errors.length===0,version:VERSION,mode:'SHADOW_ONLY',trading:false,
   at,offset,coins,scanned,live,candidateAudit,errors,
-  notice:'EARLY reads actual LIVE candidate audit from its DB binding; FORMING remains heuristic. LIVE_SELECTED is not a fill. No orders.'};
+  notice:'EARLY only reads LIVE candidates and writes EARLY observation tables. LIVE_SELECTED is not a fill. No orders.'};
 }
