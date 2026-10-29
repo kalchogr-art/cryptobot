@@ -1,3 +1,6 @@
+import type {Candle as CandidateCandle} from '../swing-hunter/types';
+import {structure as candidateStructure} from '../swing-hunter/market-structure';
+import {detectCatalog as candidateDetectCatalog,PatternCompareV2 as CandidatePatternCompareV2,detectClassicalCatalog as candidateDetectClassicalCatalog} from '../swing-hunter/pattern-catalog';
 import { encode } from "@msgpack/msgpack";
 import {
   bytesToHex,
@@ -3730,7 +3733,19 @@ async function swingCandidateAuditSchema(db:any){
  )`).run();
  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_live_candidates_time
  ON swing_live_candidates(signal_available_at,stage)`).run();
+ await db.prepare(`CREATE TABLE IF NOT EXISTS swing_live_candidate_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_key TEXT NOT NULL,
+  checked_at INTEGER NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+  interval TEXT NOT NULL, stage TEXT NOT NULL, reason TEXT,
+  market_regime TEXT, selected_pattern TEXT, reference_price REAL,
+  patterns_json TEXT NOT NULL
+ )`).run();
+ await db.prepare(`CREATE INDEX IF NOT EXISTS idx_swing_candidate_checks_key_time
+ ON swing_live_candidate_checks(candidate_key,checked_at)`).run();
 }
+// V2 audit history: immutable checks, independent from the current snapshot row.
+// Source remains confirmed swing_context_signals; a future pre-confirm detector
+// must call this same writer to provide genuine forming candidates.
 async function swingCandidateAuditWrite(db:any,row:{key:string;coin:string;side:string;interval:string;bar:number;available:number;price:number;patterns:string[];regime:string|null;selected:string|null;stage:string;reason:string;signalKey?:string},now:number){
  await db.prepare(`INSERT INTO swing_live_candidates
  (candidate_key,coin,side,interval,signal_bar_open,signal_available_at,first_seen_at,last_seen_at,reference_price,patterns_json,market_regime,selected_pattern,stage,reason,live_signal_key,checks)
@@ -3741,6 +3756,11 @@ async function swingCandidateAuditWrite(db:any,row:{key:string;coin:string;side:
  selected_pattern=excluded.selected_pattern,stage=excluded.stage,
  reason=excluded.reason,live_signal_key=excluded.live_signal_key,checks=swing_live_candidates.checks+1`)
  .bind(row.key,row.coin,row.side,row.interval,row.bar,row.available,now,now,row.price,JSON.stringify(row.patterns),row.regime,row.selected,row.stage,row.reason,row.signalKey??null).run();
+ // One check per candidate per run, preserving each intermediate decision.
+ await db.prepare(`INSERT INTO swing_live_candidate_checks
+ (candidate_key,checked_at,coin,side,interval,stage,reason,market_regime,selected_pattern,reference_price,patterns_json)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+ .bind(row.key,now,row.coin,row.side,row.interval,row.stage,row.reason,row.regime,row.selected,row.price,JSON.stringify(row.patterns)).run();
 }
 export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?:any}){
  const db=env.DB;if(!db)return {ok:false,reason:'DB_MISSING'};
@@ -3783,11 +3803,11 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   try{regime=await swingLongRegimeAt(env.SWING_DB??db,base.available);}catch(e:any){
    await audit({...base,regime:null,selected:null,stage:'ERROR',reason:'REGIME_QUERY_FAILED:'+String(e?.message||e)});throw e;
   }
-  if(!regime){await audit({...base,regime:null,selected:null,stage:'REJECTED',reason:'REGIME_UNAVAILABLE'});continue;}
+  if(!regime){await audit({...base,regime:null,selected:null,stage:'WAITING',reason:'REGIME_UNAVAILABLE'});continue;}
   const selected=item.side==='LONG'
    ?swingLongPick(regime,eligiblePatterns,String(item.interval) as '1h'|'4h')
    :swingShortPick(regime,eligiblePatterns,String(item.interval) as '1h'|'4h');
-  if(!selected){await audit({...base,regime,selected:null,stage:'REJECTED',reason:'NO_RANKED_RULE_FOR_REGIME'});continue;}
+  if(!selected){await audit({...base,regime,selected:null,stage:'WAITING',reason:'NO_RANKED_RULE_FOR_REGIME'});continue;}
   await audit({...base,regime,selected:selected.pattern,stage:'ELIGIBLE',reason:'RANKED_RULE_MATCH',signalKey:key});
   await db.prepare(`INSERT OR IGNORE INTO swing_live_queue
    (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at,exit_mode)
@@ -3797,7 +3817,10 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   await db.prepare(`UPDATE swing_live_queue SET market_regime=?,selected_pattern=?,tp_pct=?,sl_pct=?
    WHERE signal_key=? AND status='WAITING_POSITION' AND market_regime IS NULL`)
    .bind(regime,selected.pattern,0.5,1.0,key).run();
-  await audit({...base,regime,selected:selected.pattern,stage:'LIVE_SELECTED',reason:'LIVE_QUEUE_INSERT_ATTEMPTED',signalKey:key});
+  const queueRow:any=await db.prepare(`SELECT status,selected_pattern FROM swing_live_queue WHERE signal_key=?`).bind(key).first();
+  await audit({...base,regime,selected:selected.pattern,
+   stage:queueRow?'LIVE_SELECTED':'ELIGIBLE',
+   reason:queueRow?'LIVE_QUEUE_EXISTS:'+String(queueRow.status):'QUEUE_NOT_FOUND',signalKey:key});
  }
  await db.prepare(`UPDATE swing_live_queue SET status='EXPIRED',
   reason=CASE WHEN reason IS NULL OR reason='' THEN '20M_TIMEOUT'
@@ -3835,7 +3858,7 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   }
   entered.push({coin:row.coin,result:await swingEnter(env,row)});
  }
- return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length,rejected_tracking:rejectedTracking};
+ return {ok:true,live:true,entered,eligible_groups:groups.size,due_count:(due.results??[]).length,rejected_tracking:rejectedTracking,candidate_audit_v2:true};
 }
 // Swing progressive: use FAST's add -> exchange visibility -> cancel old sequence.
 // Only new PROGRESSIVE_V1 rows. Never modify legacy bracket positions.
@@ -4225,3 +4248,155 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
  }
  return {ok:true,reconciliation,manual_close_events:manualCloseEvents,events};
 }
+
+// PRECONFIRM AUDIT — observational, no order paths. LIVE rule maps are the only allowlist.
+namespace SwingCandidatePreconfirm {
+type Frame='1h'|'4h';type Side='LONG'|'SHORT';
+type Rules=Record<string,Record<string,{tp:number;sl:number}>>;
+type Env={DB?:any;SWING_DB?:any};
+const HOUR=3600000;
+const SHORT_1H=SWING_SHORT_1H_RULES,SHORT_4H=SWING_SHORT_4H_RULES;
+const LONG_1H=SWING_LONG_1H_RULES,LONG_4H=SWING_LONG_4H_RULES;
+const COINS=['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','HYPE','ADA','LTC','BCH','AAVE','UNI','NEAR','OP','ARB','WIF','TRX'];
+const STEP:{[key:string]:number}={'1h':3600000,'4h':14400000};
+function choose(regime:string,side:Side,frame:Frame,patterns:string[]){
+ const rules=(side==='LONG'?(frame==='1h'?LONG_1H:LONG_4H):(frame==='1h'?SHORT_1H:SHORT_4H))[regime];
+ if(!rules)return null;
+ for(const [pattern,params] of Object.entries(rules))if(patterns.includes(pattern))return {pattern,...params};
+ return null;
+}
+function db(env:Env){if(!env.DB?.prepare)throw Error('EARLY_DB_MISSING');return env.DB;}
+function signalsDb(env:Env){if(!(env.SWING_DB??env.DB)?.prepare)throw Error('SWING_DB_MISSING');return env.SWING_DB??env.DB;}
+function valid(c:CandidateCandle){return [c.t,c.o,c.h,c.l,c.c,c.v].every(Number.isFinite)&&c.o>0&&c.c>0&&c.l>0&&c.h>=Math.max(c.o,c.c,c.l)&&c.l<=Math.min(c.o,c.c,c.h)&&c.v>=0;}
+async function fetchBars(coin:string,frame:Frame,at:number){
+ const step=STEP[frame],start=Math.floor(at/step)*step-step*165;
+ const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),12000);
+ try{
+  const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'candleSnapshot',req:{coin,interval:frame,startTime:start,endTime:at}}),signal:ctrl.signal});
+  if(!r.ok)throw Error('HYPERLIQUID_'+r.status);
+  const raw=await r.json();if(!Array.isArray(raw))throw Error('INVALID_OHLCV');
+  const bars:CandidateCandle[]=raw.map((x:any)=>({t:Number(x.t),o:Number(x.o),h:Number(x.h),l:Number(x.l),c:Number(x.c),v:Number(x.v),n:Number(x.n)})).filter(valid).sort((a:CandidateCandle,b:CandidateCandle)=>a.t-b.t);
+  if(bars.some((c,i)=>i>0&&c.t===bars[i-1].t))throw Error('DUPLICATE_BARS');
+  return bars;
+ }finally{clearTimeout(timer);}
+}
+// Byte-for-byte equivalent query criteria to execution.ts/swingLongRegimeAt.
+async function liveRegime(env:Env,at:number){return swingLongRegimeAt(env.SWING_DB??env.DB,at);}
+function detect(bars:CandidateCandle[],frame:Frame){const market=candidateStructure(bars);return [
+ ...candidateDetectCatalog(bars,market,frame),
+ ...CandidatePatternCompareV2.detectCatalog(bars,market,frame).map(h=>({...h,id:'V2_'+h.id})),
+ ...candidateDetectClassicalCatalog(bars,market,frame)
+ ];}
+function ruleTable(side:Side,frame:Frame):Rules{
+ return side==='LONG'?(frame==='1h'?LONG_1H:LONG_4H):(frame==='1h'?SHORT_1H:SHORT_4H);
+}
+// "Potential" is explicitly a pre-detector heuristic, not a claim that the
+// real LIVE detector would accept the candle. The detector is always the authority.
+// We use only the current forming bar + preceding CLOSED bars, with no future data.
+function formingCandidates(closed:CandidateCandle[],cur:CandidateCandle[],frame:Frame,regime:string){
+ const c=cur[0],p=closed.at(-1)!;const prior=closed.slice(-20);
+ const hi=Math.max(...prior.map(x=>x.h)),lo=Math.min(...prior.map(x=>x.l));
+ const meanVolume=prior.reduce((sum,x)=>sum+x.v,0)/prior.length;
+ const span=Math.max(c.h-c.l,c.c*0.000001),body=Math.abs(c.c-c.o);
+ const upper=c.h-Math.max(c.c,c.o),lower=Math.min(c.c,c.o)-c.l;
+ const patterns:Record<string,boolean>={
+  RANGE_BREAKOUT:c.c>hi*0.998 && c.c>=c.o && body/span>=0.25,
+  RANGE_BREAKDOWN:c.c<lo*1.002 && c.c<=c.o && body/span>=0.25,
+  LIQUIDITY_SWEEP_LOW:c.l<lo && c.c>=lo*0.997 && lower/span>=0.25,
+  LIQUIDITY_SWEEP_HIGH:c.h>hi && c.c<=hi*1.003 && upper/span>=0.25,
+  MOMENTUM_REVERSAL_LONG:p.c<p.o && closed.at(-2)!.c<closed.at(-2)!.o && c.c>=p.h*0.997 && c.c>=c.o,
+  MOMENTUM_REVERSAL_SHORT:p.c>p.o && closed.at(-2)!.c>closed.at(-2)!.o && c.c<=p.l*1.003 && c.c<=c.o,
+  HAMMER:lower/span>=0.4 && c.c>=c.o,
+  SHOOTING_STAR:upper/span>=0.4 && c.c<=c.o,
+  BULL_ENGULF:p.c<p.o && c.c>=p.o*0.998 && c.c>c.o,
+  BEAR_ENGULF:p.c>p.o && c.c<=p.o*1.002 && c.c<c.o,
+  VOLUME_EXPANSION_SHORT:c.c<c.o && meanVolume>0 && c.v>=meanVolume*0.65,
+  DOUBLE_TOP:c.c<p.c && c.h>=hi*0.997,
+  DOUBLE_BOTTOM:c.c>p.c && c.l<=lo*1.003,
+  V2_DOUBLE_TOP:c.c<p.c && c.h>=hi*0.997,
+  V2_BEAR_ENGULF:p.c>p.o && c.c<=p.o*1.002 && c.c<c.o,
+  V2_BULL_ENGULF:p.c<p.o && c.c>=p.o*0.998 && c.c>c.o,
+  V2_SHOOTING_STAR:upper/span>=0.4 && c.c<=c.o
+ };
+ const result:{side:Side;pattern:string;phase:string;reason:string}[]=[];
+ for(const side of ['LONG','SHORT'] as Side[]){
+  const allowed=ruleTable(side,frame)[regime]||{};
+  for(const pattern of Object.keys(allowed)){
+   if(patterns[pattern])result.push({side,pattern,phase:'FORMING',reason:'EARLY_HEURISTIC_NOT_LIVE_DETECTOR'});
+  }
+ }
+ return result;
+}
+async function candidateSchema(d:any){await swingCandidateAuditSchema(d);}
+type CandidateHit={side:Side;pattern:string;phase:string;reason:string};
+async function recordPotentialCandidates(env:Env,coin:string,frame:Frame,barOpen:number,
+ at:number,price:number,regime:string,active:Map<string,CandidateHit>){
+ const d=db(env),step=STEP[frame];let count=0;
+ for(const side of ['LONG','SHORT'] as Side[]){
+  const allowed=new Set(Object.keys(ruleTable(side,frame)[regime]??{}));
+  const matches=[...active.values()].filter(x=>x.side===side&&allowed.has(x.pattern));
+  if(!matches.length)continue;
+  const patterns=[...new Set(matches.map(x=>x.pattern))];
+  const detected=matches.some(x=>x.phase==='LIVE_ELIGIBLE'||x.phase==='DETECTOR_HIT');
+  const stage=detected?'DETECTOR_HIT':'FORMING';
+  const reason=detected?'FORMING_BAR_DETECTOR_NOT_CLOSED':'HEURISTIC_POTENTIAL_NOT_CONFIRMED';
+  const key=`SWING:${side}:${coin}:${frame}:${barOpen}`;
+  // IMPORTANT: never downgrade or overwrite the authoritative LIVE selection.
+  await d.prepare(`INSERT INTO swing_live_candidates
+   (candidate_key,coin,side,interval,signal_bar_open,signal_available_at,first_seen_at,
+    last_seen_at,reference_price,patterns_json,market_regime,selected_pattern,stage,reason,checks)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,1)
+   ON CONFLICT(candidate_key) DO UPDATE SET
+    last_seen_at=excluded.last_seen_at,
+    reference_price=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.reference_price ELSE excluded.reference_price END,
+    patterns_json=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.patterns_json ELSE excluded.patterns_json END,
+    market_regime=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.market_regime ELSE excluded.market_regime END,
+    stage=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.stage ELSE excluded.stage END,
+    reason=CASE WHEN swing_live_candidates.stage IN ('LIVE_SELECTED','ELIGIBLE') THEN swing_live_candidates.reason ELSE excluded.reason END,
+    checks=swing_live_candidates.checks+1`)
+   .bind(key,coin,side,frame,barOpen,barOpen+step,at,at,price,JSON.stringify(patterns),regime,stage,reason).run();
+  await d.prepare(`INSERT INTO swing_live_candidate_checks
+   (candidate_key,checked_at,coin,side,interval,stage,reason,market_regime,selected_pattern,reference_price,patterns_json)
+   VALUES (?,?,?,?,?,?,?,?,NULL,?,?)`)
+   .bind(key,at,coin,side,frame,stage,reason,regime,price,JSON.stringify(patterns)).run();
+  count++;
+ }
+ return count;
+}
+
+/** Scans forming candles. FORMING is heuristic; DETECTOR_HIT is not closed-bar LIVE confirmation. */
+async function scanCandidate(env:Env,coin:string,frame:Frame,at:number){
+ const step=STEP[frame],barOpen=Math.floor(at/step)*step;
+ const bars=await fetchBars(coin,frame,at);
+ const closed=bars.filter(c=>c.t<barOpen).slice(-160),forming=bars.find(c=>c.t===barOpen);
+ if(!forming||closed.length<65)return {coin,frame,status:'NOT_READY',candidates:0};
+ if(closed.some((c,i)=>i>0&&c.t-closed[i-1].t!==step)||closed.at(-1)!.t+step!==barOpen)
+  return {coin,frame,status:'GAPPED_HISTORY',candidates:0};
+ const regime=await liveRegime(env,at);
+ if(!regime)return {coin,frame,status:'REGIME_UNAVAILABLE',candidates:0};
+ const hits=detect([...closed,forming],frame).filter(h=>h.signalBarOpen===barOpen);
+ const active=new Map<string,CandidateHit>();
+ for(const item of formingCandidates(closed,[forming],frame,regime))
+  active.set(item.side+':'+item.pattern,item);
+ for(const side of ['LONG','SHORT'] as Side[]){
+  const selected=choose(regime,side,frame,hits.filter(h=>h.side===side).map(h=>h.id));
+  if(selected)active.set(side+':'+selected.pattern,{side,pattern:selected.pattern,phase:'DETECTOR_HIT',reason:'FORMING_BAR_DETECTOR_RANKED_RULE'});
+ }
+ const candidates=await recordPotentialCandidates(env,coin,frame,barOpen,at,forming.c,regime,active);
+ return {coin,frame,status:'OK',regime,candidates,detectorHits:hits.length};
+}
+export async function runCycle(env:Env,offset=0,limit=5){
+ if(!env.DB?.prepare)return {success:false,error:'DB_BINDING_REQUIRED',trading:false};
+ const at=Date.now(),start=Math.max(0,Math.floor(offset)),count=Math.max(1,Math.min(20,Math.floor(limit)));
+ try{await candidateSchema(env.DB);}catch(e:any){return {success:false,error:'SCHEMA:'+String(e?.message||e),trading:false};}
+ const results:any[]=[],errors:string[]=[];
+ for(const coin of COINS.slice(start,start+count))for(const frame of ['1h','4h'] as Frame[]){
+  try{results.push(await scanCandidate(env,coin,frame,at));}
+  catch(e:any){errors.push(`${coin}/${frame}:${String(e?.message||e)}`);}
+ }
+ return {success:errors.length===0,module:'SWING_LIVE_CANDIDATES',version:'1.0.0',trading:false,
+  offset,coins:COINS.slice(start,start+count),candidates:results.reduce((n,r)=>n+r.candidates,0),results,errors};
+}
+
+}
+export const runSwingLiveCandidatesAudit=SwingCandidatePreconfirm.runCycle;
