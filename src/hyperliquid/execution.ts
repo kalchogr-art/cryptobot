@@ -3579,40 +3579,87 @@ function swingGuardRsi(prices:number[],period=14){
  for(let i=period+1;i<prices.length;i++){const d=prices[i]-prices[i-1];up=(up*(period-1)+Math.max(d,0))/period;down=(down*(period-1)+Math.max(-d,0))/period;}
  return down===0?(up===0?50:100):100-100/(1+up/down);
 }
-async function swingGuardCheck(row:any,price:number,now:number){
+// SWING RSI V2: pattern-specific RSI14 from the original 1h/4h signal.
+// Only combinations explicitly listed here are RSI-gated. All others keep no RSI threshold.
+const SWING_RSI_V2_RULES:Record<string,[number|null,number|null]>={
+ 'LONG|1h|LONG_REGIME|V3_BULL_FLAG':[65,null],
+ 'LONG|1h|LONG_REGIME|V3_TRIPLE_BOTTOM':[68,null],
+ 'LONG|1h|NEUTRAL|EMA_PULLBACK_LONG':[49.75,74.21],
+ 'LONG|1h|SHORT_REGIME|RANGE_BREAKOUT':[60,75],
+ 'LONG|1h|SHORT_REGIME|V3_FALLING_WEDGE':[60,null],
+ 'LONG|1h|SHORT_REGIME|V2_BULL_ENGULF':[21.55,46.66],
+ 'SHORT|1h|LONG_REGIME|V2_BEAR_ENGULF':[56,null],
+ 'SHORT|1h|LONG_REGIME|V2_SHOOTING_STAR':[91.97,null],
+ 'SHORT|1h|NEUTRAL|DOUBLE_TOP':[57,null],
+ 'SHORT|1h|NEUTRAL|V2_DOUBLE_TOP':[43,null],
+ 'SHORT|1h|NEUTRAL|RANGE_BREAKDOWN':[null,26.04],
+ 'SHORT|1h|NEUTRAL|V3_INVERSE_CUP_HANDLE':[40.88,59.21],
+ 'SHORT|1h|SHORT_REGIME|EMA_PULLBACK_SHORT':[37.02,37.44],
+ 'SHORT|1h|SHORT_REGIME|TRIANGLE_DOWN':[47,null],
+ 'SHORT|4h|NEUTRAL|BEAR_ENGULF':[36,null]
+};
+async function swingGuardSignalRsi(db:any,row:any,now:number){
+ const key=String(row.signal_key||'').split(':');
+ const tf=key[3],bar=Number(key[4]),pattern=String(row.selected_pattern||'');
+ const ruleKey=[String(row.side),tf,String(row.market_regime),pattern].join('|');
+ const bounds=SWING_RSI_V2_RULES[ruleKey];
+ if(!bounds)return {enabled:false,ruleKey,rsi:null,min:null,max:null,reason:null};
+ if(!Number.isFinite(bar)||!['1h','4h'].includes(tf))return {enabled:true,ruleKey,rsi:null,min:bounds[0],max:bounds[1],reason:'RSI_V2_BAD_SIGNAL_KEY'};
+ const q:any=await db.prepare(`SELECT json_extract(context_json,'$.indicators.rsi14') AS rsi,
+ json_extract(context_json,'$.capturedAt') AS captured_at,signal_available_at
+ FROM swing_context_signals WHERE coin=? AND side=? AND interval=?
+ AND signal_bar_open=? AND pattern=? AND signal_available_at<=?
+ AND context_json IS NOT NULL AND json_valid(context_json)
+ ORDER BY signal_available_at DESC LIMIT 1`)
+ .bind(String(row.coin),String(row.side),tf,bar,pattern,now).first();
+ const rsi=q?.rsi==null?null:Number(q.rsi);
+ const parseTs=(v:any):number|null=>{if(v==null||v==='')return null;const n=Number(v);return Number.isFinite(n)?(n<1e11?n*1000:n):Date.parse(String(v));};
+ const captured=parseTs(q?.captured_at);
+ const future=captured!==null&&(!Number.isFinite(captured)||captured>now);
+ const reason=!q?'RSI_V2_CONTEXT_MISSING':future?'RSI_V2_CONTEXT_FUTURE':
+  rsi===null||!Number.isFinite(rsi)||rsi<0||rsi>100?'RSI_V2_VALUE_MISSING':
+  (bounds[0]!==null&&rsi<bounds[0])||(bounds[1]!==null&&rsi>bounds[1])?'RSI_V2_OUTSIDE_RANGE':null;
+ return {enabled:true,ruleKey,rsi:rsi!==null&&Number.isFinite(rsi)?rsi:null,min:bounds[0],max:bounds[1],reason};
+}
+async function swingGuardCheck(db:any,row:any,price:number,now:number){
  const coin=String(row.coin).toUpperCase(),side=String(row.side),reasons:string[]=[],notes:string[]=[];
- const candles=await swingGuardCandles(coin,'5m',now-3*3600000,now);
- // Strictly completed 5-minute candles. No look-ahead and no stale indicators.
- const closed=candles.filter(x=>x.T<=now&&x.T>now-3*3600000);
- const last=closed[closed.length-1];
- if(!last||now-last.T>7*60000||closed.length<25)reasons.push('INDICATORS_MISSING_OR_STALE');
- const prices=closed.map(x=>x.c),rsi=swingGuardRsi(prices);
- const prev=swingGuardRsi(prices.slice(0,-6));
+ // The old 5m RSI/RSI-drop gate is fully replaced by the signal-time 1h/4h RSI14.
+ const signalRsi=await swingGuardSignalRsi(db,row,now);
+ if(signalRsi.reason)reasons.push(signalRsi.reason);
  // EMA50 requires >=50 completed bars: fetch separate history, do not estimate from 90m.
  const history=await swingGuardCandles(coin,'5m',now-7*3600000,now);
  const full=history.filter(x=>x.T<=now),hprices=full.map(x=>x.c);
  const ema20=swingGuardEma(hprices,20),ema50=swingGuardEma(hprices,50);
  const lastFull=full[full.length-1];
- if(!lastFull||now-lastFull.T>7*60000||hprices.length<55||rsi===null||prev===null||ema20===null||ema50===null)
+ if(!lastFull||now-lastFull.T>7*60000||hprices.length<55||ema20===null||ema50===null)
   if(!reasons.includes('INDICATORS_MISSING_OR_STALE'))reasons.push('INDICATORS_MISSING_OR_STALE');
  if(side==='SHORT'){
-  if(rsi!==null&&rsi<=30)reasons.push('SHORT_RSI_OVERSOLD');
-  if(rsi!==null&&prev!==null&&prev-rsi>=15)reasons.push('SHORT_RSI_DROP_15_IN_30M');
   if(ema20!==null&&ema50!==null&&ema20>=ema50)reasons.push('SHORT_EMA20_GTE_EMA50');
  }else if(side==='LONG'){
   if(ema50!==null&&price<ema50)reasons.push('LONG_PRICE_BELOW_EMA50');
  }
- return {reasons,indicators:{rsi14_5m_wilder:rsi,rsi14_30m_ago:prev,rsi_drop_30m:rsi!==null&&prev!==null?prev-rsi:null,
-  ema20_5m:ema20,ema50_5m:ema50,price,latest_closed_5m:lastFull?.T??null,
-  source:'HYPERLIQUID_5M_COMPLETED_CANDLES',notes}};
+ return {reasons,indicators:{ema20_5m:ema20,ema50_5m:ema50,price,latest_closed_5m:lastFull?.T??null,
+  signal_rsi_v2:signalRsi,source:'HYPERLIQUID_5M_COMPLETED_CANDLES',notes}};
+}
+function swingGuardModelTpSl(row:any){
+ const parts=String(row.signal_key||'').split(':');
+ const tf=parts[3],side=String(row.side),regime=String(row.market_regime||''),pattern=String(row.selected_pattern||'');
+ const table=side==='LONG'?(tf==='4h'?SWING_LONG_4H_RULES:SWING_LONG_1H_RULES):
+  side==='SHORT'?(tf==='4h'?SWING_SHORT_4H_RULES:SWING_SHORT_1H_RULES):null;
+ const rule=table?.[regime]?.[pattern];
+ const tp=Number(rule?.tp),sl=Number(rule?.sl);
+ return {tp:Number.isFinite(tp)&&tp>0?tp:null,sl:Number.isFinite(sl)&&sl>0?sl:null};
 }
 async function swingGuardReject(db:any,row:any,price:number,check:any){
  const now=Date.now(),key=String(row.signal_key);
+ const levels=swingGuardModelTpSl(row);
+ if(levels.tp===null||levels.sl===null)throw Error('REJECTED_SIGNAL_MODEL_TPSL_NOT_FOUND');
  await db.prepare(`INSERT OR IGNORE INTO swing_rejected_signals
  (signal_key,coin,side,interval,pattern,market_regime,rejected_at,entry_price,reasons_json,indicators_json,tp_pct,sl_pct,status,updated_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,0.5,1,'TRACKING',?)`).bind(key,String(row.coin),String(row.side),
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'TRACKING',?)`).bind(key,String(row.coin),String(row.side),
  String(key.split(':')[3]||''),String(row.selected_pattern||''),String(row.market_regime||''),now,price,
- JSON.stringify(check.reasons),JSON.stringify(check.indicators),now).run();
+ JSON.stringify(check.reasons),JSON.stringify(check.indicators),
+  levels.tp,levels.sl,now).run();
  await db.prepare(`UPDATE swing_live_queue SET status='REJECTED',reason=?,updated_at=? WHERE signal_key=? AND status='WAITING_POSITION'`)
  .bind(check.reasons.join('|'),now,key).run();
 }
@@ -3627,14 +3674,20 @@ async function swingGuardTrack(env:HyperliquidExecutionEnv){
   try{
    // Fetch from original rejected moment if no prior checkpoint; cap to 12h/720 candles.
    const candles=await swingGuardCandles(String(row.coin),'1m',Math.max(Number(row.rejected_at)-60000,start-60000),end);
+   const completed=candles.filter(c=>c.T<=end);
    if(end<=start)continue;
-   if(!candles.length)throw Error('NO_CLOSED_TRACKING_CANDLES');
+   if(!completed.length)throw Error('NO_CLOSED_TRACKING_CANDLES');
    const entry=Number(row.entry_price),long=row.side==='LONG';
-   const tp=entry*(long?1.005:0.995),sl=entry*(long?0.99:1.01);
+   const tpPct=row.tp_pct==null?NaN:Number(row.tp_pct),slPct=row.sl_pct==null?NaN:Number(row.sl_pct);
+   if(!(tpPct>0&&slPct>0&&Number.isFinite(tpPct)&&Number.isFinite(slPct))){
+    await db.prepare(`UPDATE swing_rejected_signals SET status='UNKNOWN',observation_note='INVALID_MODEL_TPSL',outcome_at=?,updated_at=? WHERE signal_key=? AND status='TRACKING'`)
+      .bind(now,now,row.signal_key).run();resolved++;continue;
+   }
+   const tp=entry*(long?1+tpPct/100:1-tpPct/100),sl=entry*(long?1-slPct/100:1+slPct/100);
    let outcome:string|null=null,at:number|null=null,exit:number|null=null,note:string|null=null;
    const firstMinute=Math.floor(Number(row.rejected_at)/60000)*60000;
    // A candle containing rejection includes pre-rejection movement: cannot infer ordering.
-   for(const c of candles){
+   for(const c of completed){
     if(c.T>end)continue;
     if(c.t<firstMinute+60000){if((long?c.h>=tp:c.l<=tp)||(long?c.l<=sl:c.h>=sl)){
       outcome='UNKNOWN';at=c.T;note='ENTRY_MINUTE_INTRABAR_ORDER_UNKNOWN';break;}continue;}
@@ -3648,7 +3701,7 @@ async function swingGuardTrack(env:HyperliquidExecutionEnv){
    if(outcome){await db.prepare(`UPDATE swing_rejected_signals SET status=?,outcome_at=?,exit_price=?,minutes_to_outcome=?,observation_note=?,last_checked_at=?,updated_at=? WHERE signal_key=? AND status='TRACKING'`)
     .bind(outcome,at,exit,at===null?null:(at-Number(row.rejected_at))/60000,note,end,now,row.signal_key).run();resolved++;}
    else {await db.prepare(`UPDATE swing_rejected_signals SET last_checked_at=?,updated_at=? WHERE signal_key=? AND status='TRACKING'`)
-    .bind(end,now,row.signal_key).run();tracked++;}
+    .bind(start,now,row.signal_key).run();tracked++;}
   }catch(e:any){await db.prepare(`UPDATE swing_rejected_signals SET observation_note=?,updated_at=? WHERE signal_key=?`)
    .bind('TRACKER_ERROR:'+String(e?.message||e).slice(0,180),now,row.signal_key).run();}
  }
@@ -3708,7 +3761,7 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
   // Entry protection is checked against live exchange price BEFORE leverage/order/ledger.
   // Fail closed on missing/stale candles or exchange errors; never silently bypass.
   let guard:any;
-  try{guard=await swingGuardCheck(row,price,Date.now());}
+  try{guard=await swingGuardCheck((env as any).SWING_DB??db,row,price,Date.now());}
   catch(e:any){guard={reasons:['INDICATORS_FETCH_FAILED'],indicators:{error:String(e?.message||e).slice(0,180),price}};}
   if(guard.reasons.length){
    await swingGuardReject(db,row,price,guard);
