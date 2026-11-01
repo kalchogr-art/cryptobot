@@ -3,8 +3,11 @@ export const COINS = ['BTC','ETH','SOL','XRP','BNB','DOGE','AVAX','LINK','SUI','
 export const STEP:Record<Interval,number>={'1h':3600000,'4h':14400000,'1d':86400000};
 const number=(v:unknown)=>Number(v);
 export async function fetchClosed(coin:string,interval:Interval,count=160):Promise<CandleSet>{
-  coin=coin.toUpperCase();
-  if(!(COINS as readonly string[]).includes(coin)) throw new Error('INVALID_COIN');
+  // Hyperliquid symbols are case-sensitive: kPEPE must not become KPEPE.
+  coin=String(coin).trim();
+  // Eligibility is checked against live Hyperliquid metadata by the dynamic-universe scheduler.
+  // Historical signal settlement must also accept coins no longer in the selected top 50.
+  if(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(coin)) throw new Error('INVALID_COIN');
   if(!(interval in STEP)) throw new Error('INVALID_INTERVAL');
   if(!Number.isInteger(count)||count<60||count>400) throw new Error('COUNT_MUST_BE_60_TO_400');
   const now=Date.now(),step=STEP[interval];
