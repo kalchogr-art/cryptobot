@@ -37,7 +37,7 @@ function parsed(v: unknown) {
 
 export async function scanAndLog(
   env: any,
-  opts: { offset?: number; limit?: number; interval?: Interval } = {}
+  opts: { offset?: number; limit?: number; interval?: Interval; coins?: readonly string[] } = {}
 ) {
   if (!NEW_SIGNALS_ENABLED) {
     return {
@@ -63,9 +63,10 @@ export async function scanAndLog(
     mode: 'RESEARCH_ONLY', trading: false,
     error: 'DAILY_PATTERN_DETECTOR_NOT_VERIFIED', inserted: 0
   };
-  const offset = safeInt(opts.offset, 0, 0, COINS.length - 1);
+  const universe = opts.coins?.length ? [...new Set(opts.coins)] : [...COINS];
+  const offset = safeInt(opts.offset, 0, 0, Math.max(0, universe.length - 1));
   const limit = safeInt(opts.limit, 3, 1, 5);
-  const coins = COINS.slice(offset, offset + limit);
+  const coins = universe.slice(offset, offset + limit);
   const results: any[] = [];
   let inserted = 0, duplicates = 0, errors = 0;
   for (const coin of coins) {
@@ -141,7 +142,6 @@ export async function settleSignals(env: any, limit = 12) {
     ORDER BY signal_available_at ASC LIMIT ?`).bind(now, n).all();
   const results: any[] = [];
   let marketRequests = 0, updated = 0;
-  // 7 days = 168 closed 1h bars; 240 covers that window with room for delay.
   const cache = new Map<string, Candle[]>();
   for (const x of rows.results || []) {
     try {
@@ -161,7 +161,6 @@ export async function settleSignals(env: any, limit = 12) {
       const cutoff = Math.min(now, since + horizon);
       const bars = all.filter(b => b.t >= since && b.t + HOUR <= cutoff)
         .sort((a,b) => a.t - b.t);
-      // Do not assign first-touch results if any earlier hourly candle is missing.
       const contiguous = bars.every((b,i) => b.t === since + i * HOUR);
       const horizonComplete = now >= since + horizon;
       const expectedBars = horizonHours;
@@ -187,7 +186,6 @@ export async function settleSignals(env: any, limit = 12) {
           hypotheticalNetPct: net === null ? null : round(net) };
       }));
 
-      // Snapshot of the original 24-hour research method, for fair comparisons.
       const first24 = bars.filter(b => b.t < since + DAY);
       const snapshot24Complete = now >= since + DAY && contiguous && first24.length === 24;
       const snapshot24 = contiguous ? evaluate(first24, snapshot24Complete) : [];
