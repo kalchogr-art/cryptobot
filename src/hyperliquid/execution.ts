@@ -3600,26 +3600,44 @@ const SWING_RSI_V2_RULES:Record<string,[number|null,number|null]>={
 };
 async function swingGuardSignalRsi(db:any,row:any,now:number){
  const key=String(row.signal_key||'').split(':');
+ const originalSide=String(key[1]||'');
+ const executionSide=String(row.side||'');
  const tf=key[3],bar=Number(key[4]),pattern=String(row.selected_pattern||'');
- const ruleKey=[String(row.side),tf,String(row.market_regime),pattern].join('|');
+ const ruleKey=[originalSide,tf,String(row.market_regime),pattern].join('|');
  const bounds=SWING_RSI_V2_RULES[ruleKey];
- if(!bounds)return {enabled:false,ruleKey,rsi:null,min:null,max:null,reason:null};
- if(!Number.isFinite(bar)||!['1h','4h'].includes(tf))return {enabled:true,ruleKey,rsi:null,min:bounds[0],max:bounds[1],reason:'RSI_V2_BAD_SIGNAL_KEY'};
+ // Signal-time RSI belongs to the ORIGINAL signal. Never query a synthetic inverse signal.
+ // Validate the inversion even when the pattern has no specific RSI rule: otherwise
+ // an invalid direction could silently skip the RSI layer and reach the EMA check.
+ if(!((originalSide==='SHORT'&&executionSide==='LONG')||(originalSide==='LONG'&&executionSide==='SHORT')))
+  return {enabled:true,ruleKey,rsi:null,min:bounds?.[0]??null,max:bounds?.[1]??null,
+   reason:'RSI_V2_INVERSE_SIDE_MISMATCH',executionSide,originalSide};
+ // No pattern rule means no pattern-specific RSI threshold (same as the original guard).
+ // The EMA/market-data guard still runs; expose the absence of a rule in diagnostics.
+ if(!bounds)return {enabled:false,ruleKey,rsi:null,min:null,max:null,reason:null,
+  note:'NO_PATTERN_SPECIFIC_RSI_V2_RULE',executionSide,originalSide};
+ if(!Number.isFinite(bar)||!['1h','4h'].includes(tf))return {enabled:true,ruleKey,rsi:null,min:bounds[0],max:bounds[1],reason:'RSI_V2_BAD_SIGNAL_KEY',executionSide,originalSide};
  const q:any=await db.prepare(`SELECT json_extract(context_json,'$.indicators.rsi14') AS rsi,
  json_extract(context_json,'$.capturedAt') AS captured_at,signal_available_at
  FROM swing_context_signals WHERE coin=? AND side=? AND interval=?
  AND signal_bar_open=? AND pattern=? AND signal_available_at<=?
  AND context_json IS NOT NULL AND json_valid(context_json)
  ORDER BY signal_available_at DESC LIMIT 1`)
- .bind(String(row.coin),String(row.side),tf,bar,pattern,now).first();
+ .bind(String(row.coin),originalSide,tf,bar,pattern,now).first();
  const rsi=q?.rsi==null?null:Number(q.rsi);
  const parseTs=(v:any):number|null=>{if(v==null||v==='')return null;const n=Number(v);return Number.isFinite(n)?(n<1e11?n*1000:n):Date.parse(String(v));};
  const captured=parseTs(q?.captured_at);
  const future=captured!==null&&(!Number.isFinite(captured)||captured>now);
+ // Use existing RSI V2 numeric bounds, but evaluate the extreme appropriate to the
+ // EXECUTION side. Inverse LONG prefers the lower RSI side; inverse SHORT the upper.
+ // This is a directional reinterpretation, not a simple pass/block inversion.
+ const threshold=executionSide==='LONG'?(bounds[0]??bounds[1]):(bounds[1]??bounds[0]);
+ const outside=threshold!==null&&rsi!==null&&Number.isFinite(rsi)&&
+  (executionSide==='LONG'?rsi>threshold:rsi<threshold);
  const reason=!q?'RSI_V2_CONTEXT_MISSING':future?'RSI_V2_CONTEXT_FUTURE':
   rsi===null||!Number.isFinite(rsi)||rsi<0||rsi>100?'RSI_V2_VALUE_MISSING':
-  (bounds[0]!==null&&rsi<bounds[0])||(bounds[1]!==null&&rsi>bounds[1])?'RSI_V2_OUTSIDE_RANGE':null;
- return {enabled:true,ruleKey,rsi:rsi!==null&&Number.isFinite(rsi)?rsi:null,min:bounds[0],max:bounds[1],reason};
+  outside?'RSI_V2_INVERSE_DIRECTION_MISMATCH':null;
+ return {enabled:true,ruleKey,rsi:rsi!==null&&Number.isFinite(rsi)?rsi:null,
+  min:bounds[0],max:bounds[1],inverse_threshold:threshold,executionSide,originalSide,reason};
 }
 async function swingGuardCheck(db:any,row:any,price:number,now:number){
  const coin=String(row.coin).toUpperCase(),side=String(row.side),reasons:string[]=[],notes:string[]=[];
@@ -3652,8 +3670,8 @@ function swingGuardModelTpSl(row:any){
 }
 async function swingGuardReject(db:any,row:any,price:number,check:any){
  const now=Date.now(),key=String(row.signal_key);
- const levels=swingGuardModelTpSl(row);
- if(levels.tp===null||levels.sl===null)throw Error('REJECTED_SIGNAL_MODEL_TPSL_NOT_FOUND');
+ const levels={tp:Number(row.tp_pct),sl:Number(row.sl_pct)};
+ if(!Number.isFinite(levels.tp)||!Number.isFinite(levels.sl)||levels.tp<=0||levels.sl<=0)throw Error('REJECTED_SIGNAL_MODEL_TPSL_NOT_FOUND');
  await db.prepare(`INSERT OR IGNORE INTO swing_rejected_signals
  (signal_key,coin,side,interval,pattern,market_regime,rejected_at,entry_price,reasons_json,indicators_json,tp_pct,sl_pct,status,updated_at)
  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'TRACKING',?)`).bind(key,String(row.coin),String(row.side),
@@ -3712,6 +3730,8 @@ async function swingEnter(env:HyperliquidExecutionEnv,row:any){
  const db=env.DB!,coin=String(row.coin).toUpperCase(),key=String(row.signal_key),now=Date.now();
  const side=String(row.side??'SHORT');
  if(side!=='LONG'&&side!=='SHORT')throw Error('INVALID_SWING_SIDE');
+ const originalSide=String(key.split(':')[1]);
+ if(originalSide!=='LONG'&&originalSide!=='SHORT'||side===originalSide)throw Error('SWING_INVERSE_SIDE_NOT_CONFIRMED');
  const strategy=side==='LONG'?SWING_LONG_STRATEGY:SWING_SHORT_B_STRATEGY;
  if(!(Number(row.tp_pct)>0&&Number(row.sl_pct)>0))throw Error('MISSING_SWING_REGIME_TPSL');
  if(now>Number(row.expires_at)){await swingExpire(db,key,'EXPIRED_20M');return 'EXPIRED';}
@@ -3962,11 +3982,11 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
   await db.prepare(`INSERT OR IGNORE INTO swing_live_queue
    (signal_key,coin,side,signal_available_at,signal_bar_open,reference_price,patterns_json,status,next_retry_at,expires_at,updated_at,exit_mode)
    VALUES (?,?,?,?,?,?,?,'WAITING_POSITION',?,?,?,?)`)
-   .bind(key,item.coin,item.side,item.signal_available_at,item.signal_bar_open,item.reference_price,
-    JSON.stringify(eligiblePatterns),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now,SWING_PROGRESSIVE_MODE).run();
+   .bind(key,item.coin,item.side==='LONG'?'SHORT':'LONG',item.signal_available_at,item.signal_bar_open,item.reference_price,
+    JSON.stringify(eligiblePatterns),now,Number(item.signal_available_at)+SWING_MAX_WAIT,now,'FIXED_TPSL').run();
   await db.prepare(`UPDATE swing_live_queue SET market_regime=?,selected_pattern=?,tp_pct=?,sl_pct=?
    WHERE signal_key=? AND status='WAITING_POSITION' AND market_regime IS NULL`)
-   .bind(regime,selected.pattern,0.5,1.0,key).run();
+   .bind(regime,selected.pattern,2.0,2.0,key).run();
   const queueRow:any=await db.prepare(`SELECT status,selected_pattern FROM swing_live_queue WHERE signal_key=?`).bind(key).first();
   await audit({...base,regime,selected:selected.pattern,
    stage:queueRow?'LIVE_SELECTED':'ELIGIBLE',
@@ -3986,25 +4006,22 @@ export async function runSwingShortLive(env:HyperliquidExecutionEnv & {SWING_DB?
  if(Number(unsafe?.n??0)>0)return {ok:false,live:false,reason:'UNRESOLVED_SWING_PROTECTION_BLOCKS_NEW_ENTRIES',unresolved:Number(unsafe.n),orders_sent:0};
  const entered=[];
  for(const row of due.results??[]){
-  if(String(row.side)==='LONG'){
-   const rule=await swingLongQueueRule(env.SWING_DB??db,row);
-   if(!rule||String(row.market_regime)!==rule.regime||
-      String(row.selected_pattern)!==rule.pattern||
-      (swingIsProgressive(row)?Number(row.sl_pct)!==1:Number(row.tp_pct)!==0.5||Number(row.sl_pct)!==1.0)){
-    await swingExpire(db,String(row.signal_key),'REJECTED_LONG_REGIME_RULE_MISMATCH');
-    entered.push({coin:row.coin,result:'REJECTED_LONG_REGIME_RULE_MISMATCH'});
-    continue;
-   }
+  const originalSide=String(row.signal_key).split(':')[1];
+  const inverseSide=originalSide==='LONG'?'SHORT':originalSide==='SHORT'?'LONG':null;
+  // Never execute legacy queued candidates with their original direction.
+  if(!inverseSide||String(row.side)!==inverseSide){
+   entered.push({coin:row.coin,result:'SKIPPED_LEGACY_NON_INVERSE_QUEUE'});
+   continue;
   }
-  if(String(row.side)==='SHORT'){
-   const rule=await swingShortQueueRule(env.SWING_DB??db,row);
-   if(!rule||String(row.market_regime)!==rule.regime||
-      String(row.selected_pattern)!==rule.pattern||
-      (swingIsProgressive(row)?Number(row.sl_pct)!==1:Number(row.tp_pct)!==0.5||Number(row.sl_pct)!==1.0)){
-    await swingExpire(db,String(row.signal_key),'REJECTED_SHORT_REGIME_RULE_MISMATCH');
-    entered.push({coin:row.coin,result:'REJECTED_SHORT_REGIME_RULE_MISMATCH'});
-    continue;
-   }
+  const rule=originalSide==='LONG'
+   ?await swingLongQueueRule(env.SWING_DB??db,{...row,side:originalSide})
+   :await swingShortQueueRule(env.SWING_DB??db,{...row,side:originalSide});
+  if(!rule||String(row.market_regime)!==rule.regime||
+     String(row.selected_pattern)!==rule.pattern||
+     swingIsProgressive(row)||Number(row.tp_pct)!==2||Number(row.sl_pct)!==2){
+   await swingExpire(db,String(row.signal_key),'REJECTED_INVERSE_FIXED_2_2_RULE_MISMATCH');
+   entered.push({coin:row.coin,result:'REJECTED_INVERSE_FIXED_2_2_RULE_MISMATCH'});
+   continue;
   }
   entered.push({coin:row.coin,result:await swingEnter(env,row)});
  }
@@ -4325,7 +4342,14 @@ export async function monitorSwingShortLive(env:HyperliquidExecutionEnv){
     }
     // Only verified, protected positions are eligible for an automated timed exit.
     // An ambiguous/failed IOC is never recorded as a closed trade.
-    const maxHold=swingMaxHoldMs(key);
+    const inverseQueue:any=await db.prepare(`SELECT side,tp_pct,sl_pct,exit_mode FROM swing_live_queue WHERE signal_key=?`).bind(key).first();
+    const originalKeySide=key.split(':')[1];
+    const isInverseFixed=originalKeySide!==String(row.side)&&
+      (originalKeySide==='LONG'||originalKeySide==='SHORT')&&
+      String(inverseQueue?.side)===String(row.side)&&
+      Number(inverseQueue?.tp_pct)===2&&Number(inverseQueue?.sl_pct)===2&&
+      String(inverseQueue?.exit_mode)==='FIXED_TPSL';
+    const maxHold=isInverseFixed?24*60*60_000:(originalKeySide&&swingMaxHoldMs(key));
     const filledAt=Number(row.entry_filled_at);
     if(maxHold!==null && Number.isFinite(filledAt) && filledAt>0 && Date.now()-filledAt>=maxHold){
       if(!SWING_TRADING_ENABLED){events.push({coin,status:'TIME_EXIT_DUE_BUT_SWING_DISABLED'});continue;}
