@@ -10,16 +10,16 @@
   },
 
   "d1_databases": [
-  {
-    "binding": "DB",
-    "database_name": "cryptobot-db",
-    "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
-  },
-  {
-    "binding": "SWING_DB",
-    "database_name": "cryptobot-db",
-    "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
-  }
+    {
+      "binding": "DB",
+      "database_name": "cryptobot-db",
+      "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+    },
+    {
+      "binding": "SWING_DB",
+      "database_name": "cryptobot-db",
+      "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d"
+    }
   ],
 
   "durable_objects": {
@@ -27,6 +27,10 @@
       {
         "name": "PROGRESSIVE_MONITOR",
         "class_name": "ProgressiveMonitor"
+      },
+      {
+        "name": "TRADER_WATCH",
+        "class_name": "TraderWatch"
       }
     ]
   },
@@ -42,8 +46,21 @@
     "ProgressiveMonitor": {
       "type": "durable-object",
       "storage": "sqlite"
+    },
+    "TraderWatch": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
   },
+
+  "migrations": [
+    {
+      "tag": "trader_watch_v1",
+      "new_sqlite_classes": [
+        "TraderWatch"
+      ]
+    }
+  ],
 
   "triggers": {
     "crons": [
