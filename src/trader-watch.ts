@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.3
+// BTC TRADER WATCH V1.4
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.3";
+const VERSION = "BTC TRADER WATCH V1.4";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
@@ -18,9 +18,10 @@ const MAX_IDS = 12000;
 const SHADOW_NOTIONAL_USD = 100;
 const SHADOW_TAKER_FEE_RATE = 0.00045; // configurable assumption, not account-specific
 const SHADOW_MAX_TRADES = 1000;
-const BOOK_MAX_AGE_MS = 1500;
+const BOOK_MAX_AGE_MS = 2000;
+const POSITION_EPS = 1e-9;
 
-type ShadowPosition = { side: "LONG" | "SHORT"; qty: number; entryPrice: number; openedAt: number; entryFees: number; traderQty: number };
+type ShadowPosition = { side: "LONG" | "SHORT"; qty: number; entryPrice: number; openedAt: number; entryFees: number; traderQty: number; positionId?: string; realizedGross?: number; realizedFees?: number; closedQty?: number; initialNotional?: number; closeEvents?: number };
 type ShadowTrade = { eventId?: string; side: string; openedAt: number; closedAt: number; entryPrice: number; exitPrice: number; qty: number; grossUsd: number; feesUsd: number; netUsd: number; holdSeconds: number; reason: string };
 
 
@@ -85,6 +86,12 @@ export class TraderWatch {
   };
 
   private pendingLedger: ShadowTrade[] = [];
+  private pendingPositions: any[] = [];
+  private book = {bid:0, ask:0, at:0};
+  private bookMessages = 0;
+  private bookStale = 0;
+  private positionSeq = 0;
+  private sessionStart = 0;
   private ledgerError: string | null = null;
 
   private state: any = {
@@ -126,6 +133,14 @@ export class TraderWatch {
         (await ctx.storage.get("ids")) ?? [];
       this.shadow = (await ctx.storage.get("shadow")) ?? this.shadow;
       this.pendingLedger = (await ctx.storage.get("pendingLedger")) ?? [];
+      this.pendingPositions = (await ctx.storage.get("pendingPositions")) ?? [];
+      this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
+      this.sessionStart = (await ctx.storage.get("sessionStart")) ?? 0;
+      // V1.3 partial position cannot be reconstructed reliably. Start a new cohort at flat.
+      if (this.shadow.position && !this.shadow.position.positionId) {
+        this.shadow.position = null;
+        this.shadow.skipped["V13_UNRECONSTRUCTED_POSITION_RESET"] = (this.shadow.skipped["V13_UNRECONSTRUCTED_POSITION_RESET"] || 0) + 1;
+      }
 
       if (this.state.active) {
         await ctx.storage.setAlarm(Date.now() + 1000);
@@ -139,7 +154,10 @@ export class TraderWatch {
       samples: this.samples,
       ids: this.ids,
       shadow: this.shadow,
-      pendingLedger: this.pendingLedger
+      pendingLedger: this.pendingLedger,
+      pendingPositions: this.pendingPositions,
+      positionSeq: this.positionSeq,
+      sessionStart: this.sessionStart
     });
   }
 
@@ -249,9 +267,17 @@ export class TraderWatch {
     this.state.last_message_at = Date.now();
     this.state.ws_messages++;
 
-    if (message?.channel !== "userFills") {
+    if (message?.channel === "l2Book") {
+      const b = message.data?.levels;
+      const bid = Number(b?.[0]?.[0]?.px);
+      const ask = Number(b?.[1]?.[0]?.px);
+      if (bid > 0 && ask >= bid && Number.isFinite(bid) && Number.isFinite(ask)) {
+        this.book = {bid,ask,at:Date.now()};
+        this.bookMessages++;
+      }
       return;
     }
+    if (message?.channel !== "userFills") return;
 
     const data = message.data;
 
@@ -300,6 +326,7 @@ export class TraderWatch {
       this.state.subscribed_at = Date.now();
       this.state.last_message_at = Date.now();
 
+      ws.send(JSON.stringify({method:"subscribe",subscription:{type:"l2Book",coin:"BTC"}}));
       ws.send(JSON.stringify({
         method: "subscribe",
         subscription: {
@@ -340,99 +367,131 @@ export class TraderWatch {
     this.shadow.skipped[reason] = (this.shadow.skipped[reason] ?? 0) + 1;
   }
 
-  // Order-book top of book is a quoted price, NOT a guaranteed executable fill.
-  // Fetch only when acting on a LIVE WS fill; never use trader's execution price.
-  private async quote(side: "BUY" | "SELL"): Promise<number> {
-    const r = await fetch(INFO_URL, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "l2Book", coin: "BTC" })
-    });
-    if (!r.ok) throw new Error(`BOOK_HTTP_${r.status}`);
-    const book: any = await r.json();
-    const levels = book?.levels;
-    const level = side === "BUY" ? levels?.[1]?.[0] : levels?.[0]?.[0];
-    const px = Number(level?.px);
-    if (!Number.isFinite(px) || px <= 0) throw new Error("INVALID_BOOK_PRICE");
+  // Price comes ONLY from the subscribed order-book stream. Never use target fill px.
+  private quote(action: "BUY" | "SELL"): number | null {
+    const age = Date.now() - this.book.at;
+    if (!this.book.at || age > BOOK_MAX_AGE_MS) {
+      this.bookStale++;
+      this.shadowSkip("STALE_OR_MISSING_WS_BOOK");
+      return null;
+    }
+    const px = action === "BUY" ? this.book.ask : this.book.bid;
+    if (!(px > 0)) return null;
     this.shadow.quotes++;
-    this.shadow.lastQuoteAt = Date.now();
+    this.shadow.lastQuoteAt = this.book.at;
     return px;
   }
 
-  private async shadowFill(fill: any) {
-    const dir = String(fill?.dir ?? "").toLowerCase();
-    const qty = Number(fill?.sz);
-    if (!Number.isFinite(qty) || qty <= 0) { this.shadowSkip("INVALID_SIZE"); return; }
-    const openLong = dir.includes("open long");
-    const openShort = dir.includes("open short");
-    const closeLong = dir.includes("close long");
-    const closeShort = dir.includes("close short");
-    if (![openLong, openShort, closeLong, closeShort].some(Boolean)) {
-      this.shadowSkip("UNSUPPORTED_DIRECTION"); return;
+  private newPosition(side: "LONG" | "SHORT", px: number, traderQty: number, now: number, eventId: string) {
+    const qty = SHADOW_NOTIONAL_USD / px;
+    this.positionSeq++;
+    this.shadow.position = {
+      side, qty, entryPrice:px, openedAt:now,
+      entryFees:qty*px*SHADOW_TAKER_FEE_RATE, traderQty,
+      positionId:`v14:${this.sessionStart}:${this.positionSeq}:${eventId}`,
+      realizedGross:0, realizedFees:0, closedQty:0,
+      initialNotional:SHADOW_NOTIONAL_USD, closeEvents:0
+    };
+  }
+
+  private closePart(pos: ShadowPosition, fraction: number, px: number, now: number, eventId: string) {
+    fraction = Math.max(0,Math.min(1,fraction));
+    if (fraction <= 0) return;
+    const qty = pos.qty * fraction;
+    const entryFee = pos.entryFees * fraction;
+    const exitFee = qty*px*SHADOW_TAKER_FEE_RATE;
+    const gross = (px-pos.entryPrice)*qty*(pos.side === "LONG" ? 1 : -1);
+    const fees = entryFee+exitFee;
+    const trade:ShadowTrade = {
+      eventId, side:pos.side, openedAt:pos.openedAt, closedAt:now,
+      entryPrice:pos.entryPrice,exitPrice:px,qty,grossUsd:gross,
+      feesUsd:fees,netUsd:gross-fees,holdSeconds:(now-pos.openedAt)/1000,
+      reason:fraction>=1-1e-8 ? "FULL_CLOSE" : "PARTIAL_CLOSE"
+    };
+    this.shadow.trades.push(trade);
+    this.pendingLedger.push(trade);
+    if(this.shadow.trades.length>SHADOW_MAX_TRADES) this.shadow.trades.splice(0,this.shadow.trades.length-SHADOW_MAX_TRADES);
+    pos.realizedGross=(pos.realizedGross||0)+gross;
+    pos.realizedFees=(pos.realizedFees||0)+fees;
+    pos.closedQty=(pos.closedQty||0)+qty;
+    pos.closeEvents=(pos.closeEvents||0)+1;
+    pos.entryFees-=entryFee;
+    pos.qty-=qty;
+    if (fraction>=1-1e-8 || pos.qty<POSITION_EPS) {
+      this.pendingPositions.push({
+        position_id:pos.positionId,side:pos.side,opened_at:pos.openedAt,
+        closed_at:now,entry_price:pos.entryPrice,exit_price:px,
+        gross_usd:pos.realizedGross,fees_usd:pos.realizedFees,
+        net_usd:(pos.realizedGross||0)-(pos.realizedFees||0),
+        hold_seconds:(now-pos.openedAt)/1000,close_events:pos.closeEvents,
+        initial_notional_usd:pos.initialNotional||SHADOW_NOTIONAL_USD
+      });
+      this.shadow.position=null;
     }
-    const side: "LONG" | "SHORT" = openLong || closeLong ? "LONG" : "SHORT";
-    const isOpen = openLong || openShort;
-    const pos = this.shadow.position;
-    if (!isOpen && (!pos || pos.side !== side)) {
-      this.shadowSkip("UNMATCHED_CLOSE_OR_PREEXISTING_POSITION"); return;
-    }
-    if (isOpen && pos && pos.side !== side) {
-      // Ambiguous state: do not invent a reversal execution or entry.
-      this.shadowSkip("OPPOSITE_OPEN_WITHOUT_MATCHED_CLOSE"); return;
-    }
-    const action: "BUY" | "SELL" = isOpen
-      ? (side === "LONG" ? "BUY" : "SELL")
-      : (side === "LONG" ? "SELL" : "BUY");
-    const px = await this.quote(action);
-    const now = Date.now();
-    if (isOpen) {
-      if (!pos) {
-        const shadowQty = SHADOW_NOTIONAL_USD / px;
-        this.shadow.position = {
-          side, qty: shadowQty, entryPrice: px, openedAt: now,
-          entryFees: shadowQty * px * SHADOW_TAKER_FEE_RATE,
-          traderQty: qty
-        };
-      } else {
-        // Follow proportional increases relative to observed trader position.
-        const added = pos.qty * (qty / Math.max(pos.traderQty, 1e-12));
-        const newQty = pos.qty + added;
-        pos.entryPrice = (pos.entryPrice * pos.qty + px * added) / newQty;
-        pos.entryFees += added * px * SHADOW_TAKER_FEE_RATE;
-        pos.qty = newQty;
-        pos.traderQty += qty;
-      }
+  }
+
+  private async shadowFill(fill:any) {
+    const qty=Number(fill?.sz);
+    if (!(qty>0) || !Number.isFinite(qty)) {this.shadowSkip("INVALID_SIZE");return;}
+    const action = fill?.side === "B" ? "BUY" : fill?.side === "A" ? "SELL" : null;
+    if(!action){this.shadowSkip("UNSUPPORTED_SIDE");return;}
+    const signedDelta=action==="BUY"?qty:-qty;
+    const rawStart=fill?.startPosition;
+    const start=rawStart==null || rawStart==="" ? NaN : Number(rawStart);
+    if(!Number.isFinite(start)) {this.shadowSkip("NO_START_POSITION");return;}
+    const end=start+signedDelta;
+    const eventId=this.fillId(fill);
+    const now=Date.now();
+    // Initial/unknown history: wait for a verified FLAT -> OPEN transition.
+    const pos=this.shadow.position;
+    if(!pos) {
+      if(Math.abs(start)>POSITION_EPS){this.shadowSkip("WAIT_FOR_FLAT_ENTRY");return;}
+      if(Math.abs(end)<=POSITION_EPS)return;
+      const px=this.quote(action);
+      if(px===null)return;
+      this.newPosition(end>0?"LONG":"SHORT",px,Math.abs(end),now,eventId);
       return;
     }
-    if (!pos) return;
-    const fraction = Math.min(1, qty / Math.max(pos.traderQty, 1e-12));
-    const closedQty = pos.qty * fraction;
-    const entryFeePart = pos.entryFees * fraction;
-    const exitFee = closedQty * px * SHADOW_TAKER_FEE_RATE;
-    const gross = (px - pos.entryPrice) * closedQty * (side === "LONG" ? 1 : -1);
-    const fees = entryFeePart + exitFee;
-    const closedEvent: ShadowTrade = {
-      eventId: this.fillId(fill),
-      side, openedAt: pos.openedAt, closedAt: now,
-      entryPrice: pos.entryPrice, exitPrice: px, qty: closedQty,
-      grossUsd: gross, feesUsd: fees, netUsd: gross - fees,
-      holdSeconds: (now - pos.openedAt) / 1000,
-      reason: fraction >= 0.999999 ? "FULL_CLOSE" : "PARTIAL_CLOSE"
-    };
-    this.shadow.trades.push(closedEvent);
-    this.pendingLedger.push(closedEvent);
-    if (this.shadow.trades.length > SHADOW_MAX_TRADES) {
-      this.shadow.trades.splice(0, this.shadow.trades.length - SHADOW_MAX_TRADES);
+    const expected=pos.side==="LONG"?pos.traderQty:-pos.traderQty;
+    // If trader's pre-fill position differs, don't manufacture a close or reversal.
+    if(Math.abs(expected-start)>Math.max(0.000001,Math.abs(start)*0.0001)) {
+      this.shadowSkip("POSITION_DESYNC_WAIT_FOR_FLAT");
+      this.shadow.position=null;
+      return;
     }
-    pos.qty -= closedQty;
-    pos.traderQty = Math.max(0, pos.traderQty - qty);
-    pos.entryFees -= entryFeePart;
-    if (fraction >= 0.999999 || pos.qty < 1e-12) this.shadow.position = null;
+    const px=this.quote(action);
+    if(px===null){
+      // Skipped fill invalidates position tracking; don't continue with stale quantity.
+      this.shadow.position=null;
+      this.shadowSkip("POSITION_INVALIDATED_BY_MISSING_QUOTE");
+      return;
+    }
+    const sameSign=start*signedDelta>0;
+    if(sameSign){
+      const added=pos.qty*(qty/Math.max(pos.traderQty,POSITION_EPS));
+      const newQty=pos.qty+added;
+      pos.entryPrice=(pos.entryPrice*pos.qty+px*added)/newQty;
+      pos.entryFees+=added*px*SHADOW_TAKER_FEE_RATE;
+      pos.qty=newQty;
+      pos.traderQty=Math.abs(end);
+      return;
+    }
+    const closedTrader=Math.min(Math.abs(start),qty);
+    const fraction=closedTrader/Math.max(pos.traderQty,POSITION_EPS);
+    this.closePart(pos,fraction,px,now,eventId);
+    if(this.shadow.position) this.shadow.position.traderQty=Math.abs(end);
+    if(start*end< -POSITION_EPS*POSITION_EPS){
+      // The same fill reverses the target. A fresh shadow entry uses the quote
+      // from the same signal; no extra API call, no target execution price.
+      const newSide=end>0?"LONG":"SHORT";
+      this.newPosition(newSide,px,Math.abs(end),now,eventId);
+    }
   }
 
   // D1 ledger is append-only and idempotent. A partial close is one close EVENT,
   // not an independently completed position. Pending writes survive DO restarts.
   private async flushLedger() {
-    if (!this.pendingLedger.length) return;
+    if (!this.pendingLedger.length && !this.pendingPositions.length) return;
     const db = this.env?.DB;
     if (!db) { this.ledgerError = "DB_BINDING_MISSING"; return; }
     try {
@@ -449,6 +508,17 @@ export class TraderWatch {
             trade.grossUsd, trade.feesUsd, trade.netUsd, trade.holdSeconds,
             trade.reason, SHADOW_NOTIONAL_USD, SHADOW_TAKER_FEE_RATE).run();
         this.pendingLedger.shift();
+      }
+      for(const pos of this.pendingPositions.slice(0,30)) {
+        await db.prepare(`INSERT OR IGNORE INTO trader_shadow_positions_v14
+          (position_id,wallet,side,opened_at,closed_at,entry_price,exit_price,
+           gross_usd,fees_usd,net_usd,hold_seconds,close_events,initial_notional_usd)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+            pos.position_id,TARGET,pos.side,pos.opened_at,pos.closed_at,
+            pos.entry_price,pos.exit_price,pos.gross_usd,pos.fees_usd,
+            pos.net_usd,pos.hold_seconds,pos.close_events,pos.initial_notional_usd
+          ).run();
+        this.pendingPositions.shift();
       }
       this.ledgerError = null;
       await this.persist();
@@ -506,6 +576,44 @@ export class TraderWatch {
       hint:"Run the provided SQL migration in cryptobot-db first."},503);}
   }
 
+  private async positionsLedger(url:URL):Promise<Response> {
+    const db=this.env?.DB;
+    if(!db)return json({ok:false,error:"DB_BINDING_MISSING"},503);
+    const page=Math.max(1,Math.min(100000,Number(url.searchParams.get("page")||1)||1));
+    const limit=Math.max(1,Math.min(100,Number(url.searchParams.get("limit")||50)||50));
+    const side=url.searchParams.get("side")||"ALL";
+    const result=url.searchParams.get("result")||"ALL";
+    const date=url.searchParams.get("date")||"";
+    if(!["ALL","LONG","SHORT"].includes(side)||!["ALL","WIN","LOSS"].includes(result)||
+      (date&&!/^\d{4}-\d{2}-\d{2}$/.test(date)))return json({ok:false,error:"INVALID_FILTER"},400);
+    const where=["wallet = ?"],args:any[]=[TARGET];
+    if(side!=="ALL"){where.push("side = ?");args.push(side);}
+    if(result==="WIN")where.push("net_usd > 0");
+    if(result==="LOSS")where.push("net_usd <= 0");
+    if(date){const start=Date.parse(date+"T00:00:00Z");if(!Number.isFinite(start))return json({ok:false,error:"INVALID_DATE"},400);
+      where.push("closed_at >= ? AND closed_at < ?");args.push(start,start+86400000);}
+    const w=where.join(" AND ");
+    try {
+      const summary=await db.prepare(`SELECT COUNT(*) AS trades,
+        SUM(CASE WHEN net_usd>0 THEN 1 ELSE 0 END) AS wins,
+        COALESCE(SUM(net_usd),0) AS net_usd,
+        COALESCE(SUM(gross_usd),0) AS gross_usd,
+        COALESCE(SUM(fees_usd),0) AS fees_usd,
+        COALESCE(SUM(initial_notional_usd),0) AS notional_usd,
+        COALESCE(AVG(hold_seconds),0) AS avg_hold_seconds
+        FROM trader_shadow_positions_v14 WHERE ${w}`).bind(...args).first();
+      const rows=await db.prepare(`SELECT * FROM trader_shadow_positions_v14 WHERE ${w}
+        ORDER BY closed_at DESC,position_id DESC LIMIT ? OFFSET ?`).bind(...args,limit,(page-1)*limit).all();
+      const total=Number(summary?.trades||0),notional=Number(summary?.notional_usd||0);
+      return json({ok:true,version:VERSION,record_type:"COMPLETED_POSITIONS_V14",total,
+        pages:Math.ceil(total/limit),rows:rows.results||[],
+        summary:{...summary,win_rate_pct:total?100*Number(summary?.wins||0)/total:null,
+          roi_pct:notional?100*Number(summary?.net_usd||0)/notional:null},
+        pending_writes:this.pendingPositions.length,ledger_error:this.ledgerError,
+        warning:"ROI = sum realized net / sum initial notional, not account equity ROI."});
+    }catch(e){return json({ok:false,error:"POSITIONS_QUERY_FAILED",detail:String(e)},503);}
+  }
+
   private shadowStats() {
     const trades = this.shadow.trades;
     const net = trades.reduce((v, t) => v + t.netUsd, 0);
@@ -514,9 +622,16 @@ export class TraderWatch {
       mode: "READ_ONLY_SHADOW", version: VERSION,
       simulated_notional_usd_per_initial_entry: SHADOW_NOTIONAL_USD,
       assumed_taker_fee_rate_per_side: SHADOW_TAKER_FEE_RATE,
-      price_source: "Hyperliquid BTC l2Book best ask/bid at signal processing time",
+      price_source: "BTC l2Book WebSocket bid/ask; max quote age 2000ms",
+      book_ws: {messages:this.bookMessages, age_ms:this.book.at?Date.now()-this.book.at:null,
+        bid:this.book.bid||null,ask:this.book.ask||null,stale_signals:this.bookStale},
+      pending_completed_positions:this.pendingPositions.length,
       current_position: this.shadow.position,
+      current_unrealized_net_usd: this.shadow.position && this.book.at && Date.now()-this.book.at<=BOOK_MAX_AGE_MS
+        ? Number(( ( (this.shadow.position.side==="LONG"?this.book.bid-this.shadow.position.entryPrice:this.shadow.position.entryPrice-this.book.ask)*this.shadow.position.qty )
+            - this.shadow.position.entryFees - this.shadow.position.qty*(this.shadow.position.side==="LONG"?this.book.bid:this.book.ask)*SHADOW_TAKER_FEE_RATE).toFixed(6)) : null,
       completed_close_events: trades.length,
+      close_event_stats_include_legacy_v13: true,
       winning_close_events: wins,
       win_rate_pct: trades.length ? Number((100 * wins / trades.length).toFixed(2)) : null,
       realized_net_usd: Number(net.toFixed(6)),
@@ -531,8 +646,8 @@ export class TraderWatch {
         "Indicative best bid/ask quotes; not verified executions, depth or market impact.",
         "Starts with no assumed trader position; unmatched closes are skipped.",
         "Open positions have no unrealized P/L; funding is excluded.",
-        "A quote request adds latency and may overstate achievable execution quality.",
-        "Multiple partial close events are not independent complete trades."
+        "WebSocket quote age is capped at 2 seconds; fills with missing quotes invalidate tracking.",
+        "Multiple partial close events are not independent complete trades; V1.4 completed positions are stored separately."
       ]
     };
   }
@@ -775,6 +890,7 @@ export class TraderWatch {
 
     if (path === "/start") {
       this.state.active = true;
+      this.sessionStart ||= Date.now();
 
       this.state.started_at ||= Date.now();
 
@@ -834,6 +950,8 @@ export class TraderWatch {
     if (path === "/status") {
       return json(this.stats());
     }
+
+    if (path === "/positions") return this.positionsLedger(url);
 
     if (path === "/ledger") {
       return this.ledger(url);
