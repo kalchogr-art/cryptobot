@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.4.1
+// BTC TRADER WATCH V1.4.2
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.4.1";
+const VERSION = "BTC TRADER WATCH V1.4.2";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
@@ -100,6 +100,14 @@ export class TraderWatch {
     next_attempt_at: 0, checks: 0, mismatches: 0, reversals_observed: 0,
     shadow_entry_allowed: false, waiting_reason: "AWAITING_POSITION_SNAPSHOT" };
   private syncInProgress = false;
+  // Separate observed fill continuity from API snapshots. Never interpret a
+  // snapshot direction change alone as a tradable entry.
+  private observed = { signed_qty: null as number | null, last_fill_time: 0,
+    last_fill_id: "", fills: 0, flat_opens: 0, fill_reversals: 0,
+    snapshot_sign_changes: 0, unverified_direction_changes: 0,
+    missed_boundaries: 0, out_of_order: 0, duplicate_or_old: 0,
+    last_transition: "NONE", last_transition_at: 0 };
+  private lastSnapshotSigned: number | null = null;
 
   private state: any = {
     version: VERSION,
@@ -169,7 +177,9 @@ export class TraderWatch {
       pendingPositions: this.pendingPositions,
       positionSeq: this.positionSeq,
       sessionStart: this.sessionStart,
-      positionSync: this.sync
+      positionSync: this.sync,
+      observedFills: this.observed,
+      lastSnapshotSigned: this.lastSnapshotSigned
     });
   }
 
@@ -299,6 +309,9 @@ export class TraderWatch {
         ? data
         : [];
 
+    // userFills batches may be delivered newest-first. Process position
+    // transitions in exchange-time order, not message array order.
+    fills.sort((a:any,b:any) => Number(a?.time||0)-Number(b?.time||0) || Number(a?.tid||0)-Number(b?.tid||0));
     for (const fill of fills) {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
@@ -499,98 +512,135 @@ export class TraderWatch {
   }
 
   private async shadowFill(fill:any) {
-    const qty=Number(fill?.sz);
-    if (!(qty>0) || !Number.isFinite(qty)) {this.shadowSkip("INVALID_SIZE");return;}
+    const qty = Number(fill?.sz);
+    if (!(qty > 0) || !Number.isFinite(qty)) { this.shadowSkip("INVALID_SIZE"); return; }
     const action = fill?.side === "B" ? "BUY" : fill?.side === "A" ? "SELL" : null;
-    if(!action){this.shadowSkip("UNSUPPORTED_SIDE");return;}
-    const signedDelta=action==="BUY"?qty:-qty;
-    const rawStart=fill?.startPosition;
-    const start=rawStart==null || rawStart==="" ? NaN : Number(rawStart);
-    if(!Number.isFinite(start)) {this.shadowSkip("NO_START_POSITION");return;}
-    const end=start+signedDelta;
-    // An authoritative snapshot is needed before trusting a new cohort.
-    if (this.sync.status === "UNINITIALIZED" || this.sync.status === "RECHECK_REQUIRED" || this.sync.status === "SYNC_UNAVAILABLE") {
+    if (!action) { this.shadowSkip("UNSUPPORTED_SIDE"); return; }
+    const rawStart = fill?.startPosition;
+    const start = rawStart == null || rawStart === "" ? NaN : Number(rawStart);
+    if (!Number.isFinite(start)) { this.shadowSkip("NO_START_POSITION"); return; }
+    const delta = action === "BUY" ? qty : -qty;
+    const end = Math.abs(start + delta) < POSITION_EPS ? 0 : start + delta;
+    const fillTime = Number(fill?.time);
+    const eventId = this.fillId(fill);
+    const now = Date.now();
+    if (fillTime < this.observed.last_fill_time ||
+        (fillTime === this.observed.last_fill_time && eventId === this.observed.last_fill_id)) {
+      this.observed.out_of_order++;
+      this.shadowSkip("OUT_OF_ORDER_FILL_NO_SHADOW_EXECUTION");
+      return;
+    }
+    const prev = this.observed.signed_qty;
+    if (prev !== null && Math.abs(prev-start) > Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)) {
+      this.observed.missed_boundaries++;
+      this.observed.last_transition = "FILL_CONTINUITY_GAP";
+      this.observed.last_transition_at = now;
+      // A missing fill makes a running shadow position untrustworthy.
+      if (this.shadow.position) {
+        this.shadow.position = null;
+        this.shadowSkip("POSITION_INVALIDATED_BY_FILL_GAP");
+      }
+      this.sync.status = "RECHECK_REQUIRED";
+      this.sync.shadow_entry_allowed = false;
+      this.sync.next_attempt_at = 0;
+    }
+    this.observed.signed_qty = end;
+    this.observed.last_fill_time = fillTime;
+    this.observed.last_fill_id = eventId;
+    this.observed.fills++;
+    const reversal = start*end < -(POSITION_EPS*POSITION_EPS);
+    const flatOpen = Math.abs(start) <= POSITION_EPS && Math.abs(end) > POSITION_EPS;
+    const becameFlat = Math.abs(start) > POSITION_EPS && Math.abs(end) <= POSITION_EPS;
+    if (reversal) {
+      this.observed.fill_reversals++;
+      this.observed.last_transition = "VERIFIED_FILL_REVERSAL";
+      this.observed.last_transition_at = now;
+      this.sync.reversals_observed++;
+    } else if (flatOpen) {
+      this.observed.flat_opens++;
+      this.observed.last_transition = "VERIFIED_FLAT_TO_OPEN";
+      this.observed.last_transition_at = now;
+    } else if (becameFlat) {
+      this.observed.last_transition = "VERIFIED_CLOSE_TO_FLAT";
+      this.observed.last_transition_at = now;
+    }
+    // Snapshot is a safety baseline. A verified exchange fill is authoritative
+    // for its own start/end transition, even when a 60-second snapshot was taken
+    // before/after a batch and says TRACKING_EXISTING.
+    if (this.sync.status === "UNINITIALIZED" || this.sync.status === "SYNC_UNAVAILABLE") {
       this.shadowSkip("AWAITING_POSITION_SYNC"); return;
     }
-    const eventId=this.fillId(fill);
-    const now=Date.now();
-    // Initial/unknown history: wait for a verified FLAT -> OPEN transition.
-    const pos=this.shadow.position;
-    if(!pos) {
-      // For an existing position, observe reductions without inventing a historical entry.
-      // A verified reversal contains a genuinely NEW opposite-side entry.
-      const reversal = start*end < -(POSITION_EPS*POSITION_EPS);
-      const flatOpen = Math.abs(start)<=POSITION_EPS && Math.abs(end)>POSITION_EPS;
+    const pos = this.shadow.position;
+    if (!pos) {
+      this.sync.signed_qty = end;
+      this.sync.trader_btc_qty = Math.abs(end);
+      this.sync.trader_side = end > POSITION_EPS ? "LONG" : end < -POSITION_EPS ? "SHORT" : "FLAT";
       if (!reversal && !flatOpen) {
-        this.sync.signed_qty=end;
-        this.sync.trader_btc_qty=Math.abs(end);
-        this.sync.trader_side=end>POSITION_EPS?"LONG":end< -POSITION_EPS?"SHORT":"FLAT";
-        this.sync.status=Math.abs(end)<=POSITION_EPS?"FLAT_CONFIRMED":"TRACKING_EXISTING";
-        this.sync.waiting_reason=Math.abs(end)<=POSITION_EPS?"AWAITING_NEXT_OPEN":"EXISTING_POSITION";
-        this.sync.shadow_entry_allowed=Math.abs(end)<=POSITION_EPS;
+        this.sync.status = Math.abs(end) <= POSITION_EPS ? "FLAT_CONFIRMED" : "TRACKING_EXISTING";
+        this.sync.waiting_reason = Math.abs(end) <= POSITION_EPS ? "AWAITING_NEXT_OPEN" : "EXISTING_POSITION";
+        this.sync.shadow_entry_allowed = Math.abs(end) <= POSITION_EPS;
         this.shadowSkip("OBSERVED_EXISTING_POSITION");
         return;
       }
-      const px=this.quote(end>0?"BUY":"SELL");
-      if(px===null) {this.sync.status="RECHECK_REQUIRED";return;}
-      this.newPosition(end>0?"LONG":"SHORT",px,Math.abs(end),now,eventId);
-      this.sync.status="SHADOW_TRACKING";
-      this.sync.shadow_entry_allowed=true;
-      this.sync.waiting_reason="NONE";
-      this.sync.signed_qty=end;
-      this.sync.trader_btc_qty=Math.abs(end);
-      this.sync.trader_side=end>0?"LONG":"SHORT";
-      if(reversal)this.sync.reversals_observed++;
+      const px = this.quote(end > 0 ? "BUY" : "SELL");
+      if (px === null) {
+        this.sync.status = "RECHECK_REQUIRED";
+        this.sync.shadow_entry_allowed = false;
+        this.sync.next_attempt_at = 0;
+        this.shadowSkip("VERIFIED_ENTRY_WITHOUT_FRESH_QUOTE");
+        return;
+      }
+      this.newPosition(end > 0 ? "LONG" : "SHORT", px, Math.abs(end), now, eventId);
+      this.sync.status = "SHADOW_TRACKING";
+      this.sync.shadow_entry_allowed = true;
+      this.sync.waiting_reason = "NONE";
       return;
     }
-    const expected=pos.side==="LONG"?pos.traderQty:-pos.traderQty;
-    // If trader's pre-fill position differs, don't manufacture a close or reversal.
-    if(Math.abs(expected-start)>Math.max(0.000001,Math.abs(start)*0.0001)) {
+    const expected = pos.side === "LONG" ? pos.traderQty : -pos.traderQty;
+    if (Math.abs(expected-start) > Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)) {
       this.shadowSkip("POSITION_DESYNC_WAIT_FOR_FLAT");
-      this.shadow.position=null;
-      this.sync.status="RECHECK_REQUIRED";
-      this.sync.shadow_entry_allowed=false;
-      this.sync.next_attempt_at=0;
+      this.shadow.position = null;
+      this.sync.status = "RECHECK_REQUIRED";
+      this.sync.shadow_entry_allowed = false;
+      this.sync.next_attempt_at = 0;
       return;
     }
-    const px=this.quote(action);
-    if(px===null){
-      // Skipped fill invalidates position tracking; don't continue with stale quantity.
-      this.shadow.position=null;
-      this.sync.status="RECHECK_REQUIRED";
-      this.sync.shadow_entry_allowed=false;
-      this.sync.next_attempt_at=0;
+    const px = this.quote(action);
+    if (px === null) {
+      this.shadow.position = null;
+      this.sync.status = "RECHECK_REQUIRED";
+      this.sync.shadow_entry_allowed = false;
+      this.sync.next_attempt_at = 0;
       this.shadowSkip("POSITION_INVALIDATED_BY_MISSING_QUOTE");
       return;
     }
-    const sameSign=start*signedDelta>0;
-    if(sameSign){
-      const added=pos.qty*(qty/Math.max(pos.traderQty,POSITION_EPS));
-      const newQty=pos.qty+added;
-      pos.entryPrice=(pos.entryPrice*pos.qty+px*added)/newQty;
-      pos.entryFees+=added*px*SHADOW_TAKER_FEE_RATE;
-      pos.qty=newQty;
-      pos.traderQty=Math.abs(end);
-      return;
+    if (start*delta > 0) {
+      // Copy size scales with changes in the trader's exposure.
+      const added = pos.qty*(qty/Math.max(pos.traderQty,POSITION_EPS));
+      const newQty = pos.qty+added;
+      pos.entryPrice = (pos.entryPrice*pos.qty+px*added)/newQty;
+      pos.entryFees += added*px*SHADOW_TAKER_FEE_RATE;
+      pos.qty = newQty;
+      pos.traderQty = Math.abs(end);
+    } else {
+      const closedTrader = Math.min(Math.abs(start),qty);
+      const fraction = closedTrader/Math.max(pos.traderQty,POSITION_EPS);
+      this.closePart(pos,fraction,px,now,eventId);
+      if (this.shadow.position) this.shadow.position.traderQty = Math.abs(end);
+      if (reversal) {
+        // The closing side and the opening side have DIFFERENT executable
+        // bid/ask prices. Never reuse the close quote for the new entry.
+        const entryPx = this.quote(end > 0 ? "BUY" : "SELL");
+        if (entryPx !== null) this.newPosition(end > 0 ? "LONG" : "SHORT",entryPx,Math.abs(end),now,eventId);
+        else this.shadowSkip("REVERSAL_ENTRY_MISSING_QUOTE");
+      }
     }
-    const closedTrader=Math.min(Math.abs(start),qty);
-    const fraction=closedTrader/Math.max(pos.traderQty,POSITION_EPS);
-    this.closePart(pos,fraction,px,now,eventId);
-    if(this.shadow.position) this.shadow.position.traderQty=Math.abs(end);
-    this.sync.signed_qty=end;
-    this.sync.trader_btc_qty=Math.abs(end);
-    this.sync.trader_side=end>POSITION_EPS?"LONG":end< -POSITION_EPS?"SHORT":"FLAT";
-    this.sync.status=this.shadow.position?"SHADOW_TRACKING":"FLAT_CONFIRMED";
-    this.sync.shadow_entry_allowed=true;
-    this.sync.waiting_reason=this.shadow.position?"NONE":"AWAITING_NEXT_OPEN";
-    if(start*end< -POSITION_EPS*POSITION_EPS){
-      // The same fill reverses the target. A fresh shadow entry uses the quote
-      // from the same signal; no extra API call, no target execution price.
-      const newSide=end>0?"LONG":"SHORT";
-      this.newPosition(newSide,px,Math.abs(end),now,eventId);
-      this.sync.reversals_observed++;
-      this.sync.status="SHADOW_TRACKING";
-    }
+    this.sync.signed_qty = end;
+    this.sync.trader_btc_qty = Math.abs(end);
+    this.sync.trader_side = end > POSITION_EPS ? "LONG" : end < -POSITION_EPS ? "SHORT" : "FLAT";
+    this.sync.status = this.shadow.position ? "SHADOW_TRACKING" : Math.abs(end) <= POSITION_EPS ? "FLAT_CONFIRMED" : "TRACKING_EXISTING";
+    this.sync.shadow_entry_allowed = !!this.shadow.position || Math.abs(end) <= POSITION_EPS;
+    this.sync.waiting_reason = this.shadow.position ? "NONE" : Math.abs(end) <= POSITION_EPS ? "AWAITING_NEXT_OPEN" : "EXISTING_POSITION";
   }
 
   // D1 ledger is append-only and idempotent. A partial close is one close EVENT,
@@ -751,9 +801,10 @@ export class TraderWatch {
       warnings: [
         "Indicative best bid/ask quotes; not verified executions, depth or market impact.",
         "Starts with no assumed trader position; unmatched closes are skipped.",
-        "Open positions have no unrealized P/L; funding is excluded.",
+        "Unrealized P/L is indicative when a fresh bid/ask is available; funding is excluded.",
         "WebSocket quote age is capped at 2 seconds; fills with missing quotes invalidate tracking.",
-        "Multiple partial close events are not independent complete trades; V1.4 completed positions are stored separately."
+        "Multiple partial close events are not independent complete trades; completed positions are stored separately.",
+         "Snapshot direction changes are diagnostic only. Only observed fill transitions create new shadow entries."
       ]
     };
   }
