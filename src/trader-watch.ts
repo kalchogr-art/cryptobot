@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.5.0
+// BTC TRADER WATCH V1.5.1
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.5.0";
+const VERSION = "BTC TRADER WATCH V1.5.1";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
@@ -156,6 +156,11 @@ export class TraderWatch {
       this.pendingPositions = (await ctx.storage.get("pendingPositions")) ?? [];
       this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
       this.v15 = (await ctx.storage.get("v15Reconstruction")) ?? this.v15;
+      // V1.5.0 had a broken signed-quantity comparison, invalidating every fill.
+      // Start a clean V1.5.1 observation cohort; do not delete any D1 data.
+      if (this.v15.schemaVersion !== "1.5.1") {
+        this.v15 = { startedAt:Date.now(), schemaVersion:"1.5.1", position:null, pending:[], recent:[], seen:[], counters:{received:0,duplicates:0,gaps:0,opens:0,closes:0,adds:0,partials:0,reversals:0,apiRecovered:0,writeFailures:0,waitingExisting:0}, lastFillAt:0,lastD1WriteAt:0,lastError:null };
+      }
       if (!this.v15.startedAt) this.v15.startedAt=Date.now();
       this.sessionStart = (await ctx.storage.get("sessionStart")) ?? 0;
       this.sync = (await ctx.storage.get("positionSync")) ?? this.sync;
@@ -726,14 +731,14 @@ export class TraderWatch {
     const end=Math.abs(start+delta)<POSITION_EPS?0:start+delta;
     const sign=(n:number)=>n>POSITION_EPS?1:n< -POSITION_EPS?-1:0;
     const pos=v.position;
-    if(pos && Math.abs(pos.targetQty*sign(pos.targetSigned)-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
+    if(pos && Math.abs(pos.targetSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
       v.counters.gaps++;
       v.recent.push({type:"GAP",at:t,expected:pos.targetSigned,actual:start,fill_id:id});
       v.position=null; // Never finalize an unverified position.
     }
     let current=v.position;
     if(!current){
-      if(sign(start)!==0){v.counters.gaps++;return;} // Existing position; wait for verified flat -> open.
+      if(sign(start)!==0){v.counters.waitingExisting=(v.counters.waitingExisting||0)+1;return;} // Existing position; not a continuity gap.
       if(sign(end)===0)return;
       this.v15Open(end,px,t,id);
       return;
