@@ -53,15 +53,6 @@
     }
   },
 
-  "migrations": [
-    {
-      "tag": "trader_watch_v1",
-      "new_sqlite_classes": [
-        "TraderWatch"
-      ]
-    }
-  ],
-
   "triggers": {
     "crons": [
       "* * * * *"
