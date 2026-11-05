@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cryptobot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-15",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "cryptobot-db", "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d" },
+    { "binding": "SWING_DB", "database_name": "cryptobot-db", "database_id": "6e53b9ed-a746-4470-824c-ddc8807aaf0d" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROGRESSIVE_MONITOR", "class_name": "ProgressiveMonitor" },
+      { "name": "TRADER_WATCH", "class_name": "TraderWatch" }
+    ]
+  },
+  "services": [ { "binding": "SELF", "service": "cryptobot" } ],
+  "exports": {
+    "ProgressiveMonitor": { "type": "durable-object", "storage": "sqlite" },
+    "TraderWatch": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "migrations": [
+    { "tag": "trader_watch_v1", "new_sqlite_classes": ["TraderWatch"] }
+  ],
+  "triggers": { "crons": ["* * * * *"] }
+}
