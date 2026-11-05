@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.6.0
+// BTC TRADER WATCH V2.0.0 POSITION MIRROR
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.6.0";
+const VERSION = "BTC TRADER WATCH V2.0.0 POSITION MIRROR";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const V16_RECOVERY_BACKOFF_MS = 120_000;
@@ -90,6 +90,13 @@ export class TraderWatch {
 
   private pendingLedger: ShadowTrade[] = [];
   private v15: any = { startedAt:0, position:null, pending:[], recent:[], seen:[], counters:{received:0,duplicates:0,gaps:0,opens:0,closes:0,adds:0,partials:0,reversals:0,apiRecovered:0,writeFailures:0}, lastFillAt:0,lastD1WriteAt:0, lastError:null };
+  private mirror: any = {schema:2, initialized:false, snapshot:null, previous:null, copy:null,
+    events:[], pending:[], lastSnapshotAt:0, lastD1WriteAt:0, lastError:null, nextPollAt:0,
+    nextBackoffAt:0, dirty:false, stats:{snapshots:0,changes:0,opens:0,closes:0,reversals:0,
+      increases:0,decreases:0,missedWindows:0,copyOpens:0,copyCloses:0,copyUnpriced:0,
+      rawFills:0,writeFailures:0}};
+  private mirrorPolling = false;
+  private mirrorLastFillAt = 0;
   private pendingPositions: any[] = [];
   private book = {bid:0, ask:0, at:0};
   private bookMessages = 0;
@@ -158,6 +165,7 @@ export class TraderWatch {
       this.pendingPositions = (await ctx.storage.get("pendingPositions")) ?? [];
       this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
       this.v15 = (await ctx.storage.get("v15Reconstruction")) ?? this.v15;
+      this.mirror = (await ctx.storage.get("positionMirrorV2")) ?? this.mirror;
       // V1.5.0 had a broken signed-quantity comparison, invalidating every fill.
       // Start a clean V1.5.1 observation cohort; do not delete any D1 data.
       if (this.v15.schemaVersion !== "1.5.1") {
@@ -200,7 +208,8 @@ export class TraderWatch {
       lastSnapshotSigned: this.lastSnapshotSigned,
       syncDiagnostics: this.syncDiagnostics,
       syncMismatchCandidate: this.syncMismatchCandidate,
-      v15Reconstruction:this.v15
+      v15Reconstruction:this.v15,
+      positionMirrorV2:this.mirror
     });
   }
 
@@ -336,13 +345,13 @@ export class TraderWatch {
     for (const fill of fills) {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
-        try { this.reconstructV15(fill, "WS_LIVE"); }
-        catch (e) { this.v15.lastError=String(e); this.error(e); }
+        this.mirrorFill(fill, "WS_LIVE");
       }
     }
 
     await this.persist();
-    await this.flushV15();
+    await this.flushMirror();
+    if (this.mirror.dirty && Date.now() >= this.mirror.nextPollAt) await this.pollMirror();
   }
 
   private connect() {
@@ -400,6 +409,7 @@ export class TraderWatch {
       this.sync.status="RECHECK_REQUIRED";
       this.sync.shadow_entry_allowed=false;
       this.sync.next_attempt_at=0;
+      this.mirror.nextPollAt=0;
 
       if (this.state.active) {
         this.ctx.storage
@@ -1065,9 +1075,9 @@ export class TraderWatch {
     btc.sort((a:any,b:any)=>Number(a?.time||0)-Number(b?.time||0)||Number(a?.tid||0)-Number(b?.tid||0));
     for (const fill of btc) {
       const classified=this.take(fill, "API");
-      if(classified==="API_BACKFILL")this.reconstructV15(fill,"API_RECOVERY");
+      if(classified==="API_BACKFILL")this.mirrorFill(fill,"API_BACKFILL");
     }
-    await this.flushV15();
+    await this.flushMirror();
 
     this.state.last_audit_at = now;
 
@@ -1206,15 +1216,20 @@ export class TraderWatch {
 
       copy_window: this.getCopyWindow(),
       shadow_copy: {
-        mode:"READ_ONLY_TARGET_FILL_RECONSTRUCTION",version:VERSION,
-        price_source:"TARGET_EXECUTION_PRICE_REFERENCE_NOT_COPY_EXECUTION",
+        mode:"READ_ONLY_POSITION_MIRROR",version:VERSION,
         position_sync:{...this.sync},
-        current_position:this.v15.position,
-        pending_completed_positions:this.v15.pending.length,
-        reconstruction:{...this.v15.counters,started_at:this.v15.startedAt,last_fill_at:this.v15.lastFillAt,
-          last_d1_write_at:this.v15.lastD1WriteAt,last_error:this.v15.lastError},
-        recent_trades:this.v15.recent.slice(-20),
-        warnings:["V1.6 cohort only; old rows remain in D1 but are not included in new-cohort diagnostics.","Target fill prices are not achievable copy prices.","Position starts only on a verified flat-open or exchange-fill reversal; no synthetic entries.","Missing fill continuity invalidates a position rather than inventing a trade; target prices are not executable copy prices."]
+        current_position:this.mirror.snapshot,
+        copy_position:this.mirror.copy,
+        mirror_stats:this.mirror.stats,
+        mirror_last_snapshot_at:this.mirror.lastSnapshotAt,
+        mirror_last_d1_write_at:this.mirror.lastD1WriteAt,
+        mirror_last_error:this.mirror.lastError,
+        pending_writes:this.mirror.pending.length,
+        recent_changes:this.mirror.events.slice(-20),
+        warnings:["Exchange position snapshots are authoritative for exposure, not complete trade history.",
+          "A position opened and closed between snapshots may be missed; fills are recorded separately.",
+          "Copy is simulated at fresh WS bid/ask, not target execution prices; missing quotes censor P/L.",
+          "Existing position at startup is observed but never assumed copied; funding excluded."]
       },
 
       sample_count: this.samples.length,
@@ -1222,6 +1237,156 @@ export class TraderWatch {
 
       trading_enabled: false
     };
+  }
+
+  // POSITION MIRROR V2. Source of truth for exposure is clearinghouseState.
+  // userFills is a durable audit trail, NOT a second source of synthetic positions.
+  private mirrorFill(fill:any,source:string){
+    if(String(fill?.coin).toUpperCase()!=="BTC")return;
+    const id=this.fillId(fill);
+    const key="fill:"+id;
+    if(this.mirror.events.some((e:any)=>e.id===key)||this.mirror.pending.some((e:any)=>e.id===key))return;
+    const e={id:key,kind:"FILL",at:Number(fill.time)||Date.now(),receivedAt:Date.now(),source,
+      side:String(fill.side||""),startPosition:Number(fill.startPosition),qty:Number(fill.sz),
+      price:Number(fill.px),hash:String(fill.hash||""),tid:String(fill.tid||"")};
+    this.mirror.events.push(e);this.mirror.pending.push(e);
+    this.mirror.stats.rawFills++;
+    this.mirrorLastFillAt=Date.now();
+    if(source==="WS_LIVE")this.mirror.dirty=true;
+    if(this.mirror.events.length>150)this.mirror.events.splice(0,this.mirror.events.length-150);
+  }
+
+  private async pollMirror(force=false){
+    const now=Date.now();
+    if(this.mirrorPolling||(!force&&now<this.mirror.nextPollAt)||now<this.mirror.nextBackoffAt)return;
+    this.mirrorPolling=true;
+    // Rate-limit event-triggered polls. Never overlap requests.
+    this.mirror.nextPollAt=now+10_000;
+    try{
+      const res=await fetch(INFO_URL,{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({type:"clearinghouseState",user:TARGET})});
+      if(!res.ok)throw new Error("MIRROR_HTTP_"+res.status);
+      const data:any=await res.json();
+      if(!Array.isArray(data?.assetPositions))throw new Error("MIRROR_INVALID_SNAPSHOT");
+      const row=data.assetPositions.find((x:any)=>String(x?.position?.coin).toUpperCase()==="BTC")?.position;
+      const qty=row?Number(row.szi):0;
+      const entry=row?Number(row.entryPx):0;
+      if(!Number.isFinite(qty)||!Number.isFinite(entry))throw new Error("MIRROR_INVALID_NUMBERS");
+      const snap={at:Date.now(),signedQty:qty,side:qty>POSITION_EPS?"LONG":qty< -POSITION_EPS?"SHORT":"FLAT",
+        qty:Math.abs(qty),entryPrice:entry,leverage:row?.leverage?.value??null,
+        positionValue:row?Number(row.positionValue)||null:null};
+      const previous=this.mirror.snapshot;
+      this.mirror.previous=previous;
+      this.mirror.snapshot=snap;
+      this.mirror.initialized=true;
+      this.mirror.lastSnapshotAt=snap.at;
+      this.mirror.dirty=false;
+      this.mirror.stats.snapshots++;
+      this.mirror.lastError=null;
+      this.mirror.nextBackoffAt=0;
+      // Persist each authoritative snapshot, even when exposure is unchanged.
+      const snapshotEvent={id:"snapshot:"+snap.at,kind:"POSITION_SNAPSHOT",at:snap.at,
+        signedQty:snap.signedQty,side:snap.side,qty:snap.qty,entryPrice:snap.entryPrice,
+        leverage:snap.leverage,positionValue:snap.positionValue};
+      this.mirror.events.push(snapshotEvent);this.mirror.pending.push(snapshotEvent);
+      if(previous)this.mirrorTransition(previous,snap);
+      if(this.mirror.events.length>150)this.mirror.events.splice(0,this.mirror.events.length-150);
+      await this.persist();
+      await this.flushMirror();
+    }catch(e){
+      this.mirror.lastError=String(e);this.error(e);
+      const is429=String(e).includes("429");
+      this.mirror.nextBackoffAt=Date.now()+(is429?120_000:30_000);
+    }finally{this.mirrorPolling=false;}
+  }
+
+  private mirrorTransition(prev:any,cur:any){
+    const old=prev.signedQty,now=cur.signedQty;
+    if(Math.abs(now-old)<POSITION_EPS)return;
+    const reversed=old*now<0;
+    const opening=Math.abs(old)<=POSITION_EPS&&Math.abs(now)>POSITION_EPS;
+    const closing=Math.abs(now)<=POSITION_EPS&&Math.abs(old)>POSITION_EPS;
+    const increasing=!reversed&&!opening&&!closing&&Math.abs(now)>Math.abs(old);
+    const decreasing=!reversed&&!opening&&!closing&&!increasing;
+    const kind=reversed?"REVERSAL":opening?"OPEN":closing?"CLOSE":increasing?"INCREASE":"DECREASE";
+    this.mirror.stats.changes++;
+    if(reversed)this.mirror.stats.reversals++;
+    else if(opening)this.mirror.stats.opens++;
+    else if(closing)this.mirror.stats.closes++;
+    else if(increasing)this.mirror.stats.increases++;
+    else this.mirror.stats.decreases++;
+    // A snapshot is a state observation, not an exchange execution.
+    const ev={id:"transition:"+cur.at,kind,at:cur.at,fromQty:old,toQty:now,
+      fromSide:prev.side,toSide:cur.side,fromEntry:prev.entryPrice,toEntry:cur.entryPrice,
+      observationWindowMs:cur.at-prev.at,source:"CLEARINGHOUSE_STATE"};
+    this.mirror.events.push(ev);this.mirror.pending.push(ev);
+    if(this.mirror.events.length>150)this.mirror.events.splice(0,this.mirror.events.length-150);
+    this.mirrorCopy(prev,cur,kind,ev);
+  }
+
+  private mirrorCopy(prev:any,cur:any,kind:string,ev:any){
+    const priceFresh=this.book.at>0&&Date.now()-this.book.at<=BOOK_MAX_AGE_MS;
+    const quote=(side:string,open:boolean)=>side==="LONG"?(open?this.book.ask:this.book.bid):(open?this.book.bid:this.book.ask);
+    let cp=this.mirror.copy;
+    // Never claim a pre-existing position was copied.
+    if(cp&&(kind==="CLOSE"||kind==="REVERSAL"||kind==="DECREASE")){
+      const fraction=kind==="DECREASE"?Math.min(1,(Math.abs(prev.signedQty)-Math.abs(cur.signedQty))/Math.abs(prev.signedQty)):1;
+      const closeQty=cp.qty*fraction;
+      const exit=priceFresh?quote(cp.side,false):null;
+      const valid=cp.valid&&exit!==null;
+      const gross=valid?(cp.side==="LONG"?exit-cp.entryPrice:cp.entryPrice-exit)*closeQty:null;
+      const fee=valid?closeQty*exit*SHADOW_TAKER_FEE_RATE:null;
+      const out={id:"copyclose:"+ev.id,kind:"COPY_CLOSE",at:cur.at,side:cp.side,qty:closeQty,
+        entryPrice:cp.entryPrice,exitPrice:exit,openedAt:cp.openedAt,valid,
+        grossUsd:gross,netUsd:valid?gross-fee-(cp.entryFeeRemaining*fraction):null,
+        feeUsd:valid?fee+cp.entryFeeRemaining*fraction:null,reason:kind};
+      this.mirror.events.push(out);this.mirror.pending.push(out);
+      this.mirror.stats.copyCloses++;
+      if(!valid)this.mirror.stats.copyUnpriced++;
+      cp.qty-=closeQty;cp.entryFeeRemaining*=1-fraction;
+      if(cp.qty<=POSITION_EPS)this.mirror.copy=null;
+    }
+    if(kind==="OPEN"||kind==="REVERSAL"){
+      if(!priceFresh){this.mirror.copy=null;this.mirror.stats.copyUnpriced++;return;}
+      const price=quote(cur.side,true);
+      this.mirror.copy={side:cur.side,openedAt:cur.at,entryPrice:price,qty:SHADOW_NOTIONAL_USD/price,
+        entryFeeRemaining:SHADOW_NOTIONAL_USD*SHADOW_TAKER_FEE_RATE,valid:true,
+        targetQtyAtEntry:cur.qty,initialNotionalUsd:SHADOW_NOTIONAL_USD};
+      this.mirror.stats.copyOpens++;
+      const e={id:"copyopen:"+ev.id,kind:"COPY_OPEN",at:cur.at,side:cur.side,qty:this.mirror.copy.qty,
+        price,notionalUsd:SHADOW_NOTIONAL_USD,source:"FRESH_L2_BOOK"};
+      this.mirror.events.push(e);this.mirror.pending.push(e);
+    }
+    // An increase in target exposure is recorded, not silently copied as $100 extra.
+  }
+
+  private async flushMirror(){
+    const db=this.env?.DB;
+    if(!db){this.mirror.lastError="DB_BINDING_MISSING";return;}
+    for(const e of this.mirror.pending.slice(0,50)){
+      try{
+        await db.prepare(`INSERT OR IGNORE INTO trader_mirror_events_v2
+          (event_id,wallet,kind,event_at,payload_json) VALUES(?,?,?,?,?)`)
+          .bind(e.id,TARGET,e.kind,e.at,JSON.stringify(e)).run();
+        this.mirror.pending.shift();this.mirror.lastD1WriteAt=Date.now();this.mirror.lastError=null;
+      }catch(err){this.mirror.stats.writeFailures++;this.mirror.lastError=String(err);break;}
+    }
+    await this.persist();
+  }
+
+  private async mirrorPositions(url:URL):Promise<Response>{
+    if(!this.env?.DB)return json({ok:false,error:"DB_BINDING_MISSING"},503);
+    const limit=Math.max(1,Math.min(100,Number(url.searchParams.get("limit")||50)));
+    try{
+      const summary=await this.env.DB.prepare(`SELECT kind,COUNT(*) AS count FROM trader_mirror_events_v2 WHERE wallet=? GROUP BY kind`).bind(TARGET).all();
+      const rows=await this.env.DB.prepare(`SELECT event_id,kind,event_at,payload_json FROM trader_mirror_events_v2 WHERE wallet=? ORDER BY event_at DESC LIMIT ?`).bind(TARGET,limit).all();
+      return json({ok:true,version:VERSION,record_type:"POSITION_MIRROR_EVENTS_NOT_VERIFIED_TRADES",
+        current_position:this.mirror.snapshot,copy_position:this.mirror.copy,
+        summary:summary.results||[],total:(rows.results||[]).length,
+        rows:(rows.results||[]).map((r:any)=>({...r,payload:JSON.parse(r.payload_json)})),
+        pending_writes:this.mirror.pending.length,ledger_error:this.mirror.lastError,
+        warning:"State changes and simulated closes are NOT proof of exact exchange trades; short round trips between snapshots can be missed."});
+    }catch(e){return json({ok:false,error:"MIRROR_D1_QUERY_FAILED",detail:String(e)},503);}
   }
 
   async alarm() {
@@ -1249,10 +1414,7 @@ export class TraderWatch {
       this.connect();
     }
 
-    if (this.sync.status === "RECHECK_REQUIRED" || this.sync.status === "UNINITIALIZED" ||
-        Date.now() >= this.sync.next_attempt_at) {
-      await this.syncPosition();
-    }
+    // Mirror is the sole position snapshot poller; legacy sync disabled.
 
     if (
       !this.state.last_audit_at ||
@@ -1269,7 +1431,8 @@ export class TraderWatch {
     }
 
     await this.persist();
-    await this.flushV15();
+    await this.flushMirror();
+    if(Date.now()>=this.mirror.nextPollAt) await this.pollMirror();
 
     await this.ctx.storage.setAlarm(
       Date.now() + ALARM_INTERVAL_MS
@@ -1287,7 +1450,7 @@ export class TraderWatch {
       this.state.started_at ||= Date.now();
 
       this.connect();
-      await this.syncPosition(true);
+      await this.pollMirror(true);
 
       await this.ctx.storage.setAlarm(
         Date.now() + ALARM_INTERVAL_MS
@@ -1344,17 +1507,18 @@ export class TraderWatch {
       return json(this.stats());
     }
 
-    if (path === "/positions") return this.positionsV15(url);
+    if (path === "/positions") return this.mirrorPositions(url);
+    if (path === "/mirror") return json({version:VERSION,mode:"READ_ONLY_POSITION_MIRROR",...this.mirror,events:this.mirror.events.slice(-30),pending:this.mirror.pending.length,trading_enabled:false});
 
     if (path === "/ledger") {
       return this.ledger(url);
     }
 
     if (path === "/shadow") {
-      return json({mode:"READ_ONLY_TARGET_FILL_RECONSTRUCTION",version:VERSION,
+      return json({mode:"READ_ONLY_POSITION_MIRROR",version:VERSION,mirror:this.mirror,legacy:{
         current_position:this.v15.position,reconstruction:this.v15.counters,
         pending_writes:this.v15.pending.length,last_error:this.v15.lastError,
-        recent_trades:this.v15.recent.slice(-20)});
+        recent_trades:this.v15.recent.slice(-20)}});
     }
 
     if (path === "/samples") {
