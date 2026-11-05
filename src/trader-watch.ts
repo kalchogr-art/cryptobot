@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.5.1
+// BTC TRADER WATCH V1.6.0
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,9 +8,10 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.5.1";
+const VERSION = "BTC TRADER WATCH V1.6.0";
 
 const AUDIT_INTERVAL_MS = 60_000;
+const V16_RECOVERY_BACKOFF_MS = 120_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
 const ALARM_INTERVAL_MS = 10_000;
 const MAX_SAMPLES = 3000;
@@ -101,6 +102,7 @@ export class TraderWatch {
     next_attempt_at: 0, checks: 0, mismatches: 0, reversals_observed: 0,
     shadow_entry_allowed: false, waiting_reason: "AWAITING_POSITION_SNAPSHOT" };
   private syncInProgress = false;
+  private auditBackoffUntil = 0;
   private syncDiagnostics = { snapshot_races: 0, snapshot_mismatch_deferred: 0,
     incomplete_positions: 0, incomplete_reasons: {} as Record<string,number>,
     additions_observed_without_copy: 0, snapshot_sign_changes: 0 };
@@ -159,7 +161,7 @@ export class TraderWatch {
       // V1.5.0 had a broken signed-quantity comparison, invalidating every fill.
       // Start a clean V1.5.1 observation cohort; do not delete any D1 data.
       if (this.v15.schemaVersion !== "1.5.1") {
-        this.v15 = { startedAt:Date.now(), schemaVersion:"1.5.1", position:null, pending:[], recent:[], seen:[], counters:{received:0,duplicates:0,gaps:0,opens:0,closes:0,adds:0,partials:0,reversals:0,apiRecovered:0,writeFailures:0,waitingExisting:0}, lastFillAt:0,lastD1WriteAt:0,lastError:null };
+        this.v15 = { startedAt:Date.now(), schemaVersion:"1.6.0", position:null, pending:[], recent:[], seen:[], counters:{received:0,duplicates:0,gaps:0,opens:0,closes:0,adds:0,partials:0,reversals:0,apiRecovered:0,writeFailures:0,waitingExisting:0,verifiedReversalAnchors:0,verifiedFlatAnchors:0,unmatchedCloses:0}, lastFillAt:0,lastD1WriteAt:0,lastError:null };
       }
       if (!this.v15.startedAt) this.v15.startedAt=Date.now();
       this.sessionStart = (await ctx.storage.get("sessionStart")) ?? 0;
@@ -705,9 +707,11 @@ export class TraderWatch {
     this.sync.waiting_reason = this.shadow.position ? "NONE" : Math.abs(end) <= POSITION_EPS ? "AWAITING_NEXT_OPEN" : "EXISTING_POSITION";
   }
 
-  // V1.5: Reconstruct the TARGET'S actual position from exchange fills.
-  // No invented trades, no order placement, no quote-dependent reconstruction.
-  // Copy P/L uses target fill prices as a REFERENCE ONLY, not executable copy prices.
+  // V1.6: deterministic exchange-fill reconstruction. A startPosition from the
+  // exchange is the signed position BEFORE this fill, and side B/A changes it.
+  // If observation begins mid-position, a VERIFIED reversal (sign change) is a
+  // legitimate boundary for the NEW position; a verified flat is an anchor too.
+  // No synthetic entries are created from snapshots or mid-position fills.
   private reconstructV15(fill:any, source:"WS_LIVE"|"API_RECOVERY") {
     const v=this.v15;
     const id=this.fillId(fill);
@@ -716,13 +720,8 @@ export class TraderWatch {
     const start=Number(fill?.startPosition);
     const delta=fill?.side==="B"?sz:fill?.side==="A"?-sz:NaN;
     if(!Number.isFinite(t)||!Number.isFinite(start)||!(sz>0)||!(px>0)||!Number.isFinite(delta))return;
-    // Never backdate a new cohort to a position already in progress at deployment.
     if(t<v.startedAt)return;
-    if(v.lastFillAt && t<v.lastFillAt){
-      // Late API/WS delivery cannot be inserted into an already processed position
-      // without replaying the complete ordered fill ledger. Do not create a false gap.
-      v.counters.lateOutOfOrder=(v.counters.lateOutOfOrder||0)+1;return;
-    }
+    if(v.lastFillAt && t<v.lastFillAt){v.counters.lateOutOfOrder=(v.counters.lateOutOfOrder||0)+1;return;}
     v.seen.push(id);
     if(v.seen.length>15000)v.seen.splice(0,v.seen.length-15000);
     v.counters.received++;
@@ -730,30 +729,40 @@ export class TraderWatch {
     v.lastFillAt=t;
     const end=Math.abs(start+delta)<POSITION_EPS?0:start+delta;
     const sign=(n:number)=>n>POSITION_EPS?1:n< -POSITION_EPS?-1:0;
-    const pos=v.position;
-    if(pos && Math.abs(pos.targetSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
-      v.counters.gaps++;
-      v.recent.push({type:"GAP",at:t,expected:pos.targetSigned,actual:start,fill_id:id});
-      v.position=null; // Never finalize an unverified position.
-    }
+    const oldSign=sign(start),newSign=sign(end);
     let current=v.position;
+    if(current && Math.abs(current.targetSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
+      v.counters.gaps++;
+      v.recent.push({type:"UNVERIFIED_GAP",at:t,expected:current.targetSigned,actual:start,fill_id:id});
+      v.position=null;current=null;
+    }
     if(!current){
-      if(sign(start)!==0){v.counters.waitingExisting=(v.counters.waitingExisting||0)+1;return;} // Existing position; not a continuity gap.
-      if(sign(end)===0)return;
-      this.v15Open(end,px,t,id);
+      // Observed a genuine flat-to-open boundary.
+      if(oldSign===0 && newSign!==0){
+        v.counters.verifiedFlatAnchors=(v.counters.verifiedFlatAnchors||0)+1;
+        this.v15Open(end,px,t,id);return;
+      }
+      // Observed a genuine reversal: close of the old (unobserved) position
+      // is NOT recorded, but the opposite position starts at THIS fill.
+      if(oldSign!==0 && newSign!==0 && oldSign!==newSign){
+        v.counters.verifiedReversalAnchors=(v.counters.verifiedReversalAnchors||0)+1;
+        this.v15Open(end,px,t,id);return;
+      }
+      if(newSign===0){v.counters.unmatchedCloses=(v.counters.unmatchedCloses||0)+1;return;}
+      v.counters.waitingExisting=(v.counters.waitingExisting||0)+1;
       return;
     }
-    const oldSign=sign(start),newSign=sign(end);
     if(oldSign===newSign && sign(delta)===oldSign){
-      // Trader adds to existing position: maintain actual weighted entry and $100 scaled copy.
       const newAbs=Math.abs(end),oldAbs=Math.abs(start);
       current.entryPrice=(current.entryPrice*oldAbs+px*sz)/newAbs;
       current.copyQty+=sz*current.copyScale;
       current.copyEntryCost+=sz*current.copyScale*px;
       current.copyEntryFees+=sz*current.copyScale*px*SHADOW_TAKER_FEE_RATE;
       current.targetSigned=end;current.targetQty=newAbs;current.adds++;
-      v.counters.adds++;
-      return;
+      v.counters.adds++;return;
+    }
+    if(oldSign===0 || sign(delta)===oldSign){
+      v.counters.gaps++;v.position=null;return;
     }
     const closeQty=Math.min(Math.abs(start),sz);
     const fraction=closeQty/Math.abs(start);
@@ -771,7 +780,6 @@ export class TraderWatch {
     current.targetSigned=end;
     current.targetQty=Math.abs(end);
     if(newSign===oldSign){v.counters.partials++;return;}
-    // Verified target FLAT or REVERSAL; one completed target position.
     const result={position_id:current.positionId,wallet:TARGET,side:current.side,
       opened_at:current.openedAt,closed_at:t,entry_price:current.entryPrice,exit_price:px,
       gross_usd:current.realizedGross,fees_usd:current.realizedFees,
@@ -784,18 +792,14 @@ export class TraderWatch {
     if(v.recent.length>50)v.recent.splice(0,v.recent.length-50);
     v.counters.closes++;
     v.position=null;
-    if(newSign!==0){
-      v.counters.reversals++;
-      // The excess quantity after closing the old position opens the opposite side.
-      this.v15Open(end,px,t,id);
-    }
+    if(newSign!==0){v.counters.reversals++;this.v15Open(end,px,t,id);}
   }
 
   private v15Open(signed:number,px:number,t:number,id:string){
     const v=this.v15;
     const scale=SHADOW_NOTIONAL_USD/(Math.abs(signed)*px);
     const copyQty=Math.abs(signed)*scale;
-    v.position={positionId:`v15:${t}:${id}`,side:signed>0?"LONG":"SHORT",
+    v.position={positionId:`v16:${t}:${id}`,side:signed>0?"LONG":"SHORT",
       openedAt:t,openFillId:id,entryPrice:px,targetSigned:signed,targetQty:Math.abs(signed),
       copyScale:scale,copyQty,copyEntryCost:copyQty*px,
       copyEntryFees:copyQty*px*SHADOW_TAKER_FEE_RATE,
@@ -1210,7 +1214,7 @@ export class TraderWatch {
         reconstruction:{...this.v15.counters,started_at:this.v15.startedAt,last_fill_at:this.v15.lastFillAt,
           last_d1_write_at:this.v15.lastD1WriteAt,last_error:this.v15.lastError},
         recent_trades:this.v15.recent.slice(-20),
-        warnings:["V1.5 only. Old V1.3/V1.4 results excluded.","Target fill prices are not achievable copy prices.","Position must be observed from flat or verified reversal.","Missing fill continuity invalidates a position rather than inventing a trade."]
+        warnings:["V1.6 cohort only; old rows remain in D1 but are not included in new-cohort diagnostics.","Target fill prices are not achievable copy prices.","Position starts only on a verified flat-open or exchange-fill reversal; no synthetic entries.","Missing fill continuity invalidates a position rather than inventing a trade; target prices are not executable copy prices."]
       },
 
       sample_count: this.samples.length,
@@ -1253,11 +1257,13 @@ export class TraderWatch {
     if (
       !this.state.last_audit_at ||
       Date.now() - this.state.last_audit_at >=
-        AUDIT_INTERVAL_MS
+        AUDIT_INTERVAL_MS && Date.now() >= this.auditBackoffUntil
     ) {
       try {
         await this.reconcile();
+        this.auditBackoffUntil = 0;
       } catch (error) {
+        this.auditBackoffUntil = Date.now() + V16_RECOVERY_BACKOFF_MS;
         this.error(error);
       }
     }
