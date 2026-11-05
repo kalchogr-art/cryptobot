@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.2
+// BTC TRADER WATCH V1.3
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.2";
+const VERSION = "BTC TRADER WATCH V1.3";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
@@ -21,7 +21,7 @@ const SHADOW_MAX_TRADES = 1000;
 const BOOK_MAX_AGE_MS = 1500;
 
 type ShadowPosition = { side: "LONG" | "SHORT"; qty: number; entryPrice: number; openedAt: number; entryFees: number; traderQty: number };
-type ShadowTrade = { side: string; openedAt: number; closedAt: number; entryPrice: number; exitPrice: number; qty: number; grossUsd: number; feesUsd: number; netUsd: number; holdSeconds: number; reason: string };
+type ShadowTrade = { eventId?: string; side: string; openedAt: number; closedAt: number; entryPrice: number; exitPrice: number; qty: number; grossUsd: number; feesUsd: number; netUsd: number; holdSeconds: number; reason: string };
 
 
 type Source = "WS_LIVE" | "WS_HISTORICAL" | "API_BACKFILL";
@@ -84,6 +84,9 @@ export class TraderWatch {
     position: null, trades: [], skipped: {}, quotes: 0, lastQuoteAt: 0, initialized: false
   };
 
+  private pendingLedger: ShadowTrade[] = [];
+  private ledgerError: string | null = null;
+
   private state: any = {
     version: VERSION,
     active: false,
@@ -122,6 +125,7 @@ export class TraderWatch {
       this.ids =
         (await ctx.storage.get("ids")) ?? [];
       this.shadow = (await ctx.storage.get("shadow")) ?? this.shadow;
+      this.pendingLedger = (await ctx.storage.get("pendingLedger")) ?? [];
 
       if (this.state.active) {
         await ctx.storage.setAlarm(Date.now() + 1000);
@@ -134,7 +138,8 @@ export class TraderWatch {
       state: this.state,
       samples: this.samples,
       ids: this.ids,
-      shadow: this.shadow
+      shadow: this.shadow,
+      pendingLedger: this.pendingLedger
     });
   }
 
@@ -265,6 +270,7 @@ export class TraderWatch {
     }
 
     await this.persist();
+    await this.flushLedger();
   }
 
   private connect() {
@@ -404,13 +410,16 @@ export class TraderWatch {
     const exitFee = closedQty * px * SHADOW_TAKER_FEE_RATE;
     const gross = (px - pos.entryPrice) * closedQty * (side === "LONG" ? 1 : -1);
     const fees = entryFeePart + exitFee;
-    this.shadow.trades.push({
+    const closedEvent: ShadowTrade = {
+      eventId: this.fillId(fill),
       side, openedAt: pos.openedAt, closedAt: now,
       entryPrice: pos.entryPrice, exitPrice: px, qty: closedQty,
       grossUsd: gross, feesUsd: fees, netUsd: gross - fees,
       holdSeconds: (now - pos.openedAt) / 1000,
       reason: fraction >= 0.999999 ? "FULL_CLOSE" : "PARTIAL_CLOSE"
-    });
+    };
+    this.shadow.trades.push(closedEvent);
+    this.pendingLedger.push(closedEvent);
     if (this.shadow.trades.length > SHADOW_MAX_TRADES) {
       this.shadow.trades.splice(0, this.shadow.trades.length - SHADOW_MAX_TRADES);
     }
@@ -418,6 +427,83 @@ export class TraderWatch {
     pos.traderQty = Math.max(0, pos.traderQty - qty);
     pos.entryFees -= entryFeePart;
     if (fraction >= 0.999999 || pos.qty < 1e-12) this.shadow.position = null;
+  }
+
+  // D1 ledger is append-only and idempotent. A partial close is one close EVENT,
+  // not an independently completed position. Pending writes survive DO restarts.
+  private async flushLedger() {
+    if (!this.pendingLedger.length) return;
+    const db = this.env?.DB;
+    if (!db) { this.ledgerError = "DB_BINDING_MISSING"; return; }
+    try {
+      // Small batches avoid D1 limits and prevent blocking the WebSocket too long.
+      for (const trade of this.pendingLedger.slice(0, 30)) {
+        if (!trade.eventId) continue;
+        await db.prepare(`INSERT OR IGNORE INTO trader_shadow_close_events
+          (event_id, wallet, coin, side, opened_at, closed_at, entry_price,
+           exit_price, qty, gross_usd, fees_usd, net_usd, hold_seconds,
+           close_reason, simulated_notional_usd, fee_rate)
+          VALUES (?, ?, 'BTC', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .bind(trade.eventId, TARGET, trade.side, trade.openedAt,
+            trade.closedAt, trade.entryPrice, trade.exitPrice, trade.qty,
+            trade.grossUsd, trade.feesUsd, trade.netUsd, trade.holdSeconds,
+            trade.reason, SHADOW_NOTIONAL_USD, SHADOW_TAKER_FEE_RATE).run();
+        this.pendingLedger.shift();
+      }
+      this.ledgerError = null;
+      await this.persist();
+    } catch (e) {
+      this.ledgerError = String(e);
+      this.error(`D1_LEDGER_WRITE: ${String(e)}`);
+      await this.persist();
+    }
+  }
+
+  private async ledger(url: URL): Promise<Response> {
+    const db = this.env?.DB;
+    if (!db) return json({ok:false,error:"DB_BINDING_MISSING"},503);
+    const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50) || 50));
+    const page = Math.max(1, Math.min(100000, Number(url.searchParams.get("page") || 1) || 1));
+    const side = url.searchParams.get("side") || "ALL";
+    const result = url.searchParams.get("result") || "ALL";
+    const date = url.searchParams.get("date") || "";
+    if (!["ALL","LONG","SHORT"].includes(side) || !["ALL","WIN","LOSS"].includes(result) ||
+        (date && !/^\d{4}-\d{2}-\d{2}$/.test(date))) return json({ok:false,error:"INVALID_FILTER"},400);
+    const where = ["wallet = ?"]; const params: any[] = [TARGET];
+    if (side !== "ALL") { where.push("side = ?"); params.push(side); }
+    if (result === "WIN") where.push("net_usd > 0");
+    if (result === "LOSS") where.push("net_usd <= 0");
+    if (date) { where.push("closed_at >= ? AND closed_at < ?");
+      const start = Date.parse(date + "T00:00:00Z");
+      if (!Number.isFinite(start)) return json({ok:false,error:"INVALID_DATE"},400);
+      params.push(start, start + 86400000);
+    }
+    const filter = where.join(" AND ");
+    try {
+      const summary = await db.prepare(`SELECT COUNT(*) AS events,
+        SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins,
+        COALESCE(SUM(net_usd),0) AS net_usd,
+        COALESCE(SUM(gross_usd),0) AS gross_usd,
+        COALESCE(SUM(fees_usd),0) AS fees_usd,
+        COALESCE(AVG(hold_seconds),0) AS avg_hold_seconds
+        FROM trader_shadow_close_events WHERE ${filter}`).bind(...params).first();
+      const rows = await db.prepare(`SELECT event_id, side, opened_at, closed_at,
+        entry_price, exit_price, qty, gross_usd, fees_usd, net_usd,
+        hold_seconds, close_reason FROM trader_shadow_close_events
+        WHERE ${filter} ORDER BY closed_at DESC, event_id DESC LIMIT ? OFFSET ?`)
+        .bind(...params, limit, (page-1)*limit).all();
+      const count = Number(summary?.events ?? 0);
+      return json({ok:true,version:VERSION,source:"D1",record_type:"CLOSE_EVENTS_NOT_FULL_TRADES",
+        filters:{date,side,result,page,limit},summary:{...summary,
+          win_rate_pct:count ? 100*Number(summary?.wins ?? 0)/count : null,
+          roi_pct_on_100_usd_per_event:null},
+        total:count,pages:Math.ceil(count/limit),rows:rows.results ?? [],
+        pending_writes:this.pendingLedger.length,ledger_error:this.ledgerError,
+        warnings:["Partial closes are counted as separate events, not completed positions.",
+          "No historical V1.2 events are backfilled automatically.",
+          "ROI is intentionally omitted until position-level accounting is implemented."]});
+    } catch (e) {return json({ok:false,error:"LEDGER_QUERY_FAILED",detail:String(e),
+      hint:"Run the provided SQL migration in cryptobot-db first."},503);}
   }
 
   private shadowStats() {
@@ -437,6 +523,7 @@ export class TraderWatch {
       realized_gross_usd: Number(trades.reduce((v,t) => v+t.grossUsd,0).toFixed(6)),
       total_fees_usd: Number(trades.reduce((v,t) => v+t.feesUsd,0).toFixed(6)),
       quotes: this.shadow.quotes,
+      ledger: {pending_writes:this.pendingLedger.length, last_error:this.ledgerError, endpoint:"/trader-watch/ledger"},
       skipped: this.shadow.skipped,
       last_quote_at: this.shadow.lastQuoteAt,
       recent_trades: trades.slice(-20),
@@ -675,6 +762,7 @@ export class TraderWatch {
     }
 
     await this.persist();
+    await this.flushLedger();
 
     await this.ctx.storage.setAlarm(
       Date.now() + ALARM_INTERVAL_MS
@@ -745,6 +833,10 @@ export class TraderWatch {
 
     if (path === "/status") {
       return json(this.stats());
+    }
+
+    if (path === "/ledger") {
+      return this.ledger(url);
     }
 
     if (path === "/shadow") {
