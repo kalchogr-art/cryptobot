@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V1.4.3
+// BTC TRADER WATCH V1.5.0
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V1.4.3";
+const VERSION = "BTC TRADER WATCH V1.5.0";
 
 const AUDIT_INTERVAL_MS = 60_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
@@ -88,6 +88,7 @@ export class TraderWatch {
   };
 
   private pendingLedger: ShadowTrade[] = [];
+  private v15: any = { startedAt:0, position:null, pending:[], recent:[], seen:[], counters:{received:0,duplicates:0,gaps:0,opens:0,closes:0,adds:0,partials:0,reversals:0,apiRecovered:0,writeFailures:0}, lastFillAt:0,lastD1WriteAt:0, lastError:null };
   private pendingPositions: any[] = [];
   private book = {bid:0, ask:0, at:0};
   private bookMessages = 0;
@@ -154,6 +155,8 @@ export class TraderWatch {
       this.pendingLedger = (await ctx.storage.get("pendingLedger")) ?? [];
       this.pendingPositions = (await ctx.storage.get("pendingPositions")) ?? [];
       this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
+      this.v15 = (await ctx.storage.get("v15Reconstruction")) ?? this.v15;
+      if (!this.v15.startedAt) this.v15.startedAt=Date.now();
       this.sessionStart = (await ctx.storage.get("sessionStart")) ?? 0;
       this.sync = (await ctx.storage.get("positionSync")) ?? this.sync;
       this.observed = (await ctx.storage.get("observedFills")) ?? this.observed;
@@ -189,7 +192,8 @@ export class TraderWatch {
       observedFills: this.observed,
       lastSnapshotSigned: this.lastSnapshotSigned,
       syncDiagnostics: this.syncDiagnostics,
-      syncMismatchCandidate: this.syncMismatchCandidate
+      syncMismatchCandidate: this.syncMismatchCandidate,
+      v15Reconstruction:this.v15
     });
   }
 
@@ -325,13 +329,13 @@ export class TraderWatch {
     for (const fill of fills) {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
-        try { await this.shadowFill(fill); }
-        catch (e) { this.shadowSkip("QUOTE_OR_PROCESSING_ERROR"); this.error(e); }
+        try { this.reconstructV15(fill, "WS_LIVE"); }
+        catch (e) { this.v15.lastError=String(e); this.error(e); }
       }
     }
 
     await this.persist();
-    await this.flushLedger();
+    await this.flushV15();
   }
 
   private connect() {
@@ -696,6 +700,152 @@ export class TraderWatch {
     this.sync.waiting_reason = this.shadow.position ? "NONE" : Math.abs(end) <= POSITION_EPS ? "AWAITING_NEXT_OPEN" : "EXISTING_POSITION";
   }
 
+  // V1.5: Reconstruct the TARGET'S actual position from exchange fills.
+  // No invented trades, no order placement, no quote-dependent reconstruction.
+  // Copy P/L uses target fill prices as a REFERENCE ONLY, not executable copy prices.
+  private reconstructV15(fill:any, source:"WS_LIVE"|"API_RECOVERY") {
+    const v=this.v15;
+    const id=this.fillId(fill);
+    if(v.seen.includes(id)){v.counters.duplicates++;return;}
+    const t=Number(fill?.time),sz=Number(fill?.sz),px=Number(fill?.px);
+    const start=Number(fill?.startPosition);
+    const delta=fill?.side==="B"?sz:fill?.side==="A"?-sz:NaN;
+    if(!Number.isFinite(t)||!Number.isFinite(start)||!(sz>0)||!(px>0)||!Number.isFinite(delta))return;
+    // Never backdate a new cohort to a position already in progress at deployment.
+    if(t<v.startedAt)return;
+    if(v.lastFillAt && t<v.lastFillAt){
+      // Late API/WS delivery cannot be inserted into an already processed position
+      // without replaying the complete ordered fill ledger. Do not create a false gap.
+      v.counters.lateOutOfOrder=(v.counters.lateOutOfOrder||0)+1;return;
+    }
+    v.seen.push(id);
+    if(v.seen.length>15000)v.seen.splice(0,v.seen.length-15000);
+    v.counters.received++;
+    if(source==="API_RECOVERY")v.counters.apiRecovered++;
+    v.lastFillAt=t;
+    const end=Math.abs(start+delta)<POSITION_EPS?0:start+delta;
+    const sign=(n:number)=>n>POSITION_EPS?1:n< -POSITION_EPS?-1:0;
+    const pos=v.position;
+    if(pos && Math.abs(pos.targetQty*sign(pos.targetSigned)-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
+      v.counters.gaps++;
+      v.recent.push({type:"GAP",at:t,expected:pos.targetSigned,actual:start,fill_id:id});
+      v.position=null; // Never finalize an unverified position.
+    }
+    let current=v.position;
+    if(!current){
+      if(sign(start)!==0){v.counters.gaps++;return;} // Existing position; wait for verified flat -> open.
+      if(sign(end)===0)return;
+      this.v15Open(end,px,t,id);
+      return;
+    }
+    const oldSign=sign(start),newSign=sign(end);
+    if(oldSign===newSign && sign(delta)===oldSign){
+      // Trader adds to existing position: maintain actual weighted entry and $100 scaled copy.
+      const newAbs=Math.abs(end),oldAbs=Math.abs(start);
+      current.entryPrice=(current.entryPrice*oldAbs+px*sz)/newAbs;
+      current.copyQty+=sz*current.copyScale;
+      current.copyEntryCost+=sz*current.copyScale*px;
+      current.copyEntryFees+=sz*current.copyScale*px*SHADOW_TAKER_FEE_RATE;
+      current.targetSigned=end;current.targetQty=newAbs;current.adds++;
+      v.counters.adds++;
+      return;
+    }
+    const closeQty=Math.min(Math.abs(start),sz);
+    const fraction=closeQty/Math.abs(start);
+    const copyClosed=current.copyQty*fraction;
+    const copyBasis=current.copyEntryCost*fraction;
+    const copyEntryFee=current.copyEntryFees*fraction;
+    const gross=(px*copyClosed-copyBasis)*oldSign;
+    const exitFee=px*copyClosed*SHADOW_TAKER_FEE_RATE;
+    current.realizedGross+=gross;
+    current.realizedFees+=copyEntryFee+exitFee;
+    current.copyQty-=copyClosed;
+    current.copyEntryCost-=copyBasis;
+    current.copyEntryFees-=copyEntryFee;
+    current.closeFills++;
+    current.targetSigned=end;
+    current.targetQty=Math.abs(end);
+    if(newSign===oldSign){v.counters.partials++;return;}
+    // Verified target FLAT or REVERSAL; one completed target position.
+    const result={position_id:current.positionId,wallet:TARGET,side:current.side,
+      opened_at:current.openedAt,closed_at:t,entry_price:current.entryPrice,exit_price:px,
+      gross_usd:current.realizedGross,fees_usd:current.realizedFees,
+      net_usd:current.realizedGross-current.realizedFees,
+      hold_seconds:(t-current.openedAt)/1000,close_events:current.closeFills,
+      initial_notional_usd:SHADOW_NOTIONAL_USD,source:"TARGET_FILLS_REFERENCE",
+      open_fill_id:current.openFillId,close_fill_id:id,add_fills:current.adds};
+    v.pending.push(result);
+    v.recent.push({type:"COMPLETE",...result});
+    if(v.recent.length>50)v.recent.splice(0,v.recent.length-50);
+    v.counters.closes++;
+    v.position=null;
+    if(newSign!==0){
+      v.counters.reversals++;
+      // The excess quantity after closing the old position opens the opposite side.
+      this.v15Open(end,px,t,id);
+    }
+  }
+
+  private v15Open(signed:number,px:number,t:number,id:string){
+    const v=this.v15;
+    const scale=SHADOW_NOTIONAL_USD/(Math.abs(signed)*px);
+    const copyQty=Math.abs(signed)*scale;
+    v.position={positionId:`v15:${t}:${id}`,side:signed>0?"LONG":"SHORT",
+      openedAt:t,openFillId:id,entryPrice:px,targetSigned:signed,targetQty:Math.abs(signed),
+      copyScale:scale,copyQty,copyEntryCost:copyQty*px,
+      copyEntryFees:copyQty*px*SHADOW_TAKER_FEE_RATE,
+      realizedGross:0,realizedFees:0,closeFills:0,adds:0};
+    v.counters.opens++;
+  }
+
+  private async flushV15(){
+    if(!this.v15.pending.length)return;
+    const db=this.env?.DB;
+    if(!db){this.v15.lastError="DB_BINDING_MISSING";return;}
+    try{
+      for(const row of this.v15.pending.slice(0,30)){
+        await db.prepare(`INSERT OR IGNORE INTO trader_copy_positions_v15
+          (position_id,wallet,side,opened_at,closed_at,entry_price,exit_price,
+           gross_usd,fees_usd,net_usd,hold_seconds,close_events,initial_notional_usd,
+           price_basis,open_fill_id,close_fill_id,add_fills)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+          row.position_id,row.wallet,row.side,row.opened_at,row.closed_at,row.entry_price,
+          row.exit_price,row.gross_usd,row.fees_usd,row.net_usd,row.hold_seconds,
+          row.close_events,row.initial_notional_usd,row.source,row.open_fill_id,row.close_fill_id,row.add_fills).run();
+        this.v15.pending.shift();this.v15.lastD1WriteAt=Date.now();
+      }
+      this.v15.lastError=null;
+      await this.persist();
+    }catch(e){this.v15.counters.writeFailures++;this.v15.lastError=String(e);this.error(`V15_D1_WRITE: ${String(e)}`);await this.persist();}
+  }
+
+  private async positionsV15(url:URL):Promise<Response>{
+    const db=this.env?.DB;
+    if(!db)return json({ok:false,error:"DB_BINDING_MISSING"},503);
+    const page=Math.max(1,Math.min(100000,Number(url.searchParams.get("page")||1)||1));
+    const limit=Math.max(1,Math.min(100,Number(url.searchParams.get("limit")||50)||50));
+    const side=url.searchParams.get("side")||"ALL",result=url.searchParams.get("result")||"ALL",date=url.searchParams.get("date")||"";
+    if(!["ALL","LONG","SHORT"].includes(side)||!["ALL","WIN","LOSS"].includes(result)||(date&&!/^\d{4}-\d{2}-\d{2}$/.test(date)))return json({ok:false,error:"INVALID_FILTER"},400);
+    const where=["wallet = ?"],args:any[]=[TARGET];
+    if(side!=="ALL"){where.push("side = ?");args.push(side);}
+    if(result==="WIN")where.push("net_usd > 0");
+    if(result==="LOSS")where.push("net_usd <= 0");
+    if(date){const start=Date.parse(date+"T00:00:00Z");where.push("closed_at >= ? AND closed_at < ?");args.push(start,start+86400000);}
+    const w=where.join(" AND ");
+    try{
+      const summary=await db.prepare(`SELECT COUNT(*) AS trades, SUM(CASE WHEN net_usd>0 THEN 1 ELSE 0 END) AS wins,
+        COALESCE(SUM(net_usd),0) AS net_usd,COALESCE(SUM(gross_usd),0) AS gross_usd,
+        COALESCE(SUM(fees_usd),0) AS fees_usd,COALESCE(SUM(initial_notional_usd),0) AS notional_usd,
+        COALESCE(AVG(hold_seconds),0) AS avg_hold_seconds FROM trader_copy_positions_v15 WHERE ${w}`).bind(...args).first();
+      const rows=await db.prepare(`SELECT * FROM trader_copy_positions_v15 WHERE ${w} ORDER BY closed_at DESC,position_id DESC LIMIT ? OFFSET ?`).bind(...args,limit,(page-1)*limit).all();
+      const total=Number(summary?.trades||0),notional=Number(summary?.notional_usd||0);
+      return json({ok:true,version:VERSION,record_type:"TARGET_RECONSTRUCTED_V15",total,pages:Math.ceil(total/limit),rows:rows.results||[],
+        summary:{...summary,win_rate_pct:total?100*Number(summary?.wins||0)/total:null,roi_pct:notional?100*Number(summary?.net_usd||0)/notional:null},
+        pending_writes:this.v15.pending.length,ledger_error:this.v15.lastError,
+        warning:"REFERENCE ONLY: prices are target fills, NOT executable copy quotes; simulated fees; not real copy P/L."});
+    }catch(e){return json({ok:false,error:"V15_POSITIONS_QUERY_FAILED",detail:String(e)},503);}
+  }
+
   // D1 ledger is append-only and idempotent. A partial close is one close EVENT,
   // not an independently completed position. Pending writes survive DO restarts.
   private async flushLedger() {
@@ -903,9 +1053,12 @@ export class TraderWatch {
 
     this.state.api_checked += btc.length;
 
+    btc.sort((a:any,b:any)=>Number(a?.time||0)-Number(b?.time||0)||Number(a?.tid||0)-Number(b?.tid||0));
     for (const fill of btc) {
-      this.take(fill, "API");
+      const classified=this.take(fill, "API");
+      if(classified==="API_BACKFILL")this.reconstructV15(fill,"API_RECOVERY");
     }
+    await this.flushV15();
 
     this.state.last_audit_at = now;
 
@@ -1043,7 +1196,17 @@ export class TraderWatch {
       },
 
       copy_window: this.getCopyWindow(),
-      shadow_copy: this.shadowStats(),
+      shadow_copy: {
+        mode:"READ_ONLY_TARGET_FILL_RECONSTRUCTION",version:VERSION,
+        price_source:"TARGET_EXECUTION_PRICE_REFERENCE_NOT_COPY_EXECUTION",
+        position_sync:{...this.sync},
+        current_position:this.v15.position,
+        pending_completed_positions:this.v15.pending.length,
+        reconstruction:{...this.v15.counters,started_at:this.v15.startedAt,last_fill_at:this.v15.lastFillAt,
+          last_d1_write_at:this.v15.lastD1WriteAt,last_error:this.v15.lastError},
+        recent_trades:this.v15.recent.slice(-20),
+        warnings:["V1.5 only. Old V1.3/V1.4 results excluded.","Target fill prices are not achievable copy prices.","Position must be observed from flat or verified reversal.","Missing fill continuity invalidates a position rather than inventing a trade."]
+      },
 
       sample_count: this.samples.length,
       errors: this.state.errors ?? [],
@@ -1095,7 +1258,7 @@ export class TraderWatch {
     }
 
     await this.persist();
-    await this.flushLedger();
+    await this.flushV15();
 
     await this.ctx.storage.setAlarm(
       Date.now() + ALARM_INTERVAL_MS
@@ -1170,14 +1333,17 @@ export class TraderWatch {
       return json(this.stats());
     }
 
-    if (path === "/positions") return this.positionsLedger(url);
+    if (path === "/positions") return this.positionsV15(url);
 
     if (path === "/ledger") {
       return this.ledger(url);
     }
 
     if (path === "/shadow") {
-      return json(this.shadowStats());
+      return json({mode:"READ_ONLY_TARGET_FILL_RECONSTRUCTION",version:VERSION,
+        current_position:this.v15.position,reconstruction:this.v15.counters,
+        pending_writes:this.v15.pending.length,last_error:this.v15.lastError,
+        recent_trades:this.v15.recent.slice(-20)});
     }
 
     if (path === "/samples") {
