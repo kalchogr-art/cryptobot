@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V2.2.0 COPY PERFORMANCE AUDIT
+// BTC TRADER WATCH V2.2.1 CONTINUITY AUDIT
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.2.0 COPY PERFORMANCE AUDIT";
+const VERSION = "BTC TRADER WATCH V2.2.1 CONTINUITY AUDIT";
 
 const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
@@ -436,10 +436,12 @@ export class TraderWatch {
       this.sync.shadow_entry_allowed=false;
       this.sync.next_attempt_at=0;
       this.mirror.nextPollAt=Date.now()+MIRROR_POLL_INTERVAL_MS;
+      // Preserve exposure for audit until we can establish whether any fills
+      // occurred during the disconnect. Never silently book a simulated close.
       this.fillMirror.paused=true;
-      this.fillMirror.pauseReason="WS_DISCONNECTED_WAIT_FOR_NEW_BOUNDARY";
+      this.fillMirror.pauseReason="WS_DISCONNECTED_AWAITING_AUDIT";
       this.fillMirror.needsBackfill=true;
-      if(this.fillMirror.copy){this.fillMirror.stats.abandoned++;this.fillMirror.copy=null;}
+      this.fillMirror.disconnectedAt=Date.now();
 
       if (this.state.active) {
         this.ctx.storage
@@ -1103,9 +1105,42 @@ export class TraderWatch {
     this.state.api_checked += btc.length;
 
     btc.sort((a:any,b:any)=>Number(a?.time||0)-Number(b?.time||0)||Number(a?.tid||0)-Number(b?.tid||0));
+    let missing=0;
     for (const fill of btc) {
       const classified=this.take(fill, "API");
-      if(classified==="API_BACKFILL")this.mirrorFill(fill,"API_BACKFILL");
+      if(classified==="API_BACKFILL"){
+        missing++;
+        this.mirrorFill(fill,"API_BACKFILL");
+        // Historical fills are audit evidence, not executable orders.
+        // In particular, do NOT price them with the current order book.
+        this.mirrorEvent({id:"v221:missing:"+this.fillId(fill),kind:"V221_API_MISSING_FILL",
+          at:Number(fill.time),source:"API_BACKFILL",start:Number(fill.startPosition),
+          qty:Number(fill.sz),side:fill.side,reason:"HISTORICAL_QUOTE_NOT_AVAILABLE"});
+      }
+    }
+    this.fillMirror.lastAuditAt=now;
+    this.fillMirror.lastAuditMissing=missing;
+    this.fillMirror.stats.apiRecovered=(this.fillMirror.stats.apiRecovered||0)+missing;
+    if(missing){
+      this.fillMirror.needsBackfill=true;
+      this.fillMirror.paused=true;
+      this.fillMirror.pauseReason="API_CONFIRMED_MISSING_FILLS_WAIT_FOR_FRESH_BOUNDARY";
+      if(this.fillMirror.copy){
+        this.mirrorEvent({id:"v221:abandoned:"+now,kind:"V221_UNPRICED_ABANDONMENT",
+          at:now,positionId:this.fillMirror.copy.id,reason:"API_MISSING_FILLS"});
+        this.fillMirror.stats.abandoned++;
+        this.fillMirror.copy=null;
+      }
+    } else if(this.fillMirror.pauseReason==="WS_DISCONNECTED_AWAITING_AUDIT"){
+      // No missing fills were found within the audited window. Resume only
+      // if the live WS is connected and its book is fresh.
+      if(this.state.connected && this.book.at && now-this.book.at<=BOOK_MAX_AGE_MS){
+        this.fillMirror.paused=false;
+        this.fillMirror.pauseReason=null;
+        this.fillMirror.needsBackfill=false;
+      }
+    } else if(!this.fillMirror.paused){
+      this.fillMirror.needsBackfill=false;
     }
     await this.flushMirror();
 
@@ -1537,6 +1572,11 @@ export class TraderWatch {
         summary:{...summary,win_rate_pct:count?100*wins/count:null,roi_pct:notional?100*net/notional:null},
         rows:(rows.results||[]).map((r:any)=>JSON.parse(r.payload_json)),
         reducer:{...this.fillMirror,completed:this.fillMirror.completed.slice(-10)},
+        live_copy_status:{paused:this.fillMirror.paused,reason:this.fillMirror.pauseReason,
+          needs_backfill:this.fillMirror.needsBackfill,last_audit_at:this.fillMirror.lastAuditAt||null,
+          last_audit_missing:this.fillMirror.lastAuditMissing??null,
+          last_fill_at:this.fillMirror.lastFillTime||null,
+          last_ws_message_at:this.state.last_message_at||null},
         coverage:"OBSERVED_AND_PRICED_ONLY",pending_writes:this.mirror.pending.length,
         warnings:["Historical V2/V2.1 snapshot COPY_CLOSE events are excluded.",
           "This is not account equity ROI or actual executable performance.",
