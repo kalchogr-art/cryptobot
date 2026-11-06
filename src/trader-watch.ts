@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V2.2.3 FILL AUDIT + RESUME
+// BTC TRADER WATCH V2.2.4 FILL CHAIN + REVERSAL
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.2.3 FILL AUDIT + RESUME";
+const VERSION = "BTC TRADER WATCH V2.2.4 FILL CHAIN + REVERSAL";
 
 const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
@@ -371,14 +371,14 @@ export class TraderWatch {
 
     // userFills batches may be delivered newest-first. Process position
     // transitions in exchange-time order, not message array order.
-    fills.sort((a:any,b:any) => Number(a?.time||0)-Number(b?.time||0) || Number(a?.tid||0)-Number(b?.tid||0));
+    const orderedFills=this.orderPositionFills(fills.filter((f:any)=>String(f?.coin).toUpperCase()==="BTC"));
     // Try a current HTTP book once per batch if WS quotes are missing. Never
     // substitute the trader's execution price for an executable copy quote.
     if(fills.some((f:any)=>String(f?.coin).toUpperCase()==="BTC") &&
        (!this.book.at || Date.now()-this.book.at>BOOK_MAX_AGE_MS)) {
       await this.refreshExecutableBook();
     }
-    for (const fill of fills) {
+    for (const fill of orderedFills) {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
         this.mirrorFill(fill, "WS_LIVE");
@@ -1120,9 +1120,9 @@ export class TraderWatch {
 
     this.state.api_checked += btc.length;
 
-    btc.sort((a:any,b:any)=>Number(a?.time||0)-Number(b?.time||0)||Number(a?.tid||0)-Number(b?.tid||0));
+    const orderedBtc=this.orderPositionFills(btc);
     let missing=0;
-    for (const fill of btc) {
+    for (const fill of orderedBtc) {
       const classified=this.take(fill, "API");
       if(classified==="API_BACKFILL"){
         missing++;
@@ -1510,6 +1510,40 @@ export class TraderWatch {
   // V2.1 COPY POLICY: verified fills only; current exposure still from clearinghouseState.
   // A fill's startPosition is the signed position BEFORE the fill.
   // dir is an additional validation hint, never a replacement for arithmetic.
+  // A single exchange millisecond can contain many fills. Numeric tid is not
+  // a position sequence. Reconstruct a unique continuous chain from each
+  // fill's signed startPosition and side/size, including cross-zero reversals.
+  // Ambiguous/disconnected batches are NOT silently rewritten or priced.
+  private orderPositionFills(input:any[]):any[]{
+    const groups=new Map<number,any[]>();
+    for(const f of input){const t=Number(f?.time)||0;
+      if(!groups.has(t))groups.set(t,[]);groups.get(t)!.push(f);}
+    const result:any[]=[];
+    let expected:number|null=this.fillMirror.lastSigned;
+    const near=(a:number,b:number)=>Math.abs(a-b)<=Math.max(SYNC_TOLERANCE,Math.abs(b)*0.0001);
+    const finish=(f:any)=>Number(f.startPosition)+(f.side==="B"?1:-1)*Number(f.sz);
+    for(const [,items] of [...groups.entries()].sort((a,b)=>a[0]-b[0])){
+      const left=[...items];
+      // First use the previous batch's verified end. If not available, find
+      // the unique head of a chain (start not equal to any other fill end).
+      while(left.length){
+        let candidates=expected===null?[]:left.filter(f=>near(Number(f.startPosition),expected!));
+        if(candidates.length!==1){
+          const heads=left.filter(f=>!left.some(g=>g!==f&&near(finish(g),Number(f.startPosition))));
+          if(candidates.length===0&&heads.length===1)candidates=heads;
+        }
+        if(candidates.length!==1){
+          // Keep the original order and allow verifiedFill's continuity guard
+          // to censor uncertain P/L rather than manufacture a fill chain.
+          result.push(...left);break;
+        }
+        const f=candidates[0];result.push(f);left.splice(left.indexOf(f),1);
+        expected=finish(f);
+      }
+    }
+    return result;
+  }
+
   private verifiedFill(fill:any, source:"WS_LIVE"|"API_BACKFILL") {
     if(String(fill?.coin).toUpperCase()!=="BTC")return;
     const v=this.fillMirror;
