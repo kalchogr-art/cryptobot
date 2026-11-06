@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.4 PIPELINE LATENCY DIAGNOSTICS';
+const VERSION = 'BTC TRADER WATCH V4.5 INCREMENTAL COPY ENGINE';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -115,6 +115,98 @@ export class TraderWatch {
   private databaseReady = false;
   private resetBusy = false;
   private readonly pipelineCap = 1200;
+  private incrementalActions = 0;
+  private recoveryReplays = 0;
+  private recoveryReason: string | null = null;
+  private appendReady = false;
+  private queuedJobs = 0;
+  private enqueue(job: () => Promise<void>): Promise<void> {
+    this.queuedJobs++;
+    const next = this.processing.catch(() => {}).then(job);
+    this.processing = next.catch(e => {
+      this.s.lastError = 'INGEST_QUEUE: ' + String(e);
+      this.s.needsAudit = true;
+    }).finally(() => { this.queuedJobs--; });
+    return this.processing;
+  }
+
+  // Validate persisted projection once after a DO restart; do not rebuild history.
+  private async verifyProjection(): Promise<void> {
+    if (this.appendReady) return;
+    await this.ensureDb();
+    const counts: any = await this.env.DB.prepare(`SELECT
+      (SELECT count(*) FROM trader_watch_v4_fills WHERE wallet=? AND epoch=?) AS fills,
+      (SELECT count(*) FROM trader_watch_v4_actions WHERE wallet=? AND epoch=?) AS actions`)
+      .bind(TARGET, this.s.epoch, TARGET, this.s.epoch).first();
+    const fills = Number(counts?.fills || 0);
+    const actions = Number(counts?.actions || 0);
+    if (fills !== this.s.ledgerCount || actions !== fills || this.s.replayGap) {
+      this.recoveryReason = 'PERSISTED_PROJECTION_NOT_ALIGNED';
+      this.recoveryReplays++;
+      await this.replay();
+      if (this.s.replayGap) throw new Error('FILL_CHAIN_GAP_REQUIRES_AUDIT');
+    }
+    this.appendReady = true;
+  }
+
+  private async writeAction(row: Row): Promise<void> {
+    await this.env.DB.prepare(`INSERT INTO trader_watch_v4_actions
+      (wallet,epoch,fill_id,event_at,payload_json) VALUES (?,?,?,?,?)
+      ON CONFLICT(wallet,epoch,fill_id) DO UPDATE SET payload_json=excluded.payload_json`)
+      .bind(TARGET, this.s.epoch, row.id, row.at, JSON.stringify(row)).run();
+  }
+
+  // Apply one verified fill, keeping exactly the V4.4 ratio and reversal rules.
+  private async appendFill(f: NormalFill): Promise<void> {
+    const start = Number(this.s.targetSigned);
+    if (!same(f.start, start)) throw new Error('APPEND_POSITION_DISCONTINUITY');
+    const action = actionOf(f);
+    const before = this.s.copySigned;
+    let copy = before, ratio = this.s.ratio;
+    let enabled = this.s.copyEnabled;
+    let copied = false, reason = '';
+    if (!enabled) {
+      if (action === 'REVERSAL' && direction(f.end) !== 0) {
+        ratio = START_NOTIONAL_USD / (Math.abs(f.end) * f.price);
+        copy = f.end * ratio;
+        enabled = true;
+        copied = true;
+        reason = 'FRESH_REVERSAL_BOUNDARY';
+      } else if (direction(f.end) === 0) {
+        copy = 0; ratio = 0; enabled = true;
+        reason = 'PREEXISTING_POSITION_REACHED_FLAT';
+      } else reason = 'PREEXISTING_POSITION_NOT_COPIED';
+    } else {
+      if (action === 'OPEN' || action === 'REVERSAL') {
+        ratio = START_NOTIONAL_USD / (Math.abs(f.end) * f.price);
+        copy = f.end * ratio;
+      } else if (action === 'CLOSE') { copy = 0; ratio = 0; }
+      else copy = f.end * ratio;
+      copied = true; reason = 'CHAIN_VERIFIED';
+    }
+    const row: Row = {id:f.id,at:f.at,receivedAt:f.receivedAt,source:f.source,
+      action,start:f.start,end:f.end,size:f.size,price:f.price,
+      targetSide:sideName(f.end),copyBefore:before,copyAfter:copy,copied,reason};
+    // Persist the action BEFORE advancing the checkpoint. Retry is idempotent.
+    await this.writeAction(row);
+    this.s.targetSigned = f.end;
+    this.s.copySigned = copy;
+    this.s.ratio = ratio;
+    this.s.copyEnabled = enabled;
+    this.s.ledgerCount++;
+    this.s.lastFillAt = f.at;
+    this.s.stats.fills++;
+    if (f.source === 'API_BACKFILL') this.s.stats.apiRecovered++;
+    if (copied) {
+      this.s.stats.copyActions++;
+      const key = {OPEN:'opens',ADD:'adds',PARTIAL_CLOSE:'partials',
+        CLOSE:'closes',REVERSAL:'reversals'}[action] as keyof Stats;
+      this.s.stats[key]++;
+    }
+    this.s.recent.push(row);
+    this.s.recent = this.s.recent.slice(-MAX_RECENT);
+    this.incrementalActions++;
+  }
 
   constructor(private ctx: any, private env: any) {
     ctx.blockConcurrencyWhile(async () => {
@@ -401,41 +493,70 @@ export class TraderWatch {
   private async ingestMany(raw: RawFill[], source: Source, receivedAt?: number): Promise<void> {
     if (!this.s.baselineAt) return;
     const processingStartedAt = Date.now();
-    const freshRows: { id: string; eventAt: number; d1DoneAt: number }[] = [];
-    let changed = false;
+    const freshRows: { f: NormalFill; d1DoneAt: number }[] = [];
+    // Check the persisted checkpoint BEFORE inserting new rows.
+    await this.verifyProjection();
     for (const x of raw) {
       const f = normalize(x, source);
       if (!f) continue;
-      // WS callback timestamp is captured before awaiting the serialized processing queue.
-      // Existing V4.3 received_at semantics are preserved; the new metric is separate.
-      if (await this.insertFill(f)) {
-        changed = true;
-        freshRows.push({ id: f.id, eventAt: f.at, d1DoneAt: Date.now() });
-      }
+      if (await this.insertFill(f)) freshRows.push({ f, d1DoneAt: Date.now() });
     }
     const replayStartedAt = Date.now();
-    if (changed) await this.replay();
-    else await this.save();
+    let fallback = false;
+    if (freshRows.length) {
+      // Append only when every newly inserted fill extends the verified prefix.
+      // A late historical fill or missing predecessor triggers canonical recovery.
+      const pending = freshRows.slice().sort((a,b) => a.f.at-b.f.at || a.f.id.localeCompare(b.f.id));
+      let expected = Number(this.s.targetSigned);
+      let lastAt = this.s.lastFillAt;
+      const ordered: typeof pending = [];
+      while (pending.length) {
+        const i = pending.findIndex(x => x.f.at >= lastAt && same(x.f.start, expected));
+        if (i < 0) { fallback = true; break; }
+        const item = pending.splice(i,1)[0];
+        ordered.push(item);
+        expected = item.f.end;
+        lastAt = item.f.at;
+      }
+      if (fallback) {
+        this.recoveryReason = 'LATE_OR_OUT_OF_ORDER_FILL';
+        this.recoveryReplays++;
+        this.appendReady = false;
+        await this.replay();
+        if (!this.s.replayGap) this.appendReady = true;
+      } else {
+        try {
+          for (const x of ordered) await this.appendFill(x.f);
+          await this.save();
+        } catch (e) {
+          this.recoveryReason = 'APPEND_WRITE_FAILURE: ' + String(e);
+          this.recoveryReplays++;
+          this.appendReady = false;
+          await this.replay();
+          if (!this.s.replayGap) this.appendReady = true;
+        }
+      }
+    } else await this.save();
     const copyReadyAt = Date.now();
     if (freshRows.length) {
       const samples = this.s.pipelineSamples || [];
       const receiveTime = receivedAt ?? processingStartedAt;
-      for (const f of freshRows) samples.push({
-        id: f.id, source, event_at: f.eventAt,
-        ws_callback_at: source === 'WS_LIVE' ? receiveTime : null,
-        processing_started_at: processingStartedAt,
-        d1_write_done_at: f.d1DoneAt,
-        replay_started_at: replayStartedAt,
-        copy_ready_at: copyReadyAt,
-        exchange_to_callback_ms: source === 'WS_LIVE' ? receiveTime - f.eventAt : null,
-        callback_queue_ms: source === 'WS_LIVE' ? processingStartedAt - receiveTime : null,
-        processing_to_d1_ms: f.d1DoneAt - processingStartedAt,
-        d1_to_copy_ready_ms: copyReadyAt - f.d1DoneAt,
-        replay_batch_ms: copyReadyAt - replayStartedAt,
-        exchange_to_copy_ready_ms: copyReadyAt - f.eventAt,
-        batch_new_fills: freshRows.length,
+      for (const {f, d1DoneAt} of freshRows) samples.push({
+        id:f.id,source,event_at:f.at,
+        ws_callback_at:source==='WS_LIVE'?receiveTime:null,
+        processing_started_at:processingStartedAt,
+        d1_write_done_at:d1DoneAt,replay_started_at:replayStartedAt,
+        copy_ready_at:copyReadyAt,
+        exchange_to_callback_ms:source==='WS_LIVE'?receiveTime-f.at:null,
+        callback_queue_ms:source==='WS_LIVE'?processingStartedAt-receiveTime:null,
+        processing_to_d1_ms:d1DoneAt-processingStartedAt,
+        d1_to_copy_ready_ms:copyReadyAt-d1DoneAt,
+        replay_batch_ms:fallback?copyReadyAt-replayStartedAt:0,
+        exchange_to_copy_ready_ms:copyReadyAt-f.at,
+        batch_new_fills:freshRows.length,
+        processing_mode:fallback?'RECOVERY_REPLAY':'INCREMENTAL',
       });
-      this.s.pipelineSamples = samples.slice(-this.pipelineCap);
+      this.s.pipelineSamples=samples.slice(-this.pipelineCap);
       await this.save();
     }
   }
@@ -457,7 +578,7 @@ export class TraderWatch {
         if (!Array.isArray(raw)) throw new Error('INVALID_API_FILLS');
         // Hyperliquid may cap results; do not silently mark a truncated window audited.
         if (raw.length >= 1900) throw new Error('API_WINDOW_POSSIBLY_TRUNCATED');
-        await this.ingestMany(raw, 'API_BACKFILL');
+        await this.enqueue(() => this.ingestMany(raw, 'API_BACKFILL'));
         cursor = upper;
         this.s.auditCursor = cursor;
         pages++;
@@ -491,7 +612,7 @@ export class TraderWatch {
     });
     ws.addEventListener('message', (ev: any) => {
       const callbackAt = Date.now();
-      this.processing = this.processing.then(async () => {
+      void this.enqueue(async () => {
         const msg = JSON.parse(String(ev.data));
         if (msg.channel !== 'userFills') return;
         const payload = msg.data;
@@ -499,10 +620,7 @@ export class TraderWatch {
           Array.isArray(payload) ? payload : [];
         // Subscription historical events are ignored only if predating baseline.
         await this.ingestMany(arr, 'WS_LIVE', callbackAt);
-        if (this.s.replayGap) await this.audit(true);
-      }).catch(e => {
-        this.s.lastError = 'WS_PROCESS: ' + String(e);
-        this.s.needsAudit = true;
+        if (this.s.replayGap) { this.s.needsAudit = true; this.s.nextApiAt = 0; }
       });
     });
     const down = () => {
@@ -549,6 +667,10 @@ export class TraderWatch {
     });
     return {ok:true, version:VERSION, mode:'READ_ONLY_OBSERVABILITY',
       epoch:this.s.epoch, samples:samples.length,
+      incremental_actions_since_restart:this.incrementalActions,
+      recovery_replays_since_restart:this.recoveryReplays,
+      last_recovery_reason:this.recoveryReason,
+      queued_ingest_jobs:this.queuedJobs,
       ws_live:metrics(samples.filter(x=>x.source==='WS_LIVE')),
       api_backfill:metrics(samples.filter(x=>x.source==='API_BACKFILL')),
       overall:metrics(samples),
@@ -556,10 +678,10 @@ export class TraderWatch {
       caveats:[
         'WS callback is measured when this Durable Object receives a message event, not at the Hyperliquid server.',
         'D1 timing includes serial inserts and per-batch overhead; individual fill timing is not isolated.',
-        'COPY ready means full ledger replay and projection persistence finished, not a real trade.',
+        'COPY ready means incremental projection persistence (or explicit recovery replay), not a real trade.',
         'Batch completion times are shared by all new fills in that batch.',
         'API backfill has no WS callback metric and is historical, not executable in real time.',
-        'Metrics only cover new fills after V4.4 deployment. Existing D1 history is preserved.',
+        'Metrics include retained V4.4 samples and new V4.5 samples. Existing D1 history is preserved.',
       ]};
   }
 
@@ -667,6 +789,10 @@ export class TraderWatch {
       pending_d1_writes: 0, error: this.s.lastError,
       ledger_count: this.s.ledgerCount, replay_gap: this.s.replayGap,
       audit_cursor: this.s.auditCursor,
+      incremental_actions_since_restart:this.incrementalActions,
+      recovery_replays_since_restart:this.recoveryReplays,
+      last_recovery_reason:this.recoveryReason,
+      queued_ingest_jobs:this.queuedJobs,
       note: 'Snapshot is compared only to audited fill state at snapshot request time. In-flight fills are marked ambiguous. Read-only.',
     };
   }
