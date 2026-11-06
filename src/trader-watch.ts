@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.5.2 SNAPSHOT VERIFICATION';
+const VERSION = 'BTC TRADER WATCH V4.6 VIRTUAL 10 USD X5';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -38,6 +38,27 @@ type Row = {
   targetSide: string; copyBefore: number; copyAfter: number;
   copied: boolean; reason: string;
 };
+type VirtualTrade = {id:string; at:number; action:Action; price:number; targetStart:number; targetEnd:number;
+  beforeQty:number; afterQty:number; deltaQty:number; realizedUsd:number; feeUsd:number;
+  equityUsd:number; cashUsd:number; usedMarginUsd:number; status:string};
+type VirtualState = {startedAt:number; balanceUsd:number; initialBalanceUsd:number;
+  qty:number; avgPrice:number; ratio:number; realizedUsd:number; feesUsd:number;
+  closedTrades:number; wins:number; losses:number; positionRealizedUsd:number;
+  positionFeesUsd:number; peakEquityUsd:number; maxDrawdownPct:number;
+  lastMarkPrice:number; lastFillId:string|null; events:number; skipped:number;
+  blockedAdds:number; rejectedOpens:number; recent:VirtualTrade[]};
+const VIRTUAL_INITIAL_BALANCE = 50;
+const VIRTUAL_MARGIN_PER_OPEN = 10;
+const VIRTUAL_LEVERAGE = 5;
+const VIRTUAL_OPEN_NOTIONAL = VIRTUAL_MARGIN_PER_OPEN * VIRTUAL_LEVERAGE;
+// Assumed taker fee; this is a configurable simulation assumption, not a quoted live fee.
+const VIRTUAL_TAKER_FEE_RATE = 0.00045;
+const VIRTUAL_SLIPPAGE_BPS = 0; // 0 until live executable price evidence is available.
+const VIRTUAL_MARGIN_BUFFER = 0.001;
+function freshVirtual(): VirtualState { return {startedAt:Date.now(),balanceUsd:50,initialBalanceUsd:50,
+ qty:0,avgPrice:0,ratio:0,realizedUsd:0,feesUsd:0,closedTrades:0,wins:0,losses:0,
+ positionRealizedUsd:0,positionFeesUsd:0,peakEquityUsd:50,maxDrawdownPct:0,
+ lastMarkPrice:0,lastFillId:null,events:0,skipped:0,blockedAdds:0,rejectedOpens:0,recent:[]}; }
 type Stats = {
   fills: number; copyActions: number; opens: number; adds: number;
   partials: number; closes: number; reversals: number;
@@ -63,6 +84,7 @@ type WatchState = {
   lastSnapshotCheck?: {requestAt:number;responseAt:number;checkedAt:number;
     exchangeSigned:number;ledgerSigned:number|null;delta:number|null;status:string} | null;
   snapshotChecks?: {matched:number;mismatched:number;raced:number;pendingExpired:number};
+  virtualV46?: VirtualState;
 };
 
 function fresh(): WatchState {
@@ -123,6 +145,7 @@ export class TraderWatch {
   private databaseReady = false;
   private resetBusy = false;
   private readonly pipelineCap = 1200;
+  private virtualReady = false;
   private incrementalActions = 0;
   private recoveryReplays = 0;
   private recoveryReason: string | null = null;
@@ -168,6 +191,135 @@ export class TraderWatch {
       .bind(TARGET, this.s.epoch, row.id, row.at, JSON.stringify(row)).run();
   }
 
+  private virtualEquity(v: VirtualState, mark:number): number {
+    const unrealized = v.qty * (mark - v.avgPrice);
+    return v.balanceUsd + unrealized;
+  }
+  private virtualUsedMargin(v: VirtualState, mark:number): number {
+    return Math.abs(v.qty) * mark / VIRTUAL_LEVERAGE;
+  }
+  private virtualMark(v:VirtualState, px:number):void {
+    if (!(px > 0)) return;
+    v.lastMarkPrice=px;
+    const eq=this.virtualEquity(v,px);
+    v.peakEquityUsd=Math.max(v.peakEquityUsd,eq);
+    if(v.peakEquityUsd>0) v.maxDrawdownPct=Math.max(v.maxDrawdownPct,100*(v.peakEquityUsd-eq)/v.peakEquityUsd);
+  }
+  private async ensureVirtual():Promise<void> {
+    if(this.virtualReady) return;
+    await this.ensureDb();
+    await this.env.DB.prepare(`CREATE TABLE IF NOT EXISTS trader_watch_v46_virtual (
+      wallet TEXT NOT NULL, epoch INTEGER NOT NULL, fill_id TEXT NOT NULL,
+      event_at INTEGER NOT NULL, payload_json TEXT NOT NULL, state_json TEXT NOT NULL,
+      PRIMARY KEY(wallet,epoch,fill_id))`).run();
+    await this.env.DB.prepare(`CREATE INDEX IF NOT EXISTS trader_watch_v46_virtual_order
+      ON trader_watch_v46_virtual(wallet,epoch,event_at)`).run();
+    const last:any=await this.env.DB.prepare(`SELECT state_json FROM trader_watch_v46_virtual
+      WHERE wallet=? AND epoch=? ORDER BY rowid DESC LIMIT 1`).bind(TARGET,this.s.epoch).first();
+    if(last?.state_json) this.s.virtualV46=JSON.parse(last.state_json);
+    else if(!this.s.virtualV46) this.s.virtualV46=freshVirtual();
+    this.virtualReady=true;
+  }
+  private async virtualApply(f:NormalFill, action:Action):Promise<void> {
+    await this.ensureVirtual();
+    const v=this.s.virtualV46!;
+    // The simulation starts with the NEXT new opening boundary, not with an
+    // already-open position. API backfills older than activation cannot be executed.
+    if(f.at < v.startedAt || f.source !== 'WS_LIVE') { v.skipped++; return; }
+    if(v.lastFillId===f.id) return;
+    const existing:any=await this.env.DB.prepare(`SELECT state_json FROM trader_watch_v46_virtual
+      WHERE wallet=? AND epoch=? AND fill_id=?`).bind(TARGET,this.s.epoch,f.id).first();
+    if(existing?.state_json) { this.s.virtualV46=JSON.parse(existing.state_json); return; }
+    const before=v.qty;
+    const executionPx=f.price*(1+(f.side==='B'?1:-1)*VIRTUAL_SLIPPAGE_BPS/10000);
+    let status='APPLIED', delta=0, realized=0, fee=0;
+    const close=(amount:number)=>{
+      const q=Math.min(Math.abs(v.qty),amount);
+      if(q<=EPS)return;
+      const old=v.qty;
+      const sign=Math.sign(old);
+      const change=-sign*q;
+      const profit=q*sign*(executionPx-v.avgPrice);
+      const cost=q*executionPx*VIRTUAL_TAKER_FEE_RATE;
+      v.balanceUsd+=profit-cost; v.realizedUsd+=profit;v.feesUsd+=cost;
+      v.positionRealizedUsd+=profit;v.positionFeesUsd+=cost;
+      realized+=profit;fee+=cost;delta+=change;
+      v.qty+=change;
+      if(Math.abs(v.qty)<EPS){
+        const net=v.positionRealizedUsd-v.positionFeesUsd;
+        v.closedTrades++;if(net>0)v.wins++;else if(net<0)v.losses++;
+        v.qty=0;v.avgPrice=0;v.ratio=0;
+        v.positionRealizedUsd=0;v.positionFeesUsd=0;
+      }
+    };
+    const open=(signedQty:number, ratio:number)=>{
+      const needed=Math.abs(signedQty)*executionPx/VIRTUAL_LEVERAGE;
+      const openingFee=Math.abs(signedQty)*executionPx*VIRTUAL_TAKER_FEE_RATE;
+      const free=v.balanceUsd+v.qty*(executionPx-v.avgPrice)-this.virtualUsedMargin(v,executionPx);
+      if(needed+openingFee+VIRTUAL_MARGIN_BUFFER>free){
+        if(Math.abs(v.qty)<EPS)v.rejectedOpens++;else v.blockedAdds++;
+        status='INSUFFICIENT_VIRTUAL_MARGIN';return;
+      }
+      const oldAbs=Math.abs(v.qty),newAbs=Math.abs(signedQty);
+      v.avgPrice=(oldAbs*v.avgPrice+newAbs*executionPx)/(oldAbs+newAbs);
+      v.qty+=signedQty;delta+=signedQty;
+      v.balanceUsd-=openingFee;v.feesUsd+=openingFee;v.positionFeesUsd+=openingFee;fee+=openingFee;
+      v.ratio=ratio;
+    };
+    if(action==='OPEN'||action==='REVERSAL') {
+      if(Math.abs(v.qty)>EPS)close(Math.abs(v.qty));
+      if(Math.abs(v.qty)<EPS){
+        const r=VIRTUAL_OPEN_NOTIONAL/(Math.abs(f.end)*executionPx);
+        open(f.end*r,r);
+      }
+    } else if(Math.abs(v.qty)<EPS || Math.sign(v.qty)!==Math.sign(f.start)) {
+      status='WAITING_FOR_FRESH_OPEN';
+    } else if(action==='CLOSE')close(Math.abs(v.qty));
+    else if(action==='PARTIAL_CLOSE') {
+      const pct=Math.min(1,Math.abs(f.start-f.end)/Math.abs(f.start));
+      close(Math.abs(v.qty)*pct);
+    } else if(action==='ADD') {
+      const pct=Math.abs(f.end-f.start)/Math.abs(f.start);
+      open(v.qty*pct,v.ratio);
+    }
+    this.virtualMark(v,executionPx);
+    v.lastFillId=f.id;v.events++;
+    const ev:VirtualTrade={id:f.id,at:f.at,action,price:executionPx,targetStart:f.start,targetEnd:f.end,
+      beforeQty:before,afterQty:v.qty,deltaQty:delta,realizedUsd:realized,feeUsd:fee,
+      equityUsd:this.virtualEquity(v,executionPx),cashUsd:v.balanceUsd,
+      usedMarginUsd:this.virtualUsedMargin(v,executionPx),status};
+    v.recent.push(ev);v.recent=v.recent.slice(-100);
+    await this.env.DB.prepare(`INSERT INTO trader_watch_v46_virtual
+      (wallet,epoch,fill_id,event_at,payload_json,state_json) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(wallet,epoch,fill_id) DO NOTHING`)
+      .bind(TARGET,this.s.epoch,f.id,f.at,JSON.stringify(ev),JSON.stringify(v)).run();
+  }
+  private async virtualReport():Promise<any> {
+    await this.ensureVirtual();
+    const v=this.s.virtualV46!;
+    const mark=v.lastMarkPrice || v.avgPrice;
+    const unrealized=v.qty*(mark-v.avgPrice);
+    const equity=v.balanceUsd+unrealized;
+    const margin=this.virtualUsedMargin(v,mark);
+    return {ok:true,version:VERSION,mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',
+      assumptions:{initial_balance_usd:50,margin_per_fresh_open_usd:10,leverage:5,
+        fresh_open_notional_usd:50,taker_fee_rate:VIRTUAL_TAKER_FEE_RATE,
+        slippage_bps:VIRTUAL_SLIPPAGE_BPS,pricing:'TRADER_FILL_PRICE_PROXY_NOT_EXECUTABLE_COPY_PRICE',
+        copy_rule:'PERCENTAGE_OF_BTC_QTY',
+        history:'NEW_WS_FILLS_AFTER_V4_6_ACTIVATION_ONLY; NO_RETROACTIVE_TRADES',
+        margin_rule:'REJECT_OPEN_OR_ADD_IF_INSUFFICIENT_FREE_EQUITY; NO_LIQUIDATION_ENGINE'},
+      started_at:v.startedAt,latest_mark_price:mark,position_btc:v.qty,
+      average_entry_price:v.avgPrice,used_margin_usd:margin,
+      free_equity_usd:equity-margin,realized_gross_usd:v.realizedUsd,
+      unrealized_usd:unrealized,fees_usd:v.feesUsd,net_realized_usd:v.realizedUsd-v.feesUsd,
+      equity_usd:equity,roi_pct:100*(equity-v.initialBalanceUsd)/v.initialBalanceUsd,
+      closed_trades:v.closedTrades,wins:v.wins,losses:v.losses,
+      win_rate_pct:v.closedTrades?100*v.wins/v.closedTrades:null,
+      max_drawdown_pct:v.maxDrawdownPct,events:v.events,skipped_historical_or_backfill:v.skipped,
+      blocked_adds:v.blockedAdds,rejected_opens:v.rejectedOpens,
+      recent_events:v.recent.slice(-50),trading_enabled:false};
+  }
+
   // Apply one verified fill, keeping exactly the V4.4 ratio and reversal rules.
   private async appendFill(f: NormalFill): Promise<void> {
     const start = Number(this.s.targetSigned);
@@ -201,6 +353,7 @@ export class TraderWatch {
       targetSide:sideName(f.end),copyBefore:before,copyAfter:copy,copied,reason};
     // Persist the action BEFORE advancing the checkpoint. Retry is idempotent.
     await this.writeAction(row);
+    await this.virtualApply(f,action);
     this.s.targetSigned = f.end;
     this.s.copySigned = copy;
     this.s.ratio = ratio;
@@ -831,6 +984,8 @@ export class TraderWatch {
       exchange_snapshot_btc: this.s.snapshotSigned,
       copy_position_btc: this.s.copySigned,
       copy_initial_notional_usd: START_NOTIONAL_USD,
+      virtual_v46: this.s.virtualV46 ? {started_at:this.s.virtualV46.startedAt,events:this.s.virtualV46.events,
+        equity_usd:this.s.virtualV46.balanceUsd+this.s.virtualV46.qty*(this.s.virtualV46.lastMarkPrice-this.s.virtualV46.avgPrice)} : null,
       copy_ratio: this.s.ratio, copy_enabled: this.s.copyEnabled,
       needs_audit: this.s.needsAudit,
       snapshot_mismatch_btc: this.s.snapshotMismatch,
@@ -913,6 +1068,8 @@ export class TraderWatch {
       if (this.resetBusy) return response({ ok: false, error: 'RESET_BUSY' }, 409);
       try {
         await this.ensureDb();
+        await this.ensureVirtual();
+        await this.save();
         // Establish snapshot baseline BEFORE subscribing to live fills.
         if (!this.s.baselineAt) {
           await this.snapshot(true);
@@ -950,6 +1107,10 @@ export class TraderWatch {
       checks:this.s.snapshotChecks || null,
       audit_cursor:this.s.auditCursor,needs_audit:this.s.needsAudit,
       replay_gap:this.s.replayGap,trading_enabled:false});
+    if (path === '/virtual-pl' && request.method === 'GET') {
+      try {return response(await this.virtualReport());}
+      catch(e){return response({ok:false,error:String(e)},503);}
+    }
     if (path === '/pipeline-audit' && request.method === 'GET') return response(this.pipelineAudit());
     if (path === '/execution-audit' && request.method === 'GET') {
       try { return response(await this.executionAudit(Number(url.searchParams.get('limit') || 5000))); }
