@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V2.2.1 CONTINUITY AUDIT
+// BTC TRADER WATCH V2.2.2 QUOTE RECOVERY
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.2.1 CONTINUITY AUDIT";
+const VERSION = "BTC TRADER WATCH V2.2.2 QUOTE RECOVERY";
 
 const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
@@ -21,7 +21,9 @@ const MAX_IDS = 12000;
 const SHADOW_NOTIONAL_USD = 100;
 const SHADOW_TAKER_FEE_RATE = 0.00045; // configurable assumption, not account-specific
 const SHADOW_MAX_TRADES = 1000;
-const BOOK_MAX_AGE_MS = 5000; // bounded freshness; no HTTP quote fallback
+const BOOK_MAX_AGE_MS = 5000; // fresh WS or HTTP order book only
+const QUOTE_HTTP_BACKOFF_MS = 1500;
+const PENDING_ENTRY_MAX_MS = 5000;
 const POSITION_EPS = 1e-9;
 const SYNC_INTERVAL_MS = 60_000;
 const SYNC_TOLERANCE = 0.000001;
@@ -109,6 +111,8 @@ export class TraderWatch {
   private mirrorLastFillAt = 0;
   private pendingPositions: any[] = [];
   private book = {bid:0, ask:0, at:0};
+  private quoteHttpLastAt = 0;
+  private quoteHttpFailures = 0;
   private bookMessages = 0;
   private bookStale = 0;
   private positionSeq = 0;
@@ -351,6 +355,7 @@ export class TraderWatch {
       if (bid > 0 && ask >= bid && Number.isFinite(bid) && Number.isFinite(ask)) {
         this.book = {bid,ask,at:Date.now()};
         this.bookMessages++;
+        if(this.tryPendingCopyEntry("WS_BOOK")) await this.persist();
       }
       return;
     }
@@ -367,11 +372,22 @@ export class TraderWatch {
     // userFills batches may be delivered newest-first. Process position
     // transitions in exchange-time order, not message array order.
     fills.sort((a:any,b:any) => Number(a?.time||0)-Number(b?.time||0) || Number(a?.tid||0)-Number(b?.tid||0));
+    // Try a current HTTP book once per batch if WS quotes are missing. Never
+    // substitute the trader's execution price for an executable copy quote.
+    if(fills.some((f:any)=>String(f?.coin).toUpperCase()==="BTC") &&
+       (!this.book.at || Date.now()-this.book.at>BOOK_MAX_AGE_MS)) {
+      await this.refreshExecutableBook();
+    }
     for (const fill of fills) {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
         this.mirrorFill(fill, "WS_LIVE");
+        // Do not open a pending copy after a fill has already changed exposure.
+        this.cancelPendingIfSuperseded(fill);
         this.verifiedFill(fill, "WS_LIVE");
+        // Quote may have arrived since the original opening. This is a new
+        // delayed entry at the current quote, never retroactive P/L.
+        if(this.fillMirror.pendingEntry) this.tryPendingCopyEntry("HTTP_BOOK");
       }
     }
 
@@ -1287,6 +1303,8 @@ export class TraderWatch {
         copy_position:this.fillMirror.copy,
         mirror_stats:this.mirror.stats,
         verified_fill_copy:this.fillMirror,
+        quote_recovery:{http_success:this.fillMirror.quoteHttpSuccess||0,http_failures:this.quoteHttpFailures,
+          pending_entry:this.fillMirror.pendingEntry||null,book_age_ms:this.book.at?Date.now()-this.book.at:null},
         mirror_last_snapshot_at:this.mirror.lastSnapshotAt,
         mirror_last_d1_write_at:this.mirror.lastD1WriteAt,
         mirror_last_error:this.mirror.lastError,
@@ -1400,6 +1418,82 @@ export class TraderWatch {
     // V2.1: do not generate copy actions from snapshot differences.
   }
 
+  // HTTP l2Book is a live market-data fallback, not a historical execution quote.
+  // Rate limit requests to avoid amplifying existing Hyperliquid 429 errors.
+  private async refreshExecutableBook(): Promise<boolean> {
+    const now=Date.now();
+    if(this.book.at && now-this.book.at<=BOOK_MAX_AGE_MS)return true;
+    if(now-this.quoteHttpLastAt<QUOTE_HTTP_BACKOFF_MS)return false;
+    this.quoteHttpLastAt=now;
+    try {
+      const response=await fetch(INFO_URL,{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({type:"l2Book",coin:"BTC"})});
+      if(!response.ok){this.quoteHttpFailures++;return false;}
+      const data:any=await response.json();
+      const bid=Number(data?.levels?.[0]?.[0]?.px);
+      const ask=Number(data?.levels?.[1]?.[0]?.px);
+      if(!(bid>0&&ask>=bid&&Number.isFinite(bid)&&Number.isFinite(ask))){this.quoteHttpFailures++;return false;}
+      // Timestamp at receipt; a REST response is not proof of actual fill price.
+      this.book={bid,ask,at:Date.now()};
+      this.fillMirror.quoteHttpSuccess=(this.fillMirror.quoteHttpSuccess||0)+1;
+      return true;
+    } catch {
+      this.quoteHttpFailures++;
+      return false;
+    }
+  }
+
+  private cancelPendingIfSuperseded(fill:any) {
+    const v=this.fillMirror,p=v.pendingEntry;
+    if(!p || String(fill?.coin).toUpperCase()!=="BTC")return;
+    const at=Number(fill.time),start=Number(fill.startPosition),sz=Number(fill.sz);
+    const delta=fill.side==="B"?sz:fill.side==="A"?-sz:NaN;
+    if(!Number.isFinite(at)||!Number.isFinite(start)||!Number.isFinite(delta)||at<=p.fillAt)return;
+    const end=start+delta;
+    // If the original direction has been closed or reversed, it is too late.
+    if(Math.sign(end)!==Math.sign(p.signedQty)||Math.abs(end)<POSITION_EPS){
+      this.mirrorEvent({id:"v222:missed:"+p.id,kind:"V222_MISSED_TOO_LATE",at:Date.now(),
+        originalFillAt:p.fillAt,reason:"TARGET_CLOSED_BEFORE_EXECUTABLE_QUOTE"});
+      v.pendingEntry=null;
+      if(v.pauseReason==="MISSING_EXECUTABLE_ENTRY_QUOTE"){
+        v.paused=false;v.pauseReason=null;
+      }
+    }else{
+      p.signedQty=end;
+    }
+  }
+
+  private tryPendingCopyEntry(source:"WS_BOOK"|"HTTP_BOOK"):boolean {
+    const v=this.fillMirror,p=v.pendingEntry;
+    if(!p||v.copy)return false;
+    const now=Date.now();
+    if(now-p.detectedAt>PENDING_ENTRY_MAX_MS){
+      this.mirrorEvent({id:"v222:expired:"+p.id,kind:"V222_MISSED_TOO_LATE",at:now,
+        originalFillAt:p.fillAt,reason:"QUOTE_RECOVERY_TIMEOUT"});
+      v.pendingEntry=null;
+      if(v.pauseReason==="MISSING_EXECUTABLE_ENTRY_QUOTE"){
+        v.paused=false;v.pauseReason=null;
+      }
+      return true;
+    }
+    if(v.needsBackfill && v.pauseReason!=="MISSING_EXECUTABLE_ENTRY_QUOTE")return false;
+    const px=this.verifiedQuote(p.side,true);
+    if(px===null)return false;
+    const positionId="v222:delayed:"+p.id;
+    v.copy={id:positionId,side:p.side,openedAt:now,entryPrice:px,
+      qty:SHADOW_NOTIONAL_USD/px,entryFeeRemaining:SHADOW_NOTIONAL_USD*SHADOW_TAKER_FEE_RATE,
+      targetQty:Math.abs(p.signedQty),realizedGross:0,realizedFees:0,closeEvents:0,
+      entryMode:"DELAYED",source,originalFillAt:p.fillAt};
+    v.stats.copyOpens++;
+    v.delayedOpens=(v.delayedOpens||0)+1;
+    v.pendingEntry=null;
+    v.paused=false;v.pauseReason=null;
+    this.mirrorEvent({id:"v222:delayedopen:"+p.id,kind:"V222_DELAYED_COPY_OPEN",at:now,
+      positionId,side:p.side,price:px,notionalUsd:SHADOW_NOTIONAL_USD,
+      originalFillAt:p.fillAt,delayMs:now-p.detectedAt,source});
+    return true;
+  }
+
   // V2.1 COPY POLICY: verified fills only; current exposure still from clearinghouseState.
   // A fill's startPosition is the signed position BEFORE the fill.
   // dir is an additional validation hint, never a replacement for arithmetic.
@@ -1462,6 +1556,14 @@ export class TraderWatch {
     v.lastEvent={id,at,kind,start,end,dir,source};
     this.mirrorEvent({id:"v21:transition:"+id,kind:"V21_"+kind,at,
       start,end,qty:sz,side:fill.side,dir,source});
+    if((isOpen||isReverse)&&v.pendingEntry){
+      this.mirrorEvent({id:"v222:replaced:"+v.pendingEntry.id,kind:"V222_MISSED_TOO_LATE",at,
+        reason:"NEW_POSITION_BOUNDARY",originalFillAt:v.pendingEntry.fillAt});
+      v.pendingEntry=null;
+      if(v.pauseReason==="MISSING_EXECUTABLE_ENTRY_QUOTE"){
+        v.paused=false;v.pauseReason=null;
+      }
+    }
     // Once continuity is lost, don't manufacture P/L. Only a new observed
     // flat->open or reversal can establish a fresh position boundary.
     if(v.paused){
@@ -1496,7 +1598,9 @@ export class TraderWatch {
             closedAt:at,entryPrice:cp.entryPrice,exitPrice:px,
             grossUsd:cp.realizedGross,feesUsd:cp.realizedFees,
             netUsd:cp.realizedGross-cp.realizedFees,closeEvents:cp.closeEvents,
-            initialNotionalUsd:SHADOW_NOTIONAL_USD};
+            initialNotionalUsd:SHADOW_NOTIONAL_USD,
+            entryMode:cp.entryMode||"EXACT",entrySource:cp.source||"WS_BOOK",
+            originalFillAt:cp.originalFillAt||cp.openedAt};
           v.completed.push(result);
           if(v.completed.length>100)v.completed.splice(0,v.completed.length-100);
           this.mirrorEvent({id:"v21:completed:"+cp.id,kind:"V21_COMPLETED_POSITION",at,...result});
@@ -1509,10 +1613,12 @@ export class TraderWatch {
       const side=end>0?"LONG":"SHORT";
       const px=this.verifiedQuote(side,true);
       if(px===null){v.stats.unpriced++;v.paused=true;v.pauseReason="MISSING_EXECUTABLE_ENTRY_QUOTE";
-        this.mirrorEvent({id:"v21:unpricedopen:"+id,kind:"V21_UNPRICED_ENTRY",at});return;}
+        v.pendingEntry={id,fillAt:at,detectedAt:Date.now(),signedQty:end,side};
+        this.mirrorEvent({id:"v21:unpricedopen:"+id,kind:"V21_UNPRICED_ENTRY",at,
+          reason:"WAITING_FOR_FRESH_QUOTE",timeoutMs:PENDING_ENTRY_MAX_MS});return;}
       v.copy={id:"v21:"+id,side,openedAt:at,entryPrice:px,
         qty:SHADOW_NOTIONAL_USD/px,entryFeeRemaining:SHADOW_NOTIONAL_USD*SHADOW_TAKER_FEE_RATE,
-        targetQty:Math.abs(end),realizedGross:0,realizedFees:0,closeEvents:0};
+        targetQty:Math.abs(end),realizedGross:0,realizedFees:0,closeEvents:0,entryMode:"EXACT",source:"WS_BOOK"};
       v.stats.copyOpens++;
       this.mirrorEvent({id:"v21:copyopen:"+id,kind:"V21_COPY_OPEN",at,
         positionId:v.copy.id,side,price:px,notionalUsd:SHADOW_NOTIONAL_USD,source:"WS_BOOK"});
@@ -1576,6 +1682,10 @@ export class TraderWatch {
           needs_backfill:this.fillMirror.needsBackfill,last_audit_at:this.fillMirror.lastAuditAt||null,
           last_audit_missing:this.fillMirror.lastAuditMissing??null,
           last_fill_at:this.fillMirror.lastFillTime||null,
+          pending_entry:this.fillMirror.pendingEntry||null,
+          http_quote_success:this.fillMirror.quoteHttpSuccess||0,
+          http_quote_failures:this.quoteHttpFailures,
+          delayed_opens:this.fillMirror.delayedOpens||0,
           last_ws_message_at:this.state.last_message_at||null},
         coverage:"OBSERVED_AND_PRICED_ONLY",pending_writes:this.mirror.pending.length,
         warnings:["Historical V2/V2.1 snapshot COPY_CLOSE events are excluded.",
