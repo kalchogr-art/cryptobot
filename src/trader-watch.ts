@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V.2.2.4 FILL CHAIN + REVERSAL
+// BTC TRADER WATCH V3.0 STATE + FILL MIRROR
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.2.4 FILL CHAIN + REVERSAL";
+const VERSION = "BTC TRADER WATCH V3.0 STATE + FILL MIRROR";
 
 const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
@@ -105,6 +105,11 @@ export class TraderWatch {
       gaps:0,outOfOrder:0,dirMismatches:0,copyOpens:0,copyCloseEvents:0,
       completedPositions:0,unpriced:0,abandoned:0,apiRecovered:0},
     completed:[],lastEvent:null};
+  // V3 is independent of legacy V2 P/L and never places orders.
+  private v3:any = {schema:3,initialized:false,anchor:null,targetSigned:null,copySigned:0,
+    ratio:0,ignoredUntilBoundary:true,verified:false,lastFillAt:0,lastSnapshotAt:0,
+    drift:null,seen:[],actions:[],stats:{fills:0,actions:0,duplicates:0,chainGaps:0,
+      opens:0,adds:0,partials:0,closes:0,reversals:0,reconciliations:0},lastError:null};
   private mirrorPolling = false;
   private auditRateLimitStrikes = 0;
   private mirrorRateLimitStrikes = 0;
@@ -180,6 +185,8 @@ export class TraderWatch {
       this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
       this.v15 = (await ctx.storage.get("v15Reconstruction")) ?? this.v15;
       this.mirror = (await ctx.storage.get("positionMirrorV2")) ?? this.mirror;
+      const savedV3:any=await ctx.storage.get("traderWatchV3");
+      if(savedV3?.schema===3)this.v3=savedV3;
       // V2.1 accidentally did not persist the fill-copy reducer. Recover only
       // previously stored V2.2 state; never reconstruct an executable entry
       // from old D1 events or a snapshot.
@@ -238,6 +245,7 @@ export class TraderWatch {
       syncMismatchCandidate: this.syncMismatchCandidate,
       v15Reconstruction:this.v15,
       positionMirrorV2:this.mirror,
+      traderWatchV3:this.v3,
       [MIRROR_V21_KEY]:this.fillMirror
     });
   }
@@ -382,6 +390,7 @@ export class TraderWatch {
       const source = this.take(fill, "WS");
       if (source === "WS_LIVE") {
         this.mirrorFill(fill, "WS_LIVE");
+        this.v3Fill(fill);
         // Do not open a pending copy after a fill has already changed exposure.
         this.cancelPendingIfSuperseded(fill);
         this.verifiedFill(fill, "WS_LIVE");
@@ -1375,6 +1384,7 @@ export class TraderWatch {
       const previous=this.mirror.snapshot;
       this.mirror.previous=previous;
       this.mirror.snapshot=snap;
+      this.v3Snapshot(snap);
       this.mirror.initialized=true;
       this.mirror.lastSnapshotAt=snap.at;
       this.mirror.dirty=false;
@@ -1406,6 +1416,92 @@ export class TraderWatch {
       this.mirror.nextPollAt=Math.max(this.mirror.nextPollAt,this.mirror.nextBackoffAt);
     }finally{this.mirrorPolling=false;}
   }
+
+  // V3: position delta is authoritative per fill. Never infer individual fills
+  // from a clearinghouse snapshot; snapshot is only an exposure check.
+  private v3Snapshot(snap:any){
+    const v=this.v3;
+    v.lastSnapshotAt=snap.at;
+    if(!v.initialized){
+      v.initialized=true;
+      v.anchor=snap.signedQty;
+      v.targetSigned=snap.signedQty;
+      v.ignoredUntilBoundary=Math.abs(snap.signedQty)>POSITION_EPS;
+      v.verified=!v.ignoredUntilBoundary;
+      v.drift=null;
+      return;
+    }
+    const expected=Number(v.targetSigned);
+    const delta=snap.signedQty-expected;
+    const tolerance=Math.max(0.000001,Math.abs(snap.signedQty)*0.00001);
+    if(Math.abs(delta)>tolerance){
+      v.drift={at:snap.at,expected,observed:snap.signedQty,delta,
+        reason:"SNAPSHOT_FILL_MISMATCH",note:"A snapshot cannot reconstruct missing actions"};
+      v.verified=false;
+    }else if(!v.drift){v.verified=true;}
+  }
+
+  private v3Fill(fill:any){
+    const v=this.v3;
+    if(String(fill?.coin).toUpperCase()!=="BTC")return;
+    const id=String(fill.tid??"")+":"+String(fill.hash??"");
+    if(!fill.tid||v.seen.includes(id)){v.stats.duplicates++;return;}
+    const start=Number(fill.startPosition),size=Number(fill.sz),px=Number(fill.px);
+    if(!Number.isFinite(start)||!Number.isFinite(size)||size<=0||!Number.isFinite(px)||px<=0||!(["B","A"].includes(fill.side)))return;
+    const end=start+(fill.side==="B"?size:-size);
+    if(!Number.isFinite(end))return;
+    v.seen.push(id);if(v.seen.length>10000)v.seen.splice(0,v.seen.length-10000);
+    v.stats.fills++;
+    v.lastFillAt=Number(fill.time)||Date.now();
+    const sign=(x:number)=>x>POSITION_EPS?1:x< -POSITION_EPS?-1:0;
+    const a=sign(start),b=sign(end);
+    const action=a===0&&b!==0?"OPEN":a!==0&&b===0?"CLOSE":a!==b?"REVERSAL":Math.abs(end)>Math.abs(start)+POSITION_EPS?"ADD":"PARTIAL_CLOSE";
+    const continuous=v.targetSigned===null||Math.abs(Number(v.targetSigned)-start)<=0.000001;
+    if(!continuous){v.stats.chainGaps++;v.verified=false;v.drift={at:Date.now(),expected:v.targetSigned,observed:start,delta:start-Number(v.targetSigned),reason:"FILL_CHAIN_GAP",fillId:id};}
+    // A pre-existing position is never retroactively copied. Wait for a
+    // verifiable zero crossing or reversal; the latter opens the new side.
+    if(!v.initialized){v.initialized=true;v.anchor=start;v.targetSigned=start;v.ignoredUntilBoundary=sign(start)!==0;}
+    const priorCopy=v.copySigned;
+    if(v.ignoredUntilBoundary){
+      if(action==="REVERSAL"||b===0){
+        v.ignoredUntilBoundary=false;
+        v.ratio=b!==0?100/(px*Math.abs(end)):0;
+        v.copySigned=b!==0?end*v.ratio:0;
+      }
+    }else if(!continuous){
+      // Do not invent missed trades. Freeze COPY until a new clean boundary.
+      v.ignoredUntilBoundary=true;v.ratio=0;v.copySigned=0;
+    }else if(action==="OPEN"||action==="REVERSAL"){
+      v.ratio=b!==0?100/(px*Math.abs(end)):0;
+      v.copySigned=b!==0?end*v.ratio:0;
+    }else if(action==="CLOSE"){
+      v.copySigned=0;v.ratio=0;
+    }else{
+      v.copySigned=end*v.ratio;
+    }
+    v.targetSigned=end;
+    v.stats.actions++;
+    const key=action==="OPEN"?"opens":action==="ADD"?"adds":action==="PARTIAL_CLOSE"?"partials":action==="CLOSE"?"closes":"reversals";
+    v.stats[key]++;
+    v.actions.push({id,at:v.lastFillAt,receivedAt:Date.now(),action,side:b>0?"LONG":b<0?"SHORT":"FLAT",
+      start,end,fillQty:size,price:px,copyBefore:priorCopy,copyAfter:v.copySigned,
+      copied:!v.ignoredUntilBoundary&&continuous,continuous,source:"WS_LIVE"});
+    if(v.actions.length>300)v.actions.splice(0,v.actions.length-300);
+    if(continuous&&!v.drift)v.verified=true;
+    // A previously flagged mismatch is not automatically cleared by a later
+    // matching fill. It requires an explicit new clean boundary.
+    if(v.drift&&b===0&&continuous){v.drift=null;v.verified=true;v.ignoredUntilBoundary=false;v.ratio=0;v.copySigned=0;}
+  }
+
+  private v3Status(){const v=this.v3;return {ok:true,version:"BTC TRADER WATCH V3.0 STATE + FILL MIRROR",mode:"READ_ONLY_NO_ORDERS",
+    target:TARGET,active:this.state.active,connected:this.state.connected,
+    target_position_from_fills:v.targetSigned,copy_position_btc:v.copySigned,
+    copy_initial_notional_usd:100,ratio:v.ratio,
+    exchange_snapshot:this.mirror.snapshot,initialized:v.initialized,
+    ignored_preexisting_position:v.ignoredUntilBoundary,verified:v.verified&&!v.drift,
+    drift:v.drift,last_fill_at:v.lastFillAt,last_snapshot_at:v.lastSnapshotAt,
+    stats:v.stats,recent_actions:v.actions.slice(-80),trading_enabled:false,
+    note:"Fill actions are exact only when continuous; snapshots detect drift but cannot recover intermediate actions."};}
 
   private mirrorTransition(prev:any,cur:any){
     const old=prev.signedQty,now=cur.signedQty;
@@ -1917,6 +2013,8 @@ export class TraderWatch {
         }, 502);
       }
     }
+
+    if (path === "/v3") return json(this.v3Status());
 
     if (path === "/status") {
       return json(this.stats());
