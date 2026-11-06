@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.3 COPY EXECUTION AUDIT';
+const VERSION = 'BTC TRADER WATCH V4.4 PIPELINE LATENCY DIAGNOSTICS';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -56,6 +56,7 @@ type WatchState = {
   snapshotRequestAt?: number; snapshotResponseAt?: number;
   snapshotAlignedTarget?: number | null; snapshotSyncStatus?: string;
   snapshotConfirmedMismatch?: boolean;
+  pipelineSamples?: any[];
 };
 
 function fresh(): WatchState {
@@ -113,6 +114,7 @@ export class TraderWatch {
   private auditBusy = false;
   private databaseReady = false;
   private resetBusy = false;
+  private readonly pipelineCap = 1200;
 
   constructor(private ctx: any, private env: any) {
     ctx.blockConcurrencyWhile(async () => {
@@ -396,16 +398,46 @@ export class TraderWatch {
     await this.save();
   }
 
-  private async ingestMany(raw: RawFill[], source: Source): Promise<void> {
+  private async ingestMany(raw: RawFill[], source: Source, receivedAt?: number): Promise<void> {
     if (!this.s.baselineAt) return;
+    const processingStartedAt = Date.now();
+    const freshRows: { id: string; eventAt: number; d1DoneAt: number }[] = [];
     let changed = false;
     for (const x of raw) {
       const f = normalize(x, source);
       if (!f) continue;
-      if (await this.insertFill(f)) changed = true;
+      // WS callback timestamp is captured before awaiting the serialized processing queue.
+      // Existing V4.3 received_at semantics are preserved; the new metric is separate.
+      if (await this.insertFill(f)) {
+        changed = true;
+        freshRows.push({ id: f.id, eventAt: f.at, d1DoneAt: Date.now() });
+      }
     }
+    const replayStartedAt = Date.now();
     if (changed) await this.replay();
     else await this.save();
+    const copyReadyAt = Date.now();
+    if (freshRows.length) {
+      const samples = this.s.pipelineSamples || [];
+      const receiveTime = receivedAt ?? processingStartedAt;
+      for (const f of freshRows) samples.push({
+        id: f.id, source, event_at: f.eventAt,
+        ws_callback_at: source === 'WS_LIVE' ? receiveTime : null,
+        processing_started_at: processingStartedAt,
+        d1_write_done_at: f.d1DoneAt,
+        replay_started_at: replayStartedAt,
+        copy_ready_at: copyReadyAt,
+        exchange_to_callback_ms: source === 'WS_LIVE' ? receiveTime - f.eventAt : null,
+        callback_queue_ms: source === 'WS_LIVE' ? processingStartedAt - receiveTime : null,
+        processing_to_d1_ms: f.d1DoneAt - processingStartedAt,
+        d1_to_copy_ready_ms: copyReadyAt - f.d1DoneAt,
+        replay_batch_ms: copyReadyAt - replayStartedAt,
+        exchange_to_copy_ready_ms: copyReadyAt - f.eventAt,
+        batch_new_fills: freshRows.length,
+      });
+      this.s.pipelineSamples = samples.slice(-this.pipelineCap);
+      await this.save();
+    }
   }
 
   private async audit(force = false): Promise<void> {
@@ -458,6 +490,7 @@ export class TraderWatch {
       this.audit(true).catch(e => { this.s.lastError = String(e); });
     });
     ws.addEventListener('message', (ev: any) => {
+      const callbackAt = Date.now();
       this.processing = this.processing.then(async () => {
         const msg = JSON.parse(String(ev.data));
         if (msg.channel !== 'userFills') return;
@@ -465,7 +498,7 @@ export class TraderWatch {
         const arr = Array.isArray(payload?.fills) ? payload.fills :
           Array.isArray(payload) ? payload : [];
         // Subscription historical events are ignored only if predating baseline.
-        await this.ingestMany(arr, 'WS_LIVE');
+        await this.ingestMany(arr, 'WS_LIVE', callbackAt);
         if (this.s.replayGap) await this.audit(true);
       }).catch(e => {
         this.s.lastError = 'WS_PROCESS: ' + String(e);
@@ -496,6 +529,38 @@ export class TraderWatch {
       await this.save();
       if (this.s.active) await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
+  }
+
+  // V4.4: Bounded observational samples; no order submission or strategy changes.
+  private pipelineAudit(): any {
+    const samples: any[] = this.s.pipelineSamples || [];
+    const summarize = (rows: any[], key: string) => {
+      const a = rows.map(r => r[key]).filter((v: any) => typeof v === 'number' && Number.isFinite(v)).sort((x: number,y: number) => x-y);
+      const pct = (p: number) => a.length ? a[Math.min(a.length-1, Math.ceil(p*a.length)-1)] : null;
+      return {count:a.length, p50_ms:pct(.5), p90_ms:pct(.9), p95_ms:pct(.95), max_ms:a.length?a[a.length-1]:null};
+    };
+    const metrics = (rows: any[]) => ({
+      exchange_to_ws_callback: summarize(rows, 'exchange_to_callback_ms'),
+      ws_callback_queue: summarize(rows, 'callback_queue_ms'),
+      processing_to_d1: summarize(rows, 'processing_to_d1_ms'),
+      d1_to_copy_ready: summarize(rows, 'd1_to_copy_ready_ms'),
+      replay_batch: summarize(rows, 'replay_batch_ms'),
+      exchange_to_copy_ready: summarize(rows, 'exchange_to_copy_ready_ms'),
+    });
+    return {ok:true, version:VERSION, mode:'READ_ONLY_OBSERVABILITY',
+      epoch:this.s.epoch, samples:samples.length,
+      ws_live:metrics(samples.filter(x=>x.source==='WS_LIVE')),
+      api_backfill:metrics(samples.filter(x=>x.source==='API_BACKFILL')),
+      overall:metrics(samples),
+      slowest:samples.slice().sort((a,b)=>b.exchange_to_copy_ready_ms-a.exchange_to_copy_ready_ms).slice(0,12),
+      caveats:[
+        'WS callback is measured when this Durable Object receives a message event, not at the Hyperliquid server.',
+        'D1 timing includes serial inserts and per-batch overhead; individual fill timing is not isolated.',
+        'COPY ready means full ledger replay and projection persistence finished, not a real trade.',
+        'Batch completion times are shared by all new fills in that batch.',
+        'API backfill has no WS callback metric and is historical, not executable in real time.',
+        'Metrics only cover new fills after V4.4 deployment. Existing D1 history is preserved.',
+      ]};
   }
 
   // V4.3: Observability only. The "latency" below measures detection/ingestion,
@@ -689,6 +754,7 @@ export class TraderWatch {
       return response(this.status());
     }
     if (['/status', '/v4', '/mirror'].includes(path)) return response(this.status());
+    if (path === '/pipeline-audit' && request.method === 'GET') return response(this.pipelineAudit());
     if (path === '/execution-audit' && request.method === 'GET') {
       try { return response(await this.executionAudit(Number(url.searchParams.get('limit') || 5000))); }
       catch (e) { return response({ok:false,error:String(e)},503); }
