@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V2.2.2 QUOTE RECOVERY
+// BTC TRADER WATCH V2.2.3 FILL AUDIT + RESUME
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,7 +8,7 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.2.2 QUOTE RECOVERY";
+const VERSION = "BTC TRADER WATCH V2.2.3 FILL AUDIT + RESUME";
 
 const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
@@ -1155,6 +1155,18 @@ export class TraderWatch {
         this.fillMirror.pauseReason=null;
         this.fillMirror.needsBackfill=false;
       }
+    } else if(this.fillMirror.pauseReason==="FILL_CONTINUITY_GAP" ||
+              this.fillMirror.pauseReason==="API_CONFIRMED_MISSING_FILLS_WAIT_FOR_FRESH_BOUNDARY"){
+      // Zero newly missing fills in the audited window does not reconstruct
+      // a censored old trade. It only permits a NEW, explicitly late copy
+      // entry after the next continuous WS fill with a fresh executable book.
+      if(this.state.connected && this.book.at && now-this.book.at<=BOOK_MAX_AGE_MS){
+        this.fillMirror.needsBackfill=false;
+        this.fillMirror.paused=false;
+        this.fillMirror.pauseReason=null;
+        this.fillMirror.resumeNextFill=true;
+        this.fillMirror.lastCleanAuditAt=now;
+      }
     } else if(!this.fillMirror.paused){
       this.fillMirror.needsBackfill=false;
     }
@@ -1303,6 +1315,7 @@ export class TraderWatch {
         copy_position:this.fillMirror.copy,
         mirror_stats:this.mirror.stats,
         verified_fill_copy:this.fillMirror,
+        trader_fill_pnl_audit:this.fillMirror.traderAudit||null,
         quote_recovery:{http_success:this.fillMirror.quoteHttpSuccess||0,http_failures:this.quoteHttpFailures,
           pending_entry:this.fillMirror.pendingEntry||null,book_age_ms:this.book.at?Date.now()-this.book.at:null},
         mirror_last_snapshot_at:this.mirror.lastSnapshotAt,
@@ -1539,6 +1552,7 @@ export class TraderWatch {
       kind:"V21_DIR_MISMATCH",at,dir,start,end,source});}
     const continuityGap=v.lastSigned!==null&&Math.abs(v.lastSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001);
     if(continuityGap){
+      v.resumeNextFill=false;
       v.stats.gaps++;v.paused=true;v.pauseReason="FILL_CONTINUITY_GAP";v.needsBackfill=true;
       if(v.copy){v.stats.abandoned++;v.copy=null;}
       this.mirrorEvent({id:"v21:gap:"+id,kind:"V21_GAP",at,
@@ -1548,6 +1562,19 @@ export class TraderWatch {
     v.lastSigned=end;v.lastFillTime=at;v.lastFillId=id;
     const kind=isReverse?"REVERSAL":isOpen?"OPEN":isClose?"CLOSE":isAdd?"ADD":"PARTIAL_CLOSE";
     v.stats.verified++;
+    // Hyperliquid supplies realized P/L and fee on EACH execution.
+    // This is a trader audit, not copy P/L; no extra REST requests.
+    const traderClosedPnl=Number(fill.closedPnl),traderFee=Number(fill.fee);
+    if(Number.isFinite(traderClosedPnl) && Number.isFinite(traderFee)){
+      v.traderAudit??={fills:0,closingFills:0,realizedGrossUsd:0,feesUsd:0,netAfterFeesUsd:0,
+        profitableClosingFills:0,losingClosingFills:0};
+      const a=v.traderAudit;
+      a.fills++;a.realizedGrossUsd+=traderClosedPnl;a.feesUsd+=traderFee;
+      a.netAfterFeesUsd+=traderClosedPnl-traderFee;
+      if(isClose||isReverse||isPartial){a.closingFills++;
+        if(traderClosedPnl>0)a.profitableClosingFills++;
+        if(traderClosedPnl<0)a.losingClosingFills++;}
+    }
     if(isReverse)v.stats.reversals++;
     else if(isOpen)v.stats.opens++;
     else if(isClose)v.stats.fullCloses++;
@@ -1585,6 +1612,8 @@ export class TraderWatch {
         const exitFee=closeQty*px*SHADOW_TAKER_FEE_RATE;
         const gross=(px-cp.entryPrice)*closeQty*(cp.side==="LONG"?1:-1);
         cp.realizedGross+=gross;cp.realizedFees+=entryFee+exitFee;
+        if(Number.isFinite(traderClosedPnl))cp.traderRealizedGross=(cp.traderRealizedGross||0)+traderClosedPnl;
+        if(Number.isFinite(traderFee))cp.traderObservedFees=(cp.traderObservedFees||0)+traderFee;
         cp.qty-=closeQty;cp.entryFeeRemaining-=entryFee;
         cp.closeEvents++;
         v.stats.copyCloseEvents++;
@@ -1600,7 +1629,10 @@ export class TraderWatch {
             netUsd:cp.realizedGross-cp.realizedFees,closeEvents:cp.closeEvents,
             initialNotionalUsd:SHADOW_NOTIONAL_USD,
             entryMode:cp.entryMode||"EXACT",entrySource:cp.source||"WS_BOOK",
-            originalFillAt:cp.originalFillAt||cp.openedAt};
+            originalFillAt:cp.originalFillAt||cp.openedAt,
+            traderObservedCloseGrossUsd:cp.traderRealizedGross??null,
+            traderObservedCloseFeesUsd:cp.traderObservedFees??null,
+            traderComparisonNote:"TRADER_FILL_VALUES_ARE_ACTUAL_SIZE; COPY_IS_100_USD_NOTIONAL"};
           v.completed.push(result);
           if(v.completed.length>100)v.completed.splice(0,v.completed.length-100);
           this.mirrorEvent({id:"v21:completed:"+cp.id,kind:"V21_COMPLETED_POSITION",at,...result});
@@ -1610,6 +1642,7 @@ export class TraderWatch {
     }
     // A fresh verified opening boundary creates exactly one $100 copy position.
     if((isOpen||isReverse)&&!v.paused&&!v.copy){
+      v.resumeNextFill=false; // a normal boundary supersedes pending recovered entry
       const side=end>0?"LONG":"SHORT";
       const px=this.verifiedQuote(side,true);
       if(px===null){v.stats.unpriced++;v.paused=true;v.pauseReason="MISSING_EXECUTABLE_ENTRY_QUOTE";
@@ -1624,6 +1657,24 @@ export class TraderWatch {
         positionId:v.copy.id,side,price:px,notionalUsd:SHADOW_NOTIONAL_USD,source:"WS_BOOK"});
     } else if(v.copy&&isAdd){v.copy.targetQty=Math.abs(end);}
     else if(v.copy&&isPartial){v.copy.targetQty=Math.abs(end);}
+    // Late re-entry: do not rewrite past P/L. A verified continuous WS fill
+    // plus a fresh book permits a NEW simulated position at today's price.
+    if(v.resumeNextFill && !continuityGap && !v.paused && !v.copy &&
+       !v.pendingEntry && end!==0 && source==="WS_LIVE"){
+      const side=end>0?"LONG":"SHORT";
+      const px=this.verifiedQuote(side,true);
+      if(px!==null){
+        v.copy={id:"v223:recovered:"+id,side,openedAt:Date.now(),entryPrice:px,
+          qty:SHADOW_NOTIONAL_USD/px,entryFeeRemaining:SHADOW_NOTIONAL_USD*SHADOW_TAKER_FEE_RATE,
+          targetQty:Math.abs(end),realizedGross:0,realizedFees:0,closeEvents:0,
+          entryMode:"RECOVERED",source:"WS_BOOK",originalFillAt:at};
+        v.stats.copyOpens++;v.recoveredOpens=(v.recoveredOpens||0)+1;
+        v.resumeNextFill=false;
+        this.mirrorEvent({id:"v223:recoveredopen:"+id,kind:"V223_RECOVERED_COPY_OPEN",at:Date.now(),
+          positionId:v.copy.id,side,price:px,notionalUsd:SHADOW_NOTIONAL_USD,
+          reason:"POST_AUDIT_FRESH_QUOTE_NOT_ORIGINAL_ENTRY"});
+      }
+    }
   }
 
   private verifiedQuote(side:"LONG"|"SHORT",opening:boolean):number|null{
@@ -1686,11 +1737,14 @@ export class TraderWatch {
           http_quote_success:this.fillMirror.quoteHttpSuccess||0,
           http_quote_failures:this.quoteHttpFailures,
           delayed_opens:this.fillMirror.delayedOpens||0,
+          recovered_opens:this.fillMirror.recoveredOpens||0,
+          trader_fill_pnl_audit:this.fillMirror.traderAudit||null,
           last_ws_message_at:this.state.last_message_at||null},
         coverage:"OBSERVED_AND_PRICED_ONLY",pending_writes:this.mirror.pending.length,
         warnings:["Historical V2/V2.1 snapshot COPY_CLOSE events are excluded.",
           "This is not account equity ROI or actual executable performance.",
           "Incomplete, missed, delayed and unpriced trades are excluded, causing selection bias.",
+          "Trader realized P/L is exchange fill closedPnl and fee, NOT the same notional as the $100 copy.",
           "V2.1 did not persist reducer state; a V2.2 restart waits for a fresh verified boundary.",
           "Funding, order-book depth, slippage beyond top-of-book and network order latency are excluded."]});
     }catch(e){return json({ok:false,error:"V22_PERFORMANCE_QUERY_FAILED",detail:String(e)},503);}
