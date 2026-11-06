@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.2 SNAPSHOT ALIGNMENT';
+const VERSION = 'BTC TRADER WATCH V4.3 COPY EXECUTION AUDIT';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -498,6 +498,87 @@ export class TraderWatch {
     }
   }
 
+  // V4.3: Observability only. The "latency" below measures detection/ingestion,
+  // NOT real exchange order execution or a live fill of the virtual copy.
+  private async executionAudit(limit = 5000): Promise<any> {
+    await this.ensureDb();
+    const rows: Row[] = [];
+    let offset = 0;
+    const cap = Math.max(100, Math.min(20000, limit));
+    while (offset < cap) {
+      const page: any = await this.env.DB.prepare(`SELECT payload_json FROM trader_watch_v4_actions
+        WHERE wallet=? AND epoch=? ORDER BY event_at DESC,fill_id DESC LIMIT 500 OFFSET ?`)
+        .bind(TARGET, this.s.epoch, offset).all();
+      const batch: any[] = page.results || [];
+      for (const x of batch) {
+        try { rows.push(JSON.parse(x.payload_json)); } catch {}
+      }
+      offset += batch.length;
+      if (batch.length < 500) break;
+    }
+    const latency = (a: Row[]) => a.map(r => r.receivedAt - r.at)
+      .filter(x => Number.isFinite(x) && x >= 0).sort((a,b) => a-b);
+    const percentile = (arr: number[], p: number) => arr.length
+      ? arr[Math.min(arr.length-1, Math.ceil(arr.length*p)-1)] : null;
+    const describe = (a: Row[]) => {
+      const ms = latency(a);
+      return { count: a.length, measured: ms.length,
+        p50_ms: percentile(ms,0.5), p90_ms: percentile(ms,0.9),
+        p95_ms: percentile(ms,0.95), p99_ms: percentile(ms,0.99),
+        max_ms: ms.length ? ms[ms.length-1] : null,
+        over_5s: ms.filter(x=>x>5000).length,
+        over_10s: ms.filter(x=>x>10000).length,
+        over_20s: ms.filter(x=>x>20000).length,
+        over_30s: ms.filter(x=>x>30000).length };
+    };
+    const copied = rows.filter(r => r.copied);
+    const skipped = rows.filter(r => !r.copied);
+    const eps = 1e-7;
+    const mismatches = copied.filter(r => {
+      if (!Number.isFinite(r.copyAfter) || !Number.isFinite(r.copyBefore)) return true;
+      if (r.action === 'CLOSE') return Math.abs(r.copyAfter) > eps;
+      if (r.action === 'OPEN' || r.action === 'REVERSAL')
+        return Math.abs(Math.abs(r.copyAfter)*r.price-START_NOTIONAL_USD) > 0.1;
+      // For ADD/PARTIAL_CLOSE the ratio is inherited from the active position.
+      // Compare consecutive before/after against the signed source fill delta.
+      const delta = r.end-r.start;
+      const copyDelta = r.copyAfter-r.copyBefore;
+      return Math.abs(delta) < eps || Math.sign(delta) !== Math.sign(copyDelta);
+    });
+    const live = rows.filter(r => r.source === 'WS_LIVE');
+    const backfill = rows.filter(r => r.source === 'API_BACKFILL');
+    const mostDelayed = rows.slice().sort((a,b) =>
+      (b.receivedAt-b.at)-(a.receivedAt-a.at)).slice(0,15)
+      .map(r => ({ id:r.id, at:r.at, receivedAt:r.receivedAt,
+        delay_ms:r.receivedAt-r.at, source:r.source, action:r.action, copied:r.copied }));
+    return { ok:true, version:VERSION, mode:'READ_ONLY_VIRTUAL_COPY_AUDIT',
+      epoch:this.s.epoch, evaluated_actions:rows.length,
+      total_ledger_actions:this.s.ledgerCount,
+      sample_truncated:rows.length < this.s.ledgerCount,
+      time_basis:'receivedAt - exchange fill time (NOT actual trade execution)',
+      overall:describe(rows), ws_live:describe(live), api_backfill:describe(backfill),
+      copied_actions:copied.length, skipped_actions:skipped.length,
+      copy_math_flags:mismatches.length,
+      flagged_examples:mismatches.slice(0,10).map(r=>({id:r.id,action:r.action,
+        start:r.start,end:r.end,copyBefore:r.copyBefore,copyAfter:r.copyAfter})),
+      action_counts: {
+        OPEN:copied.filter(r=>r.action==='OPEN').length,
+        ADD:copied.filter(r=>r.action==='ADD').length,
+        PARTIAL_CLOSE:copied.filter(r=>r.action==='PARTIAL_CLOSE').length,
+        CLOSE:copied.filter(r=>r.action==='CLOSE').length,
+        REVERSAL:copied.filter(r=>r.action==='REVERSAL').length,
+      },
+      most_delayed:mostDelayed,
+      position_check:{ target_from_fills:this.s.targetSigned,
+        exchange_snapshot:this.s.snapshotSigned, copy_position:this.s.copySigned,
+        replay_gap:this.s.replayGap, snapshot_sync_status:this.s.snapshotSyncStatus,
+        snapshot_confirmed_mismatch:this.s.snapshotConfirmedMismatch },
+      limitations:['Delayed API backfills are historical simulations, not timely executable copies.',
+        'Snapshot and latest fill may refer to different moments.',
+        'Audit flags check arithmetic direction and fresh $100 notional, not market execution.',
+        'No real orders, fills, slippage or execution fees are measured.'] };
+  }
+
   private status() {
     return {
       ok: true, version: VERSION, target: TARGET, trading_enabled: false,
@@ -608,6 +689,10 @@ export class TraderWatch {
       return response(this.status());
     }
     if (['/status', '/v4', '/mirror'].includes(path)) return response(this.status());
+    if (path === '/execution-audit' && request.method === 'GET') {
+      try { return response(await this.executionAudit(Number(url.searchParams.get('limit') || 5000))); }
+      catch (e) { return response({ok:false,error:String(e)},503); }
+    }
     if (path === '/actions') {
       try {
         await this.ensureDb();
