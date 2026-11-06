@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.5.1 BATCH RECOVERY + CLEAN METRICS';
+const VERSION = 'BTC TRADER WATCH V4.5.2 SNAPSHOT VERIFICATION';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -57,6 +57,12 @@ type WatchState = {
   snapshotAlignedTarget?: number | null; snapshotSyncStatus?: string;
   snapshotConfirmedMismatch?: boolean;
   pipelineSamples?: any[];
+  pendingSnapshots?: {requestAt:number;responseAt:number;signed:number}[];
+  lastVerifiedSnapshot?: {requestAt:number;responseAt:number;verifiedAt:number;
+    exchangeSigned:number;ledgerSigned:number;delta:number;status:string} | null;
+  lastSnapshotCheck?: {requestAt:number;responseAt:number;checkedAt:number;
+    exchangeSigned:number;ledgerSigned:number|null;delta:number|null;status:string} | null;
+  snapshotChecks?: {matched:number;mismatched:number;raced:number;pendingExpired:number};
 };
 
 function fresh(): WatchState {
@@ -74,6 +80,8 @@ function fresh(): WatchState {
     snapshotRequestAt: 0, snapshotResponseAt: 0,
     snapshotAlignedTarget: null, snapshotSyncStatus: 'NOT_CHECKED',
     snapshotConfirmedMismatch: false,
+    pendingSnapshots: [], lastVerifiedSnapshot: null, lastSnapshotCheck: null,
+    snapshotChecks: {matched:0,mismatched:0,raced:0,pendingExpired:0},
   };
 }
 const same = (a: number, b: number) => Math.abs(a - b) <= EPS;
@@ -131,7 +139,7 @@ export class TraderWatch {
       this.s.lastError = 'INGEST_QUEUE: ' + String(e);
       this.s.needsAudit = true;
     }).finally(() => { this.queuedJobs--; });
-    return this.processing;
+    return next;
   }
 
   // Validate persisted projection once after a DO restart; do not rebuild history.
@@ -264,56 +272,66 @@ export class TraderWatch {
     return r.json();
   }
 
-  // A clearinghouse snapshot has no exchange sequence number. Never compare it
-  // directly to a later WS position: only a completed API audit can establish
-  // the fill position at the snapshot request boundary.
+  // Retain snapshots across newer polls. A 30-second poll must not overwrite
+  // the snapshot waiting for the 60-second API audit.
+  // Only a completed API audit through responseAt can verify a snapshot.
   private async evaluateSnapshotAlignment(): Promise<void> {
-    if (this.s.baselineSigned === null || !this.s.snapshotRequestAt) return;
-    this.s.snapshotAlignedTarget = null;
-    this.s.snapshotMismatch = null;
-    this.s.snapshotConfirmedMismatch = false;
+    const pending = this.s.pendingSnapshots || [];
+    if (!pending.length || this.s.baselineSigned === null) return;
     if (this.s.replayGap) {
       this.s.snapshotSyncStatus = 'FILL_CHAIN_GAP';
       this.s.needsAudit = true;
       return;
     }
-    // A complete audit through the snapshot response is needed: otherwise a
-    // missing WS fill might create a false match or false mismatch.
-    if (this.s.auditCursor < Number(this.s.snapshotResponseAt || 0)) {
+    const ready = pending.filter(x => x.responseAt <= this.s.auditCursor);
+    if (!ready.length) {
       this.s.snapshotSyncStatus = 'AWAITING_API_AUDIT';
       return;
     }
     const fills = await this.ledger();
-    const { ordered, gap } = this.chain(fills);
+    const {ordered,gap} = this.chain(fills);
     if (gap) {
       this.s.snapshotSyncStatus = 'FILL_CHAIN_GAP';
       this.s.needsAudit = true;
       return;
     }
-    const requestAt = Number(this.s.snapshotRequestAt);
-    const responseAt = Number(this.s.snapshotResponseAt);
-    // Any fill during the HTTP request makes the exchange's internal snapshot
-    // point unknowable. Wait for a quieter snapshot rather than guess.
-    if (ordered.some(f => f.at >= requestAt && f.at <= responseAt)) {
-      this.s.snapshotSyncStatus = 'SNAPSHOT_RACE_WITH_FILLS';
-      return;
+    const counters = this.s.snapshotChecks || {matched:0,mismatched:0,raced:0,pendingExpired:0};
+    for (const shot of ready) {
+      let status = 'MATCHED_AT_SNAPSHOT_TIME';
+      let aligned: number | null = Number(this.s.baselineSigned);
+      let delta: number | null = null;
+      // The exchange has no sequence number for the clearinghouse snapshot.
+      // Reject snapshots whose request overlaps any fill, rather than guessing.
+      if (ordered.some(f => f.at >= shot.requestAt && f.at <= shot.responseAt)) {
+        status = 'SNAPSHOT_RACE_WITH_FILLS';
+        aligned = null;
+        counters.raced++;
+      } else {
+        for (const f of ordered) {
+          if (f.at > shot.requestAt) break;
+          aligned = f.end;
+        }
+        delta = shot.signed - Number(aligned);
+        if (same(delta,0)) counters.matched++;
+        else {status='CONFIRMED_MISMATCH_AFTER_AUDIT';counters.mismatched++;this.s.needsAudit=true;}
+      }
+      const check = {requestAt:shot.requestAt,responseAt:shot.responseAt,
+        checkedAt:Date.now(),exchangeSigned:shot.signed,ledgerSigned:aligned,delta,status};
+      this.s.lastSnapshotCheck = check;
+      if (status === 'MATCHED_AT_SNAPSHOT_TIME') this.s.lastVerifiedSnapshot = {
+        requestAt:shot.requestAt,responseAt:shot.responseAt,verifiedAt:check.checkedAt,
+        exchangeSigned:shot.signed,ledgerSigned:Number(aligned),delta:0,status};
+      // Current snapshot fields describe only the latest snapshot, not an old one.
+      if (shot.responseAt === this.s.snapshotResponseAt) {
+        this.s.snapshotSyncStatus = status;
+        this.s.snapshotAlignedTarget = aligned;
+        this.s.snapshotMismatch = status === 'CONFIRMED_MISMATCH_AFTER_AUDIT' ? delta : null;
+        this.s.snapshotConfirmedMismatch = status === 'CONFIRMED_MISMATCH_AFTER_AUDIT';
+      }
     }
-    let aligned = Number(this.s.baselineSigned);
-    for (const f of ordered) {
-      if (f.at > requestAt) break;
-      aligned = f.end;
-    }
-    this.s.snapshotAlignedTarget = aligned;
-    const delta = Number(this.s.snapshotSigned) - aligned;
-    if (same(delta, 0)) {
-      this.s.snapshotSyncStatus = 'MATCHED_AT_SNAPSHOT_TIME';
-      this.s.snapshotMismatch = null;
-    } else {
-      this.s.snapshotSyncStatus = 'CONFIRMED_MISMATCH_AFTER_AUDIT';
-      this.s.snapshotMismatch = delta;
-      this.s.snapshotConfirmedMismatch = true;
-      this.s.needsAudit = true;
-    }
+    this.s.snapshotChecks = counters;
+    this.s.pendingSnapshots = pending.filter(x => x.responseAt > this.s.auditCursor);
+    if (this.s.pendingSnapshots.length) this.s.snapshotSyncStatus = 'AWAITING_API_AUDIT';
   }
 
   private async snapshot(force = false): Promise<void> {
@@ -344,7 +362,19 @@ export class TraderWatch {
         this.s.snapshotAlignedTarget = null;
         this.s.snapshotMismatch = null;
         this.s.snapshotConfirmedMismatch = false;
-        await this.evaluateSnapshotAlignment();
+        const pending = this.s.pendingSnapshots || [];
+        pending.push({requestAt:started,responseAt:completed,signed});
+        // Bound persisted state without discarding the most recent samples.
+        if (pending.length > 24) {
+          const dropped = pending.length - 24;
+          pending.splice(0,dropped);
+          const c = this.s.snapshotChecks || {matched:0,mismatched:0,raced:0,pendingExpired:0};
+          c.pendingExpired += dropped;
+          this.s.snapshotChecks = c;
+        }
+        this.s.pendingSnapshots = pending;
+        // Do not run a full-ledger comparison on every 30-second snapshot.
+        // The completed API audit will verify all snapshots it covers.
       }
     } catch (e) {
       this.s.lastError = 'SNAPSHOT: ' + String(e);
@@ -600,7 +630,7 @@ export class TraderWatch {
       if (cursor < end) this.s.needsAudit = true;
       else if (!this.s.replayGap) this.s.needsAudit = false;
       await this.evaluateSnapshotAlignment();
-      this.s.lastError = null;
+      if (!this.s.snapshotConfirmedMismatch && !this.s.replayGap) this.s.lastError = null;
     } catch (e) {
       this.s.needsAudit = true;
       this.s.lastError = 'AUDIT: ' + String(e);
@@ -634,7 +664,7 @@ export class TraderWatch {
         // Subscription historical events are ignored only if predating baseline.
         await this.ingestMany(arr, 'WS_LIVE', callbackAt);
         if (this.s.replayGap) { this.s.needsAudit = true; this.s.nextApiAt = 0; }
-      });
+      }).catch(() => {});
     });
     const down = () => {
       if (this.ws !== ws) return;
@@ -783,6 +813,8 @@ export class TraderWatch {
       position_check:{ target_from_fills:this.s.targetSigned,
         exchange_snapshot:this.s.snapshotSigned, copy_position:this.s.copySigned,
         replay_gap:this.s.replayGap, snapshot_sync_status:this.s.snapshotSyncStatus,
+        last_verified_snapshot:this.s.lastVerifiedSnapshot || null,
+        last_snapshot_check:this.s.lastSnapshotCheck || null,
         snapshot_confirmed_mismatch:this.s.snapshotConfirmedMismatch },
       limitations:['Delayed API backfills are historical simulations, not timely executable copies.',
         'Snapshot and latest fill may refer to different moments.',
@@ -807,6 +839,10 @@ export class TraderWatch {
       snapshot_request_at: this.s.snapshotRequestAt || null,
       snapshot_response_at: this.s.snapshotResponseAt || null,
       snapshot_confirmed_mismatch: !!this.s.snapshotConfirmedMismatch,
+      pending_snapshot_count: (this.s.pendingSnapshots || []).length,
+      last_verified_snapshot: this.s.lastVerifiedSnapshot || null,
+      last_snapshot_check: this.s.lastSnapshotCheck || null,
+      snapshot_check_counts: this.s.snapshotChecks || {matched:0,mismatched:0,raced:0,pendingExpired:0},
       last_fill_at: this.s.lastFillAt, last_audit_at: this.s.lastAuditAt,
       last_snapshot_at: this.s.lastSnapshotAt,
       stats: this.s.stats, recent_actions: this.s.recent,
@@ -904,6 +940,16 @@ export class TraderWatch {
       return response(this.status());
     }
     if (['/status', '/v4', '/mirror'].includes(path)) return response(this.status());
+    if (path === '/snapshot-audit' && request.method === 'GET') return response({
+      ok:true,version:VERSION,mode:'READ_ONLY_SNAPSHOT_VERIFICATION',
+      latest_snapshot:{signed:this.s.snapshotSigned,request_at:this.s.snapshotRequestAt,
+        response_at:this.s.snapshotResponseAt,status:this.s.snapshotSyncStatus},
+      last_verified_snapshot:this.s.lastVerifiedSnapshot || null,
+      last_snapshot_check:this.s.lastSnapshotCheck || null,
+      pending_snapshot_count:(this.s.pendingSnapshots || []).length,
+      checks:this.s.snapshotChecks || null,
+      audit_cursor:this.s.auditCursor,needs_audit:this.s.needsAudit,
+      replay_gap:this.s.replayGap,trading_enabled:false});
     if (path === '/pipeline-audit' && request.method === 'GET') return response(this.pipelineAudit());
     if (path === '/execution-audit' && request.method === 'GET') {
       try { return response(await this.executionAudit(Number(url.searchParams.get('limit') || 5000))); }
