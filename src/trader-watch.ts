@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V4.2 .— C.LEAN FILL LEDGER + DETERMINISTIC REPLAY
+// BTC TRADER WATCH V4.2 .— CLEAN FILL LEDGER + DETERMINISTIC REPLAY
 // Cloudflare Durable Object: export class TraderWatch
 // READ ONLY: this file never submits an exchange order.
 // Only BTC fills from the configured public wallet are tracked.
@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.7.5 LIMIT MIRROR RECONCILED';
+const VERSION = 'BTC TRADER WATCH V4.7.6 AUTHORITATIVE OPEN ORDERS';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -425,14 +425,50 @@ export class TraderWatch {
       if(this.observedOrders.size<=1000)break;if(!val.active)this.observedOrders.delete(key);}}
     await this.persistMaker();
   }
+  // V4.7.6: a successful, complete REST snapshot is the authority for which
+  // OIDs are currently resting. Two consecutive misses protect against races.
+  // Historical order rows, fills, session, and P/L remain untouched.
   private async seedMakerOrders():Promise<void> {
+    const requestStartedAt=Date.now();
     const rows=await this.info({type:'frontendOpenOrders',user:TARGET});
     if(!Array.isArray(rows))throw Error('MAKER_OPEN_ORDERS_SNAPSHOT_INVALID');
-    const now=Date.now();let count=0;
-    for(const o of rows){if(o.coin!=='BTC'||o.oid===undefined)continue;
-      count++;await this.recordOrder(o,'open','REST_OPEN_ORDERS',now);}
-    this.orderStats.resting=count;
-    // Missing from snapshot does not prove cancellation; await orderUpdates.
+    // Do not reconcile from an invalid/partial-looking payload.
+    if(rows.some((o:any)=>!o||typeof o!=='object'||o.oid===undefined||
+      typeof o.coin!=='string'))throw Error('MAKER_OPEN_ORDERS_SNAPSHOT_MALFORMED');
+    await this.ensureMaker();
+    const now=Date.now(),present=new Set<string>();
+    for(const o of rows){if(o.coin!=='BTC')continue;
+      present.add(String(o.oid));
+      await this.recordOrder(o,'open','REST_OPEN_ORDERS',now);
+      const row=this.observedOrders.get(String(o.oid));
+      if(row){row.snapshotMissingCount=0;row.snapshotMissingSince=0;}
+    }
+    this.orderStats.resting=present.size;
+    const v=this.maker;
+    v.target_active_orders=present.size;
+    v.last_open_orders_snapshot_at=now;
+    v.open_orders_snapshot_successes=(v.open_orders_snapshot_successes||0)+1;
+    let confirmed=0,pending=0;
+    for(const [oid,o] of this.observedOrders){
+      if(!o.active||present.has(oid))continue;
+      // A newer WS event can legitimately outrun an in-flight REST snapshot.
+      if(o.lastSeen>requestStartedAt)continue;
+      o.snapshotMissingCount=(o.snapshotMissingCount||0)+1;
+      o.snapshotMissingSince=o.snapshotMissingSince||now;
+      if(o.snapshotMissingCount<2){pending++;continue;}
+      o.active=false;o.status='not_in_target_open_orders';o.lastSeen=now;
+      o.source='REST_OPEN_ORDERS_RECONCILIATION';
+      v.snapshot_closed_orders=(v.snapshot_closed_orders||0)+1;
+      confirmed++;
+      const event={oid,at:now,status:o.status,source:o.source,
+        side:o.side,price:o.price,remaining:o.remaining,active:false};
+      v.order_events.unshift(event);v.order_events=v.order_events.slice(0,80);
+      this.orderLifecycle.unshift(event);this.orderLifecycle=this.orderLifecycle.slice(0,100);
+    }
+    v.snapshot_last_closed=confirmed;
+    v.snapshot_pending_missing=pending;
+    v.virtual_active_after_snapshot=Array.from(this.observedOrders.values()).filter((o:any)=>o.active).length;
+    await this.persistMaker();
   }
   private async ingestMakerOrderUpdates(payload:any):Promise<void> {
     const rows=Array.isArray(payload)?payload:Array.isArray(payload?.orders)?payload.orders:[];
@@ -566,6 +602,13 @@ export class TraderWatch {
       maker_fee_assumption:0.00015,
       execution_basis:'TARGET_MAKER_FILL_CONDITIONAL_LIMIT_MIRROR_NOT_QUEUE_PROVEN',
       active_virtual_limit_orders:active.length,
+      target_active_orders_last_rest_snapshot:v.target_active_orders??null,
+      last_open_orders_snapshot_at:v.last_open_orders_snapshot_at??null,
+      open_orders_snapshot_successes:v.open_orders_snapshot_successes||0,
+      snapshot_closed_stale_orders_total:v.snapshot_closed_orders||0,
+      snapshot_closed_stale_orders_last:v.snapshot_last_closed||0,
+      snapshot_pending_missing_confirmation:v.snapshot_pending_missing||0,
+      active_order_count_delta_to_snapshot:v.target_active_orders==null?null:active.length-v.target_active_orders,
       virtual_limit_orders:active.slice(0,30).map((o:any)=>({oid:o.oid,side:o.side,
         limit_price:o.price,remaining_btc:o.remaining,placed_at:o.virtualPlacedAt})),
       observed_order_count:this.observedOrders.size,
