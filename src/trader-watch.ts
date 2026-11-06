@@ -1,4 +1,4 @@
-// BTC TRADER WATCH V2.1.0 VERIFIED FILL COPY
+// BTC TRADER WATCH V2.2.0 COPY PERFORMANCE AUDIT
 // LIVE LATENCY / BACKFILL / WS COVERAGE / COPY WINDOW
 // READ ONLY — NO ORDERS, NO SIGNING, NO TRADING
 
@@ -8,13 +8,14 @@ const INFO_URL = "https://api.hyperliquid.xyz/info";
 const TARGET =
   "0xbb160cb61e694570f9d570f9fcde7c61dd2143ad";
 
-const VERSION = "BTC TRADER WATCH V2.1.0 VERIFIED FILL COPY";
+const VERSION = "BTC TRADER WATCH V2.2.0 COPY PERFORMANCE AUDIT";
 
-const AUDIT_INTERVAL_MS = 60_000;
+const AUDIT_INTERVAL_MS = 120_000;
 const MIRROR_V21_KEY = "verifiedFillMirrorV21";
 const V16_RECOVERY_BACKOFF_MS = 120_000;
 const AUDIT_WINDOW_MS = 5 * 60_000;
 const ALARM_INTERVAL_MS = 10_000;
+const MIRROR_POLL_INTERVAL_MS = 30_000;
 const MAX_SAMPLES = 3000;
 const MAX_IDS = 12000;
 const SHADOW_NOTIONAL_USD = 100;
@@ -103,6 +104,8 @@ export class TraderWatch {
       completedPositions:0,unpriced:0,abandoned:0,apiRecovered:0},
     completed:[],lastEvent:null};
   private mirrorPolling = false;
+  private auditRateLimitStrikes = 0;
+  private mirrorRateLimitStrikes = 0;
   private mirrorLastFillAt = 0;
   private pendingPositions: any[] = [];
   private book = {bid:0, ask:0, at:0};
@@ -173,6 +176,20 @@ export class TraderWatch {
       this.positionSeq = (await ctx.storage.get("positionSeq")) ?? 0;
       this.v15 = (await ctx.storage.get("v15Reconstruction")) ?? this.v15;
       this.mirror = (await ctx.storage.get("positionMirrorV2")) ?? this.mirror;
+      // V2.1 accidentally did not persist the fill-copy reducer. Recover only
+      // previously stored V2.2 state; never reconstruct an executable entry
+      // from old D1 events or a snapshot.
+      const savedFillMirror = await ctx.storage.get(MIRROR_V21_KEY);
+      if (savedFillMirror && savedFillMirror.schema === 22) {
+        this.fillMirror = savedFillMirror;
+      } else {
+        this.fillMirror.schema = 22;
+        this.fillMirror.startedAt = Date.now();
+        this.fillMirror.paused = true;
+        this.fillMirror.pauseReason = "WAIT_FOR_VERIFIED_NEW_BOUNDARY_AFTER_DEPLOY";
+        this.fillMirror.needsBackfill = false;
+      }
+      this.mirror.nextPollAt = Math.max(Date.now(), Number(this.mirror.nextBackoffAt || 0));
       // V1.5.0 had a broken signed-quantity comparison, invalidating every fill.
       // Start a clean V1.5.1 observation cohort; do not delete any D1 data.
       if (this.v15.schemaVersion !== "1.5.1") {
@@ -216,7 +233,8 @@ export class TraderWatch {
       syncDiagnostics: this.syncDiagnostics,
       syncMismatchCandidate: this.syncMismatchCandidate,
       v15Reconstruction:this.v15,
-      positionMirrorV2:this.mirror
+      positionMirrorV2:this.mirror,
+      [MIRROR_V21_KEY]:this.fillMirror
     });
   }
 
@@ -417,7 +435,11 @@ export class TraderWatch {
       this.sync.status="RECHECK_REQUIRED";
       this.sync.shadow_entry_allowed=false;
       this.sync.next_attempt_at=0;
-      this.mirror.nextPollAt=0;
+      this.mirror.nextPollAt=Date.now()+MIRROR_POLL_INTERVAL_MS;
+      this.fillMirror.paused=true;
+      this.fillMirror.pauseReason="WS_DISCONNECTED_WAIT_FOR_NEW_BOUNDARY";
+      this.fillMirror.needsBackfill=true;
+      if(this.fillMirror.copy){this.fillMirror.stats.abandoned++;this.fillMirror.copy=null;}
 
       if (this.state.active) {
         this.ctx.storage
@@ -1225,10 +1247,11 @@ export class TraderWatch {
       copy_window: this.getCopyWindow(),
       shadow_copy: {
         mode:"READ_ONLY_POSITION_MIRROR",version:VERSION,
-        position_sync:{...this.sync},
+        position_sync:{status:"LEGACY_DISABLED",note:"Use current_position and verified_fill_copy for V2.2"},
         current_position:this.mirror.snapshot,
         copy_position:this.fillMirror.copy,
         mirror_stats:this.mirror.stats,
+        verified_fill_copy:this.fillMirror,
         mirror_last_snapshot_at:this.mirror.lastSnapshotAt,
         mirror_last_d1_write_at:this.mirror.lastD1WriteAt,
         mirror_last_error:this.mirror.lastError,
@@ -1269,7 +1292,7 @@ export class TraderWatch {
     if(this.mirrorPolling||(!force&&now<this.mirror.nextPollAt)||now<this.mirror.nextBackoffAt)return;
     this.mirrorPolling=true;
     // Rate-limit event-triggered polls. Never overlap requests.
-    this.mirror.nextPollAt=now+10_000;
+    this.mirror.nextPollAt=now+MIRROR_POLL_INTERVAL_MS;
     try{
       const res=await fetch(INFO_URL,{method:"POST",headers:{"content-type":"application/json"},
         body:JSON.stringify({type:"clearinghouseState",user:TARGET})});
@@ -1292,6 +1315,7 @@ export class TraderWatch {
       this.mirror.stats.snapshots++;
       this.mirror.lastError=null;
       this.mirror.nextBackoffAt=0;
+      this.mirrorRateLimitStrikes=0;
       // Persist each authoritative snapshot, even when exposure is unchanged.
       const snapshotEvent={id:"snapshot:"+snap.at,kind:"POSITION_SNAPSHOT",at:snap.at,
         signedQty:snap.signedQty,side:snap.side,qty:snap.qty,entryPrice:snap.entryPrice,
@@ -1311,7 +1335,9 @@ export class TraderWatch {
     }catch(e){
       this.mirror.lastError=String(e);this.error(e);
       const is429=String(e).includes("429");
-      this.mirror.nextBackoffAt=Date.now()+(is429?120_000:30_000);
+      if(is429)this.mirrorRateLimitStrikes=Math.min(5,this.mirrorRateLimitStrikes+1);
+      this.mirror.nextBackoffAt=Date.now()+(is429?Math.min(15*60_000,120_000*2**(this.mirrorRateLimitStrikes-1)):30_000);
+      this.mirror.nextPollAt=Math.max(this.mirror.nextPollAt,this.mirror.nextBackoffAt);
     }finally{this.mirrorPolling=false;}
   }
 
@@ -1382,7 +1408,8 @@ export class TraderWatch {
       (isPartial&&dir.startsWith("open"));
     if(dirBad){v.stats.dirMismatches++;this.mirrorEvent({id:"v21:dir:"+id,
       kind:"V21_DIR_MISMATCH",at,dir,start,end,source});}
-    if(v.lastSigned!==null&&Math.abs(v.lastSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001)){
+    const continuityGap=v.lastSigned!==null&&Math.abs(v.lastSigned-start)>Math.max(SYNC_TOLERANCE,Math.abs(start)*0.0001);
+    if(continuityGap){
       v.stats.gaps++;v.paused=true;v.pauseReason="FILL_CONTINUITY_GAP";v.needsBackfill=true;
       if(v.copy){v.stats.abandoned++;v.copy=null;}
       this.mirrorEvent({id:"v21:gap:"+id,kind:"V21_GAP",at,
@@ -1403,13 +1430,13 @@ export class TraderWatch {
     // Once continuity is lost, don't manufacture P/L. Only a new observed
     // flat->open or reversal can establish a fresh position boundary.
     if(v.paused){
-      if(!isOpen&&!isReverse)return;
+      if(continuityGap||(!isOpen&&!isReverse))return;
       v.paused=false;v.pauseReason=null;
     }
     // Existing position at startup is NEVER assumed to have been copied.
     if(v.copy && (isClose||isReverse||isPartial)){
       const cp=v.copy;
-      const fraction=isPartial?Math.min(1,sz/Math.abs(start)):1;
+      const fraction=isPartial?Math.min(1,sz/Math.max(Math.abs(start),POSITION_EPS)):1;
       const closeQty=cp.qty*fraction;
       const px=this.verifiedQuote(cp.side,false);
       if(px===null){
@@ -1443,7 +1470,7 @@ export class TraderWatch {
       }
     }
     // A fresh verified opening boundary creates exactly one $100 copy position.
-    if((isOpen||isReverse)&&!v.paused){
+    if((isOpen||isReverse)&&!v.paused&&!v.copy){
       const side=end>0?"LONG":"SHORT";
       const px=this.verifiedQuote(side,true);
       if(px===null){v.stats.unpriced++;v.paused=true;v.pauseReason="MISSING_EXECUTABLE_ENTRY_QUOTE";
@@ -1483,6 +1510,40 @@ export class TraderWatch {
       }catch(err){this.mirror.stats.writeFailures++;this.mirror.lastError=String(err);break;}
     }
     await this.persist();
+  }
+
+  private async performanceV22(url:URL):Promise<Response>{
+    const db=this.env?.DB;
+    if(!db)return json({ok:false,error:"DB_BINDING_MISSING"},503);
+    const limit=Math.max(1,Math.min(100,Number(url.searchParams.get("limit")||50)||50));
+    try {
+      // Only V21_COMPLETED_POSITION is a fully completed simulated position.
+      // Older snapshot COPY_CLOSE and V21_COPY_CLOSE are NOT trades.
+      const summary=await db.prepare(`SELECT COUNT(*) AS completed_positions,
+        SUM(CASE WHEN CAST(json_extract(payload_json,'$.netUsd') AS REAL)>0 THEN 1 ELSE 0 END) AS wins,
+        SUM(CASE WHEN CAST(json_extract(payload_json,'$.netUsd') AS REAL)<=0 THEN 1 ELSE 0 END) AS losses,
+        COALESCE(SUM(CAST(json_extract(payload_json,'$.grossUsd') AS REAL)),0) AS gross_usd,
+        COALESCE(SUM(CAST(json_extract(payload_json,'$.feesUsd') AS REAL)),0) AS fees_usd,
+        COALESCE(SUM(CAST(json_extract(payload_json,'$.netUsd') AS REAL)),0) AS net_usd,
+        COALESCE(SUM(CAST(json_extract(payload_json,'$.initialNotionalUsd') AS REAL)),0) AS total_initial_notional_usd,
+        AVG((CAST(json_extract(payload_json,'$.closedAt') AS REAL)-CAST(json_extract(payload_json,'$.openedAt') AS REAL))/1000.0) AS avg_hold_seconds
+        FROM trader_mirror_events_v2 WHERE wallet=? AND kind='V21_COMPLETED_POSITION'`).bind(TARGET).first();
+      const rows=await db.prepare(`SELECT event_id,event_at,payload_json FROM trader_mirror_events_v2
+        WHERE wallet=? AND kind='V21_COMPLETED_POSITION' ORDER BY event_at DESC,event_id DESC LIMIT ?`)
+        .bind(TARGET,limit).all();
+      const count=Number(summary?.completed_positions||0),wins=Number(summary?.wins||0),net=Number(summary?.net_usd||0),notional=Number(summary?.total_initial_notional_usd||0);
+      return json({ok:true,version:VERSION,record_type:"VERIFIED_FILL_COPY_COMPLETED_POSITIONS_ONLY",
+        simulated_initial_notional_usd:SHADOW_NOTIONAL_USD,completed_positions:count,
+        summary:{...summary,win_rate_pct:count?100*wins/count:null,roi_pct:notional?100*net/notional:null},
+        rows:(rows.results||[]).map((r:any)=>JSON.parse(r.payload_json)),
+        reducer:{...this.fillMirror,completed:this.fillMirror.completed.slice(-10)},
+        coverage:"OBSERVED_AND_PRICED_ONLY",pending_writes:this.mirror.pending.length,
+        warnings:["Historical V2/V2.1 snapshot COPY_CLOSE events are excluded.",
+          "This is not account equity ROI or actual executable performance.",
+          "Incomplete, missed, delayed and unpriced trades are excluded, causing selection bias.",
+          "V2.1 did not persist reducer state; a V2.2 restart waits for a fresh verified boundary.",
+          "Funding, order-book depth, slippage beyond top-of-book and network order latency are excluded."]});
+    }catch(e){return json({ok:false,error:"V22_PERFORMANCE_QUERY_FAILED",detail:String(e)},503);}
   }
 
   private async mirrorPositions(url:URL):Promise<Response>{
@@ -1536,8 +1597,11 @@ export class TraderWatch {
       try {
         await this.reconcile();
         this.auditBackoffUntil = 0;
+        this.auditRateLimitStrikes=0;
       } catch (error) {
-        this.auditBackoffUntil = Date.now() + V16_RECOVERY_BACKOFF_MS;
+        const is429=String(error).includes("429");
+        if(is429)this.auditRateLimitStrikes=Math.min(5,this.auditRateLimitStrikes+1);
+        this.auditBackoffUntil=Date.now()+(is429?Math.min(15*60_000,V16_RECOVERY_BACKOFF_MS*2**(this.auditRateLimitStrikes-1)):V16_RECOVERY_BACKOFF_MS);
         this.error(error);
       }
     }
@@ -1597,6 +1661,7 @@ export class TraderWatch {
     }
 
     if (path === "/audit") {
+      if(Date.now()<this.auditBackoffUntil)return json({ok:false,error:"AUDIT_BACKOFF_ACTIVE",retry_at:this.auditBackoffUntil},429);
       try {
         await this.reconcile();
 
@@ -1619,7 +1684,8 @@ export class TraderWatch {
       return json(this.stats());
     }
 
-    if (path === "/positions") return this.mirrorPositions(url);
+    if (path === "/positions") return url.searchParams.get("view")==="performance" ? this.performanceV22(url) : this.mirrorPositions(url);
+    if (path === "/performance") return this.performanceV22(url);
     if (path === "/mirror") return json({version:VERSION,mode:"READ_ONLY_VERIFIED_FILL_COPY",...this.mirror,copy:this.fillMirror.copy,verified_fill_copy:this.fillMirror,events:this.mirror.events.slice(-30),pending:this.mirror.pending.length,trading_enabled:false});
 
     if (path === "/ledger") {
