@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.7 MAKER ORDER OBSERVED SIMULATION';
+const VERSION = 'BTC TRADER WATCH V4.7.3 VIRTUAL RESTING LIMIT MIRROR';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -337,7 +337,8 @@ export class TraderWatch {
       .bind(TARGET,this.s.epoch,f.id,f.at,JSON.stringify(ev),JSON.stringify(v)).run();
   }
 
-  // V4.7 independent order-observed maker-proxy model. Never sends an exchange order.
+  // V4.7.3: independent, persistent VIRTUAL limit-order mirror. No exchange orders.
+  private readonly makerStrategy='VIRTUAL_RESTING_LIMIT_ORDER_MIRROR_V473';
   private async ensureMaker():Promise<void> {
     if(this.makerReady)return;
     await this.env.DB.prepare(`CREATE TABLE IF NOT EXISTS trader_watch_maker_sessions
@@ -348,114 +349,161 @@ export class TraderWatch {
       payload_json TEXT NOT NULL,PRIMARY KEY(wallet,session_id,fill_id))`).run();
     const row:any=await this.env.DB.prepare(`SELECT state_json FROM trader_watch_maker_sessions
       WHERE wallet=? ORDER BY started_at DESC LIMIT 1`).bind(TARGET).first();
-    this.maker=row?JSON.parse(row.state_json):this.freshMaker();
-    if(!row)await this.persistMaker();
+    const previous=row?JSON.parse(row.state_json):null;
+    // A new strategy must never mutate old proxy-session accounting.
+    this.maker=previous?.strategy===this.makerStrategy?previous:this.freshMaker();
+    this.observedOrders=new Map(Object.entries(this.maker.orders||{}));
+    if(!previous||previous.strategy!==this.makerStrategy)await this.persistMaker();
     this.makerReady=true;
   }
-  private freshMaker():any {const now=Date.now();return {session_id:'MAKER-'+now,started_at:now,
-    strategy:'PREOBSERVED_LIMIT_MAKER_FILL_PROXY',phase:'WAITING_FOR_NEW_POSITION',balance:5000,
-    qty:0,avg:0,gross:0,fees:0,turnover:0,last_price:0,events:0,eligible:0,
-    skipped_unobserved:0,skipped_taker:0,skipped_backfill:0,skipped_before_order:0,
-    skipped_price:0,skipped_min:0,missed_qty:0,position_count:0,closed_positions:0,
-    wins:0,losses:0,position_gross:0,position_fees:0,position_id:0,
-    target_last:0,last_event_at:0,recent:[],warning:null};}
+  private freshMaker():any {const now=Date.now();return {
+    session_id:'LIMIT-'+now,started_at:now,strategy:this.makerStrategy,
+    phase:'WAITING_FOR_NEW_POSITION',balance:5000,qty:0,avg:0,gross:0,fees:0,
+    turnover:0,last_price:0,events:0,eligible:0,position_id:0,
+    closed_positions:0,wins:0,losses:0,position_gross:0,position_fees:0,
+    target_last:0,last_event_at:0,orders:{},order_events:[],recent:[],
+    order_created:0,order_changed:0,order_cancelled:0,order_filled:0,
+    skipped_unknown_order:0,skipped_before_observed:0,skipped_limit:0,
+    skipped_not_maker:0,skipped_min:0,skipped_margin:0,skipped_wait:0,
+    skipped_backfill:0,duplicate:0,partial_fills:0,filled_qty:0,
+    target_fill_qty:0,missed_qty:0,unfilled_order_qty:0,confidence:'TARGET_FILL_CONDITIONAL',
+    warning:'Virtual limit fills use target execution as a liquidity proxy; our queue priority is unknown.'};}
   private async persistMaker():Promise<void> {const v=this.maker;
+    v.orders=Object.fromEntries(this.observedOrders);
     await this.env.DB.prepare(`INSERT INTO trader_watch_maker_sessions
       (wallet,session_id,started_at,state_json) VALUES(?,?,?,?)
       ON CONFLICT(wallet,session_id) DO UPDATE SET state_json=excluded.state_json`)
       .bind(TARGET,v.session_id,v.started_at,JSON.stringify(v)).run();}
+  private orderLifecycle:any[]=[];
+  private orderStats={opened:0,updated:0,cancelled:0,filled:0,resting:0,unknown:0};
+  private async recordOrder(o:any,status:string,source:string,at=Date.now()):Promise<void> {
+    if(o?.coin!=='BTC'||o?.oid===undefined||o?.oid===null)return;
+    await this.ensureMaker();
+    const v=this.maker,oid=String(o.oid),old=this.observedOrders.get(oid);
+    const normalized=String(status||'open').toLowerCase();
+    const terminal=['canceled','cancelled','filled','rejected','margincanceled','selftradecanceled',
+      'reduceonlycanceled'].includes(normalized);
+    const side=o.side??old?.side;
+    const price=Number(o.limitPx??old?.price);
+    const sz=Number(o.sz??old?.size);
+    if(side!=='A'&&side!=='B')return;
+    if(!Number.isFinite(price)||price<=0||!Number.isFinite(sz)||sz<0)return;
+    const firstSeen=old?.observedAt??at;
+    // At initial observation, create the virtual resting order immediately.
+    // Do not pretend to have been in the queue before observation.
+    const remaining=old?old.remaining:sz*V463_SCALE;
+    const row={oid,side,price,size:sz,remaining,observedAt:firstSeen,
+      exchangePlacedAt:Number(o.timestamp)||old?.exchangePlacedAt||at,
+      status:normalized,active:!terminal,lastSeen:at,source,
+      virtualPlacedAt:old?.virtualPlacedAt??at,filled:old?.filled??0};
+    if(old&&(old.price!==price||old.size!==sz)){
+      // Amended orders lose their simulated queue priority. Keep already filled volume.
+      row.remaining=Math.max(0,sz*V463_SCALE-row.filled);
+      row.virtualPlacedAt=at;v.order_changed++;
+    }
+    if(!old){v.order_created++;this.orderStats.opened++;}
+    else this.orderStats.updated++;
+    if(terminal){row.active=false;if(normalized.includes('cancel')){
+      v.order_cancelled++;this.orderStats.cancelled++;}
+      if(normalized==='filled'){v.order_filled++;this.orderStats.filled++;}}
+    this.observedOrders.set(oid,row);
+    const event={oid,at,status:normalized,source,side,price,remaining:row.remaining,active:row.active};
+    v.order_events.unshift(event);v.order_events=v.order_events.slice(0,80);
+    this.orderLifecycle.unshift(event);this.orderLifecycle=this.orderLifecycle.slice(0,100);
+    // Never evict an active order; evict oldest terminal orders only.
+    if(this.observedOrders.size>1200){for(const [key,val] of this.observedOrders){
+      if(this.observedOrders.size<=1000)break;if(!val.active)this.observedOrders.delete(key);}}
+    await this.persistMaker();
+  }
   private async seedMakerOrders():Promise<void> {
     const rows=await this.info({type:'frontendOpenOrders',user:TARGET});
     if(!Array.isArray(rows))throw Error('MAKER_OPEN_ORDERS_SNAPSHOT_INVALID');
-    const now=Date.now();
+    const now=Date.now();let count=0;
     for(const o of rows){if(o.coin!=='BTC'||o.oid===undefined)continue;
-      const key=String(o.oid);if(!this.observedOrders.has(key))this.observedOrders.set(key,{
-        oid:key,side:o.side,price:Number(o.limitPx),size:Number(o.sz),
-        observedAt:now,exchangePlacedAt:Number(o.timestamp)||now,
-        type:o.orderType||'Limit',reduceOnly:!!o.reduceOnly,source:'REST_OPEN_ORDERS'});
-    }
-    this.trimMakerOrders();
+      count++;await this.recordOrder(o,'open','REST_OPEN_ORDERS',now);}
+    this.orderStats.resting=count;
+    // Missing from snapshot does not prove cancellation; await orderUpdates.
   }
-  private trimMakerOrders():void {if(this.observedOrders.size>2000){
-    const entries=[...this.observedOrders.entries()].sort((a,b)=>a[1].observedAt-b[1].observedAt);
-    for(const [key] of entries.slice(0,this.observedOrders.size-1500))this.observedOrders.delete(key);
-  }}
-  private ingestMakerOrderUpdates(payload:any):void {
+  private async ingestMakerOrderUpdates(payload:any):Promise<void> {
     const rows=Array.isArray(payload)?payload:Array.isArray(payload?.orders)?payload.orders:[];
     for(const item of rows){const o=item?.order||item;
-      if(o?.coin!=='BTC'||o?.oid===undefined)continue;
-      const key=String(o.oid),old=this.observedOrders.get(key),now=Date.now();
-      const status=String(item?.status||'').toLowerCase();
-      if(old){old.status=status;old.lastSeen=now;continue;}
-      if(status&&status!=='open')continue;
-      this.observedOrders.set(key,{oid:key,side:o.side,price:Number(o.limitPx),
-        size:Number(o.sz),observedAt:now,exchangePlacedAt:Number(o.timestamp)||now,
-        type:o.orderType||'Limit',source:'WS_ORDER_UPDATES',status});
-    }
-    this.trimMakerOrders();
+      await this.recordOrder(o,String(item?.status||'open'),'WS_ORDER_UPDATES');}
   }
   private async applyMaker(f:NormalFill):Promise<void> {
     await this.ensureMaker();const v=this.maker;
-    // No replay, no guessed maker execution. An order must be observed before its fill.
     if(f.source!=='WS_LIVE'){v.skipped_backfill++;return;}
     const exists:any=await this.env.DB.prepare(`SELECT fill_id FROM trader_watch_maker_events
       WHERE wallet=? AND session_id=? AND fill_id=?`).bind(TARGET,v.session_id,f.id).first();
-    if(exists)return;
+    if(exists){v.duplicate++;return;}
     const o=f.oid?this.observedOrders.get(f.oid):undefined;
-    let status='APPLIED',executed=0,fee=0,realized=0;
-    if(f.crossed!==false){status=f.crossed===true?'SKIP_TAKER':'SKIP_MAKER_UNKNOWN';v.skipped_taker++;}
-    else if(!o){status='SKIP_ORDER_NOT_PREOBSERVED';v.skipped_unobserved++;}
-    else if(o.observedAt>f.receivedAt||o.exchangePlacedAt>f.at){status='SKIP_ORDER_NOT_PREOBSERVED_IN_TIME';v.skipped_before_order++;}
-    else if(o.side!==f.side||!Number.isFinite(o.price)||
-      (f.side==='B'&&f.price>o.price+0.01)||(f.side==='A'&&f.price<o.price-0.01)){
-      status='SKIP_LIMIT_PRICE_OR_SIDE_MISMATCH';v.skipped_price++;
-    }else{
-      const delta=(f.side==='B'?1:-1)*f.size*V463_SCALE;
-      const price=f.price;const before=v.qty;const desired=before+delta;
-      const startBoundary=direction(f.start)===0&&direction(f.end)!==0||
-        direction(f.start)!==0&&direction(f.end)!==0&&direction(f.start)!==direction(f.end);
-      if(v.phase==='WAITING_FOR_NEW_POSITION'&&!startBoundary){status='WAIT_NEW_TARGET_POSITION';}
-      else if(v.phase==='WAITING_FOR_NEW_POSITION'){
-        // First fill can reverse a pre-existing position. Only open the new-side fraction.
-        const newQty=direction(f.start)!==0?f.end*V463_SCALE:delta;
-        if(Math.abs(newQty)*price<10){status='WAIT_MINIMUM_NOTIONAL';v.skipped_min++;}
-        else{v.phase='TRACKING';v.qty=newQty;v.avg=price;v.position_id++;
-          executed=Math.abs(newQty)*price;fee=executed*0.00015;
-          v.balance-=fee;v.fees+=fee;v.position_fees+=fee;v.turnover+=executed;v.eligible++;}
-      }else if(Math.abs(delta)*price<10){status='SKIP_MINIMUM_NOTIONAL';v.skipped_min++;v.missed_qty+=delta;}
-      else{
-        const oldSign=direction(before),newSign=direction(desired);
-        const closeQty=oldSign!==0&&oldSign!==direction(delta)?Math.min(Math.abs(before),Math.abs(delta)):0;
-        const openQty=Math.max(0,Math.abs(delta)-closeQty);
-        const closeN=closeQty*price,openN=openQty*price;
-        const equity=v.balance+before*(price-v.avg);
-        const required=Math.abs(desired)*price/5;
-        if(required>equity+1e-8){status='SKIP_MARGIN_INSUFFICIENT';v.missed_qty+=delta;}
-        else{
-          realized=closeQty*oldSign*(price-v.avg);
-          v.balance+=realized;v.gross+=realized;v.position_gross+=realized;
+    const price=f.price,fillSide=f.side==='B'?1:-1;
+    const boundary=(direction(f.start)===0&&direction(f.end)!==0)||
+      (direction(f.start)!==0&&direction(f.end)!==0&&direction(f.start)!==direction(f.end));
+    let status='UNMATCHED',executed=0,fee=0,realized=0,filled=0;
+    v.target_fill_qty+=f.size*V463_SCALE;
+    if(!o){status='NO_VIRTUAL_LIMIT_ORDER';v.skipped_unknown_order++;}
+    else if(o.virtualPlacedAt>f.receivedAt||o.exchangePlacedAt>f.at){
+      status='ORDER_NOT_RESTING_AT_FILL';v.skipped_before_observed++;}
+    else if(o.side!==f.side||(fillSide===1&&price>o.price+0.01)||
+      (fillSide===-1&&price<o.price-0.01)){
+      status='PRICE_OR_SIDE_MISMATCH';v.skipped_limit++;}
+    else if(f.crossed!==false){status='TARGET_FILL_NOT_VERIFIED_MAKER';v.skipped_not_maker++;}
+    else if(v.phase==='WAITING_FOR_NEW_POSITION'&&!boundary){
+      status='WAIT_NEW_POSITION_BOUNDARY';v.skipped_wait++;}
+    else {
+      // Conditional virtual fill: target maker fill supplies evidence of traded liquidity.
+      // This is NOT proof that our later-arriving order would have queue priority.
+      const qty=Math.min(Math.max(0,o.remaining),f.size*V463_SCALE);
+      if(qty*price<10){status='BELOW_MIN_ORDER_NOTIONAL';v.skipped_min++;}
+      else {
+        const delta=fillSide*qty,before=v.qty,oldSign=direction(before);
+        const closing=oldSign!==0&&oldSign!==fillSide;
+        const closeQty=closing?Math.min(Math.abs(before),qty):0;
+        const openQty=qty-closeQty;
+        const after=before+delta;
+        const unrealized=before*(price-v.avg);
+        const equity=v.balance+unrealized;
+        const projectedMargin=Math.abs(after)*price/5;
+        const proposedFee=qty*price*0.00015;
+        const proposedGross=closeQty*oldSign*(price-v.avg);
+        if(projectedMargin>equity+proposedGross-proposedFee+1e-8){
+          status='INSUFFICIENT_VIRTUAL_MARGIN';v.skipped_margin++;}
+        else {
+          if(v.phase==='WAITING_FOR_NEW_POSITION')v.phase='TRACKING';
+          realized=proposedGross;fee=proposedFee;executed=qty*price;filled=qty;
+          v.balance+=realized-fee;v.gross+=realized;v.fees+=fee;
+          v.position_gross+=realized;v.turnover+=executed;
           const remaining=before-oldSign*closeQty;
-          v.avg=openQty>0?(Math.abs(remaining)>EPS&&direction(remaining)===direction(delta)?
-            (Math.abs(remaining)*v.avg+openQty*price)/(Math.abs(remaining)+openQty):price):
-            Math.abs(remaining)>EPS?v.avg:0;
-          v.qty=desired;executed=closeN+openN;fee=executed*0.00015;
-          v.balance-=fee;v.fees+=fee;v.turnover+=executed;v.eligible++;
-          if(oldSign!==0&&(newSign===0||newSign!==oldSign)){
-            const closingFee=closeN*0.00015;
+          if(openQty>EPS){v.avg=(Math.abs(remaining)>EPS&&direction(remaining)===fillSide)?
+            (Math.abs(remaining)*v.avg+openQty*price)/(Math.abs(remaining)+openQty):price;}
+          else if(Math.abs(remaining)<EPS)v.avg=0;
+          v.qty=Math.abs(after)<EPS?0:after;
+          if(oldSign!==0&&(direction(v.qty)===0||direction(v.qty)!==oldSign)){
+            const closingFee=closeQty*price*0.00015;
             v.position_fees+=closingFee;
             const net=v.position_gross-v.position_fees;
             v.closed_positions++;if(net>0)v.wins++;else if(net<0)v.losses++;
-            v.position_gross=0;v.position_fees=openN*0.00015;
-            if(newSign!==0)v.position_id++;
-          }else v.position_fees+=fee;
+            v.position_gross=0;v.position_fees=openQty*price*0.00015;
+            if(direction(v.qty)!==0)v.position_id++;
+          }else{
+            if(oldSign===0&&direction(v.qty)!==0)v.position_id++;
+            v.position_fees+=fee;
+          }
+          o.remaining=Math.max(0,o.remaining-qty);o.filled+=qty;
+          v.eligible++;v.filled_qty+=qty;
+          if(o.remaining>EPS)v.partial_fills++;
+          status='VIRTUAL_LIMIT_FILL_CONDITIONAL';
         }
       }
     }
-    v.events++;v.last_event_at=f.at;v.last_price=f.price;v.target_last=f.end;
-    const event={id:f.id,at:f.at,oid:f.oid,source:f.source,action:status,
-      target_start:f.start,target_end:f.end,limit_price:o?.price??null,
-      fill_price:f.price,crossed:f.crossed??null,executed_notional_usd:executed,
-      maker_fee_usd:fee,gross_realized_usd:realized,copy_qty_btc:v.qty};
+    if(filled===0)v.missed_qty+=f.size*V463_SCALE;
+    v.events++;v.last_event_at=f.at;v.last_price=price;v.target_last=f.end;
+    const event={id:f.id,at:f.at,oid:f.oid,status,side:f.side,
+      limit_price:o?.price??null,target_fill_price:price,target_fill_qty:f.size,
+      virtual_order_remaining:o?.remaining??null,virtual_fill_qty:filled,
+      target_crossed:f.crossed??null,executed_notional_usd:executed,
+      maker_fee_usd:fee,gross_realized_usd:realized,copy_qty_btc:v.qty,
+      caveat:'Target maker fill does not prove copy queue fill.'};
     v.recent.unshift(event);v.recent=v.recent.slice(0,70);
     await this.env.DB.prepare(`INSERT OR IGNORE INTO trader_watch_maker_events
       (wallet,session_id,fill_id,event_at,payload_json) VALUES(?,?,?,?,?)`)
@@ -466,30 +514,45 @@ export class TraderWatch {
     await this.ensureMaker();const v=this.maker;
     const mark=v.last_price||v.avg||0;
     const unrealized=v.qty*(mark-v.avg),equity=v.balance+unrealized;
+    const usedMargin=Math.abs(v.qty)*mark/5,freeEquity=equity-usedMargin;
+    const active=[...this.observedOrders.values()].filter((o:any)=>o.active&&o.remaining>EPS);
     return {ok:true,version:VERSION,mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',
-      strategy:'PREOBSERVED_LIMIT_MAKER_FILL_PROXY',session_id:v.session_id,
-      phase:v.phase,initial_balance_usd:5000,leverage:5,copy_scale:V463_SCALE,
-      maker_fee_assumption:0.00015,fee_basis:'ONLY_VERIFIED_MAKER_FILLS',
-      execution_basis:'TARGET_MAKER_FILL_PRICE_PROXY_NOT_INDEPENDENT_COPY_QUEUE',
+      strategy:this.makerStrategy,session_id:v.session_id,phase:v.phase,
+      initial_balance_usd:5000,leverage:5,copy_scale:V463_SCALE,
+      maker_fee_assumption:0.00015,
+      execution_basis:'TARGET_MAKER_FILL_CONDITIONAL_LIMIT_MIRROR_NOT_QUEUE_PROVEN',
+      active_virtual_limit_orders:active.length,
+      virtual_limit_orders:active.slice(0,30).map((o:any)=>({oid:o.oid,side:o.side,
+        limit_price:o.price,remaining_btc:o.remaining,placed_at:o.virtualPlacedAt})),
       observed_order_count:this.observedOrders.size,
+      order_lifecycle_counts:{created:v.order_created,changed:v.order_changed,
+        cancelled:v.order_cancelled,filled:v.order_filled,partial_fills:v.partial_fills},
+      order_lifecycle_recent:v.order_events.slice(0,30),
       balance_usd:v.balance,equity_usd:equity,roi_pct:(equity/5000-1)*100,
+      used_margin_usd:usedMargin,free_equity_usd:freeEquity,
+      available_balance_usd:freeEquity,
+      capital_utilization_pct:equity>0?100*usedMargin/equity:null,
       realized_gross_usd:v.gross,fees_usd:v.fees,net_realized_usd:v.gross-v.fees,
       unrealized_usd:unrealized,position_btc:v.qty,average_entry_price:v.avg,
       last_fill_price_proxy:mark,turnover_usd:v.turnover,
       completed_positions:v.closed_positions,wins:v.wins,losses:v.losses,
       win_rate_pct:v.closed_positions?100*v.wins/v.closed_positions:null,
       counts:{processed:v.events,eligible_maker_fills:v.eligible,
-        skipped_unobserved_order:v.skipped_unobserved,skipped_taker_or_unknown:v.skipped_taker,
-        skipped_backfill:v.skipped_backfill,skipped_before_order:v.skipped_before_order,
-        skipped_price:v.skipped_price,skipped_minimum:v.skipped_min},
+        skipped_unobserved_order:v.skipped_unknown_order,
+        skipped_taker_or_unknown:v.skipped_not_maker,
+        skipped_before_order:v.skipped_before_observed,
+        skipped_price:v.skipped_limit,skipped_minimum:v.skipped_min,
+        skipped_margin:v.skipped_margin,waiting_for_boundary:v.skipped_wait,
+        skipped_backfill:v.skipped_backfill,duplicate:v.duplicate},
+      target_fill_qty_btc:v.target_fill_qty,virtual_filled_qty_btc:v.filled_qty,
+      missing_fill_qty_btc:v.missed_qty,
       reconciliation_delta_usd:v.balance-(5000+v.gross-v.fees),
-      recent_events:v.recent,limitations:[
-        'The observed target maker fill does NOT guarantee the copied limit order would fill: queue position differs.',
-        'No fills are invented when the target order is not observed before execution.',
-        'Missed fills can cause position divergence; this is a conditional maker-fill proxy, not an executable order-book replay.',
-        'Resting-order cancellations and independent market queue are not simulated.',
-        'The old V4.6.5 session remains preserved and queryable through /virtual-v465-archive.'
-      ],trading_enabled:false};
+      recent_events:v.recent,
+      limitations:['Virtual LIMIT orders are created at first observed order update/snapshot.',
+        'Fill requires matching target maker fill, price, side and virtual resting quantity.',
+        'A target fill does NOT guarantee our copy order would fill: no queue-position or order-book replay.',
+        'Late updates, disconnected periods and unknown order priority can materially bias ROI.',
+        'Previous maker-proxy and V4.6.5 sessions are preserved in D1.'],trading_enabled:false};
   }
 
   private v463Equity(v:V463State,price:number):number {
@@ -1263,10 +1326,10 @@ export class TraderWatch {
       const callbackAt = Date.now();
       void this.enqueue(async () => {
         const msg = JSON.parse(String(ev.data));
-        if(msg.channel==='orderUpdates'){this.ingestMakerOrderUpdates(msg.data);return;}
+        if(msg.channel==='orderUpdates'){await this.ingestMakerOrderUpdates(msg.data);return;}
         if(msg.channel==='openOrders'){
           const orders=Array.isArray(msg.data?.orders)?msg.data.orders:[];
-          this.ingestMakerOrderUpdates(orders.map((order:any)=>({order,status:'open'})));return;
+          await this.ingestMakerOrderUpdates(orders.map((order:any)=>({order,status:'open'})));return;
         }
         if (msg.channel !== 'userFills') return;
         const payload = msg.data;
@@ -1602,4 +1665,4 @@ export class TraderWatch {
     }
     return response({ ok: false, error: 'NOT_FOUND' }, 404);
   }
-}
+                                                            }
