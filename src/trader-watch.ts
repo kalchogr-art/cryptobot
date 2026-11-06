@@ -6,7 +6,7 @@
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
 const WS_URL = 'wss://api.hyperliquid.xyz/ws';
-const VERSION = 'BTC TRADER WATCH V4.5 INCREMENTAL COPY ENGINE';
+const VERSION = 'BTC TRADER WATCH V4.5.1 BATCH RECOVERY + CLEAN METRICS';
 const EPS = 0.00000001;
 const START_NOTIONAL_USD = 100;
 const AUDIT_INTERVAL_MS = 60000;
@@ -120,6 +120,10 @@ export class TraderWatch {
   private recoveryReason: string | null = null;
   private appendReady = false;
   private queuedJobs = 0;
+  private readonly diagnosticSince = Date.now();
+  private recoveryRowsWritten = 0;
+  private lastRecoveryMs: number | null = null;
+  private recoveryPending = false;
   private enqueue(job: () => Promise<void>): Promise<void> {
     this.queuedJobs++;
     const next = this.processing.catch(() => {}).then(job);
@@ -141,7 +145,7 @@ export class TraderWatch {
     const fills = Number(counts?.fills || 0);
     const actions = Number(counts?.actions || 0);
     if (fills !== this.s.ledgerCount || actions !== fills || this.s.replayGap) {
-      this.recoveryReason = 'PERSISTED_PROJECTION_NOT_ALIGNED';
+      this.recoveryReason = `PERSISTED_PROJECTION_NOT_ALIGNED:fills=${fills},actions=${actions},checkpoint=${this.s.ledgerCount},gap=${this.s.replayGap}`;
       this.recoveryReplays++;
       await this.replay();
       if (this.s.replayGap) throw new Error('FILL_CHAIN_GAP_REQUIRES_AUDIT');
@@ -481,12 +485,20 @@ export class TraderWatch {
     // Rebuild action projection from the canonical fill ledger.
     // These are virtual actions, not orders.
     await this.ensureDb();
-    for (const row of actions) {
-      await this.env.DB.prepare(`INSERT INTO trader_watch_v4_actions
-        (wallet,epoch,fill_id,event_at,payload_json) VALUES (?,?,?,?,?)
-        ON CONFLICT(wallet,epoch,fill_id) DO UPDATE SET payload_json=excluded.payload_json`)
-        .bind(TARGET, this.s.epoch, row.id, row.at, JSON.stringify(row)).run();
+    // D1 batch executes ordered prepared statements with far fewer round trips.
+    // Never delete existing actions; retries remain idempotent.
+    const recoveryStart = Date.now();
+    for (let i = 0; i < actions.length; i += 80) {
+      const statements = actions.slice(i, i + 80).map(row =>
+        this.env.DB.prepare(`INSERT INTO trader_watch_v4_actions
+          (wallet,epoch,fill_id,event_at,payload_json) VALUES (?,?,?,?,?)
+          ON CONFLICT(wallet,epoch,fill_id) DO UPDATE SET
+          event_at=excluded.event_at,payload_json=excluded.payload_json`)
+          .bind(TARGET, this.s.epoch, row.id, row.at, JSON.stringify(row)));
+      await this.env.DB.batch(statements);
+      this.recoveryRowsWritten += statements.length;
     }
+    this.lastRecoveryMs = Date.now() - recoveryStart;
     await this.save();
   }
 
@@ -529,6 +541,7 @@ export class TraderWatch {
           for (const x of ordered) await this.appendFill(x.f);
           await this.save();
         } catch (e) {
+          fallback = true;
           this.recoveryReason = 'APPEND_WRITE_FAILURE: ' + String(e);
           this.recoveryReplays++;
           this.appendReady = false;
@@ -651,7 +664,10 @@ export class TraderWatch {
 
   // V4.4: Bounded observational samples; no order submission or strategy changes.
   private pipelineAudit(): any {
-    const samples: any[] = this.s.pipelineSamples || [];
+    const retained: any[] = this.s.pipelineSamples || [];
+    const samples = retained.filter(x => x.processing_mode === 'INCREMENTAL' || x.processing_mode === 'RECOVERY_REPLAY');
+    const incremental = samples.filter(x => x.processing_mode === 'INCREMENTAL');
+    const recovery = samples.filter(x => x.processing_mode === 'RECOVERY_REPLAY');
     const summarize = (rows: any[], key: string) => {
       const a = rows.map(r => r[key]).filter((v: any) => typeof v === 'number' && Number.isFinite(v)).sort((x: number,y: number) => x-y);
       const pct = (p: number) => a.length ? a[Math.min(a.length-1, Math.ceil(p*a.length)-1)] : null;
@@ -667,6 +683,14 @@ export class TraderWatch {
     });
     return {ok:true, version:VERSION, mode:'READ_ONLY_OBSERVABILITY',
       epoch:this.s.epoch, samples:samples.length,
+      retained_legacy_samples:retained.length-samples.length,
+      diagnostic_started_at:this.diagnosticSince,
+      incremental_samples:incremental.length,
+      recovery_samples:recovery.length,
+      incremental_only:metrics(incremental),
+      recovery_only:metrics(recovery),
+      recovery_d1_rows_written_since_restart:this.recoveryRowsWritten,
+      last_recovery_d1_batch_ms:this.lastRecoveryMs,
       incremental_actions_since_restart:this.incrementalActions,
       recovery_replays_since_restart:this.recoveryReplays,
       last_recovery_reason:this.recoveryReason,
@@ -681,7 +705,7 @@ export class TraderWatch {
         'COPY ready means incremental projection persistence (or explicit recovery replay), not a real trade.',
         'Batch completion times are shared by all new fills in that batch.',
         'API backfill has no WS callback metric and is historical, not executable in real time.',
-        'Metrics include retained V4.4 samples and new V4.5 samples. Existing D1 history is preserved.',
+        'Main metrics exclude legacy V4.4 samples. Incremental and recovery modes are reported separately. Historical V4.5 samples remain included.',
       ]};
   }
 
