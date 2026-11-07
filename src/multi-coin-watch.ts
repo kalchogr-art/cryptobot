@@ -1,4 +1,4 @@
-// MULTI-COIN TRADER WATCH V1 — VIRTUAL ONLY, NO EXCHANGE ORDERS.
+// MUL.TI-COIN TRADER WATCH V1 — VIRTUAL ONLY, NO EXCHANGE ORDERS.
 // Single wallet; D1 event log; Durable Object state. Starts flat; old target positions ignored until flat.
 export const MC_WALLET='0x34fb5ec7d4e939161946340ea2a1f29254b893de';
 const INFO='https://api.hyperliquid.xyz/info';
