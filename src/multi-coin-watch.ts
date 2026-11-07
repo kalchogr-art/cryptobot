@@ -1,4 +1,4 @@
-// MUL.TI-COIN TRADER WATCH V1 — VIRTUAL ONLY, NO EXCHANGE ORDERS.
+// MULTI-COIN TRADER WATCH V1 — VIRTUAL ONLY, NO EXCHANGE ORDERS.
 // Single wallet; D1 event log; Durable Object state. Starts flat; old target positions ignored until flat.
 export const MC_WALLET='0x34fb5ec7d4e939161946340ea2a1f29254b893de';
 const INFO='https://api.hyperliquid.xyz/info';
@@ -40,7 +40,20 @@ export class MultiCoinEngine {
     const signed=f.side==='B'?size:-size,end=round(start+signed),pos=s.positions[coin];
     const exists:any=await this.db.prepare('SELECT 1 AS yes FROM mc_watch_events WHERE session_id=? AND fill_id=?').bind(s.id,id).first();if(exists)return;
     let action='SKIPPED',reason='',delta=0,realized=0,fee=0,notional=0;
-    if(s.ignored[coin]){if(sign(end)===0){delete s.ignored[coin];reason='TARGET_BASELINE_FLATTENED';}else reason='INHERITED_TARGET_POSITION';}
+    if(s.ignored[coin]){
+      // Ignore pre-existing exposure, but start copying on a fresh increase or direction flip.
+      // Reductions of inherited exposure are not our trades.
+      const freshIncrease=sign(start)===sign(end)&&sign(end)!==0&&Math.abs(end)>Math.abs(start)+EPS;
+      const freshDirection=sign(end)!==0&&(sign(start)===0||sign(start)!==sign(end));
+      if(sign(end)===0){delete s.ignored[coin];reason='TARGET_BASELINE_FLATTENED';}
+      else if(freshIncrease||freshDirection){
+        if(this.free(s)<OPEN_MARGIN){reason='INSUFFICIENT_FREE_MARGIN';}
+        else {action='OPEN';delta=sign(end)*OPEN_NOTIONAL/px;notional=OPEN_NOTIONAL;
+          fee=notional*(f.crossed===true?TAKER_FEE:MAKER_FEE);
+          s.positions[coin]={coin,qty:delta,avg:px,opened:at,gross:0,fees:fee,entryFees:fee,last:px,targetQty:end,trades:1};
+          delete s.ignored[coin];reason=freshDirection?'INHERITED_DIRECTION_FLIP':'INHERITED_POSITION_INCREASE';}
+      }else reason='INHERITED_TARGET_POSITION';
+    }
     else if(!pos){if(sign(start)!==0){reason='UNTRACKED_POSITION_STARTED_BEFORE_SESSION';s.ignored[coin]=sign(end)!==0;}
       else if(sign(end)!==0){action='OPEN';delta=sign(end)*OPEN_NOTIONAL/px;notional=Math.abs(delta*px);
         if(notional<MIN_NOTIONAL){reason='MIN_NOTIONAL';action='SKIPPED';}
