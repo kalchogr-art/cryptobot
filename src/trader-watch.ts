@@ -1,7 +1,7 @@
 import { MultiCoinEngine } from "./multi-coin-watch";
 // BTC TRADER WATCH V4.2 .— CLEAN FILL LEDGER + DETERMINISTIC REPLAY
 // Cloudflare Durable Object: export class TraderWatch
-// READ ONLY: this file never submits an exchange order.
+// READ ONLY: this file neve.r submits an exchange order.
 // Only BTC fills from the configured public wallet are tracked.
 
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
