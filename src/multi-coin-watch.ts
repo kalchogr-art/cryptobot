@@ -137,11 +137,11 @@ export class MultiCoinEngine {
     const r:any=await this.db.prepare('SELECT payload FROM mc_watch_order_events WHERE session_id=? ORDER BY at DESC LIMIT ?').bind(s.id,Math.max(1,Math.min(300,limit))).all();
     return{ok:true,as_of:s.ordersLastPoll||0,last_error:s.ordersLastError||null,active:Object.values(s.orders||{}),history:(r.results||[]).map((x:any)=>JSON.parse(x.payload)),note:'Snapshot-only: disappearance does not prove fill; no virtual orders are submitted.'};
   }
-  private async apply(s:Session,f:any){const coin=String(f.coin||'');const at=asNum(f.time),px=asNum(f.px),size=asNum(f.sz),start=asNum(f.startPosition);
-    const id=coin+':'+String(f.tid??f.hash??'')+':'+String(f.hash||'');if(!coin||!at||!px||!size||!['A','B'].includes(f.side))return;
+  private async apply(s:Session,f:any,recovery=false){const coin=String(f.coin||'');const at=asNum(f.time),px=asNum(f.px),size=asNum(f.sz),start=asNum(f.startPosition);
+    const id=coin+':'+String(f.tid??f.hash??'')+':'+String(f.hash||'')+(recovery?':VERIFIED_RECOVERY':'');if(!coin||!at||!px||!size||!['A','B'].includes(f.side))return;
     const signed=f.side==='B'?size:-size,end=round(start+signed),pos=s.positions[coin];
     const exists:any=await this.db.prepare('SELECT 1 AS yes FROM mc_watch_events WHERE session_id=? AND fill_id=?').bind(s.id,id).first();if(exists)return;
-    await this.mirrorFill(s,f);
+    if(!recovery)await this.mirrorFill(s,f);
     let action='SKIPPED',reason='',delta=0,realized=0,fee=0,notional=0;
     if(s.ignored[coin]){
       // Ignore pre-existing exposure, but start copying on a fresh increase or direction flip.
@@ -199,60 +199,110 @@ export class MultiCoinEngine {
     if(reason.startsWith('TARGET_POSITION_GAP'))s.accuracyGaps=(s.accuracyGaps||0)+1;
     if(action!=='SKIPPED'){if(f.crossed===true)s.takerFills=(s.takerFills||0)+1;else if(f.crossed===false)s.makerFills=(s.makerFills||0)+1;else s.unknownFills=(s.unknownFills||0)+1;}
     if(action!=='SKIPPED'){s.fills++;s.gross+=realized;s.fees+=fee;s.cash+=realized-fee;s.turnover+=notional;}
-    const record={id,at,coin,action,reason,price:px,source:'HYPERLIQUID_PUBLIC_FILL',target_before:start,target_after:end,virtual_delta:delta,notional,realized,fee,virtual_qty_after:s.positions[coin]?.qty||0,crossed:f.crossed??null};
+    const record={id,at,coin,action,reason,price:px,recovered_from_verified_skipped_fill:recovery,source:'HYPERLIQUID_PUBLIC_FILL',target_before:start,target_after:end,virtual_delta:delta,notional,realized,fee,virtual_qty_after:s.positions[coin]?.qty||0,crossed:f.crossed??null};
     await this.log(s,id,at,coin,action,record);
   }
   private free(s:Session){let used=0,unreal=0;for(const p of Object.values(s.positions)){const mark=s.lastPrice[p.coin]||p.last||p.avg;used+=Math.abs(p.qty*mark)/LEVERAGE;unreal+=p.qty*(mark-p.avg);}return s.cash+unreal-used;}
+  // A GAP HOLD row is an actual recorded target fill, not an invented trade.
+  // Recover ONLY the provably contiguous prefix from the current target anchor.
+  // Keep the original SKIPPED audit rows intact; a recovered event gets its own ID.
+  // Never force a resync across an unverified missing fill.
+  private async recoverVerifiedSkipped(s:Session){
+    const rows:any=await this.db.prepare(`SELECT fill_id,payload FROM mc_watch_events WHERE session_id=? AND action='SKIPPED' AND json_extract(payload,'$.reason')='TARGET_POSITION_GAP_HELD_FOR_AUDIT' ORDER BY at ASC LIMIT 1500`).bind(s.id).all();
+    const byCoin=new Map<string,any[]>();
+    for(const r of rows.results||[]){
+      const e=JSON.parse(r.payload);const coin=String(e.coin||'');
+      if(!s.positions[coin]||!Number.isFinite(Number(e.target_before))||!Number.isFinite(Number(e.target_after)))continue;
+      if(!byCoin.has(coin))byCoin.set(coin,[]);
+      byCoin.get(coin)!.push({row:r,event:e});
+    }
+    for(const [coin,items] of byCoin){
+      let anchor=s.positions[coin]?.targetQty;
+      if(anchor===undefined)continue;
+      const remaining=[...items];
+      while(remaining.length){
+        const index=remaining.findIndex(({event:e})=>Math.abs(Number(e.target_before)-anchor!)<=Math.max(1e-7,Math.abs(anchor!)*.00001));
+        if(index<0)break;
+        const {row,event:e}=remaining.splice(index,1)[0];
+        const recoveredId=row.fill_id+':VERIFIED_RECOVERY';
+        const exists:any=await this.db.prepare('SELECT 1 AS yes FROM mc_watch_events WHERE session_id=? AND fill_id=?').bind(s.id,recoveredId).first();
+        if(exists){anchor=Number(e.target_after);continue;}
+        const signed=Number(e.target_after)-Number(e.target_before);
+        if(Math.abs(signed)<EPS||!Number.isFinite(signed)||Number(e.price)<=0)break;
+        const parts=String(row.fill_id).split(':');
+        const fill={coin,time:Number(e.at),px:Number(e.price),sz:Math.abs(signed),startPosition:Number(e.target_before),side:signed>0?'B':'A',tid:parts[1],hash:parts.slice(2).join(':'),crossed:e.crossed};
+        await this.apply(s,fill,true);
+        anchor=s.positions[coin]?.targetQty;
+        if(anchor===undefined)break;
+      }
+    }
+  }
   async poll(){const s=await this.get();if(!s?.active)return;await this.tables();try{
       // Observe orders first so fills in the same polling cycle can match by oid.
       try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
-      const from=Math.max(s.started,s.cursor-120000);
+      // V1.3.6: fetch a deeper bounded history so rapid partial fills missed by
+      // earlier polls can be reconstructed before advancing the virtual ledger.
+      // Existing SKIPPED records remain immutable audit records: do not silently
+      // replay them or invent historical P/L.
+      const from=Math.max(s.started,s.cursor-30*60*1000);
       const fills:any=await info({type:'userFillsByTime',user:MC_WALLET,startTime:from,aggregateByTime:false});
       if(!Array.isArray(fills))throw Error('UNEXPECTED_FILLS_RESPONSE');
       if(fills.length>=1900)throw Error('FILL_PAGE_NEAR_LIMIT_MANUAL_AUDIT_REQUIRED');
-      // Hyperliquid may return several fills with the same millisecond timestamp.
-      // Their lexical tid order is NOT necessarily their position-execution order.
-      // Reconstruct a continuous startPosition -> endPosition chain per coin,
-      // anchored to our last verified targetQty. Never invent a missing fill.
       fills.sort((a:any,b:any)=>asNum(a.time)-asNum(b.time)||String(a.tid).localeCompare(String(b.tid)));
-      const pending=[...fills];
-      const processed=new Set<string>();
-      const key=(f:any)=>String(f.coin)+':'+String(f.tid??f.hash??'')+':'+String(f.hash||'');
-      // First discard fills already recorded in D1; they can appear in the rewind window.
+      const seen=new Set<string>();
       const freshFills:any[]=[];
-      for(const f of pending){
-        const id=key(f);
-        if(processed.has(id))continue;
-        processed.add(id);
+      for(const f of fills){
+        const id=String(f.coin)+':'+String(f.tid??f.hash??'')+':'+String(f.hash||'');
+        if(seen.has(id))continue;
+        seen.add(id);
         const exists:any=await this.db.prepare('SELECT 1 AS yes FROM mc_watch_events WHERE session_id=? AND fill_id=?').bind(s.id,id).first();
         if(!exists)freshFills.push(f);
       }
+      // Repair previously logged GAP HOLD rows when the original real fills
+      // form an exact chain from the currently accounted target position.
+      // This does not synthesize missing fills or reset virtual P/L.
+      await this.recoverVerifiedSkipped(s);
+      // Resolve continuity PER COIN across the entire fetched batch, not only
+      // among fills with an identical timestamp. Hyperliquid tid ordering is
+      // not a reliable position-chain order for multi-fill executions.
+      const byCoin=new Map<string,any[]>();
+      for(const f of freshFills){const coin=String(f.coin||'');if(!byCoin.has(coin))byCoin.set(coin,[]);byCoin.get(coin)!.push(f);}
       const ordered:any[]=[];
-      const remaining=[...freshFills];
-      while(remaining.length){
-        let choice=-1;
-        // Prefer the earliest fill that connects to the verified target position.
-        // This is especially important around LONG -> SHORT reversals.
-        const earliest=asNum(remaining[0].time);
-        for(let i=0;i<remaining.length;i++){
-          const f=remaining[i];
-          if(asNum(f.time)!==earliest)break;
-          const p=s.positions[String(f.coin)];
-          const expected=p?.targetQty;
-          if(expected===undefined)continue;
-          const start=asNum(f.startPosition);
-          if(Math.abs(start-expected)<=Math.max(1e-7,Math.abs(expected)*.00001)){
-            choice=i;break;
+      for(const [coin,group] of byCoin){
+        let anchor=s.positions[coin]?.targetQty;
+        // For an untracked coin use the earliest event's start as the anchor;
+        // inherited-position handling remains unchanged in apply().
+        if(anchor===undefined)anchor=asNum(group[0]?.startPosition);
+        const remaining=[...group];
+        while(remaining.length){
+          let choice=remaining.findIndex(f=>Math.abs(asNum(f.startPosition)-anchor!)<=Math.max(1e-7,Math.abs(anchor!)*.00001));
+          if(choice<0){
+            // No provable bridge: retain GAP HOLD, never fake a close/reversal.
+            // Keep the remaining fills in chronological order for audit.
+            ordered.push(...remaining);
+            break;
           }
+          const f=remaining.splice(choice,1)[0];
+          ordered.push(f);
+          anchor=round(asNum(f.startPosition)+(f.side==='B'?1:-1)*asNum(f.sz));
         }
-        if(choice<0)choice=0;
-        const f=remaining.splice(choice,1)[0];
-        // apply immediately so the next selection sees the updated verified anchor.
-        await this.apply(s,f);
-        ordered.push(f);
       }
-      // Advance cursor only after processing all fetched fills.
-      for(const f of ordered)s.cursor=Math.max(s.cursor,asNum(f.time));
+      // Across coins the exact interleaving is irrelevant to position
+      // continuity, but processing chronologically preserves cash ordering.
+      // Within each coin, the chain order constructed above must be retained.
+      const coinCursor=new Map<string,number>();
+      const chains=new Map<string,any[]>();
+      for(const f of ordered){const c=String(f.coin);if(!chains.has(c))chains.set(c,[]);chains.get(c)!.push(f);}
+      const allCoins=[...chains.keys()];
+      while(true){
+        let coin:string|null=null,earliest=Infinity;
+        for(const c of allCoins){const idx=coinCursor.get(c)||0;const f=chains.get(c)![idx];if(f&&asNum(f.time)<earliest){coin=c;earliest=asNum(f.time);}}
+        if(coin===null)break;
+        const idx=coinCursor.get(coin)||0;
+        const f=chains.get(coin)![idx];coinCursor.set(coin,idx+1);
+        await this.apply(s,f);
+        s.cursor=Math.max(s.cursor,asNum(f.time));
+      }
       const mids:any=await info({type:'allMids'});for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);
       for(const p of Object.values(s.positions))p.last=s.lastPrice[p.coin]||p.last;
       // Open orders were observed before processing fills.
@@ -262,7 +312,7 @@ export class MultiCoinEngine {
   }
   async status(){const s=await this.get();if(!s)return{ok:true,configured:true,active:false,needs_start:true,wallet:MC_WALLET};
     let used=0,unreal=0;const positions=Object.values(s.positions).map(p=>{const mark=s.lastPrice[p.coin]||p.last||p.avg;const u=p.qty*(mark-p.avg);const margin=Math.abs(p.qty*mark)/LEVERAGE;used+=margin;unreal+=u;return{...p,direction:sign(p.qty)>0?'LONG':'SHORT',mark,unrealized:u,margin,notional:Math.abs(p.qty*mark),duration_ms:Date.now()-p.opened};});
-    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3.3 REVERSAL FILL CHAIN FIX',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','On target position gaps, virtual exposure is held and further fills for that coin are blocked pending reconciliation; missing fills are not reconstructed','Perpetual market only; spot fills are not included']};}
+    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3.7 VERIFIED GAP REPLAY',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','Only contiguous previously audited target fills can be recovered; unknown gaps remain on hold and are never fabricated','Perpetual market only; spot fills are not included']};}
 
   // Read-only target position observer. Separate key: never mutates the virtual session.
   async targetPositions(){
