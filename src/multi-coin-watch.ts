@@ -31,8 +31,8 @@ export class MultiCoinEngine {
   async stop(){const s=await this.get();if(!s)return{ok:true,active:false};s.active=false;await this.put(s);return this.status();}
   async newSession(){await this.tables();const old=await this.get();if(old?.active)throw Error('STOP_BEFORE_NEW_SESSION');await this.put(fresh());return this.status();}
   private async log(s:Session,id:string,at:number,coin:string,action:string,details:any){await this.db.prepare(`INSERT OR IGNORE INTO mc_watch_events(session_id,fill_id,at,coin,action,payload) VALUES(?,?,?,?,?,?)`).bind(s.id,id,at,coin,action,JSON.stringify(details)).run();}
-  private async close(s:Session,p:Position,at:number,price:number,id:string){const net=p.gross-p.fees;const row={...p,closed:at,exit:price,net,direction:sign(p.targetQty)>=0?'LONG':'SHORT'};
-    await this.db.prepare(`INSERT OR IGNORE INTO mc_watch_closed(session_id,trade_id,coin,direction,opened,closed,entry,exit,gross,fees,net,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).bind(s.id,id,p.coin,sign(p.targetQty)>=0?'LONG':'SHORT',p.opened,at,p.avg,price,p.gross,p.fees,net,JSON.stringify(row)).run();
+  private async close(s:Session,p:Position,at:number,price:number,id:string){const net=p.gross-p.fees;const row={...p,closed:at,exit:price,net,direction:sign(p.qty)>=0?'LONG':'SHORT'};
+    await this.db.prepare(`INSERT OR IGNORE INTO mc_watch_closed(session_id,trade_id,coin,direction,opened,closed,entry,exit,gross,fees,net,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).bind(s.id,id,p.coin,sign(p.qty)>=0?'LONG':'SHORT',p.opened,at,p.avg,price,p.gross,p.fees,net,JSON.stringify(row)).run();
     s.closed++;if(net>0)s.wins++;else s.losses++;
   }
   private async apply(s:Session,f:any){const coin=String(f.coin||'');const at=asNum(f.time),px=asNum(f.px),size=asNum(f.sz),start=asNum(f.startPosition);
@@ -63,7 +63,39 @@ export class MultiCoinEngine {
     }else{
       const before=pos.qty,oldTarget=Math.abs(start),newTarget=Math.abs(end);
       if(sign(start)!==sign(pos.targetQty) || Math.abs(start-pos.targetQty)>Math.max(1e-7,oldTarget*.00001)){
-        reason='TARGET_POSITION_GAP';s.ignored[coin]=sign(end)!==0; // never silently rescale after missed fills
+        // The target sequence diverged. Never leave a stale virtual position open.
+        // Reconcile against the live clearinghouse snapshot, then close at an explicitly
+        // ESTIMATED mark (not an observed execution). Do not backfill missing fills.
+        const live:any=await info({type:'clearinghouseState',user:MC_WALLET});
+        const liveQty=asNum((live.assetPositions||[]).find((x:any)=>x.position?.coin===coin)?.position?.szi);
+        const sameDirection=sign(liveQty)===sign(end) && Math.abs(liveQty-end)<=Math.max(1e-7,Math.abs(end)*0.00001);
+        const mid:any=await info({type:'allMids'});
+        const estimatedPx=asNum(mid?.[coin])||px;
+        const closingQty=Math.abs(pos.qty);
+        const closeNotional=closingQty*estimatedPx;
+        const closeRealized=closingQty*(estimatedPx-pos.avg)*sign(pos.qty);
+        const closeFee=closeNotional*TAKER_FEE;
+        delta=-pos.qty;notional=closeNotional;realized=closeRealized;fee=closeFee;
+        pos.gross+=closeRealized;pos.fees+=closeFee;
+        await this.close(s,{...pos},at,estimatedPx,id);
+        delete s.positions[coin];
+        action='RESYNC_CLOSE';
+        reason='TARGET_POSITION_GAP_ESTIMATED_CLOSE';
+        s.ignored[coin]=sign(liveQty)!==0;
+        // A reversal is confirmed only when both the fill and live position agree.
+        // Otherwise wait for a clean subsequent fill; do not invent an entry.
+        if(sign(start)!==0&&sign(end)===-sign(start)&&sameDirection&&sign(end)!==0&&this.free(s)>=OPEN_MARGIN){
+          const newQty=sign(end)*OPEN_NOTIONAL/estimatedPx;
+          const newFee=OPEN_NOTIONAL*TAKER_FEE;
+          s.positions[coin]={coin,qty:newQty,avg:estimatedPx,opened:at,gross:0,fees:newFee,entryFees:newFee,last:estimatedPx,targetQty:liveQty,trades:1};
+          delete s.ignored[coin];
+          fee+=newFee;notional+=OPEN_NOTIONAL;
+          action='RESYNC_REVERSAL';
+          reason='TARGET_POSITION_GAP_CONFIRMED_REVERSAL_ESTIMATED_FILL';
+        }
+        // The target can have traded further since the fill: targetQty is
+        // the confirmed snapshot, so subsequent historical fills may not be
+        // continuous. Such fills must never be treated as new entries.
       }else if(sign(end)===sign(start)&&newTarget>oldTarget){
         action='ADD';delta=before*(newTarget/oldTarget-1);notional=Math.abs(delta*px);
         if(this.free(s)<notional/LEVERAGE){action='SKIPPED';reason='INSUFFICIENT_FREE_MARGIN';s.ignored[coin]=true;}
@@ -102,7 +134,7 @@ export class MultiCoinEngine {
   }
   async status(){const s=await this.get();if(!s)return{ok:true,configured:true,active:false,needs_start:true,wallet:MC_WALLET};
     let used=0,unreal=0;const positions=Object.values(s.positions).map(p=>{const mark=s.lastPrice[p.coin]||p.last||p.avg;const u=p.qty*(mark-p.avg);const margin=Math.abs(p.qty*mark)/LEVERAGE;used+=margin;unreal+=u;return{...p,direction:sign(p.qty)>0?'LONG':'SHORT',mark,unrealized:u,margin,notional:Math.abs(p.qty*mark),duration_ms:Date.now()-p.opened};});
-    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','If target position tracking diverges, affected coin is blocked until flat','Perpetual market only; spot fills are not included']};}
+    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','On target position gaps, virtual exposure is closed using an estimated current mid; confirmed reversal may reopen at estimated mid; missing fills are not reconstructed','Perpetual market only; spot fills are not included']};}
   async events(limit:number){await this.tables();const s=await this.get();if(!s)return{ok:true,rows:[]};const r:any=await this.db.prepare('SELECT payload FROM mc_watch_events WHERE session_id=? ORDER BY at DESC LIMIT ?').bind(s.id,Math.max(1,Math.min(500,limit))).all();return{ok:true,rows:(r.results||[]).map((x:any)=>JSON.parse(x.payload))};}
   async closed(limit:number){await this.tables();const s=await this.get();if(!s)return{ok:true,rows:[]};const r:any=await this.db.prepare('SELECT coin,direction,opened,closed,entry,exit,gross,fees,net FROM mc_watch_closed WHERE session_id=? ORDER BY closed DESC LIMIT ?').bind(s.id,Math.max(1,Math.min(500,limit))).all();return{ok:true,rows:r.results||[]};}
   async route(path:string,method:string,url:URL){try{if(path==='/multi/start'&&method==='POST')return reply(await this.start());if(path==='/multi/stop'&&method==='POST')return reply(await this.stop());if(path==='/multi/new-session'&&method==='POST')return reply(await this.newSession());if(path==='/multi/status')return reply(await this.status());if(path==='/multi/events')return reply(await this.events(Number(url.searchParams.get('limit')||200)));if(path==='/multi/closed')return reply(await this.closed(Number(url.searchParams.get('limit')||200)));return reply({ok:false,error:'NOT_FOUND'},404);}catch(e){return reply({ok:false,error:String(e)},503);}}
