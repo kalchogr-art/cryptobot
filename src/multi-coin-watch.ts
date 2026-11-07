@@ -1,5 +1,5 @@
 // MULTI-COIN TRADER WATCH V1 — VIRTUAL ONLY, NO EXCHANGE ORDERS.
-// Single wallet; D1 event log; Durable Object state. Starts flat; old target positions ignored until flat.
+// V1.3 order-to-fill audit, virtual only. Original copy engine and session are retained.
 export const MC_WALLET='0x34fb5ec7d4e939161946340ea2a1f29254b893de';
 const INFO='https://api.hyperliquid.xyz/info';
 const INITIAL=1000, LEVERAGE=10, OPEN_MARGIN=10, OPEN_NOTIONAL=OPEN_MARGIN*LEVERAGE;
@@ -10,8 +10,11 @@ const round=(x:number)=>Math.round(x*1e10)/1e10;
 const reply=(v:any,status=200)=>new Response(JSON.stringify(v,null,2),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 type Position={coin:string;qty:number;avg:number;opened:number;gross:number;fees:number;entryFees:number;last:number;targetQty:number;trades:number};
 type WatchOrder={oid:string;coin:string;side:string;limitPx:number;size:number;remaining:number;reduceOnly:boolean;orderType:string;firstSeen:number;lastSeen:number};
-type Session={id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number};
-function fresh():Session{return{id:'MC-'+Date.now(),active:false,started:Date.now(),cursor:Date.now(),cash:INITIAL,initial:INITIAL,positions:{},baseline:{},ignored:{},lastPrice:{},fills:0,skipped:0,turnover:0,fees:0,gross:0,closed:0,wins:0,losses:0,errors:[],lastPoll:0,lastError:null,orders:{},ordersLastPoll:0,ordersLastError:null,orderChanges:0,accuracyEligible:0,accuracyMatched:0,accuracyGaps:0,makerFills:0,takerFills:0,unknownFills:0};}
+type MirrorOrder={oid:string;coin:string;side:string;px:number;targetSize:number;virtualSize:number;filledTarget:number;filledVirtual:number;status:string;seenAt:number;lastAt:number;scale:number;};
+type MirrorPosition={coin:string;qty:number;avg:number;realized:number;fees:number;};
+type MirrorFill={oid:string;coin:string;at:number;targetSize:number;virtualSize:number;px:number;crossed:boolean|null;};
+type Session={id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number;mirrorOrders?:Record<string,MirrorOrder>;mirrorMatches?:number;mirrorUnmatched?:number;mirrorFills?:MirrorFill[];mirrorScale?:Record<string,number>;mirrorPositions?:Record<string,MirrorPosition>;mirrorRealized?:number;mirrorFees?:number;};
+function fresh():Session{return{id:'MC-'+Date.now(),active:false,started:Date.now(),cursor:Date.now(),cash:INITIAL,initial:INITIAL,positions:{},baseline:{},ignored:{},lastPrice:{},fills:0,skipped:0,turnover:0,fees:0,gross:0,closed:0,wins:0,losses:0,errors:[],lastPoll:0,lastError:null,orders:{},ordersLastPoll:0,ordersLastError:null,orderChanges:0,accuracyEligible:0,accuracyMatched:0,accuracyGaps:0,makerFills:0,takerFills:0,unknownFills:0,mirrorOrders:{},mirrorMatches:0,mirrorUnmatched:0,mirrorFills:[],mirrorScale:{},mirrorPositions:{},mirrorRealized:0,mirrorFees:0};}
 async function info(body:any){const r=await fetch(INFO,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('HL_HTTP_'+r.status);return r.json() as Promise<any>;}
 export class MultiCoinEngine {
   constructor(private storage:any,private db:any){}
@@ -23,6 +26,67 @@ export class MultiCoinEngine {
     await this.db.prepare(`CREATE TABLE IF NOT EXISTS mc_watch_closed (session_id TEXT NOT NULL, trade_id TEXT NOT NULL, coin TEXT NOT NULL, direction TEXT NOT NULL, opened INTEGER NOT NULL, closed INTEGER NOT NULL, entry REAL NOT NULL, exit REAL NOT NULL, gross REAL NOT NULL, fees REAL NOT NULL, net REAL NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(session_id,trade_id))`).run();
     await this.db.prepare(`CREATE TABLE IF NOT EXISTS mc_watch_order_events (session_id TEXT NOT NULL, event_id TEXT NOT NULL, at INTEGER NOT NULL, oid TEXT NOT NULL, coin TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(session_id,event_id))`).run();
     await this.db.prepare(`CREATE INDEX IF NOT EXISTS mc_watch_order_events_at ON mc_watch_order_events(session_id,at DESC)`).run();
+  }
+  // Order-to-fill audit is deliberately separate from the existing virtual P/L engine.
+  // A target fill proves the TARGET order executed, not that our hypothetical maker order did.
+  private async mirrorObserve(s:Session, raw:any[], now:number){
+    s.mirrorOrders ||= {}; s.mirrorScale ||= {};
+    const active=new Set<string>();
+    for(const o of raw){
+      const oid=String(o.oid??''); const coin=String(o.coin??'');
+      const px=asNum(o.limitPx),sz=asNum(o.sz);
+      if(!oid||!coin||px<=0||sz<=0)continue;
+      active.add(oid);
+      const old=s.mirrorOrders[oid];
+      // Derive a reference ratio from the first observed position, otherwise use $100/target notional.
+      // This is an observation baseline, not a claim of exact trader account equity scaling.
+      let scale=s.mirrorScale[coin];
+      if(!scale){
+        const target=asNum(s.baseline[coin])||asNum(s.positions[coin]?.targetQty);
+        scale=Math.abs(target)>EPS?OPEN_NOTIONAL/(Math.abs(target)*px):OPEN_NOTIONAL/(sz*px);
+        s.mirrorScale[coin]=scale;
+      }
+      const virtualSize=round(sz*scale);
+      if(!old){s.mirrorOrders[oid]={oid,coin,side:String(o.side||''),px,targetSize:sz,virtualSize,filledTarget:0,filledVirtual:0,status:'PENDING',seenAt:now,lastAt:now,scale};}
+      else {old.px=px;old.targetSize=sz;old.virtualSize=round(sz*old.scale);old.lastAt=now;if(old.status==='DISAPPEARED_UNCONFIRMED')old.status='PENDING';}
+    }
+    for(const o of Object.values(s.mirrorOrders))if(o.status==='PENDING'&&!active.has(o.oid))o.status='DISAPPEARED_UNCONFIRMED';
+  }
+  private async mirrorFill(s:Session,f:any){
+    const oid=String(f.oid??'');if(!oid)return;
+    const m=s.mirrorOrders?.[oid];
+    if(!m){s.mirrorUnmatched=(s.mirrorUnmatched||0)+1;return;}
+    const sz=asNum(f.sz),px=asNum(f.px),at=asNum(f.time);
+    if(sz<=0||px<=0)return;
+    const v=round(sz*m.scale);
+    m.filledTarget+=sz;m.filledVirtual=round(m.filledVirtual+v);m.lastAt=at;
+    m.status=m.filledTarget+1e-8>=m.targetSize?'TARGET_FILLED':'TARGET_PARTIAL_FILL';
+    // Separate theoretical target-linked virtual ledger. Never modifies the original copy ledger.
+    s.mirrorPositions ||= {};
+    const signed=String(f.side)==='B'?v:-v;
+    const old=s.mirrorPositions[m.coin]||{coin:m.coin,qty:0,avg:0,realized:0,fees:0};
+    const prior=old.qty;
+    const fee=Math.abs(v*px)*(f.crossed===true?TAKER_FEE:MAKER_FEE);
+    old.fees+=fee;s.mirrorFees=(s.mirrorFees||0)+fee;
+    if(sign(prior)===0||sign(prior)===sign(signed)){
+      const next=prior+signed;
+      old.avg=(Math.abs(prior)*old.avg+Math.abs(signed)*px)/Math.abs(next);
+      old.qty=round(next);
+    }else{
+      const closing=Math.min(Math.abs(prior),Math.abs(signed));
+      const pnl=closing*(px-old.avg)*sign(prior);
+      old.realized+=pnl;s.mirrorRealized=(s.mirrorRealized||0)+pnl;
+      old.qty=round(prior+signed);
+      if(sign(old.qty)!==sign(prior))old.avg=sign(old.qty)===0?0:px;
+    }
+    s.mirrorPositions[m.coin]=old;
+    s.mirrorMatches=(s.mirrorMatches||0)+1;
+    (s.mirrorFills ||= []).push({oid,coin:m.coin,at,targetSize:sz,virtualSize:v,px,crossed:typeof f.crossed==='boolean'?f.crossed:null});
+    s.mirrorFills=s.mirrorFills.slice(-300);
+  }
+  async mirrorStatus(limit=100){const s=await this.get();if(!s)return{ok:true,active:[],fills:[]};
+    const all=Object.values(s.mirrorOrders||{});
+    return{ok:true,mode:'TARGET_ORDER_MIRROR_AUDIT_ONLY',session_id:s.id,orders:all.slice(-Math.max(1,Math.min(limit,500))),theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,unmatched_target_fills:s.mirrorUnmatched||0,linked_fills:(s.mirrorFills||[]).slice(-Math.max(1,Math.min(limit,300))),note:'Theoretical P/L uses matched TARGET fills, not proven virtual maker fills. Unobserved orders are excluded; latency, queue, funding and slippage are not modeled.'};
   }
   async start(){await this.tables();let s=await this.get();if(s?.active)return this.status();if(!s)s=fresh();
     // First start, or resumption: snapshot existing target positions to prevent copying inherited exposure.
@@ -60,6 +124,7 @@ export class MultiCoinEngine {
         // Absence alone cannot distinguish cancellation from full fill.
         await this.orderLog(s,oid,old.coin,'ORDER_DISAPPEARED',now,{...old,reason:'UNKNOWN_CANCEL_OR_FILL'});
       }
+      await this.mirrorObserve(s,raw,now);
       s.orders=next;s.ordersLastPoll=now;s.ordersLastError=null;
     }catch(e){s.ordersLastError=String(e);throw e;}
   }
@@ -76,6 +141,7 @@ export class MultiCoinEngine {
     const id=coin+':'+String(f.tid??f.hash??'')+':'+String(f.hash||'');if(!coin||!at||!px||!size||!['A','B'].includes(f.side))return;
     const signed=f.side==='B'?size:-size,end=round(start+signed),pos=s.positions[coin];
     const exists:any=await this.db.prepare('SELECT 1 AS yes FROM mc_watch_events WHERE session_id=? AND fill_id=?').bind(s.id,id).first();if(exists)return;
+    await this.mirrorFill(s,f);
     let action='SKIPPED',reason='',delta=0,realized=0,fee=0,notional=0;
     if(s.ignored[coin]){
       // Ignore pre-existing exposure, but start copying on a fresh increase or direction flip.
@@ -100,39 +166,15 @@ export class MultiCoinEngine {
     }else{
       const before=pos.qty,oldTarget=Math.abs(start),newTarget=Math.abs(end);
       if(sign(start)!==sign(pos.targetQty) || Math.abs(start-pos.targetQty)>Math.max(1e-7,oldTarget*.00001)){
-        // The target sequence diverged. Never leave a stale virtual position open.
-        // Reconcile against the live clearinghouse snapshot, then close at an explicitly
-        // ESTIMATED mark (not an observed execution). Do not backfill missing fills.
-        const live:any=await info({type:'clearinghouseState',user:MC_WALLET});
-        const liveQty=asNum((live.assetPositions||[]).find((x:any)=>x.position?.coin===coin)?.position?.szi);
-        const sameDirection=sign(liveQty)===sign(end) && Math.abs(liveQty-end)<=Math.max(1e-7,Math.abs(end)*0.00001);
-        const mid:any=await info({type:'allMids'});
-        const estimatedPx=asNum(mid?.[coin])||px;
-        const closingQty=Math.abs(pos.qty);
-        const closeNotional=closingQty*estimatedPx;
-        const closeRealized=closingQty*(estimatedPx-pos.avg)*sign(pos.qty);
-        const closeFee=closeNotional*TAKER_FEE;
-        delta=-pos.qty;notional=closeNotional;realized=closeRealized;fee=closeFee;
-        pos.gross+=closeRealized;pos.fees+=closeFee;
-        await this.close(s,{...pos},at,estimatedPx,id);
-        delete s.positions[coin];
-        action='RESYNC_CLOSE';
-        reason='TARGET_POSITION_GAP_ESTIMATED_CLOSE';
-        s.ignored[coin]=sign(liveQty)!==0;
-        // A reversal is confirmed only when both the fill and live position agree.
-        // Otherwise wait for a clean subsequent fill; do not invent an entry.
-        if(sign(start)!==0&&sign(end)===-sign(start)&&sameDirection&&sign(end)!==0&&this.free(s)>=OPEN_MARGIN){
-          const newQty=sign(end)*OPEN_NOTIONAL/estimatedPx;
-          const newFee=OPEN_NOTIONAL*TAKER_FEE;
-          s.positions[coin]={coin,qty:newQty,avg:estimatedPx,opened:at,gross:0,fees:newFee,entryFees:newFee,last:estimatedPx,targetQty:liveQty,trades:1};
-          delete s.ignored[coin];
-          fee+=newFee;notional+=OPEN_NOTIONAL;
-          action='RESYNC_REVERSAL';
-          reason='TARGET_POSITION_GAP_CONFIRMED_REVERSAL_ESTIMATED_FILL';
-        }
-        // The target can have traded further since the fill: targetQty is
-        // the confirmed snapshot, so subsequent historical fills may not be
-        // continuous. Such fills must never be treated as new entries.
+        // Gap protection: a missing fill is NOT proof that the trader closed.
+        // Keep the virtual exposure and explicitly mark it unsynchronized.
+        // Do not fabricate P/L, fees, or an entry/exit at a live midpoint.
+        action='SKIPPED';
+        reason='TARGET_POSITION_GAP_HELD_FOR_AUDIT';
+        s.errors.push(new Date(at).toISOString()+' GAP '+coin+' expected='+pos.targetQty+' fill_start='+start+' fill_end='+end+'; position held, manual reconciliation required');
+        s.errors=s.errors.slice(-30);
+        // Keep targetQty unchanged: never silently claim the missing sequence was copied.
+        // Further fills remain blocked on this coin until a verified reconciliation.
       }else if(sign(end)===sign(start)&&newTarget>oldTarget){
         action='ADD';delta=before*(newTarget/oldTarget-1);notional=Math.abs(delta*px);
         if(this.free(s)<notional/LEVERAGE){action='SKIPPED';reason='INSUFFICIENT_FREE_MARGIN';s.ignored[coin]=true;}
@@ -162,6 +204,8 @@ export class MultiCoinEngine {
   }
   private free(s:Session){let used=0,unreal=0;for(const p of Object.values(s.positions)){const mark=s.lastPrice[p.coin]||p.last||p.avg;used+=Math.abs(p.qty*mark)/LEVERAGE;unreal+=p.qty*(mark-p.avg);}return s.cash+unreal-used;}
   async poll(){const s=await this.get();if(!s?.active)return;await this.tables();try{
+      // Observe orders first so fills in the same polling cycle can match by oid.
+      try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
       const from=Math.max(s.started,s.cursor-2000);
       const fills:any=await info({type:'userFillsByTime',user:MC_WALLET,startTime:from,aggregateByTime:false});
       if(!Array.isArray(fills))throw Error('UNEXPECTED_FILLS_RESPONSE');
@@ -170,16 +214,15 @@ export class MultiCoinEngine {
       for(const f of fills){await this.apply(s,f);s.cursor=Math.max(s.cursor,asNum(f.time));}
       const mids:any=await info({type:'allMids'});for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);
       for(const p of Object.values(s.positions))p.last=s.lastPrice[p.coin]||p.last;
-      // Open-order polling is independent: do not invalidate fill processing on failure.
-      try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
+      // Open orders were observed before processing fills.
       s.lastPoll=Date.now();s.lastError=null;
     }catch(e){s.lastError=String(e);s.errors.push(new Date().toISOString()+' '+String(e));s.errors=s.errors.slice(-30);}
     await this.put(s);
   }
   async status(){const s=await this.get();if(!s)return{ok:true,configured:true,active:false,needs_start:true,wallet:MC_WALLET};
     let used=0,unreal=0;const positions=Object.values(s.positions).map(p=>{const mark=s.lastPrice[p.coin]||p.last||p.avg;const u=p.qty*(mark-p.avg);const margin=Math.abs(p.qty*mark)/LEVERAGE;used+=margin;unreal+=u;return{...p,direction:sign(p.qty)>0?'LONG':'SHORT',mark,unrealized:u,margin,notional:Math.abs(p.qty*mark),duration_ms:Date.now()-p.opened};});
-    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.2 ORDER OBSERVER',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','On target position gaps, virtual exposure is closed using an estimated current mid; confirmed reversal may reopen at estimated mid; missing fills are not reconstructed','Perpetual market only; spot fills are not included']};}
+    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3 ORDER-FILL LINK AUDIT',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','On target position gaps, virtual exposure is held and further fills for that coin are blocked pending reconciliation; missing fills are not reconstructed','Perpetual market only; spot fills are not included']};}
   async events(limit:number){await this.tables();const s=await this.get();if(!s)return{ok:true,rows:[]};const r:any=await this.db.prepare('SELECT payload FROM mc_watch_events WHERE session_id=? ORDER BY at DESC LIMIT ?').bind(s.id,Math.max(1,Math.min(500,limit))).all();return{ok:true,rows:(r.results||[]).map((x:any)=>JSON.parse(x.payload))};}
   async closed(limit:number){await this.tables();const s=await this.get();if(!s)return{ok:true,rows:[]};const r:any=await this.db.prepare('SELECT coin,direction,opened,closed,entry,exit,gross,fees,net FROM mc_watch_closed WHERE session_id=? ORDER BY closed DESC LIMIT ?').bind(s.id,Math.max(1,Math.min(500,limit))).all();return{ok:true,rows:r.results||[]};}
-  async route(path:string,method:string,url:URL){try{if(path==='/multi/start'&&method==='POST')return reply(await this.start());if(path==='/multi/stop'&&method==='POST')return reply(await this.stop());if(path==='/multi/new-session'&&method==='POST')return reply(await this.newSession());if(path==='/multi/status')return reply(await this.status());if(path==='/multi/events')return reply(await this.events(Number(url.searchParams.get('limit')||200)));if(path==='/multi/orders')return reply(await this.orders(Number(url.searchParams.get('limit')||100)));if(path==='/multi/closed')return reply(await this.closed(Number(url.searchParams.get('limit')||200)));return reply({ok:false,error:'NOT_FOUND'},404);}catch(e){return reply({ok:false,error:String(e)},503);}}
+  async route(path:string,method:string,url:URL){try{if(path==='/multi/start'&&method==='POST')return reply(await this.start());if(path==='/multi/stop'&&method==='POST')return reply(await this.stop());if(path==='/multi/new-session'&&method==='POST')return reply(await this.newSession());if(path==='/multi/status')return reply(await this.status());if(path==='/multi/events')return reply(await this.events(Number(url.searchParams.get('limit')||200)));if(path==='/multi/mirror')return reply(await this.mirrorStatus(Number(url.searchParams.get('limit')||100)));if(path==='/multi/orders')return reply(await this.orders(Number(url.searchParams.get('limit')||100)));if(path==='/multi/closed')return reply(await this.closed(Number(url.searchParams.get('limit')||200)));return reply({ok:false,error:'NOT_FOUND'},404);}catch(e){return reply({ok:false,error:String(e)},503);}}
 }
