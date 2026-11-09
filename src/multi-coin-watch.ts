@@ -204,43 +204,69 @@ export class MultiCoinEngine {
     if(!replayExisting)await this.log(s,id,at,coin,action,record);
   }
   private free(s:Session){let used=0,unreal=0;for(const p of Object.values(s.positions)){const mark=s.lastPrice[p.coin]||p.last||p.avg;used+=Math.abs(p.qty*mark)/LEVERAGE;unreal+=p.qty*(mark-p.avg);}return s.cash+unreal-used;}
-  // Repair only a provable ONE-EVENT durable-state rollback. The latest successful
-  // D1 event must be a REVERSAL, and the stored position must match the exact
-  // previous successful event (both target quantity and virtual quantity).
-  // This is NOT a generic resync: ambiguous cases remain held for audit.
+  // Restore a rolled-back durable checkpoint using ONLY a contiguous sequence
+  // of already-successful D1 events. This covers ADD, PARTIAL_CLOSE and REVERSAL.
+  // The event ledger remains unchanged. No target-only forced resynchronization.
   private async repairStaleCheckpoint(s:Session){
-    const coins=Object.keys(s.positions);
-    for(const coin of coins){
-      const rows:any=await this.db.prepare(`SELECT fill_id,action,payload FROM mc_watch_events
-        WHERE session_id=? AND coin=? AND action IN ('OPEN','ADD','PARTIAL_CLOSE','CLOSE','REVERSAL')
-        ORDER BY at DESC, rowid DESC LIMIT 2`).bind(s.id,coin).all();
-      const events=rows.results||[];
-      if(events.length!==2)continue;
-      const newest=JSON.parse(events[0].payload),previous=JSON.parse(events[1].payload);
+    const near=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(1e-7,Math.abs(b)*1e-6);
+    for(const coin of Object.keys(s.positions)){
       const pos=s.positions[coin];
-      if(!pos||events[0].action!=='REVERSAL')continue;
-      const near=(a:number,b:number)=>Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(1e-7,Math.abs(b)*1e-6);
-      // Already at the latest checkpoint: no repair required.
-      if(near(pos.targetQty,Number(newest.target_after))&&near(pos.qty,Number(newest.virtual_qty_after)))continue;
-      if(!near(pos.targetQty,Number(previous.target_after))||!near(pos.qty,Number(previous.virtual_qty_after)))continue;
-      if(!near(Number(newest.target_before),pos.targetQty))continue;
-      const start=Number(newest.target_before),end=Number(newest.target_after),px=Number(newest.price),at=Number(newest.at);
-      if(!Number.isFinite(px)||px<=0||!Number.isFinite(at)||at<=0||sign(start)===sign(end)||sign(end)===0)continue;
-      // The original virtual reversal always opens a $100 notional position.
-      const expectedQty=sign(end)*OPEN_NOTIONAL/px;
-      if(!near(expectedQty,Number(newest.virtual_qty_after)))continue;
-      const parts=String(events[0].fill_id).split(':');
-      if(parts.length<3)continue;
-      const signed=end-start;
-      const fill={coin,time:at,px,sz:Math.abs(signed),startPosition:start,side:signed>0?'B':'A',tid:parts[1],hash:parts.slice(2).join(':'),crossed:newest.crossed};
-      // The D1 event and closed-trade record already exist. Reapply only the
-      // missing durable accounting; do not duplicate the event or trade row.
-      await this.apply(s,fill,false,true);
-      const after=s.positions[coin];
-      if(!after||!near(after.targetQty,end)||!near(after.qty,Number(newest.virtual_qty_after)))
-        throw Error('CHECKPOINT_REPAIR_RESULT_MISMATCH_'+coin);
-      await this.put(s);
-      s.errors.push(new Date().toISOString()+' VERIFIED_CHECKPOINT_REPAIR '+coin+' '+start+' -> '+end+' from existing D1 REVERSAL');
+      if(!pos)continue;
+      const rows:any=await this.db.prepare(`SELECT fill_id,action,at,payload FROM mc_watch_events
+        WHERE session_id=? AND coin=? AND action IN ('OPEN','ADD','PARTIAL_CLOSE','CLOSE','REVERSAL')
+        ORDER BY at DESC,rowid DESC LIMIT 150`).bind(s.id,coin).all();
+      const events=(rows.results||[]).reverse().map((r:any)=>({...r,event:JSON.parse(r.payload)}));
+      if(events.length<2)continue;
+      const latest=events[events.length-1].event;
+      if(near(pos.targetQty,Number(latest.target_after))&&near(pos.qty,Number(latest.virtual_qty_after)))continue;
+      // Find the most recent fully matching persisted checkpoint. A target
+      // quantity alone is insufficient because targets often revisit the same size.
+      let anchor=-1;
+      for(let i=events.length-2;i>=0;i--){
+        const e=events[i].event;
+        if(near(pos.targetQty,Number(e.target_after))&&near(pos.qty,Number(e.virtual_qty_after))){anchor=i;break;}
+      }
+      if(anchor<0)continue;
+      const chain=events.slice(anchor+1);
+      if(chain.length>100)continue;
+      let expected=Number(events[anchor].event.target_after);
+      let valid=true;
+      for(const row of chain){
+        const e=row.event;
+        const before=Number(e.target_before),after=Number(e.target_after);
+        const px=Number(e.price),at=Number(e.at),delta=after-before;
+        if(!near(before,expected)||!Number.isFinite(px)||px<=0||!Number.isFinite(at)||at<=0||!Number.isFinite(delta)||Math.abs(delta)<EPS||!['ADD','PARTIAL_CLOSE','REVERSAL'].includes(row.action)){
+          valid=false;break;
+        }
+        expected=after;
+      }
+      if(!valid)continue;
+      // Replay on an isolated copy, then compare EVERY resulting checkpoint to
+      // its recorded D1 outcome before publishing any repaired durable state.
+      const candidate:Session=JSON.parse(JSON.stringify(s));
+      let matched=true;
+      for(const row of chain){
+        const e=row.event;
+        const start=Number(e.target_before),end=Number(e.target_after),delta=end-start;
+        const parts=String(row.fill_id).replace(/:VERIFIED_RECOVERY$/u,'').split(':');
+        if(parts.length<3){matched=false;break;}
+        const fill={coin,time:Number(e.at),px:Number(e.price),sz:Math.abs(delta),startPosition:start,side:delta>0?'B':'A',tid:parts[1],hash:parts.slice(2).join(':'),crossed:e.crossed};
+        const beforeGross=candidate.gross,beforeFees=candidate.fees,beforeTurnover=candidate.turnover;
+        await this.apply(candidate,fill,false,true);
+        const after=candidate.positions[coin];
+        if(!after||!near(after.targetQty,end)||!near(after.qty,Number(e.virtual_qty_after))||
+           !near(candidate.gross-beforeGross,Number(e.realized))||
+           !near(candidate.fees-beforeFees,Number(e.fee))||
+           !near(candidate.turnover-beforeTurnover,Number(e.notional))){matched=false;break;}
+      }
+      if(!matched)continue;
+      // A fresh read protects against another poll modifying the checkpoint.
+      const persisted=await this.get();
+      if(!persisted||persisted.id!==s.id||!persisted.positions[coin]||
+         !near(persisted.positions[coin].targetQty,pos.targetQty)||
+         !near(persisted.positions[coin].qty,pos.qty))continue;
+      Object.assign(s,candidate);
+      s.errors.push(new Date().toISOString()+' VERIFIED_CHECKPOINT_CHAIN_REPAIR '+coin+' events='+chain.length+' target='+pos.targetQty+' -> '+expected);
       s.errors=s.errors.slice(-30);
       await this.put(s);
     }
@@ -376,7 +402,7 @@ export class MultiCoinEngine {
   }
   async status(){const s=await this.get();if(!s)return{ok:true,configured:true,active:false,needs_start:true,wallet:MC_WALLET};
     let used=0,unreal=0;const positions=Object.values(s.positions).map(p=>{const mark=s.lastPrice[p.coin]||p.last||p.avg;const u=p.qty*(mark-p.avg);const margin=Math.abs(p.qty*mark)/LEVERAGE;used+=margin;unreal+=u;return{...p,direction:sign(p.qty)>0?'LONG':'SHORT',mark,unrealized:u,margin,notional:Math.abs(p.qty*mark),duration_ms:Date.now()-p.opened};});
-    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3.9 VERIFIED CHECKPOINT REPAIR',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','Only contiguous previously audited target fills can be recovered; unknown gaps remain on hold and are never fabricated','Perpetual market only; spot fills are not included']};}
+    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.4.0 VERIFIED CHAIN CHECKPOINT REPAIR',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','Only contiguous previously audited target fills can be recovered; unknown gaps remain on hold and are never fabricated','Perpetual market only; spot fills are not included']};}
 
   // Read-only target position observer. Separate key: never mutates the virtual session.
   async targetPositions(){
