@@ -1464,7 +1464,28 @@ export class TraderWatch {
   async alarm(): Promise<void> {
     const multi = new MultiCoinEngine(this.ctx.storage,this.env.DB);
     const mc = await multi.get();
-    if(mc?.active){await multi.poll();await this.ctx.storage.setAlarm(Date.now()+10000);return;}
+    if(mc?.active){
+      try {
+        await multi.poll();
+      } catch(e) {
+        // Do not let a transient poll or checkpoint failure permanently stop alarms.
+        // Keep the multi-coin session and its saved positions untouched.
+        try {
+          const state=await multi.get();
+          if(state?.active){
+            state.lastError='ALARM_MULTI: '+String(e);
+            state.errors=(state.errors||[]).concat(new Date().toISOString()+' ALARM_MULTI '+String(e)).slice(-30);
+            await multi.put(state);
+          }
+        } catch(_diagnosticError) {
+          // Failure to save diagnostics must not prevent the next alarm.
+        }
+      } finally {
+        // Re-arm even when the poll fails; no extra Hyperliquid requests here.
+        await this.ctx.storage.setAlarm(Date.now()+ALARM_INTERVAL_MS);
+      }
+      return;
+    }
     if(mc && !mc.active) return;
     if (!this.s.active || this.resetBusy) return;
     try {
@@ -1704,7 +1725,21 @@ export class TraderWatch {
         this.s.active=false;this.s.connected=false;try{this.ws?.close(1000,"switch to multi")}catch{}this.ws=null;await this.save();
       }
       const result=await multi.route(path,request.method,url);
-      if(path==="/multi/start" && result.ok) {const data=await multi.get();if(data?.active)await this.ctx.storage.setAlarm(Date.now()+1000);}
+      if(path==="/multi/start" && result.ok) {
+        const data=await multi.get();
+        if(data?.active)await this.ctx.storage.setAlarm(Date.now()+1000);
+      }
+      // A status read can revive a missing alarm without resetting the session.
+      // Do not move an already scheduled alarm on each dashboard refresh.
+      if(path==="/multi/status" && request.method==="GET" && result.ok){
+        try {
+          const data=await multi.get();
+          if(data?.active && await this.ctx.storage.getAlarm()===null)
+            await this.ctx.storage.setAlarm(Date.now()+ALARM_INTERVAL_MS);
+        } catch(_alarmRecoveryError) {
+          // Status remains readable if the recovery check is unavailable.
+        }
+      }
       return result;
     }
     if (path === '/reset' && request.method === 'POST') return this.reset();
