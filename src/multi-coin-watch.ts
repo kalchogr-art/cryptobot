@@ -14,7 +14,7 @@ type MirrorOrder={oid:string;coin:string;side:string;px:number;targetSize:number
 type MirrorPosition={coin:string;qty:number;avg:number;realized:number;fees:number;};
 type MirrorFill={oid:string;coin:string;at:number;targetSize:number;virtualSize:number;px:number;crossed:boolean|null;};
 type PendingWrite={kind:'event'|'closed';id:string;at:number;coin:string;action?:string;payload:any};
-type Session={pendingWrites?:PendingWrite[];id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number;mirrorOrders?:Record<string,MirrorOrder>;mirrorMatches?:number;mirrorUnmatched?:number;mirrorFills?:MirrorFill[];mirrorScale?:Record<string,number>;mirrorPositions?:Record<string,MirrorPosition>;mirrorRealized?:number;mirrorFees?:number;};
+type Session={pendingWrites?:PendingWrite[];rateLimitUntil?:number;lastFillsPoll?:number;lastMidsPoll?:number;id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number;mirrorOrders?:Record<string,MirrorOrder>;mirrorMatches?:number;mirrorUnmatched?:number;mirrorFills?:MirrorFill[];mirrorScale?:Record<string,number>;mirrorPositions?:Record<string,MirrorPosition>;mirrorRealized?:number;mirrorFees?:number;};
 function fresh():Session{return{id:'MC-'+Date.now(),active:false,started:Date.now(),cursor:Date.now(),cash:INITIAL,initial:INITIAL,positions:{},baseline:{},ignored:{},lastPrice:{},fills:0,skipped:0,turnover:0,fees:0,gross:0,closed:0,wins:0,losses:0,errors:[],lastPoll:0,lastError:null,orders:{},ordersLastPoll:0,ordersLastError:null,orderChanges:0,accuracyEligible:0,accuracyMatched:0,accuracyGaps:0,makerFills:0,takerFills:0,unknownFills:0,mirrorOrders:{},mirrorMatches:0,mirrorUnmatched:0,mirrorFills:[],mirrorScale:{},mirrorPositions:{},mirrorRealized:0,mirrorFees:0};}
 async function info(body:any){const r=await fetch(INFO,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('HL_HTTP_'+r.status);return r.json() as Promise<any>;}
 export class MultiCoinEngine {
@@ -312,7 +312,10 @@ export class MultiCoinEngine {
     const run=this.pollOnce();this.pollInFlight=run;
     try{await run;}finally{if(this.pollInFlight===run)this.pollInFlight=null;}
   }
-  private async pollOnce(){const s=await this.get();if(!s?.active)return;await this.tables();
+  private async pollOnce(){const s=await this.get();if(!s?.active)return;
+    // Persisted cooldown prevents alarms from hammering Hyperliquid after HTTP 429.
+    if((s.rateLimitUntil||0)>Date.now())return;
+    await this.tables();
     // Recover any committed ledger changes whose D1 audit write was interrupted.
     try{await this.flushPending(s,40);}catch(e){
       s.lastError='PENDING_AUDIT_FLUSH_FAILED '+String(e);
@@ -321,8 +324,8 @@ export class MultiCoinEngine {
       // Do not freeze ingestion because an audit D1 write failed.
     }
     try{
-      // Observe orders first so fills in the same polling cycle can match by oid.
-      try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
+      // Prioritize fills; ancillary endpoints must not consume the request budget first.
+      // Order snapshots are best-effort and sampled at most once per minute.
       // V1.3.6: fetch a deeper bounded history so rapid partial fills missed by
       // earlier polls can be reconstructed before advancing the virtual ledger.
       // Existing SKIPPED records remain immutable audit records: do not silently
@@ -400,22 +403,43 @@ export class MultiCoinEngine {
         // Do not flush D1 inside the fill loop: avoid repeated backlog scans.
 
       }
-      // Bounded second drain; new fills do not wait for the entire old backlog.
+      // A successful fills response is the ingestion heartbeat, independent of prices/orders.
+      s.lastFillsPoll=Date.now();
+      s.lastPoll=s.lastFillsPoll;
+      s.lastError=null;
+      await this.put(s);
+      // Bounded second drain; audit errors do not stop fill ingestion.
       try{await this.flushPending(s,80);}catch(e){
         s.lastError='PENDING_AUDIT_FLUSH_FAILED '+String(e);
         s.errors.push(new Date().toISOString()+' '+s.lastError);s.errors=s.errors.slice(-30);
       }
-      const mids:any=await info({type:'allMids'});for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);
-      for(const p of Object.values(s.positions))p.last=s.lastPrice[p.coin]||p.last;
-      // Open orders were observed before processing fills.
-      s.lastPoll=Date.now();
-      if(!(s.pendingWrites||[]).length)s.lastError=null;
-    }catch(e){s.lastError=String(e);s.errors.push(new Date().toISOString()+' '+String(e));s.errors=s.errors.slice(-30);}
+      // Nonessential API calls are rate-limited locally and cannot invalidate a good fills poll.
+      if(Date.now()-(s.ordersLastPoll||0)>=60000){
+        try{await this.watchOrders(s);}catch(e){
+          s.ordersLastError=String(e);
+          if(String(e).includes('HL_HTTP_429'))s.rateLimitUntil=Date.now()+120000;
+          s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);
+        }
+      }
+      if(!(s.rateLimitUntil||0) || s.rateLimitUntil<=Date.now()){
+        if(Date.now()-(s.lastMidsPoll||0)>=60000){
+          try{
+            const mids:any=await info({type:'allMids'});
+            for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);
+            for(const p of Object.values(s.positions))p.last=s.lastPrice[p.coin]||p.last;
+            s.lastMidsPoll=Date.now();
+          }catch(e){
+            if(String(e).includes('HL_HTTP_429'))s.rateLimitUntil=Date.now()+120000;
+            s.errors.push(new Date().toISOString()+' MIDS '+String(e));s.errors=s.errors.slice(-30);
+          }
+        }
+      }
+    }catch(e){s.lastError=String(e);if(String(e).includes('HL_HTTP_429'))s.rateLimitUntil=Date.now()+120000;s.errors.push(new Date().toISOString()+' '+String(e));s.errors=s.errors.slice(-30);}
     await this.put(s);
   }
   async status(){const s=await this.get();if(!s)return{ok:true,configured:true,active:false,needs_start:true,wallet:MC_WALLET};
     let used=0,unreal=0;const positions=Object.values(s.positions).map(p=>{const mark=s.lastPrice[p.coin]||p.last||p.avg;const u=p.qty*(mark-p.avg);const margin=Math.abs(p.qty*mark)/LEVERAGE;used+=margin;unreal+=u;return{...p,direction:sign(p.qty)>0?'LONG':'SHORT',mark,unrealized:u,margin,notional:Math.abs(p.qty*mark),duration_ms:Date.now()-p.opened};});
-    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3.11 BOUNDED AUDIT QUEUE',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_error:s.lastError,pending_audit_writes:(s.pendingWrites||[]).length,pending_audit_oldest:(s.pendingWrites||[])[0]?.at||null,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','Only contiguous previously audited target fills can be recovered; unknown gaps remain on hold and are never fabricated','Perpetual market only; spot fills are not included']};}
+    const equity=s.cash+unreal;return{ok:true,version:'MULTI-COIN TRADER WATCH V1.3.12 API RATE LIMIT + INGESTION HEARTBEAT',mode:'VIRTUAL_ONLY_NO_REAL_ORDERS',wallet:MC_WALLET,active:s.active,session_id:s.id,started_at:s.started,last_poll:s.lastPoll,last_fills_poll:s.lastFillsPoll||0,last_mids_poll:s.lastMidsPoll||0,rate_limit_until:s.rateLimitUntil||0,rate_limit_remaining_ms:Math.max(0,(s.rateLimitUntil||0)-Date.now()),last_error:s.lastError,pending_audit_writes:(s.pendingWrites||[]).length,pending_audit_oldest:(s.pendingWrites||[])[0]?.at||null,initial_usd:s.initial,cash_usd:s.cash,equity_usd:equity,roi_pct:(equity/s.initial-1)*100,used_margin_usd:used,free_margin_usd:equity-used,unrealized_usd:unreal,realized_gross_usd:s.gross,fees_usd:s.fees,net_realized_usd:s.gross-s.fees,turnover_usd:s.turnover,open_positions:positions,open_count:positions.length,closed_count:s.closed,wins:s.wins,losses:s.losses,win_rate_pct:s.closed?s.wins/s.closed*100:0,processed_fills:s.fills,skipped_fills:s.skipped,open_orders_count:Object.keys(s.orders||{}).length,open_orders_last_poll:s.ordersLastPoll||0,open_orders_error:s.ordersLastError||null,order_changes:s.orderChanges||0,mirror_pending_orders:Object.values(s.mirrorOrders||{}).filter(o=>o.status==='PENDING').length,mirror_theoretical_realized_gross:s.mirrorRealized||0,theoretical_fees:s.mirrorFees||0,theoretical_realized_net:(s.mirrorRealized||0)-(s.mirrorFees||0),theoretical_positions:Object.values(s.mirrorPositions||{}),matched_target_fills:s.mirrorMatches||0,mirror_unmatched_target_fills:s.mirrorUnmatched||0,copy_accuracy_pct:(s.accuracyEligible||0)>0?100*(s.accuracyMatched||0)/(s.accuracyEligible||1):null,copy_accuracy_sample:s.accuracyEligible||0,copy_accuracy_matched:s.accuracyMatched||0,copy_accuracy_gaps:s.accuracyGaps||0,copy_accuracy_since_upgrade:true,maker_target_fills:s.makerFills||0,taker_target_fills:s.takerFills||0,unknown_target_fills:s.unknownFills||0,ignored_inherited_coins:Object.keys(s.ignored),leverage:LEVERAGE,initial_margin_per_position:OPEN_MARGIN,initial_notional_per_position:OPEN_NOTIONAL,fee_assumptions:{maker:MAKER_FEE,taker:TAKER_FEE},limitations:['Virtual fill at target fill price; own order execution is not proven','Funding, liquidation, price slippage and exchange precision rules not modeled','Only contiguous previously audited target fills can be recovered; unknown gaps remain on hold and are never fabricated','Perpetual market only; spot fills are not included']};}
 
   // Read-only target position observer. Separate key: never mutates the virtual session.
   async targetPositions(){
