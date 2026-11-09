@@ -1,7 +1,7 @@
 import { MultiCoinEngine } from "./multi-coin-watch";
 // BTC TRADER WATCH V4.2 .— CLEAN FILL LEDGER + DETERMINISTIC REPLAY
 // Cloudflare Durable Object: export class TraderWatch
-// READ ONLY: this file neve.r submits an exchange order.
+// READ ONLY: this file never submits an exchange order.
 // Only BTC fills from the configured public wallet are tracked.
 
 const TARGET = '0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
@@ -1464,7 +1464,26 @@ export class TraderWatch {
   async alarm(): Promise<void> {
     const multi = new MultiCoinEngine(this.ctx.storage,this.env.DB);
     const mc = await multi.get();
-    if(mc?.active){await multi.poll();await this.ctx.storage.setAlarm(Date.now()+10000);return;}
+    if (mc?.active) {
+      // Always re-arm the Durable Object alarm, even if a D1/API call fails.
+      // Otherwise a single failed poll permanently breaks Activity Log updates.
+      try {
+        await multi.poll();
+      } catch (e) {
+        try {
+          const current = await multi.get();
+          if (current) {
+            current.lastError = 'ALARM_POLL: ' + String(e);
+            current.errors.push(new Date().toISOString() + ' ALARM_POLL ' + String(e));
+            current.errors = current.errors.slice(-30);
+            await multi.put(current);
+          }
+        } catch (_) { /* never prevent the next alarm */ }
+      } finally {
+        await this.ctx.storage.setAlarm(Date.now() + 30000);
+      }
+      return;
+    }
     if(mc && !mc.active) return;
     if (!this.s.active || this.resetBusy) return;
     try {
