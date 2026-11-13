@@ -1,4 +1,4 @@
-// MULTI-COIN TRADER WATCH V2 PRE-LIVE TEST — VIRTUAL ONLY, NO EXCHANGE ORDERS.
+// MULT.I-COIN TRADER WATCH V2 PRE-LIVE TEST — VIRTUAL ONLY, NO EXCHANGE ORDERS.
 // V2 PRE-LIVE: $50 initial, $1.04 initial margin, 10x, no fixed position-count cap.
 // V1.3.16 GAP durability and existing copy execution logic retained. Start a NEW SESSION to apply capital.
 export const MC_WALLET='0x34fb5ec7d4e939161946340ea2a1f29254b893de';
