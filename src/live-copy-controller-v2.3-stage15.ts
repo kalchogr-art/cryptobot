@@ -41,7 +41,7 @@ export class LiveCopyControllerStage7 {
         latest.mode='STOPPED';await this.save(latest);return;
       }
       const latest=await this.load();
-      this.audit(latest,'AUTO_SYNC_OK',undefined,`processed=${result.processed||0} ignored=${result.ignored||0}`);
+      if((result.processed||0)>0||(result.ignored||0)>0||result.bootstrapped)this.audit(latest,'AUTO_SYNC_OK',undefined,`processed=${result.processed||0} ignored=${result.ignored||0}`);
       await this.save(latest);
     }catch(error){
       const latest=await this.load();this.audit(latest,'AUTO_SYNC_EXCEPTION',undefined,String(error).slice(0,240));
@@ -64,17 +64,57 @@ export class LiveCopyControllerStage7 {
     if(!o){const capital=await this.accountCapital();o={capital,startedAt:Date.now(),source:'spotClearinghouseState.USDC.total',resetCount:0};await this.state.storage.put('live_copy_v23_overview',o);}
     return o;
   }
+  // Read-only target telemetry. Public Hyperliquid info endpoint; no signing or orders.
+  // Counts are scoped to the source watcher session, not to LIVE COPY fills.
+  private async targetTelemetry(){
+    const cursor=await this.state.storage.get<{session:string;rowid:number}>('live_copy_v23_d1_cursor');
+    const wallet=(this.env as any).LIVE_COPY_TARGET_ACCOUNT||'0x34fb5ec7d4e939161946340ea2a1f29254b893de'; // Fallback: same public target as multi-coin-watch V2.2
+    const info=async(type:string)=>{
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),8000);
+      try{
+        const response=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type,user:wallet}),signal:controller.signal});
+        if(!response.ok)throw Error(type+'_HTTP_'+response.status);
+        return await response.json() as any;
+      }finally{clearTimeout(timeout);}
+    };
+    const [orders,positions,counts]=await Promise.allSettled([
+      info('openOrders'),info('clearinghouseState'),
+      (async()=>{
+        if(!this.env.DB||!cursor?.session)return null;
+        // Only genuine target fills; ignore synthetic bookkeeping and gap-recovery rows.
+        return await this.env.DB.prepare(`SELECT
+          SUM(CASE WHEN json_extract(payload,'$.crossed') = 0 THEN 1 ELSE 0 END) AS maker,
+          SUM(CASE WHEN json_extract(payload,'$.crossed') = 1 THEN 1 ELSE 0 END) AS taker
+          FROM mc_watch_events
+          WHERE session_id=? AND json_extract(payload,'$.source')='HYPERLIQUID_PUBLIC_FILL'
+          AND COALESCE(json_extract(payload,'$.recovered_from_verified_skipped_fill'),0)=0
+          AND action NOT IN ('SKIPPED','GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL')`)
+          .bind(cursor.session).first<{maker:number|null;taker:number|null}>();
+      })()
+    ]);
+    const errors:string[]=[];
+    if(orders.status==='rejected')errors.push('openOrders: '+String(orders.reason));
+    if(positions.status==='rejected')errors.push('clearinghouseState: '+String(positions.reason));
+    if(counts.status==='rejected')errors.push('D1 fills: '+String(counts.reason));
+    const openOrders=orders.status==='fulfilled'&&Array.isArray(orders.value)?orders.value.length:null;
+    const rawPositions=positions.status==='fulfilled'?positions.value?.assetPositions:null;
+    const openPositions=Array.isArray(rawPositions)?rawPositions.filter((x:any)=>Math.abs(Number(x?.position?.szi))>0).length:null;
+    const stats=counts.status==='fulfilled'?counts.value:null;
+    return {target_maker_fills:stats?Number(stats.maker||0):null,target_taker_fills:stats?Number(stats.taker||0):null,
+      target_open_orders:openOrders,target_open_positions:openPositions,
+      target_session:cursor?.session||null,target_updated_at:Date.now(),target_errors:errors};
+  }
   private async overviewStatus(s:Snapshot){
-    const o=await this.overview();const ledger=await this.ledger();
+    const o=await this.overview();const ledger=await this.ledger();const target=await this.targetTelemetry();
     const intents=Object.values(ledger.intents);
     const ownedOpen=Object.values(ledger.confirmedByCoin).filter(q=>Number.isFinite(q)&&Math.abs(q)>1e-9).length;
     return {capital:o?.capital??null,capital_at:o?.startedAt??null,capital_source:o?.source??null,reset_count:o?.resetCount??0,
       equity:null,roi:null,free_margin:null,used_margin:null,realized_gross:null,fees:null,realized_net:null,unrealized:null,turnover:null,
       our_open_positions:ownedOpen,closed_trades:null,win_rate:null,processed_fills:Object.keys(s.seen).length,
-      skipped:null,copy_accuracy:null,accuracy_sample:null,target_maker_fills:null,target_taker_fills:null,
-      target_open_orders:null,target_open_positions:null,
+      skipped:null,copy_accuracy:null,accuracy_sample:null,...target,
       ledger_intents:intents.length,confirmed_intents:intents.filter(i=>i.status==='FILLED').length,
-      accounting_note:'No verified exchange-fill fee/PnL ledger. Financial and target-order metrics are unavailable, not zero.'};
+      accounting_note:'Target order/position counts are live public API snapshots. Maker/taker are source watcher-session D1 fill counts (including inherited fills), not LIVE COPY executions. Financial P/L remains unavailable.'};
   }
 
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
@@ -84,6 +124,16 @@ export class LiveCopyControllerStage7 {
     if(!this.env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!==`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`)return json({ok:false,error:'UNAUTHORIZED'},401);
     const path=new URL(request.url).pathname;
     const s=await this.load();
+    if(request.method==='GET'&&path==='/diagnostic'){
+      const cursor=await this.state.storage.get<{session:string;rowid:number}>('live_copy_v23_d1_cursor');
+      if(!this.env.DB)return json({ok:false,error:'DB_BINDING_MISSING'},503);
+      try{
+        const latest=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
+        const last=latest?{rowid:latest.rowid,session:latest.session_id,fill_id:latest.fill_id,at:latest.at,coin:latest.coin,action:latest.action}:null;
+        const pending=await this.env.DB.prepare('SELECT COUNT(*) AS n FROM mc_watch_events WHERE rowid>?').bind(cursor?.rowid||0).first<{n:number}>();
+        return json({ok:true,read_only:true,mode:s.mode,cursor:cursor||null,latest_source:last,pending_rows:pending?.n??null,watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
+      }catch(e){return json({ok:false,error:'D1_DIAGNOSTIC_FAILED',detail:String(e)},503);}
+    }
     if(request.method==='GET'&&path==='/status')return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -148,11 +198,12 @@ export class LiveCopyControllerStage7 {
         }
         const decimals=precisions.get(row.coin);
         if(decimals===undefined){failure={error:'UNKNOWN_ASSET_PRECISION',coin:row.coin,rowid:row.rowid};break;}
-        const event={coin:row.coin,fill_id:row.fill_id,whale_before_qty:e.target_before,whale_target_qty:e.target_after,price:e.price,sz_decimals:decimals,time:row.at};
+        const event={coin:row.coin,fill_id:row.fill_id,source_action:row.action,whale_before_qty:e.target_before,whale_target_qty:e.target_after,price:e.price,sz_decimals:decimals,time:row.at};
         const response=await this.fetch(new Request('https://live-copy.internal/event',{method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(event)}));
         const result:any=await response.json();
         if(!response.ok){failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;}
         if(result.ignored)ignored++;else processed++;
+        if(row.action==='REVERSAL'){const latest=await this.load();this.audit(latest,result.ignored?'REVERSAL_IGNORED':'REVERSAL_HANDLED',row.coin,`rowid=${row.rowid} reason=${result.reason||result.proposal?.reason||'accepted'}`);await this.save(latest);}
         cursor={session:row.session_id,rowid:row.rowid};
         // Commit after each processed event to avoid skipping events on crash.
         await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
@@ -219,7 +270,7 @@ export class LiveCopyControllerStage7 {
     }
     if(path!=='/event')return json({ok:false,error:'NOT_FOUND'},404);
     if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
-    const {coin,fill_id,whale_target_qty,whale_before_qty,price,sz_decimals,time}=body;
+    const {coin,fill_id,source_action,whale_target_qty,whale_before_qty,price,sz_decimals,time}=body;
     if(typeof coin!=='string'||!/^[A-Z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
     if(s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){await this.halt('LIVE_EVENT_NOT_AUTHORIZED');return json({ok:false,error:'LIVE_EVENT_NOT_AUTHORIZED',stopped:true},409);}
     if(s.sessionKind!=='LIVE'&&this.liveEnabled()){await this.halt('DRY_RUN_CONFIG_CHANGED');return json({ok:false,error:'DRY_RUN_CONFIG_CHANGED',stopped:true},409);}
@@ -234,9 +285,18 @@ export class LiveCopyControllerStage7 {
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
     if(old?.suspended)return json({ok:true,ignored:true,reason:'COIN_SUSPENDED',exchange_order_sent:false});
-    if(!old && (Math.abs(whale_before_qty)>1e-10||Math.abs(whale_target_qty)<1e-10)){
-      s.seen[id]=Date.now();this.audit(s,'SKIP_INHERITED',coin);await this.save(s);
+    // A genuine public fill can reverse an inherited whale position.
+    // The old side was NEVER owned by LIVE COPY: anchor only the NEW side.
+    // Never synthesize a close order for the inherited side.
+    const inheritedReversal=!old && source_action==='REVERSAL' &&
+      Math.abs(whale_before_qty)>1e-10 && Math.abs(whale_target_qty)>1e-10 &&
+      Math.sign(whale_before_qty)!==Math.sign(whale_target_qty);
+    if(!old && !inheritedReversal && (Math.abs(whale_before_qty)>1e-10||Math.abs(whale_target_qty)<1e-10)){
+      s.seen[id]=Date.now();this.audit(s,'SKIP_INHERITED',coin,`source=${source_action||'UNKNOWN'} before=${whale_before_qty} after=${whale_target_qty}`);await this.save(s);
       return json({ok:true,ignored:true,reason:'WAIT_NEW_FLAT_TO_OPEN',exchange_order_sent:false});
+    }
+    if(inheritedReversal){
+      this.audit(s,'INHERITED_REVERSAL_NEW_ENTRY',coin,`before=${whale_before_qty} after=${whale_target_qty} fill=${fill_id}`);
     }
     // A new episode after a confirmed flat target gets a fresh scaling anchor.
     // Refuse to rearm when the previous position is still open or unresolved.
@@ -252,9 +312,13 @@ export class LiveCopyControllerStage7 {
     const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,episode:(old?.episode||0)+1};
     const ledger=await this.ledger();
     if(ledger.suspendedCoins[coin])return json({ok:false,error:'MANUALLY_CLOSED_COIN_REQUIRES_REARM'},409);
+    if(inheritedReversal && this.liveAuthorized(s)){
+      await this.halt('INHERITED_REVERSAL_LIVE_REQUIRES_SEPARATE_VALIDATION',coin);
+      return json({ok:false,error:'INHERITED_REVERSAL_LIVE_REQUIRES_SEPARATE_VALIDATION',exchange_order_sent:false},409);
+    }
     if(!this.liveAuthorized(s)){
       const proposal=planCopyAction({state:record,whaleTargetQty:whale_target_qty,price,szDecimals:sz_decimals});
-      s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'DRY_RUN_PROPOSAL',coin,`${proposal.kind}:${proposal.reason}`);
+      s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'DRY_RUN_PROPOSAL',coin,`${proposal.kind}:${proposal.reason}${inheritedReversal?' [INHERITED_REVERSAL_NEW_SIDE]':''}`);
       if(Object.keys(s.seen).length>=25000){s.mode='STOPPED';this.audit(s,'DEDUP_CAP_STOP');}
       await this.save(s);
       return json({ok:true,mode:s.mode,proposal,exchange_order_sent:false,trading_enabled:false});
