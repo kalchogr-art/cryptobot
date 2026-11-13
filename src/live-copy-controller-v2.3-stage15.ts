@@ -90,6 +90,9 @@ export class LiveCopyControllerStage7 {
   // Read-only target telemetry. Public Hyperliquid info endpoint; no signing or orders.
   // Maker/taker counts are scoped to the current LIVE COPY START cursor, not watcher history.
   private async targetTelemetry(){
+    const key='live_copy_v23_target_telemetry_cache';
+    const prior=await this.state.storage.get<{at:number;value:any}>(key);
+    if(prior&&Date.now()-prior.at<60000)return prior.value;
     const cursor=await this.state.storage.get<{session:string;rowid:number}>('live_copy_v23_d1_cursor');
     const baseline=await this.state.storage.get<{session:string;rowid:number;startedAt:number}>('live_copy_v23_session_baseline');
     const wallet=(this.env as any).LIVE_COPY_TARGET_ACCOUNT; // Explicit target only: never silently use a fallback wallet
@@ -126,12 +129,85 @@ export class LiveCopyControllerStage7 {
     const rawPositions=positions.status==='fulfilled'?positions.value?.assetPositions:null;
     const openPositions=Array.isArray(rawPositions)?rawPositions.filter((x:any)=>Math.abs(Number(x?.position?.szi))>0).length:null;
     const stats=counts.status==='fulfilled'?counts.value:null;
-    return {target_maker_fills:stats!==null?Number(stats.maker||0):null,target_taker_fills:stats!==null?Number(stats.taker||0):null,
+    const result={target_maker_fills:stats!==null?Number(stats.maker||0):null,target_taker_fills:stats!==null?Number(stats.taker||0):null,
       target_open_orders:openOrders,target_open_positions:openPositions,
       target_session:cursor?.session||null,target_session_started_at:baseline?.startedAt??null,target_updated_at:Date.now(),target_errors:errors};
+    if(errors.length&&prior)return {...prior.value,target_errors:errors,target_stale:true};
+    await this.state.storage.put(key,{at:Date.now(),value:result});
+    return result;
   }
   // No Hyperliquid calls in /status: reuse the snapshot explicitly fetched by /account.
   private async cachedAccount(){return await this.state.storage.get<{at:number;account:Awaited<ReturnType<typeof readLiveAccount>>}>('live_copy_v23_dashboard_account');}
+  // Read-only, exchange-verified accounting. Refresh ONLY from /account, not /status
+  // or the trading alarm. Match OIDs from our durable ledger; never attribute other
+  // strategies' wallet fills to LIVE COPY.
+  private async refreshCopyAccounting(s:Snapshot){
+    const ledger=await this.ledger();
+    const intents=Object.values(ledger.intents).filter(i=>i.exchangeOid&&i.confirmedFillQty>0&&
+      ['FILLED','PARTIAL'].includes(i.status));
+    const oids=new Map<string,typeof intents[number]>();
+    for(const i of intents)oids.set(String(i.exchangeOid),i);
+    const allConfirmed=Object.values(ledger.intents).filter(i=>i.confirmedFillQty>0);
+    const missingOid=allConfirmed.filter(i=>!i.exchangeOid).length;
+    const wallet=this.env.HYPERLIQUID_MASTER_ACCOUNT?.trim();
+    if(!wallet||!/^0x[0-9a-fA-F]{40}$/.test(wallet))throw Error('INVALID_MASTER_ACCOUNT');
+    const since=Math.max(0,Math.min(s.startedAt||Date.now(),...intents.map(i=>i.createdAt))-60000);
+    const response=await fetch('https://api.hyperliquid.xyz/info',{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({type:'userFillsByTime',user:wallet,startTime:since,aggregateByTime:false})
+    });
+    if(!response.ok)throw Error('FILLS_HTTP_'+response.status);
+    const rows:any=await response.json();
+    if(!Array.isArray(rows))throw Error('INVALID_FILLS_RESPONSE');
+    // Hyperliquid caps this endpoint; a truncated response cannot be called complete.
+    const possiblyTruncated=rows.length>=2000;
+    const matches=rows.filter((f:any)=>oids.has(String(f.oid))&&
+      Number.isFinite(Number(f.time))&&Number(f.time)>=since);
+    const unique=new Map<string,any>();
+    for(const f of matches){const key=String(f.hash||'')+':'+String(f.tid??'')+':'+String(f.oid);
+      if(!unique.has(key))unique.set(key,f);}
+    const fills=[...unique.values()];
+    const sum=(key:string)=>fills.reduce((a,f)=>a+Number(f[key]),0);
+    const valid=fills.every(f=>Number.isFinite(Number(f.px))&&Number(f.px)>0&&
+      Number.isFinite(Number(f.sz))&&Number(f.sz)>0&&
+      Number.isFinite(Number(f.fee))&&Number.isFinite(Number(f.closedPnl)));
+    const realized=valid?sum('closedPnl'):null;
+    const fees=valid?sum('fee'):null;
+    const turnover=valid?fills.reduce((a,f)=>a+Number(f.px)*Number(f.sz),0):null;
+    const closeIntents=intents.filter(i=>i.kind==='FULL_CLOSE'||i.kind==='MANUAL_CLOSE');
+    const fullyMatched=closeIntents.filter(i=>{
+      const group=fills.filter(f=>String(f.oid)===String(i.exchangeOid));
+      const qty=group.reduce((a,f)=>a+Number(f.sz),0);
+      return group.length>0&&Math.abs(qty-i.confirmedFillQty)<1e-7&&i.status==='FILLED';
+    });
+    const wins=fullyMatched.filter(i=>fills.filter(f=>String(f.oid)===String(i.exchangeOid))
+      .reduce((a,f)=>a+Number(f.closedPnl)-Number(f.fee),0)>0).length;
+    const allOidsMatched=intents.every(i=>{
+      const group=fills.filter(f=>String(f.oid)===String(i.exchangeOid));
+      const qty=group.reduce((a,f)=>a+Number(f.sz),0);
+      return group.length>0&&Number.isFinite(qty)&&Math.abs(qty-i.confirmedFillQty)<=Math.max(1e-7,i.confirmedFillQty*1e-7);
+    });
+    // Do not call an empty history complete when the session has no confirmed orders.
+    const complete=allConfirmed.length>0&&!possiblyTruncated&&!missingOid&&allOidsMatched&&valid;
+    // A CLOSE order is not always a completed trade: partial CLOSEs, multiple
+    // fills and reversals need position-level reconstruction for win rate.
+    // Keep that metric unavailable rather than count order IDs as trades.
+    const result={at:Date.now(),session_started_at:s.startedAt,realized_gross:valid&&fills.length?realized:null,
+      fees:valid&&fills.length?fees:null,realized_net:valid&&fills.length?realized!-fees!:null,
+      turnover:valid&&fills.length?turnover:null,
+      closed_trades:null,win_rate:null,
+      fill_count:fills.length,order_count:new Set(fills.map(f=>String(f.oid))).size,
+      close_order_count:fullyMatched.length,close_order_wins:wins,
+      confirmed_intents:allConfirmed.length,matched_intents:intents.filter(i=>fills.some(f=>String(f.oid)===String(i.exchangeOid))).length,
+      missing_oid:missingOid,possibly_truncated:possiblyTruncated,complete,
+      note:complete?'Matched to LIVE COPY exchange OIDs':
+        'PARTIAL HISTORY: metrics include only verified matched OIDs; totals may be incomplete'};
+    await this.state.storage.put('live_copy_v23_accounting_snapshot',result);
+    return result;
+  }
+  private async cachedCopyAccounting(){
+    return await this.state.storage.get<any>('live_copy_v23_accounting_snapshot');
+  }
   private coinDetails(s:Snapshot,ledger:LiveLedger){
     return Object.values(s.coins).map(p=>{
       const intents=Object.values(ledger.intents).filter(i=>i.coin===p.coin).sort((a,b)=>a.createdAt-b.createdAt);
@@ -159,6 +235,8 @@ export class LiveCopyControllerStage7 {
     const ledger=await this.ledger();
     const target=await this.targetTelemetry();
     const cache=await this.cachedAccount();
+    const accountingCache=await this.cachedCopyAccounting();
+    const accounting=accountingCache?.session_started_at===s.startedAt?accountingCache:null;
     const account=cache&&Date.now()-cache.at<120000?cache.account:null;
     const intents=Object.values(ledger.intents);
     const confirmedIntents=intents.filter(i=>i.status==='FILLED');
@@ -166,38 +244,51 @@ export class LiveCopyControllerStage7 {
     const paper=s.sessionKind==='DRY_RUN'?await this.paper():null;
     const validPaper=!!paper&&paper.startedAt===s.startedAt;
     // NEVER mix virtual fills or estimated fees with LIVE financial metrics.
-    // Even in LIVE, real P/L, fees, turnover, equity and ROI remain unavailable
-    // until an exchange-fill accounting ledger is implemented and verified.
-    // A stored starting USDC balance is NOT current account equity.
+    // LIVE fills are matched by exchange OID; missing matches remain unavailable.
+    // Capital stays unchanged; account snapshots are read-only.
     const dry=s.sessionKind!=='LIVE';
     const skipped=validPaper?Number(paper.skipped||0):null;
-    // Exchange-provided PERP account metrics, never a sum with spot USDC.
-    // Do not confuse account-wide equity/PnL with LIVE COPY strategy performance.
+    const accuracyCoins=Object.values(s.coins).filter(c=>Number.isFinite(c.scale)&&c.scale>0&&Number.isFinite(c.lastWhaleTarget));
+    const accurate=accuracyCoins.filter(c=>{
+      const desired=c.lastWhaleTarget*c.scale,actual=Number(ledger.confirmedByCoin[c.coin]||0);
+      return Math.abs(desired-actual)<=Math.max(0.005*Math.abs(desired),1e-8);
+    }).length;
+    // Unified USDC collateral is the account-wide balance basis used for initial capital.
+    // Never add PERP accountValue: it can double-count collateral in unified mode.
+    // Other spot assets are not valued here; do not label this full multi-asset portfolio equity.
+    // Do not confuse account-wide balance with LIVE COPY strategy performance.
     const validNumber=(v:unknown):number|null=>typeof v==='number'&&Number.isFinite(v)?v:null;
-    const accountEquity=dry?null:validNumber(account?.accountValue);
+    const accountEquity=dry?null:validNumber(account?.spotUsdcTotal);
     const accountUnrealized=dry||!account?null:
       account.positions.every(p=>Number.isFinite(p.unrealized))
         ? account.positions.reduce((total,p)=>total+p.unrealized,0):null;
     return {
       capital:o?.capital??null,capital_at:o?.startedAt??null,
       capital_source:o?.source??null,reset_count:o?.resetCount??0,
-      equity:accountEquity,roi:null,free_margin:dry?null:validNumber(account?.withdrawable),used_margin:dry?null:validNumber(account?.totalMarginUsed),
-      realized_gross:null,fees:null,realized_net:null,unrealized:accountUnrealized,turnover:null,
+      equity:accountEquity,roi:!dry&&accounting?.complete&&o?.capital>0&&Number.isFinite(accounting.realized_net)&&account&&account.positions.every(p=>Math.abs(Number(ledger.confirmedByCoin[p.coin]||0)-p.qty)<1e-8)&&Number.isFinite(accountUnrealized)?(accounting.realized_net+accountUnrealized)/o.capital*100:null,free_margin:dry?null:validNumber(account?.withdrawable),used_margin:dry?null:validNumber(account?.totalMarginUsed),
+      realized_gross:dry?null:accounting?.realized_gross??null,
+      fees:dry?null:accounting?.fees??null,
+      realized_net:dry?null:accounting?.realized_net??null,
+      unrealized:accountUnrealized,turnover:dry?null:accounting?.turnover??null,
       our_open_positions:dry?0:ownedOpen,
-      closed_trades:null,win_rate:null,
+      closed_trades:dry?null:accounting?.closed_trades??null,
+      win_rate:dry?null:accounting?.win_rate??null,
       processed_fills:Object.keys(s.seen).length,skipped,
-      copy_accuracy:null,accuracy_sample:null,
+      own_exchange_fills:accounting?.fill_count??null,own_exchange_orders:accounting?.order_count??null,
+      copy_accuracy:dry||!accuracyCoins.length?null:accurate/accuracyCoins.length*100,
+      accuracy_sample:dry?null:accuracyCoins.length,
       ...target,
       ledger_intents:intents.length,confirmed_intents:confirmedIntents.length,
-      accounting_mode:dry?'DRY_RUN_DIAGNOSTIC_ONLY':'LIVE_EXCHANGE_ACCOUNTING_PENDING',
+      accounting_mode:dry?'DRY_RUN_DIAGNOSTIC_ONLY':accounting?.complete?'LIVE_MATCHED_EXCHANGE_FILLS':'LIVE_PARTIAL_EXCHANGE_FILLS',
+      accounting_snapshot_at:accounting?.at??null,accounting_diagnostic:accounting??null,
       paper_session_ready:validPaper,paper_started_at:paper?.startedAt??null,
       session_started_at:s.startedAt,telemetry_error:target.target_errors,
-      account_snapshot_at:account?cache?.at:null,account_metrics_scope:"PERP_ACCOUNT_NOT_LIVE_COPY_ONLY",
+      account_snapshot_at:account?cache?.at:null,account_metrics_scope:"UNIFIED_USDC_COLLATERAL_NOT_FULL_MULTI_ASSET_PORTFOLIO",
       diagnostic_paper_proposals:validPaper?Number(paper.executions||0):null,
       diagnostic_paper_accuracy_sample:validPaper?Number(paper.accuracySample||0):null,
       accounting_note:dry
         ? 'DRY RUN: no real orders. All financial and own-position figures are intentionally hidden; proposals are diagnostics only.'
-        : 'LIVE: маржинът е от последния Hyperliquid PERP snapshot (общ акаунт). ROI, P/L, такси и оборот остават — до потвърден отчет по борсови fills. Натисни ОБНОВИ АКАУНТ за нов snapshot.'
+        : 'LIVE: Equity показва общия USDC collateral от Unified акаунта, без да добавя PERP accountValue втори път. Други spot активи не са оценени. Маржинът е от PERP snapshot. P/L, такси и оборот са само от съпоставени LIVE COPY OID; при непълна история са частични. ROI се показва само при пълно съпоставяне на fills и ако всички отворени PERP позиции съвпадат с LIVE COPY ledger; външни потоци могат да го изкривят. Натисни БАЛАНС за обновяване. '+(accounting?.note||'Няма отчет от fills.')
     };
   }
 
@@ -374,7 +465,10 @@ export class LiveCopyControllerStage7 {
       catch(e){return json({ok:false,error:'ACCOUNT_READ_FAILED',detail:String(e)},503);}
     }
     if(path==='/account'){
-      try { const account=await readLiveAccount(this.env);await this.state.storage.put('live_copy_v23_dashboard_account',{at:Date.now(),account});return json({ok:true,account}); }
+      try { const account=await readLiveAccount(this.env);await this.state.storage.put('live_copy_v23_dashboard_account',{at:Date.now(),account});
+        let accounting:any=null,accounting_error:string|null=null;
+        if(s.sessionKind==='LIVE')try{accounting=await this.refreshCopyAccounting(s);}catch(e){accounting_error=String(e);}
+        return json({ok:true,account,accounting,accounting_error}); }
       catch(e){return json({ok:false,error:'ACCOUNT_READ_FAILED',detail:String(e)},503);}
     }
     if(path==='/close'||path==='/close-all'){
