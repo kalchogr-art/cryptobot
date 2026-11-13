@@ -50,6 +50,33 @@ export class LiveCopyControllerStage7 {
     if((await this.load()).mode==='RUNNING'&&this.state.storage.setAlarm)await this.state.storage.setAlarm(Date.now()+15000);
   }
   private async ledger(){return await this.state.storage.get<LiveLedger>('live_copy_v23_ledger')||emptyLiveLedger();}
+  // Overview is stored separately from trading state. No retroactive P/L is invented.
+  private async overview(){return await this.state.storage.get<{capital:number;startedAt:number;source:string;resetCount:number}>('live_copy_v23_overview');}
+  private async accountCapital(){
+    const a=await readLiveAccount(this.env);
+    // Unified USDC is a collateral figure, NOT total portfolio equity if other assets exist.
+    const n=a.spotUsdcTotal;
+    if(typeof n!=='number'||!Number.isFinite(n)||n<0)throw Error('UNIFIED_USDC_NOT_AVAILABLE_FOR_CAPITAL');
+    return n;
+  }
+  private async ensureOverview(){
+    let o=await this.overview();
+    if(!o){const capital=await this.accountCapital();o={capital,startedAt:Date.now(),source:'spotClearinghouseState.USDC.total',resetCount:0};await this.state.storage.put('live_copy_v23_overview',o);}
+    return o;
+  }
+  private async overviewStatus(s:Snapshot){
+    const o=await this.overview();const ledger=await this.ledger();
+    const intents=Object.values(ledger.intents);
+    const ownedOpen=Object.values(ledger.confirmedByCoin).filter(q=>Number.isFinite(q)&&Math.abs(q)>1e-9).length;
+    return {capital:o?.capital??null,capital_at:o?.startedAt??null,capital_source:o?.source??null,reset_count:o?.resetCount??0,
+      equity:null,roi:null,free_margin:null,used_margin:null,realized_gross:null,fees:null,realized_net:null,unrealized:null,turnover:null,
+      our_open_positions:ownedOpen,closed_trades:null,win_rate:null,processed_fills:Object.keys(s.seen).length,
+      skipped:null,copy_accuracy:null,accuracy_sample:null,target_maker_fills:null,target_taker_fills:null,
+      target_open_orders:null,target_open_positions:null,
+      ledger_intents:intents.length,confirmed_intents:intents.filter(i=>i.status==='FILLED').length,
+      accounting_note:'No verified exchange-fill fee/PnL ledger. Financial and target-order metrics are unavailable, not zero.'};
+  }
+
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
   private liveAuthorized(s:Snapshot){return s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&this.liveArmAt!==null&&this.liveArmAt===s.startedAt&&this.liveEnabled();}
   private async halt(reason:string,coin?:string){this.liveArmAt=null;const s=await this.load();s.mode='STOPPED';this.audit(s,'LIVE_HALTED',coin,reason);await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();}
@@ -57,9 +84,13 @@ export class LiveCopyControllerStage7 {
     if(!this.env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!==`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`)return json({ok:false,error:'UNAUTHORIZED'},401);
     const path=new URL(request.url).pathname;
     const s=await this.load();
-    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
+    if(path==='/overview-init'){
+      try{const overview=await this.ensureOverview();return json({ok:true,overview,read_only:true});}
+      catch(e){return json({ok:false,error:'OVERVIEW_CAPITAL_UNAVAILABLE',detail:String(e)},503);}
+    }
     if(path==='/stop'){this.liveArmAt=null;s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
     if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(!report.safeToTrade)return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
       // Fail closed on restart: never silently backfill a stopped interval.
@@ -169,8 +200,21 @@ export class LiveCopyControllerStage7 {
         const result=path==='/close'
           ? await closeOwnedPosition({coin:body.coin,commandId,store,exchange})
           : await closeAllOwned({commandId,store,exchange});
+        let overview_reset:any=null;
+        if(path==='/close-all'){
+          const updated=await this.ledger();
+          const open=Object.values(updated.confirmedByCoin).some(q=>Math.abs(q)>1e-9);
+          const unresolved=Object.values(updated.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+          if((result as any).allConfirmedClosed===true&&!open&&!unresolved){
+            try{const capital=await this.accountCapital();const previous=await this.overview();
+              overview_reset={capital,startedAt:Date.now(),source:'spotClearinghouseState.USDC.total',resetCount:(previous?.resetCount||0)+1};
+              await this.state.storage.put('live_copy_v23_overview',overview_reset);
+              this.audit(s,'OVERVIEW_CAPITAL_RESET',undefined,'New verified USDC snapshot after owned positions flat');
+            }catch(e){this.audit(s,'OVERVIEW_RESET_PENDING',undefined,String(e).slice(0,150));}
+          }else this.audit(s,'OVERVIEW_RESET_BLOCKED',undefined,'Owned positions or unresolved intents remain');
+        }
         this.audit(s,'MANUAL_CLOSE_COMMAND',body.coin,JSON.stringify(result).slice(0,240));await this.save(s);
-        return json({ok:true,result,live_write_attempted:true});
+        return json({ok:true,result,overview_reset,live_write_attempted:true});
       }catch(e){return json({ok:false,error:'MANUAL_CLOSE_FAILED',detail:String(e)},409);}
     }
     if(path!=='/event')return json({ok:false,error:'NOT_FOUND'},404);
