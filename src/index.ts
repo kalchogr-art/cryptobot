@@ -15,7 +15,7 @@ import { scanAndLog as swingScanAndLog, settleSignals as swingSettleSignals } fr
             export { ProgressiveMonitor } from "./hyperliquid/progressive-monitor";
 
             // ============================================================
-            // CRYPTOBOT V1.2 — MICROSTRUCTURE ENGINE
+            // CRYPT.OBOT V1.2 — MICROSTRUCTURE ENGINE
             // READ ONLY / NO TRADING
             //
             // Coins: BTC / ETH / SOL / XRP / BNB / DOGE / AVAX / LINK / SUI / HYPE
