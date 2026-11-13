@@ -23,6 +23,23 @@ const round=(n:number)=>Math.round(n*1e10)/1e10;
 export class LiveCopyControllerStage7 {
   // Memory is a per-instance cache; the explicit START authorization is stored durably.
   private liveArmAt:number|null=null;
+  private readonly metaCacheKey='live_copy_v23_meta_cache';
+  private readonly rateLimitUntilKey='live_copy_v23_rate_limit_until';
+  private isRateLimited(e:unknown){return /(?:HTTP_429|META_HTTP_429|RATE_LIMIT|TOO_MANY_REQUESTS)/i.test(String(e));}
+  private async deferRateLimit(source:string){
+    const until=Date.now()+60000;
+    await this.state.storage.put(this.rateLimitUntilKey,until);
+    const current=await this.load();this.audit(current,'HYPERLIQUID_RATE_LIMIT_BACKOFF',undefined,source+'; retry after 60s; NO ORDERS');await this.save(current);
+    return until;
+  }
+  private async cachedMeta(){
+    const old=await this.state.storage.get<{at:number;data:any}>(this.metaCacheKey);
+    if(old&&Date.now()-old.at<30*60*1000&&Array.isArray(old.data?.universe))return old.data;
+    const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'meta'})});
+    if(!r.ok)throw Error('META_HTTP_'+r.status);
+    const data:any=await r.json();if(!Array.isArray(data?.universe))throw Error('META_UNIVERSE_MISSING');
+    await this.state.storage.put(this.metaCacheKey,{at:Date.now(),data});return data;
+  }
   constructor(private state:State,private env:Env){}
   private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
   private async save(s:Snapshot){await this.state.storage.put(KEY,s);}
@@ -31,12 +48,18 @@ export class LiveCopyControllerStage7 {
   async alarm():Promise<void>{
     const s=await this.load();
     if(s.mode!=='RUNNING')return;
+    const rateLimitUntil=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
+    if(Date.now()<rateLimitUntil){if(this.state.storage.setAlarm)await this.state.storage.setAlarm(rateLimitUntil+1000);return;}
     try{
       const response=await this.fetch(new Request('https://live-copy.internal/sync',{
         method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},body:'{}'
       }));
       const result:any=await response.json();
       if(!response.ok){
+        if(result?.retryable===true&&result?.error==='HYPERLIQUID_RATE_LIMIT_BACKOFF'){
+          if(this.state.storage.setAlarm)await this.state.storage.setAlarm(Math.max(Date.now()+1000,Number(result.retry_at)||Date.now()+60000));
+          return;
+        }
         const latest=await this.load();this.audit(latest,'AUTO_SYNC_ERROR',undefined,JSON.stringify(result).slice(0,240));
         latest.mode='STOPPED';await this.save(latest);return;
       }
@@ -195,7 +218,7 @@ export class LiveCopyControllerStage7 {
       this.audit(s,'LIVE_ARM_RESTORED',undefined,'Durable authorization and exchange reconciliation verified');
       await this.save(s);
       return {ok:true,reason:'AUTHORIZED_RESTORED'};
-    }catch(e){return {ok:false,reason:'RESTART_ACCOUNT_CHECK_FAILED:'+String(e).slice(0,120)};}
+    }catch(e){if(this.isRateLimited(e))return {ok:false,reason:'HYPERLIQUID_RATE_LIMIT_RETRY'};return {ok:false,reason:'RESTART_ACCOUNT_CHECK_FAILED:'+String(e).slice(0,120)};}
   }
   private liveAuthorized(s:Snapshot){return s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&this.liveArmAt!==null&&this.liveArmAt===s.startedAt&&this.liveEnabled();}
   private liveAuthorizationReason(s:Snapshot):string {
@@ -254,7 +277,8 @@ export class LiveCopyControllerStage7 {
       if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
-      if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){const restored=await this.restoreLiveArm(s);if(!restored.ok){await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+restored.reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason:restored.reason,stopped:true},409);}}
+      if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){const restored=await this.restoreLiveArm(s);if(!restored.ok){if(restored.reason==='HYPERLIQUID_RATE_LIMIT_RETRY'){const retryAt=await this.deferRateLimit('RESTORE_LIVE_ARM');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
+        await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+restored.reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason:restored.reason,stopped:true},409);}}
       if(s.mode==='RUNNING'&&((s.sessionKind==='LIVE'&&!this.liveAuthorized(s))||(s.sessionKind!=='LIVE'&&this.liveEnabled()))){const reason=s.sessionKind==='LIVE'?this.liveAuthorizationReason(s):'DRY_RUN_CONFIGURATION_CHANGED_TO_LIVE';await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason,stopped:true},409);}
       if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
       if(!this.env.DB){await this.halt('DB_BINDING_MISSING');return json({ok:false,error:'DB_BINDING_MISSING',stopped:true},503);}
@@ -272,9 +296,10 @@ export class LiveCopyControllerStage7 {
       // No fresh D1 fills: do not depend on exchange metadata for an empty sync.
       if(!(rows.results||[]).length)return json({ok:true,processed:0,ignored:0,cursor,has_more:false,metadata_skipped:'NO_NEW_FILLS'});
       let metadata:any=null;let metadataError='';
-      try{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'meta'})});if(!r.ok)throw Error('META_HTTP_'+r.status);metadata=await r.json();if(!Array.isArray(metadata?.universe))throw Error('META_UNIVERSE_MISSING');}
+      try{metadata=await this.cachedMeta();}
       catch(e){metadataError=String(e);}
-      if(metadataError){await this.halt('METADATA_UNAVAILABLE');return json({ok:false,error:'METADATA_UNAVAILABLE',detail:metadataError,cursor,stopped:true},503);}
+      if(metadataError){if(this.isRateLimited(metadataError)){const retryAt=await this.deferRateLimit('METADATA');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
+        await this.halt('METADATA_UNAVAILABLE');return json({ok:false,error:'METADATA_UNAVAILABLE',detail:metadataError,cursor,stopped:true},503);}
       const precisions=new Map<string,number>(metadata.universe.map((a:any)=>[a.name,a.szDecimals]));
       let processed=0,ignored=0;let failure:any=null;
       for(const row of rows.results||[]){
@@ -455,7 +480,8 @@ export class LiveCopyControllerStage7 {
       markPrice=Number(mids[coin]);
       if(!Number.isFinite(markPrice)||markPrice<=0||Math.abs(markPrice-price)/markPrice>0.005)throw Error('STALE_SOURCE_PRICE');
       assertPositionOwned(ledger,coin,account.positions.find(p=>p.coin===coin)?.qty||0,sz_decimals);
-    }catch(e){await this.halt('PRE_TRADE_CHECK_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail:String(e)},409);}
+    }catch(e){if(this.isRateLimited(e)){const retryAt=await this.deferRateLimit('PRE_TRADE_READ_ONLY_CHECK');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
+      await this.halt('PRE_TRADE_CHECK_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail:String(e)},409);}
     if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){await this.halt('UNRESOLVED_INTENT_BEFORE_NEW_ORDER',coin);return json({ok:false,error:'UNRESOLVED_INTENT_BEFORE_NEW_ORDER'},409);}
     const intentId=`AUTO:${coin}:${fill_id}`;
     let planned;
