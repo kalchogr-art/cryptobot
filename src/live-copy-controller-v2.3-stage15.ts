@@ -21,7 +21,7 @@ const json=(v:unknown,status=200)=>new Response(JSON.stringify(v),{status,header
 const finite=(v:unknown)=>typeof v==='number'&&Number.isFinite(v);
 const round=(n:number)=>Math.round(n*1e10)/1e10;
 export class LiveCopyControllerStage7 {
-  // Intentionally volatile: a DO restart/hibernation revokes LIVE permission.
+  // Memory is a per-instance cache; the explicit START authorization is stored durably.
   private liveArmAt:number|null=null;
   constructor(private state:State,private env:Env){}
   private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
@@ -178,6 +178,25 @@ export class LiveCopyControllerStage7 {
   }
   private async paperSkip(){const a=await this.paper();if(a){a.skipped++;await this.state.storage.put('live_copy_v23_paper_session',a);}}
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
+  private armConfig(){return JSON.stringify({trading:this.env.LIVE_COPY_TRADING_ENABLED,auto:this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED,leverage:this.env.LIVE_COPY_LEVERAGE_VERIFIED,mode:this.env.LIVE_COPY_LEVERAGE_MODE,account:this.env.HYPERLIQUID_MASTER_ACCOUNT});}
+  private async restoreLiveArm(s:Snapshot):Promise<{ok:boolean;reason:string}>{
+    if(s.mode!=='RUNNING'||s.sessionKind!=='LIVE'||!this.liveEnabled()||!s.startedAt)return {ok:false,reason:'LIVE_CONFIGURATION_DISABLED_OR_CHANGED'};
+    if(this.liveAuthorized(s))return {ok:true,reason:'AUTHORIZED'};
+    const saved=await this.state.storage.get<{startedAt:number;config:string}>('live_copy_v23_durable_arm');
+    if(!saved||saved.startedAt!==s.startedAt)return {ok:false,reason:'DURABLE_ARM_MISSING_OR_SESSION_MISMATCH'};
+    if(saved.config!==this.armConfig())return {ok:false,reason:'LIVE_CONFIGURATION_CHANGED'};
+    try{
+      const ledger=await this.ledger();
+      if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return {ok:false,reason:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'};
+      const account=await readLiveAccount(this.env);
+      const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);
+      if(!report.safeToTrade)return {ok:false,reason:'RESTART_RECONCILIATION_BLOCKED'};
+      this.liveArmAt=s.startedAt;
+      this.audit(s,'LIVE_ARM_RESTORED',undefined,'Durable authorization and exchange reconciliation verified');
+      await this.save(s);
+      return {ok:true,reason:'AUTHORIZED_RESTORED'};
+    }catch(e){return {ok:false,reason:'RESTART_ACCOUNT_CHECK_FAILED:'+String(e).slice(0,120)};}
+  }
   private liveAuthorized(s:Snapshot){return s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&this.liveArmAt!==null&&this.liveArmAt===s.startedAt&&this.liveEnabled();}
   private liveAuthorizationReason(s:Snapshot):string {
     if(s.mode!=='RUNNING')return 'SESSION_NOT_RUNNING';
@@ -187,7 +206,7 @@ export class LiveCopyControllerStage7 {
     if(this.liveArmAt!==s.startedAt)return 'LIVE_ARM_SESSION_MISMATCH';
     return 'AUTHORIZED';
   }
-  private async halt(reason:string,coin?:string){this.liveArmAt=null;const s=await this.load();s.mode='STOPPED';this.audit(s,'LIVE_HALTED',coin,reason);await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();}
+  private async halt(reason:string,coin?:string){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);const s=await this.load();s.mode='STOPPED';this.audit(s,'LIVE_HALTED',coin,reason);await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();}
   async fetch(request:Request):Promise<Response>{
     if(!this.env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!==`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`)return json({ok:false,error:'UNAUTHORIZED'},401);
     const path=new URL(request.url).pathname;
@@ -209,9 +228,9 @@ export class LiveCopyControllerStage7 {
       try{const overview=await this.ensureOverview();return json({ok:true,overview,read_only:true});}
       catch(e){return json({ok:false,error:'OVERVIEW_CAPITAL_UNAVAILABLE',detail:String(e)},503);}
     }
-    if(path==='/stop'){this.liveArmAt=null;s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
+    if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
     if(path==='/start'&&s.mode==='RUNNING')return json({ok:false,error:'ALREADY_RUNNING_STOP_FIRST'},409);
-    if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(!report.safeToTrade)return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
+    if(path==='/start'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(!report.safeToTrade)return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
       // Fail closed on restart: never silently backfill a stopped interval.
       // Existing owned positions require explicit reconciliation/handling, not a fresh anchor.
       if(this.liveEnabled()){
@@ -233,8 +252,9 @@ export class LiveCopyControllerStage7 {
       await this.state.storage.put('live_copy_v23_session_baseline',{...anchor,startedAt});
       s.coins={};s.seen={};s.recent=[];
       if(!this.liveEnabled())await this.paperReset(startedAt);
-      s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE')this.liveArmAt=s.startedAt;await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
+      s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
+      if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){const restored=await this.restoreLiveArm(s);if(!restored.ok){await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+restored.reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason:restored.reason,stopped:true},409);}}
       if(s.mode==='RUNNING'&&((s.sessionKind==='LIVE'&&!this.liveAuthorized(s))||(s.sessionKind!=='LIVE'&&this.liveEnabled()))){const reason=s.sessionKind==='LIVE'?this.liveAuthorizationReason(s):'DRY_RUN_CONFIGURATION_CHANGED_TO_LIVE';await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason,stopped:true},409);}
       if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
       if(!this.env.DB){await this.halt('DB_BINDING_MISSING');return json({ok:false,error:'DB_BINDING_MISSING',stopped:true},503);}
