@@ -83,15 +83,32 @@ async function sendAction(action: Record<string,unknown>, key: `0x${string}`, ma
 export async function readLiveAccount(env: LiveCopyEnv) {
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
   if (!validAddress(master)) throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
-  const [state,meta] = await Promise.all([
-    info({type:'clearinghouseState',user:master}), info({type:'meta'})
+  const [state,meta,spotResult] = await Promise.all([
+    info({type:'clearinghouseState',user:master}), info({type:'meta'}),
+    // Unified-account collateral is reported in spotClearinghouseState.
+    // A failed spot read must not silently masquerade as a zero balance.
+    info({type:'spotClearinghouseState',user:master}).then(value=>({ok:true,value} as const),error=>({ok:false,error:String(error)} as const))
   ]);
   const positions = (state.assetPositions || []).map((entry:any) => {
     const p = entry.position || {};
     return {coin:p.coin, qty:n(p.szi), entry:n(p.entryPx), unrealized:n(p.unrealizedPnl),
       marginUsed:n(p.marginUsed), leverage:p.leverage, liquidationPx:p.liquidationPx};
   }).filter((p:any)=>Number.isFinite(p.qty) && p.qty!==0);
+  const spotBalances = spotResult.ok && Array.isArray(spotResult.value?.balances)
+    ? spotResult.value.balances : [];
+  const usdc = spotBalances.find((b:any)=>String(b.coin).toUpperCase()==='USDC');
+  const usdcTotal = usdc ? Number(usdc.total) : null;
+  const usdcHold = usdc ? Number(usdc.hold || 0) : null;
+  // Do not sum perp accountValue and spot USDC: this double-counts unified collateral.
+  // Expose sources separately rather than presenting an unverified equity formula.
+  const spotUsdcTotal = usdcTotal!==null && Number.isFinite(usdcTotal) ? usdcTotal : null;
+  const spotUsdcHold = usdcHold!==null && Number.isFinite(usdcHold) ? usdcHold : null;
   return {ok:true, mode:'READ_ONLY', masterAccount:master,
+    balanceMode:'UNIFIED_SOURCES_SEPARATE',
+    spotUsdcTotal, spotUsdcHold,
+    spotUsdcAvailable:spotUsdcTotal!==null && spotUsdcHold!==null ? spotUsdcTotal-spotUsdcHold : null,
+    spotBalanceError:spotResult.ok ? null : spotResult.error,
+    spotBalances:spotBalances.map((b:any)=>({coin:b.coin,total:b.total,hold:b.hold})),
     accountValue:n(state.marginSummary?.accountValue), withdrawable:n(state.withdrawable),
     totalMarginUsed:n(state.marginSummary?.totalMarginUsed), positions,
     assetMeta:(meta.universe||[]).map((a:any,i:number)=>({coin:a.name,assetId:i,szDecimals:a.szDecimals,maxLeverage:a.maxLeverage}))};
