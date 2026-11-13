@@ -62,15 +62,6 @@
     }
   },
 
-  "migrations": [
-    {
-      "tag": "live_copy_v23_initial",
-      "new_sqlite_classes": [
-        "LiveCopyControllerStage7"
-      ]
-    }
-  ],
-
   "triggers": {
     "crons": [
       "* * * * *"
