@@ -110,14 +110,71 @@ export class LiveCopyControllerStage7 {
     const o=await this.overview();const ledger=await this.ledger();const target=await this.targetTelemetry();
     const intents=Object.values(ledger.intents);
     const ownedOpen=Object.values(ledger.confirmedByCoin).filter(q=>Number.isFinite(q)&&Math.abs(q)>1e-9).length;
+    const paper=s.sessionKind==='DRY_RUN'?await this.paper():null;
+    const validPaper=paper&&paper.startedAt===s.startedAt;
+    const open=validPaper?Object.values(paper.positions).filter((x:any)=>Math.abs(x.qty)>1e-10):[];
+    const used=validPaper?(open as any[]).reduce((sum:number,x:any)=>sum+Math.abs(x.qty*x.mark)/10,0):null;
+    const unrealized=validPaper?(open as any[]).reduce((sum:number,x:any)=>sum+(x.mark-x.entry)*x.qty,0):null;
+    const net=validPaper?paper.realizedGross-paper.fees:null;
+    const equity=validPaper&&o?o.capital+net+unrealized:null;
+    const skipped=validPaper?paper.skipped:null;
+    const samples=validPaper?paper.accuracySample:null;
+    const hits=validPaper?paper.accuracyHits:null;
     return {capital:o?.capital??null,capital_at:o?.startedAt??null,capital_source:o?.source??null,reset_count:o?.resetCount??0,
-      equity:null,roi:null,free_margin:null,used_margin:null,realized_gross:null,fees:null,realized_net:null,unrealized:null,turnover:null,
-      our_open_positions:ownedOpen,closed_trades:null,win_rate:null,processed_fills:Object.keys(s.seen).length,
-      skipped:null,copy_accuracy:null,accuracy_sample:null,...target,
-      ledger_intents:intents.length,confirmed_intents:intents.filter(i=>i.status==='FILLED').length,
-      accounting_note:'Target open orders/positions are current public snapshots; maker/taker are genuine source fills after this LIVE COPY session baseline up to the processed cursor. Financial P/L remains unavailable.'};
+      equity,roi:equity!==null&&o&&o.capital>0?(equity/o.capital-1)*100:null,
+      free_margin:equity!==null&&used!==null?equity-used:null,used_margin:used,
+      realized_gross:validPaper?paper.realizedGross:null,fees:validPaper?paper.fees:null,realized_net:net,
+      unrealized,turnover:validPaper?paper.turnover:null,
+      our_open_positions:validPaper?open.length:ownedOpen,
+      closed_trades:validPaper?paper.closed:null,win_rate:validPaper&&paper.closed>0?100*paper.wins/paper.closed:null,
+      processed_fills:Object.keys(s.seen).length,skipped,
+      copy_accuracy:samples>0?100*hits/samples:null,accuracy_sample:samples,
+      ...target,ledger_intents:intents.length,confirmed_intents:intents.filter(i=>i.status==='FILLED').length,
+      accounting_mode:validPaper?'PAPER_ESTIMATE':s.sessionKind==='LIVE'?'LIVE_CONFIRMED_ONLY':'NO_SESSION',
+      accounting_note:validPaper?'DRY RUN: independent simulated fills; fees estimated at 0.045% per fill, 10x assumed; no slippage/funding. NOT REAL P/L.':
+        'LIVE: no exchange fee/PnL execution ledger yet; unavailable values intentionally not fabricated. Target snapshots are live.'};
   }
 
+  // Independent, session-scoped PAPER ledger. Never mistaken for real exchange fills.
+  private async paper(){return await this.state.storage.get<any>('live_copy_v23_paper_session')||null;}
+  private async paperReset(startedAt:number){
+    await this.state.storage.put('live_copy_v23_paper_session',{startedAt,positions:{},realizedGross:0,fees:0,turnover:0,closed:0,wins:0,executions:0,skipped:0,accuracySample:0,accuracyHits:0});
+  }
+  private async paperFill(coin:string,price:number,delta:number,feeRate=0.00045){
+    if(!Number.isFinite(delta)||Math.abs(delta)<1e-12||!Number.isFinite(price)||price<=0)return;
+    const a=await this.paper();if(!a)return;
+    const old=a.positions[coin]||{qty:0,entry:0,mark:price};
+    let qty=old.qty,entry=old.entry,realized=0,closed=false;
+    if(Math.abs(qty)>1e-10&&Math.sign(qty)!==Math.sign(delta)){
+      const reduced=Math.min(Math.abs(qty),Math.abs(delta));
+      realized=(price-entry)*reduced*Math.sign(qty);
+      qty+=Math.sign(delta)*reduced;
+      closed=Math.abs(qty)<1e-10;
+      if(closed){qty=0;entry=0;}
+      const residual=Math.abs(delta)-reduced;
+      if(residual>1e-10){qty=Math.sign(delta)*residual;entry=price;}
+    }else{
+      const newQty=qty+delta;
+      entry=Math.abs(newQty)>1e-10?(Math.abs(qty)*entry+Math.abs(delta)*price)/Math.abs(newQty):0;
+      qty=newQty;
+    }
+    a.realizedGross+=realized;a.turnover+=Math.abs(delta*price);a.fees+=Math.abs(delta*price)*feeRate;
+    a.executions++;if(closed){a.closed++;if(realized>0)a.wins++;}
+    a.positions[coin]={qty,entry,mark:price};
+    await this.state.storage.put('live_copy_v23_paper_session',a);
+  }
+  private async paperMark(coin:string,price:number){
+    const a=await this.paper();if(!a||!a.positions[coin])return;
+    a.positions[coin].mark=price;await this.state.storage.put('live_copy_v23_paper_session',a);
+  }
+  private async paperSkip(){const a=await this.paper();if(a){a.skipped++;await this.state.storage.put('live_copy_v23_paper_session',a);}}
+  private async paperAccuracy(coin:string,desired:number,precision:number){
+    const a=await this.paper();if(!a||!Number.isFinite(desired))return;
+    a.accuracySample++;
+    const actual=Number(a.positions?.[coin]?.qty||0);
+    if(Math.abs(actual-desired)<=Math.max(10**(-precision),Math.abs(desired)*0.005))a.accuracyHits++;
+    await this.state.storage.put('live_copy_v23_paper_session',a);
+  }
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
   private liveAuthorized(s:Snapshot){return s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&this.liveArmAt!==null&&this.liveArmAt===s.startedAt&&this.liveEnabled();}
   private async halt(reason:string,coin?:string){this.liveArmAt=null;const s=await this.load();s.mode='STOPPED';this.audit(s,'LIVE_HALTED',coin,reason);await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();}
@@ -160,11 +217,14 @@ export class LiveCopyControllerStage7 {
       // real-order ledger or re-anchor LIVE positions without the existing safety checks.
       if(!this.env.DB)return json({ok:false,error:'DB_BINDING_MISSING'},503);
       const last=await this.env.DB.prepare('SELECT session_id AS session, rowid FROM mc_watch_events ORDER BY rowid DESC LIMIT 1').bind().first<{session:string;rowid:number}>();
+      // Capture the first account capital before the session, without changing an existing baseline.
+      try{await this.ensureOverview();}catch(e){return json({ok:false,error:'START_CAPITAL_UNAVAILABLE',detail:String(e)},503);}
       const startedAt=Date.now();
       const anchor={session:last?.session||'',rowid:last?.rowid||0};
       await this.state.storage.put('live_copy_v23_d1_cursor',anchor);
       await this.state.storage.put('live_copy_v23_session_baseline',{...anchor,startedAt});
       s.coins={};s.seen={};s.recent=[];
+      if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE')this.liveArmAt=s.startedAt;await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
       if(s.mode==='RUNNING'&&((s.sessionKind==='LIVE'&&!this.liveAuthorized(s))||(s.sessionKind!=='LIVE'&&this.liveEnabled()))){await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED');return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',stopped:true},409);}
@@ -271,6 +331,7 @@ export class LiveCopyControllerStage7 {
             try{const capital=await this.accountCapital();const previous=await this.overview();
               overview_reset={capital,startedAt:Date.now(),source:'spotClearinghouseState.USDC.total',resetCount:(previous?.resetCount||0)+1};
               await this.state.storage.put('live_copy_v23_overview',overview_reset);
+              await this.paperReset(overview_reset.startedAt);
               this.audit(s,'OVERVIEW_CAPITAL_RESET',undefined,'New verified USDC snapshot after owned positions flat');
             }catch(e){this.audit(s,'OVERVIEW_RESET_PENDING',undefined,String(e).slice(0,150));}
           }else this.audit(s,'OVERVIEW_RESET_BLOCKED',undefined,'Owned positions or unresolved intents remain');
@@ -292,6 +353,7 @@ export class LiveCopyControllerStage7 {
     }
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
+    if(s.sessionKind==='DRY_RUN')await this.paperMark(coin,price);
     const old=s.coins[coin];
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
@@ -303,6 +365,7 @@ export class LiveCopyControllerStage7 {
       Math.abs(whale_before_qty)>1e-10 && Math.abs(whale_target_qty)>1e-10 &&
       Math.sign(whale_before_qty)!==Math.sign(whale_target_qty);
     if(!old && !inheritedReversal && (Math.abs(whale_before_qty)>1e-10||Math.abs(whale_target_qty)<1e-10)){
+      if(s.sessionKind==='DRY_RUN')await this.paperSkip();
       s.seen[id]=Date.now();this.audit(s,'SKIP_INHERITED',coin,`source=${source_action||'UNKNOWN'} before=${whale_before_qty} after=${whale_target_qty}`);await this.save(s);
       return json({ok:true,ignored:true,reason:'WAIT_NEW_FLAT_TO_OPEN',exchange_order_sent:false});
     }
@@ -328,7 +391,15 @@ export class LiveCopyControllerStage7 {
       return json({ok:false,error:'INHERITED_REVERSAL_LIVE_REQUIRES_SEPARATE_VALIDATION',exchange_order_sent:false},409);
     }
     if(!this.liveAuthorized(s)){
-      const proposal=planCopyAction({state:record,whaleTargetQty:whale_target_qty,price,szDecimals:sz_decimals});
+      const paper=await this.paper();
+      const paperQty=Number(paper?.positions?.[coin]?.qty||0);
+      const proposal=planCopyAction({state:{...record,confirmedOwnQty:paperQty},whaleTargetQty:whale_target_qty,price,szDecimals:sz_decimals});
+      if(proposal.kind!=='NONE'&&proposal.quantity>0){
+        await this.paperFill(coin,price,proposal.signedDelta);
+      }else{await this.paperSkip();}
+      await this.paperAccuracy(coin,proposal.desiredOwnQty,sz_decimals);
+      const updatedPaper=await this.paper();
+      record.confirmedOwnQty=Number(updatedPaper?.positions?.[coin]?.qty||0);
       s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'DRY_RUN_PROPOSAL',coin,`${proposal.kind}:${proposal.reason}${inheritedReversal?' [INHERITED_REVERSAL_NEW_SIDE]':''}`);
       if(Object.keys(s.seen).length>=25000){s.mode='STOPPED';this.audit(s,'DEDUP_CAP_STOP');}
       await this.save(s);
