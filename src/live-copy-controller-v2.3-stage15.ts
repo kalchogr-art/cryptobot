@@ -13,7 +13,7 @@ import {reconcileCopyLedger} from './live-copy-reconciliation-v2.3';
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
-type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number};
+type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number};
 type Snapshot={version:2;mode:'STOPPED'|'RUNNING';sessionKind?:'DRY_RUN'|'LIVE';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[]};
 const KEY='live_copy_v23_stage7';
 const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',startedAt:null,coins:{},seen:{},recent:[]});
@@ -130,10 +130,36 @@ export class LiveCopyControllerStage7 {
       target_open_orders:openOrders,target_open_positions:openPositions,
       target_session:cursor?.session||null,target_session_started_at:baseline?.startedAt??null,target_updated_at:Date.now(),target_errors:errors};
   }
+  // No Hyperliquid calls in /status: reuse the snapshot explicitly fetched by /account.
+  private async cachedAccount(){return await this.state.storage.get<{at:number;account:Awaited<ReturnType<typeof readLiveAccount>>}>('live_copy_v23_dashboard_account');}
+  private coinDetails(s:Snapshot,ledger:LiveLedger){
+    return Object.values(s.coins).map(p=>{
+      const intents=Object.values(ledger.intents).filter(i=>i.coin===p.coin).sort((a,b)=>a.createdAt-b.createdAt);
+      const filled=intents.filter(i=>i.status==='FILLED');
+      const entry=filled.find(i=>i.kind==='OPEN');
+      const adds=filled.filter(i=>i.kind==='ADD');
+      const latest=filled[filled.length-1];
+      const actual=Number(ledger.confirmedByCoin[p.coin]||0);
+      const desired=Number(p.lastWhaleTarget)*Number(p.scale);
+      const delta=desired-actual;
+      const increasing=Math.abs(actual)>1e-9 && Math.sign(delta)===Math.sign(actual);
+      const pendingAddUsd=increasing?Math.max(0,Math.abs(delta)*Number(p.lastPrice)):0;
+      const minimumUsd=10.40; // strategy threshold; exchange may impose another minimum
+      return {...p,confirmedOwnQty:actual,addSignals:p.addSignals??null,
+        pendingAddUsd:Math.round(pendingAddUsd*100)/100,
+        addRemainingUsd:increasing?Math.round(Math.max(0,minimumUsd-pendingAddUsd)*100)/100:null,
+        addMinimumUsd:minimumUsd,filledAdds:adds.length,
+        openedAt:entry?.createdAt??null,lastAddAt:adds.length?adds[adds.length-1].updatedAt:null,
+        lastOrderAt:latest?.updatedAt??null,lastAddSignalAt:p.lastAddSignalAt??null,
+        confirmedFillCount:filled.length};
+    });
+  }
   private async overviewStatus(s:Snapshot){
     const o=await this.overview();
     const ledger=await this.ledger();
     const target=await this.targetTelemetry();
+    const cache=await this.cachedAccount();
+    const account=cache&&Date.now()-cache.at<120000?cache.account:null;
     const intents=Object.values(ledger.intents);
     const confirmedIntents=intents.filter(i=>i.status==='FILLED');
     const ownedOpen=Object.values(ledger.confirmedByCoin).filter(q=>Number.isFinite(q)&&Math.abs(q)>1e-9).length;
@@ -148,7 +174,7 @@ export class LiveCopyControllerStage7 {
     return {
       capital:o?.capital??null,capital_at:o?.startedAt??null,
       capital_source:o?.source??null,reset_count:o?.resetCount??0,
-      equity:null,roi:null,free_margin:null,used_margin:null,
+      equity:null,roi:null,free_margin:dry?null:(account?.withdrawable??null),used_margin:dry?null:(account?.totalMarginUsed??null),
       realized_gross:null,fees:null,realized_net:null,unrealized:null,turnover:null,
       our_open_positions:dry?0:ownedOpen,
       closed_trades:null,win_rate:null,
@@ -159,11 +185,12 @@ export class LiveCopyControllerStage7 {
       accounting_mode:dry?'DRY_RUN_DIAGNOSTIC_ONLY':'LIVE_EXCHANGE_ACCOUNTING_PENDING',
       paper_session_ready:validPaper,paper_started_at:paper?.startedAt??null,
       session_started_at:s.startedAt,telemetry_error:target.target_errors,
+      account_snapshot_at:account?cache?.at:null,account_metrics_scope:"PERP_ACCOUNT_NOT_LIVE_COPY_ONLY",
       diagnostic_paper_proposals:validPaper?Number(paper.executions||0):null,
       diagnostic_paper_accuracy_sample:validPaper?Number(paper.accuracySample||0):null,
       accounting_note:dry
         ? 'DRY RUN: no real orders. All financial and own-position figures are intentionally hidden; proposals are diagnostics only.'
-        : 'LIVE: only exchange-confirmed ownership count is shown. Real P/L, equity, fees, ROI and accuracy require verified exchange-fill reconciliation.'
+        : 'LIVE: маржинът е от последния Hyperliquid PERP snapshot (общ акаунт). ROI, P/L, такси и оборот остават — до потвърден отчет по борсови fills. Натисни ОБНОВИ АКАУНТ за нов snapshot.'
     };
   }
 
@@ -244,7 +271,7 @@ export class LiveCopyControllerStage7 {
         return json({ok:true,read_only:true,mode:s.mode,cursor:cursor||null,latest_source:last,pending_rows:pending?.n??null,watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
       }catch(e){return json({ok:false,error:'D1_DIAGNOSTIC_FAILED',detail:String(e)},503);}
     }
-    if(request.method==='GET'&&path==='/status')return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/overview-init'){
@@ -340,7 +367,7 @@ export class LiveCopyControllerStage7 {
       catch(e){return json({ok:false,error:'ACCOUNT_READ_FAILED',detail:String(e)},503);}
     }
     if(path==='/account'){
-      try { const account=await readLiveAccount(this.env);return json({ok:true,account}); }
+      try { const account=await readLiveAccount(this.env);await this.state.storage.put('live_copy_v23_dashboard_account',{at:Date.now(),account});return json({ok:true,account}); }
       catch(e){return json({ok:false,error:'ACCOUNT_READ_FAILED',detail:String(e)},503);}
     }
     if(path==='/close'||path==='/close-all'){
@@ -437,6 +464,12 @@ export class LiveCopyControllerStage7 {
     const scale=(!old||newEpisode)?10.40/(Math.abs(whale_target_qty)*price):old.scale;
     if(!Number.isFinite(scale)||scale<=0)return json({ok:false,error:'INVALID_SCALE'},400);
     const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:old.firstDetectedAt??Date.now(),lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:Date.now(),episode:(old?.episode||0)+1};
+    // Count new ADD signals only for an already tracked/owned position.
+    // Persist together with the accepted event, not on failed exchange writes.
+    const isAddSignal=!!old&&!newEpisode&&source_action==='ADD'&&Math.abs(old.confirmedOwnQty)>1e-9;
+    const addCount=(old?.addSignals||0)+(isAddSignal?1:0);
+    record.addSignals=newEpisode?0:addCount;
+    record.lastAddSignalAt=isAddSignal?Date.now():(newEpisode?undefined:old?.lastAddSignalAt);
     const ledger=await this.ledger();
     if(ledger.suspendedCoins[coin])return json({ok:false,error:'MANUALLY_CLOSED_COIN_REQUIRES_REARM'},409);
     // An inherited reversal creates a NEW position on the opposite side.
