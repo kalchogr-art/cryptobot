@@ -1,3 +1,4 @@
+
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cryptobot",
@@ -31,6 +32,10 @@
       {
         "name": "TRADER_WATCH",
         "class_name": "TraderWatch"
+      },
+      {
+        "name": "LIVE_COPY_CONTROLLER",
+        "class_name": "LiveCopyControllerStage7"
       }
     ]
   },
@@ -50,8 +55,21 @@
     "TraderWatch": {
       "type": "durable-object",
       "storage": "sqlite"
+    },
+    "LiveCopyControllerStage7": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
   },
+
+  "migrations": [
+    {
+      "tag": "live_copy_v23_initial",
+      "new_sqlite_classes": [
+        "LiveCopyControllerStage7"
+      ]
+    }
+  ],
 
   "triggers": {
     "crons": [
