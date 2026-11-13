@@ -5,6 +5,8 @@ export const MC_WALLET='0x34fb5ec7d4e939161946340ea2a1f29254b893de';
 const INFO='https://api.hyperliquid.xyz/info';
 const INITIAL=50, LEVERAGE=10, OPEN_MARGIN=1.04, OPEN_NOTIONAL=OPEN_MARGIN*LEVERAGE;
 const MAKER_FEE=.00015, TAKER_FEE=.00045, MIN_NOTIONAL=10, EPS=1e-10;
+// API budget: throttle auxiliary snapshots only; never throttle target fills.
+const ORDER_SNAPSHOT_INTERVAL_MS=60_000, PRICE_SNAPSHOT_INTERVAL_MS=60_000;
 const PRELIVE_ORDER_MIN=10.40, COMPARE_OPEN_NOTIONAL=20; // conservative simulation threshold; actual exchange minimum is separate
 const asNum=(x:any)=>Number(x)||0;
 const sign=(x:number)=>Math.abs(x)<EPS?0:Math.sign(x);
@@ -20,8 +22,8 @@ type PreLiveState={cash:number;positions:Record<string,PreLivePosition>;ignored:
 function newPreLive():PreLiveState{return{cash:INITIAL,positions:{},ignored:{},gross:0,fees:0,turnover:0,executed:0,deferredAdds:0,deferredReductions:0,blockedMargin:0,closed:0,wins:0,losses:0,delayMsTotal:0,delaySamples:0,events:0};}
 // Quantity precision is sourced from Hyperliquid metadata when available.
 // Missing precision blocks shadow execution rather than pretending an order is valid.
-type Session={preLive?:PreLiveState;preLive2?:PreLiveState;szDecimals?:Record<string,number>;id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number;mirrorOrders?:Record<string,MirrorOrder>;mirrorMatches?:number;mirrorUnmatched?:number;mirrorFills?:MirrorFill[];mirrorScale?:Record<string,number>;mirrorPositions?:Record<string,MirrorPosition>;mirrorRealized?:number;mirrorFees?:number;gapPending?:Record<string,{tradeId:string;fillId:string;at:number;coin:string;price:number;position:Position;record:any}>;};
-function fresh():Session{return{id:'MC-'+Date.now(),active:false,started:Date.now(),cursor:Date.now(),cash:INITIAL,initial:INITIAL,positions:{},baseline:{},ignored:{},lastPrice:{},fills:0,skipped:0,turnover:0,fees:0,gross:0,closed:0,wins:0,losses:0,errors:[],lastPoll:0,lastError:null,orders:{},ordersLastPoll:0,ordersLastError:null,orderChanges:0,accuracyEligible:0,accuracyMatched:0,accuracyGaps:0,makerFills:0,takerFills:0,unknownFills:0,mirrorOrders:{},mirrorMatches:0,mirrorUnmatched:0,mirrorFills:[],mirrorScale:{},mirrorPositions:{},mirrorRealized:0,mirrorFees:0,preLive:newPreLive(),preLive2:newPreLive(),szDecimals:{}};}
+type Session={preLive?:PreLiveState;preLive2?:PreLiveState;szDecimals?:Record<string,number>;id:string;active:boolean;started:number;cursor:number;cash:number;initial:number;positions:Record<string,Position>;baseline:Record<string,number>;ignored:Record<string,boolean>;lastPrice:Record<string,number>;fills:number;skipped:number;turnover:number;fees:number;gross:number;closed:number;wins:number;losses:number;errors:string[];lastPoll:number;lastError:string|null;pricesLastPoll?:number;orders?:Record<string,WatchOrder>;ordersLastPoll?:number;ordersLastError?:string|null;orderChanges?:number;accuracyEligible?:number;accuracyMatched?:number;accuracyGaps?:number;makerFills?:number;takerFills?:number;unknownFills?:number;mirrorOrders?:Record<string,MirrorOrder>;mirrorMatches?:number;mirrorUnmatched?:number;mirrorFills?:MirrorFill[];mirrorScale?:Record<string,number>;mirrorPositions?:Record<string,MirrorPosition>;mirrorRealized?:number;mirrorFees?:number;gapPending?:Record<string,{tradeId:string;fillId:string;at:number;coin:string;price:number;position:Position;record:any}>;};
+function fresh():Session{return{id:'MC-'+Date.now(),active:false,started:Date.now(),cursor:Date.now(),cash:INITIAL,initial:INITIAL,positions:{},baseline:{},ignored:{},lastPrice:{},fills:0,skipped:0,turnover:0,fees:0,gross:0,closed:0,wins:0,losses:0,errors:[],lastPoll:0,lastError:null,pricesLastPoll:0,orders:{},ordersLastPoll:0,ordersLastError:null,orderChanges:0,accuracyEligible:0,accuracyMatched:0,accuracyGaps:0,makerFills:0,takerFills:0,unknownFills:0,mirrorOrders:{},mirrorMatches:0,mirrorUnmatched:0,mirrorFills:[],mirrorScale:{},mirrorPositions:{},mirrorRealized:0,mirrorFees:0,preLive:newPreLive(),preLive2:newPreLive(),szDecimals:{}};}
 async function info(body:any){const r=await fetch(INFO,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('HL_HTTP_'+r.status);return r.json() as Promise<any>;}
 const inFlightPolls=new WeakMap<object,Promise<void>>();
 export class MultiCoinEngine {
@@ -391,7 +393,7 @@ export class MultiCoinEngine {
         s.szDecimals=Object.fromEntries((meta.universe||[]).filter((x:any)=>Number.isInteger(x.szDecimals)).map((x:any)=>[x.name,x.szDecimals]));
       }
       // Observe orders first so fills in the same polling cycle can match by oid.
-      try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
+      try{if(Date.now()-(s.ordersLastPoll||0)>=ORDER_SNAPSHOT_INTERVAL_MS)await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
       // V1.3.6: fetch a deeper bounded history so rapid partial fills missed by
       // earlier polls can be reconstructed before advancing the virtual ledger.
       // Existing SKIPPED records remain immutable audit records: do not silently
@@ -458,7 +460,10 @@ export class MultiCoinEngine {
         s.cursor=Math.max(s.cursor,asNum(f.time));
         await this.put(s); // Per-fill checkpoint prevents D1 getting ahead of DO.
       }
-      const mids:any=await info({type:'allMids'});for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);
+      if(Date.now()-(s.pricesLastPoll||0)>=PRICE_SNAPSHOT_INTERVAL_MS){
+        try{const mids:any=await info({type:'allMids'});for(const [c,v] of Object.entries(mids||{}))s.lastPrice[c]=asNum(v);s.pricesLastPoll=Date.now();}
+        catch(e){s.errors.push(new Date().toISOString()+' PRICES '+String(e));s.errors=s.errors.slice(-30);}
+      }
       for(const p of Object.values(s.positions))p.last=s.lastPrice[p.coin]||p.last;
       // Open orders were observed before processing fills.
       s.lastPoll=Date.now();s.lastError=null;
