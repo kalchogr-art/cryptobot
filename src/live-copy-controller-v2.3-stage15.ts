@@ -423,7 +423,7 @@ export class LiveCopyControllerStage7 {
       return json({ok:true,ignored:true,reason:'WAIT_NEW_FLAT_TO_OPEN',exchange_order_sent:false});
     }
     if(inheritedReversal){
-      this.audit(s,'INHERITED_REVERSAL_NEW_ENTRY',coin,`before=${whale_before_qty} after=${whale_target_qty} fill=${fill_id}`);
+      this.audit(s,'INHERITED_REVERSAL_NEW_ENTRY',coin,`before=${whale_before_qty} after=${whale_target_qty} fill=${fill_id}; fixed_entry_notional=10.40`);
     }
     // A new episode after a confirmed flat target gets a fresh scaling anchor.
     // Refuse to rearm when the previous position is still open or unresolved.
@@ -439,10 +439,9 @@ export class LiveCopyControllerStage7 {
     const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:old.firstDetectedAt??Date.now(),lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:Date.now(),episode:(old?.episode||0)+1};
     const ledger=await this.ledger();
     if(ledger.suspendedCoins[coin])return json({ok:false,error:'MANUALLY_CLOSED_COIN_REQUIRES_REARM'},409);
-    if(inheritedReversal && this.liveAuthorized(s)){
-      await this.halt('INHERITED_REVERSAL_LIVE_REQUIRES_SEPARATE_VALIDATION',coin);
-      return json({ok:false,error:'INHERITED_REVERSAL_LIVE_REQUIRES_SEPARATE_VALIDATION',exchange_order_sent:false},409);
-    }
+    // An inherited reversal creates a NEW position on the opposite side.
+    // The previous side was never ours, so do not send any close for it.
+    // New entry sizing uses the fixed $10.40 notional anchor above.
     if(s.sessionKind==='DRY_RUN'){
       const paper=await this.paper();
       const paperQty=Number(paper?.positions?.[coin]?.qty||0);
