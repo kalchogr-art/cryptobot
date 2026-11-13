@@ -20,6 +20,16 @@ const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',starte
 const json=(v:unknown,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 const finite=(v:unknown)=>typeof v==='number'&&Number.isFinite(v);
 const round=(n:number)=>Math.round(n*1e10)/1e10;
+// ZEC ONLY: smallest exchange-valid initial order >= $10.40, with a hard $20 cap.
+// No fallback to larger orders; no catch-up of old whale fills.
+function zecInitialQuantity(price:number,decimals:number):number|null{
+  if(!Number.isFinite(price)||price<=0||!Number.isInteger(decimals)||decimals<0||decimals>8)return null;
+  const unit=10**(-decimals);
+  const qty=Math.ceil((10.40/price)/unit-1e-9)*unit;
+  const notional=qty*price;
+  return notional>=10-1e-7&&notional<=20+1e-7?round(qty):null;
+}
+
 export class LiveCopyControllerStage7 {
   // Memory is a per-instance cache; the explicit START authorization is stored durably.
   private liveArmAt:number|null=null;
@@ -42,8 +52,32 @@ export class LiveCopyControllerStage7 {
   }
   constructor(private state:State,private env:Env){}
   private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
-  private async save(s:Snapshot){await this.state.storage.put(KEY,s);}
-  private audit(s:Snapshot,kind:string,coin?:string,detail?:string){s.recent.unshift({at:Date.now(),kind,coin,detail});s.recent=s.recent.slice(0,100);}
+  private async save(s:Snapshot){
+    await this.state.storage.put(KEY,s);
+    // D1 is independent of order execution: telemetry failures never change a fill.
+    const pending=this.activityQueue.splice(0);
+    if(!pending.length||!this.env.DB)return;
+    try{
+      if(!this.activityTableReady){await this.env.DB.prepare('CREATE TABLE IF NOT EXISTS live_copy_our_activity (id TEXT PRIMARY KEY, at INTEGER NOT NULL, coin TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)').bind().all();this.activityTableReady=true;}
+      for(const event of pending){
+        await this.env.DB.prepare('INSERT OR IGNORE INTO live_copy_our_activity (id,at,coin,kind,detail) VALUES (?,?,?,?,?)').bind(event.id,event.at,event.coin,event.kind,event.detail).all();
+      }
+    }catch(_e){
+      // Retain failed telemetry for retry; never block real-order state commits.
+      this.activityQueue.unshift(...pending);
+    }
+  }
+  private activityQueue:{id:string;at:number;coin:string;kind:string;detail:string}[]=[];
+  private activityTableReady=false;
+
+  private audit(s:Snapshot,kind:string,coin?:string,detail?:string){
+    const at=Date.now();s.recent.unshift({at,kind,coin,detail});s.recent=s.recent.slice(0,100);
+    if(coin&&kind!=='LIVE_ARM_RESTORED'){
+      const id=coin+':'+at+':'+kind+':'+Math.random().toString(36).slice(2);
+      this.activityQueue.push({id,at,coin,kind,detail:detail||''});
+    }
+  }
+
   // Alarms are serialized by the Durable Object. Never overwrite fresh state from /sync.
   async alarm():Promise<void>{
     const s=await this.load();
@@ -369,6 +403,17 @@ export class LiveCopyControllerStage7 {
         return json({ok:true,read_only:true,mode:s.mode,cursor:cursor||null,latest_source:last,pending_rows:pending?.n??null,watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
       }catch(e){return json({ok:false,error:'D1_DIAGNOSTIC_FAILED',detail:String(e)},503);}
     }
+    if(request.method==='GET'&&path==='/our-activity'){
+      if(!this.env.DB)return json({ok:false,error:'D1_BINDING_MISSING'},503);
+      const coin=new URL(request.url).searchParams.get('coin')?.toUpperCase()||'';
+      if(coin&&!/^[A-Z0-9]{2,20}$/.test(coin))return json({ok:false,error:'INVALID_COIN'},400);
+      try{
+        if(!this.activityTableReady){await this.env.DB.prepare('CREATE TABLE IF NOT EXISTS live_copy_our_activity (id TEXT PRIMARY KEY, at INTEGER NOT NULL, coin TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL)').bind().all();this.activityTableReady=true;}
+        const sql=coin?'SELECT id,at,coin,kind,detail FROM live_copy_our_activity WHERE coin=? ORDER BY at DESC LIMIT 200':'SELECT id,at,coin,kind,detail FROM live_copy_our_activity ORDER BY at DESC LIMIT 200';
+        const rows=await this.env.DB.prepare(sql).bind(...(coin?[coin]:[])).all();
+        return json({ok:true,coin:coin||null,events:rows.results,read_only:true});
+      }catch(e){return json({ok:false,error:'OUR_ACTIVITY_UNAVAILABLE',detail:String(e)},503);}
+    }
     if(request.method==='GET'&&path==='/status')return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -517,7 +562,9 @@ export class LiveCopyControllerStage7 {
             }catch(e){this.audit(s,'OVERVIEW_RESET_PENDING',undefined,String(e).slice(0,150));}
           }else this.audit(s,'OVERVIEW_RESET_BLOCKED',undefined,'Owned positions or unresolved intents remain');
         }
-        this.audit(s,'MANUAL_CLOSE_COMMAND',body.coin,JSON.stringify(result).slice(0,240));await this.save(s);
+        this.audit(s,'MANUAL_CLOSE_COMMAND',body.coin,JSON.stringify(result).slice(0,240));
+        if(path==='/close-all')for(const [coin,qty] of Object.entries((await this.ledger()).confirmedByCoin))
+          this.audit(s,'CLOSE_ALL_POSITION_RESULT',coin,`remaining_confirmed_qty=${qty}; command=${commandId}`);await this.save(s);
         return json({ok:true,result,overview_reset,live_write_attempted:true});
       }catch(e){return json({ok:false,error:'MANUAL_CLOSE_FAILED',detail:String(e)},409);}
     }
@@ -562,7 +609,16 @@ export class LiveCopyControllerStage7 {
       if(Math.abs(prior.confirmedByCoin[coin]||0)>1e-9 || Object.values(prior.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
         return json({ok:false,error:'PRIOR_EPISODE_NOT_CLOSED'},409);
     }
-    const scale=(!old||newEpisode)?10.40/(Math.abs(whale_target_qty)*price):old.scale;
+    // For ZEC, a fresh initial entry is sized to a valid exchange quantity.
+    // Also repair an unfilled tracked ZEC episode with no outstanding intent.
+    // Never resize an existing real position or touch any other coin.
+    const zecUnfilled=coin==='ZEC'&&!!old&&Math.abs(old.confirmedOwnQty)<1e-10&&
+      !old.pendingIntentId&&!old.suspended&&Math.abs((await this.ledger()).confirmedByCoin[coin]||0)<1e-10;
+    const zecQty=coin==='ZEC'&&(!old||newEpisode||zecUnfilled)?zecInitialQuantity(price,sz_decimals):null;
+    const scale=(coin==='ZEC'&&zecQty!==null&&(!old||newEpisode||zecUnfilled))
+      ?zecQty/Math.abs(whale_target_qty)
+      :(!old||newEpisode)?10.40/(Math.abs(whale_target_qty)*price):old.scale;
+
     if(!Number.isFinite(scale)||scale<=0)return json({ok:false,error:'INVALID_SCALE'},400);
     const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:old.firstDetectedAt??Date.now(),lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:Date.now(),episode:(old?.episode||0)+1};
     // Count new ADD signals only for an already tracked/owned position.
@@ -572,6 +628,10 @@ export class LiveCopyControllerStage7 {
     record.addSignals=newEpisode?0:addCount;
     record.lastAddSignalAt=isAddSignal?Date.now():(newEpisode?undefined:old?.lastAddSignalAt);
     const ledger=await this.ledger();
+    if(coin==='ZEC'&&(!old||newEpisode||zecUnfilled)&&zecQty===null){
+      this.audit(s,'ZEC_MINIMUM_BLOCKED',coin,`price=${price}; szDecimals=${sz_decimals}; cap=$20; no order`);
+      // Do not silently increase beyond cap or mark the source fill as executed.
+    }
     if(ledger.suspendedCoins[coin])return json({ok:false,error:'MANUALLY_CLOSED_COIN_REQUIRES_REARM'},409);
     // An inherited reversal creates a NEW position on the opposite side.
     // The previous side was never ours, so do not send any close for it.
@@ -620,10 +680,11 @@ export class LiveCopyControllerStage7 {
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
     catch(e){await this.halt('INTENT_PLANNING_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'INTENT_PLANNING_FAILED',detail:String(e)},409);}
-    if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
+    if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason+` pending_usd=${planned.proposal.pendingNotional.toFixed(4)}`);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
     // Persist the reservation and in-flight state BEFORE the exchange request.
     await this.state.storage.put('live_copy_v23_ledger',planned.ledger);
     s.coins[coin]=planned.state as Coin;await this.save(s);
+    this.audit(s,'OUR_ORDER_SUBMITTING',coin,`${planned.proposal.kind} qty=${planned.proposal.quantity} reference=${markPrice} reduceOnly=${planned.proposal.reduceOnly}`);await this.save(s);
     const submitting=beginSubmission(planned.state,planned.ledger,intentId,Date.now());
     await this.state.storage.put('live_copy_v23_ledger',submitting.ledger);
     let receipt;
@@ -636,7 +697,7 @@ export class LiveCopyControllerStage7 {
     catch(e){await this.halt('SETTLEMENT_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'SETTLEMENT_FAILED_RECONCILE',detail:String(e)},409);}
     await this.state.storage.put('live_copy_v23_ledger',settled.ledger);
     s.coins[coin]=settled.state as Coin;
-    this.audit(s,'LIVE_ORDER_'+settled.outcome,coin,intentId);
+    this.audit(s,'LIVE_ORDER_'+settled.outcome,coin,`${planned.proposal.kind} qty=${planned.proposal.quantity} filled=${receipt.filledQty??'unknown'} oid=${receipt.oid??'unknown'} intent=${intentId}`);
     if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'){
       s.mode='STOPPED';await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
       return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:settled.outcome,intentId},409);
