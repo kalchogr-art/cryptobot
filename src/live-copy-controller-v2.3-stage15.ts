@@ -171,11 +171,18 @@ export class LiveCopyControllerStage7 {
     // A stored starting USDC balance is NOT current account equity.
     const dry=s.sessionKind!=='LIVE';
     const skipped=validPaper?Number(paper.skipped||0):null;
+    // Exchange-provided PERP account metrics, never a sum with spot USDC.
+    // Do not confuse account-wide equity/PnL with LIVE COPY strategy performance.
+    const validNumber=(v:unknown):number|null=>typeof v==='number'&&Number.isFinite(v)?v:null;
+    const accountEquity=dry?null:validNumber(account?.accountValue);
+    const accountUnrealized=dry||!account?null:
+      account.positions.every(p=>Number.isFinite(p.unrealized))
+        ? account.positions.reduce((total,p)=>total+p.unrealized,0):null;
     return {
       capital:o?.capital??null,capital_at:o?.startedAt??null,
       capital_source:o?.source??null,reset_count:o?.resetCount??0,
-      equity:null,roi:null,free_margin:dry?null:(account?.withdrawable??null),used_margin:dry?null:(account?.totalMarginUsed??null),
-      realized_gross:null,fees:null,realized_net:null,unrealized:null,turnover:null,
+      equity:accountEquity,roi:null,free_margin:dry?null:validNumber(account?.withdrawable),used_margin:dry?null:validNumber(account?.totalMarginUsed),
+      realized_gross:null,fees:null,realized_net:null,unrealized:accountUnrealized,turnover:null,
       our_open_positions:dry?0:ownedOpen,
       closed_trades:null,win_rate:null,
       processed_fills:Object.keys(s.seen).length,skipped,
