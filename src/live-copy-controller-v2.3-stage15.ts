@@ -1,4 +1,4 @@
-/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN REPEATED TARGET FIX.
+/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN + COIN REARM + VERIFIED REVERSAL REPLACE FIX.
  * Same controller and seven helpers, merged into one TypeScript module.
  * No local ./live-copy-*.ts imports are needed.
  * Requires the existing npm dependencies @msgpack/msgpack and viem.
@@ -745,6 +745,7 @@ import cloidForIntent = __LC_EXECUTION.cloidForIntent;
 import verifyLiveOrder = __LC_EXECUTION.verifyLiveOrder;
 import readLiveCoinQuantity = __LC_EXECUTION.readLiveCoinQuantity;
 import LiveCopyEnv = __LC_EXECUTION.LiveCopyEnv;
+import ExchangeReceipt = __LC_SETTLEMENT.ExchangeReceipt;
 import closeOwnedPosition = __LC_MANUAL_CLOSE.closeOwnedPosition;
 import closeAllOwned = __LC_MANUAL_CLOSE.closeAllOwned;
 import CloseAdapter = __LC_MANUAL_CLOSE.CloseAdapter;
@@ -763,7 +764,7 @@ import reconcileCopyLedger = __LC_RECONCILIATION.reconcileCopyLedger;
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
-type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number};
+type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number;forceNewEpisode?:boolean};
 // ===== SOURCE CHAIN INTAKE (D1 ROWID != WHALE EXECUTION ORDER) =====
 // A durable intake queue commits the D1 ingestion watermark only AFTER all
 // fetched rows are persisted. Each source fill is acknowledged independently;
@@ -1057,6 +1058,147 @@ export class LiveCopyControllerStage7 {
         `intent=${intent.id}; oid=${result.oid}; status=${result.status}; filled=${result.totalFilledQty}; expected=${expected}; actual=${current}`);
       await this.save(s);
     }
+  }
+
+  /** A fresh OPEN/REVERSAL may replace a temporarily suspended source target.
+   * The OLD intent is never removed while its exchange outcome is unknown.
+   * Re-arm only after a fresh exchange position and mark-price check, and only
+   * if all intents for this coin are terminal. Never adopt somebody else's
+   * position in a shared Hyperliquid account.
+   */
+  private async rearmCoinOnVerifiedFreshSignal(s:Snapshot,coin:string,action:string,
+      before:number,price:number,eventTime:number,decimals:number):Promise<boolean>{
+    if(action!=='OPEN'&&action!=='REVERSAL')return false;
+    const eventMs=eventTime<1e11?eventTime*1000:eventTime;
+    if(Date.now()-eventMs>60000||eventMs-Date.now()>30000)return false;
+    const old=s.coins[coin];
+    const ledger=await this.ledger();
+    if(!old?.suspended&&!ledger.suspendedCoins[coin])return false;
+    const related=Object.values(ledger.intents).filter(i=>i.coin===coin);
+    if(related.some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return false;
+    if(old?.pendingIntentId){
+      const pending=ledger.intents[old.pendingIntentId];
+      if(!pending||!['FILLED','REJECTED','CANCELLED'].includes(pending.status))return false;
+    }
+    // A manual CLOSE must not silently reopen the same whale position. A
+    // genuinely new zero-to-open episode can rearm after a verified flat account.
+    const manual=related.some(i=>i.kind==='MANUAL_CLOSE');
+    const expected=ledger.confirmedByCoin[coin]||0;
+    if(manual && !(action==='OPEN'&&Math.abs(before)<1e-10&&Math.abs(expected)<1e-10))return false;
+    let actual:number,mid:number;
+    try{
+      const account=await readLiveAccount(this.env);
+      if(!account.assetMeta.some((a:any)=>a.coin===coin&&a.szDecimals===decimals))return false;
+      actual=account.positions.find((p:any)=>p.coin===coin)?.qty||0;
+      const r=await fetch('https://api.hyperliquid.xyz/info',{
+        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
+      if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
+      const mids=await r.json() as Record<string,string>;
+      mid=Number(mids[coin]);
+    }catch(e){
+      if(this.isRateLimited(e))await this.deferRateLimit('COIN_REARM_READ');
+      return false;
+    }
+    if(!Number.isFinite(actual)||Math.abs(actual-expected)>0.51*10**(-decimals))return false;
+    if(!Number.isFinite(mid)||mid<=0||Math.abs(mid-price)/mid>0.005)return false;
+    const unlocked={...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:false}};
+    await this.state.storage.put('live_copy_v23_ledger',unlocked);
+    if(old)s.coins[coin]={...old,suspended:false,pendingIntentId:null,confirmedOwnQty:expected,
+      forceNewEpisode:Math.abs(expected)<1e-10};
+    this.audit(s,'COIN_REARM_VERIFIED',coin,
+      `trigger=${action}; previous_position=${expected}; exchange_position=${actual}; fresh_mark=${mid}; old_terminal_only=true`);
+    await this.save(s);
+    return true;
+  }
+
+  /** After a VERIFIED reduce-only FULL_CLOSE on a true reversal, immediately
+   * submit the replacement side as a new durable intent, or leave it flat.
+   * Never increase exposure while the prior close is unknown, partially filled,
+   * or not yet visible as flat on the exchange.
+   */
+  private async enterNewSideAfterVerifiedClose(s:Snapshot,input:{coin:string;fillId:string;
+      target:number;sourcePrice:number;eventTime:number;decimals:number;priorSign:number}){
+    const {coin,fillId,target,sourcePrice,eventTime,decimals,priorSign}=input;
+    const latestSession=await this.load();
+    if(latestSession.mode!=='RUNNING'||!this.liveAuthorized(latestSession))
+      return {placed:false,reason:'LIVE_NO_LONGER_AUTHORIZED'};
+    if(Math.abs(target)<1e-10||Math.sign(target)===priorSign)
+      return {placed:false,reason:'NO_OPPOSITE_TARGET'};
+    const ledger=await this.ledger();
+    if(ledger.suspendedCoins[coin]||Object.values(ledger.intents).some(i=>i.coin===coin&&
+      ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
+      return {placed:false,reason:'PREVIOUS_INTENT_NOT_RESOLVED'};
+    if(Math.abs(ledger.confirmedByCoin[coin]||0)>1e-9)
+      return {placed:false,reason:'OLD_POSITION_NOT_LEDGER_FLAT'};
+    let mark:number;
+    try{
+      const account=await readLiveAccount(this.env);
+      const actual=account.positions.find((p:any)=>p.coin===coin)?.qty||0;
+      if(Math.abs(actual)>0.51*10**(-decimals))return {placed:false,reason:'OLD_POSITION_NOT_EXCHANGE_FLAT'};
+      const r=await fetch('https://api.hyperliquid.xyz/info',{
+        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
+      if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
+      const mids=await r.json() as Record<string,string>;mark=Number(mids[coin]);
+      if(!Number.isFinite(mark)||mark<=0||Math.abs(mark-sourcePrice)/mark>0.005)
+        return {placed:false,reason:'REPLACEMENT_SOURCE_PRICE_STALE'};
+      const ms=eventTime<1e11?eventTime*1000:eventTime;
+      if(Date.now()-ms>60000)return {placed:false,reason:'REPLACEMENT_SOURCE_EVENT_STALE'};
+    }catch(e){
+      if(this.isRateLimited(e))await this.deferRateLimit('REPLACEMENT_FLAT_CHECK');
+      return {placed:false,reason:'REPLACEMENT_EXCHANGE_READ_FAILED'};
+    }
+    const unit=10**(-decimals);
+    const qty=coin==='ZEC'?zecInitialQuantity(mark,decimals):
+      round(Math.ceil(10.40/mark/unit-1e-9)*unit);
+    if(qty===null||!Number.isFinite(qty)||qty<=0||qty*mark<10.40-1e-7||qty*mark>20+1e-7)
+      return {placed:false,reason:'REPLACEMENT_NOTIONAL_OR_PRECISION_UNSAFE'};
+    const previous=s.coins[coin];if(!previous)return {placed:false,reason:'MISSING_COIN_STATE'};
+    const successor:Coin={...previous,anchorTargetQty:target,scale:qty/Math.abs(target),
+      confirmedOwnQty:0,pendingIntentId:null,suspended:false,episode:previous.episode+1};
+    // Persist new scaling even if the second order is rejected. The next
+    // source event must not reuse the prior side's leverage/scale.
+    s.coins[coin]=successor;await this.save(s);
+    const intentId=`AUTO:${coin}:${fillId}:REPLACEMENT`;
+    let planned;
+    try{planned=planAndReserve({state:successor,ledger,whaleTargetQty:target,price:mark,
+      szDecimals:decimals,sourceFillId:fillId,intentId,now:Date.now()});}
+    catch(e){this.audit(s,'REPLACEMENT_PLAN_SKIPPED',coin,String(e));await this.save(s);
+      return {placed:false,reason:'REPLACEMENT_PLAN_FAILED'};}
+    if(!planned.intent)return {placed:false,reason:planned.proposal.reason};
+    planned.ledger.intents[intentId]={...planned.ledger.intents[intentId],exchangeCloid:cloidForIntent(intentId)};
+    await this.state.storage.put('live_copy_v23_ledger',planned.ledger);
+    s.coins[coin]=planned.state as Coin;await this.save(s);
+    const submitting=beginSubmission(planned.state,planned.ledger,intentId,Date.now());
+    await this.state.storage.put('live_copy_v23_ledger',submitting.ledger);
+    this.audit(s,'OUR_REPLACEMENT_SUBMITTING',coin,
+      `OPEN qty=${planned.proposal.quantity} reference=${mark} after_verified_close=true`);
+    await this.save(s);
+    let receipt:ExchangeReceipt;
+    let rateLimited=false;
+    try{
+      const result=await executeLiveIoc(this.env,{intentId,coin,
+        direction:planned.proposal.signedDelta>0?'LONG':'SHORT',
+        quantity:planned.proposal.quantity,reduceOnly:false,referencePrice:mark});
+      rateLimited=this.isRateLimited(result.raw);
+      receipt={intentId,coin,status:result.status,executed:result.executed,
+        filledQty:result.filledQty,requestedQty:result.requestedQty,oid:result.oid};
+    }catch(_e){receipt={intentId,coin,status:'UNKNOWN_WRITE_OUTCOME',executed:false};}
+    let settled;
+    try{settled=applyTrustedReceipt(submitting.state,submitting.ledger,receipt,Date.now());}
+    catch(e){await this.halt('REPLACEMENT_SETTLEMENT_FAILED:'+String(e).slice(0,100),coin);
+      return {placed:false,reason:'REPLACEMENT_SETTLEMENT_FAILED'};}
+    await this.state.storage.put('live_copy_v23_ledger',settled.ledger);
+    s.coins[coin]=settled.state as Coin;
+    this.audit(s,'LIVE_REPLACEMENT_'+settled.outcome,coin,
+      `old_verified_flat=true; new_intent=${intentId}; qty=${planned.proposal.quantity}; oid=${receipt.oid??'unknown'}`);
+    if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL')
+      this.audit(s,'COIN_AWAITING_ORDER_VERIFICATION',coin,
+        `new_intent=${intentId}; outcome=${settled.outcome}; no_resubmit=true`);
+    await this.save(s);
+    if(rateLimited)await this.deferRateLimit('REPLACEMENT_WRITE_UNKNOWN');
+    return {placed:settled.outcome==='FILLED',reason:settled.outcome,
+      intentId,exchange_order_sent:settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'?'UNKNOWN':
+        receipt.executed===true};
   }
 
   // Overview is stored separately from trading state. No retroactive P/L is invented.
@@ -1780,12 +1922,35 @@ export class LiveCopyControllerStage7 {
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
     if(s.sessionKind==='DRY_RUN')await this.paperMark(coin,price);
+    // Old soft quarantines are rearmed only by a NEW, live-priced OPEN/REVERSAL.
+    // A previously transmitted UNKNOWN order is not canceled or erased.
+    if(s.sessionKind==='LIVE' && (source_action==='OPEN'||source_action==='REVERSAL')){
+      const pending=(await this.ledger());
+      if(Object.values(pending.intents).some(i=>i.coin===coin&&
+        ['SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
+        await this.recoverPendingOrders();
+        const latest=await this.load();
+        if(latest.mode!=='RUNNING')return json({ok:false,error:'LIVE_HALTED_DURING_RECOVERY'},409);
+        Object.assign(s,latest);
+      }
+      await this.rearmCoinOnVerifiedFreshSignal(s,coin,source_action,whale_before_qty,
+        price,time,sz_decimals);
+    }
     const old=s.coins[coin];
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(this.liveAuthorized(s)){
       const eventMs=time<1e11?time*1000:time;
       if(eventMs-Date.now()>30000)return json({ok:false,error:'FUTURE_WHALE_FILL',eventMs},409);
       if(Date.now()-eventMs>300000){
+        // A stale first sighting of a coin has sent NO order and must not
+        // prevent a later fresh OPEN/REVERSAL from starting a new episode.
+        // An already tracked coin still needs target-chain reconciliation.
+        if(!old){
+          s.seen[id]=Date.now();
+          this.audit(s,'STALE_UNTRACKED_FILL_SKIPPED',coin,`fill=${fill_id}; no_owned_position`);
+          await this.save(s);
+          return json({ok:true,ignored:true,reason:'STALE_UNTRACKED_FILL_SKIPPED',exchange_order_sent:false});
+        }
         // Do not trade stale fills. Quarantine this coin while preserving the
         // whale's source target chain, so OTHER coins may proceed.
         if(old)s.coins[coin]={...old,lastWhaleTarget:whale_target_qty,
@@ -1825,7 +1990,11 @@ export class LiveCopyControllerStage7 {
     }
     // A new episode after a confirmed flat target gets a fresh scaling anchor.
     // Refuse to rearm when the previous position is still open or unresolved.
-    const newEpisode=!!old&&Math.abs(old.lastWhaleTarget)<1e-10&&Math.abs(whale_target_qty)>1e-10;
+    const newEpisode=!!old && (Math.abs(whale_target_qty)>1e-10) && (
+      Math.abs(old.lastWhaleTarget)<1e-10 || !!old.forceNewEpisode ||
+      ((source_action==='OPEN'||source_action==='REVERSAL') &&
+        Math.abs(old.confirmedOwnQty)<1e-10 && !old.pendingIntentId &&
+        Math.abs((await this.ledger()).confirmedByCoin[coin]||0)<1e-10));
     if(newEpisode){
       const prior=await this.ledger();
       if(prior.suspendedCoins[coin])return json({ok:false,error:'MANUAL_CLOSE_SUSPENSION_REQUIRES_REARM'},409);
@@ -1843,7 +2012,7 @@ export class LiveCopyControllerStage7 {
       :(!old||newEpisode)?10.40/(Math.abs(whale_target_qty)*price):old.scale;
 
     if(!Number.isFinite(scale)||scale<=0)return json({ok:false,error:'INVALID_SCALE'},400);
-    const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:old.firstDetectedAt??Date.now(),lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:Date.now(),episode:(old?.episode||0)+1};
+    const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:old.firstDetectedAt??Date.now(),lastFillId:fill_id,forceNewEpisode:false}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,firstDetectedAt:Date.now(),episode:(old?.episode||0)+1,forceNewEpisode:false};
     // Count new ADD signals only for an already tracked/owned position.
     // Persist together with the accepted event, not on failed exchange writes.
     const isAddSignal=!!old&&!newEpisode&&source_action==='ADD'&&Math.abs(old.confirmedOwnQty)>1e-9;
@@ -1897,9 +2066,16 @@ export class LiveCopyControllerStage7 {
       if(!Number.isFinite(markPrice)||markPrice<=0||Math.abs(markPrice-price)/markPrice>0.005)throw Error('STALE_SOURCE_PRICE');
       assertPositionOwned(ledger,coin,account.positions.find((p:any)=>p.coin===coin)?.qty||0,sz_decimals);
     }catch(e){if(this.isRateLimited(e)){const retryAt=await this.deferRateLimit('PRE_TRADE_READ_ONLY_CHECK');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
-      record.suspended=true;s.coins[coin]=record;s.seen[id]=Date.now();
-      this.audit(s,'PRE_TRADE_COIN_QUARANTINED',coin,String(e).slice(0,200));await this.save(s);
-      return json({ok:true,ignored:true,quarantined:true,reason:'PRE_TRADE_CHECK_FAILED',detail:String(e)});}
+      const reason=String(e);
+      // An out-of-date source quote or a failed read did NOT send any order.
+      // Do not permanently quarantine the coin for this transient condition.
+      const temporary=/STALE_SOURCE_PRICE|MARK_PRICE_HTTP_|PRE_ORDER_ACCOUNT_READ|ACCOUNT_HTTP_|FETCH_FAILED|NETWORK/i.test(reason);
+      record.suspended=!temporary;
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,temporary?'PRE_TRADE_TEMPORARY_SKIP':'PRE_TRADE_COIN_QUARANTINED',coin,reason.slice(0,200));
+      await this.save(s);
+      return json({ok:true,ignored:true,quarantined:!temporary,
+        reason:temporary?'PRE_TRADE_TEMPORARY_SKIP':'PRE_TRADE_CHECK_FAILED',detail:reason});}
     if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
       s.coins[coin]={...record,suspended:true};s.seen[id]=Date.now();
       this.audit(s,'COIN_UNRESOLVED_BLOCKED',coin,'Previous order still pending verification');await this.save(s);
@@ -1945,6 +2121,21 @@ export class LiveCopyControllerStage7 {
     }
     s.seen[id]=Date.now();await this.save(s);
     if(exchangeRateLimited)await this.deferRateLimit('EXCHANGE_RESPONSE');
+    // A real reversal replaces the PREVIOUS OWNED position in two independent
+    // confirmed legs: reduceOnly close first, then a fresh capped new OPEN.
+    // An UNKNOWN/PARTIAL close never reaches here and can never trigger OPEN.
+    if(planned.proposal.kind==='FULL_CLOSE'&&settled.outcome==='FILLED'&&
+       Math.abs(whale_target_qty)>1e-10&&
+       Math.sign(whale_target_qty)!==Math.sign(record.confirmedOwnQty)&&
+       Math.abs(record.confirmedOwnQty)>1e-10){
+      const successor=await this.enterNewSideAfterVerifiedClose(s,{
+        coin,fillId:fill_id,target:whale_target_qty,sourcePrice:price,eventTime:time,
+        decimals:sz_decimals,priorSign:Math.sign(record.confirmedOwnQty)});
+      this.audit(s,'REVERSAL_REPLACEMENT_RESULT',coin,`reason=${successor.reason}; placed=${successor.placed}`);
+      await this.save(s);
+      return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,
+        replacement:successor,exchange_order_sent:orderWasSent,trading_enabled:true});
+    }
     return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,exchange_order_sent:orderWasSent,trading_enabled:true});
   }
 }
