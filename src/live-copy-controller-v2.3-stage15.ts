@@ -7,7 +7,7 @@ import {planAndReserve, beginSubmission, applyTrustedReceipt} from './live-copy-
 import {assertPositionOwned, markUnknown} from './live-copy-ledger-v2.3';
 import {emptyLiveLedger, type LiveLedger} from './live-copy-ledger-v2.3';
 import {readLiveAccount, executeLiveIoc, type LiveCopyEnv} from './live-copy-execution-v2.3';
-import {closeOwnedPosition, closeAllOwned, type CloseAdapter} from './live-copy-manual-close-v2.3-stage12-EMPTY-FIX';
+import {closeOwnedPosition, closeAllOwned, type CloseAdapter} from './live-copy-manual-close-v2.3-stage12';
 import {reconcileCopyLedger} from './live-copy-reconciliation-v2.3';
 
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
