@@ -26,8 +26,17 @@ export function settleExchangeReceipt(ledger:LiveLedger, receipt:ExchangeReceipt
     const status=next.intents[intent.id].status;
     return {ledger:next,outcome:status==='FILLED'?'FILLED':'PARTIAL',reason:'EXCHANGE_REPORTED_FILL'};
   }
-  if (receipt.status==='REJECTED' && !receipt.executed) {
-    return {ledger:markRejected(ledger,intent.id,now,'EXCHANGE_REJECTED'),outcome:'REJECTED',reason:'EXCHANGE_REJECTED'};
+  // Explicit adapter statuses that guarantee NO order request was sent, or a
+  // definitive rejection from the exchange. Do not classify an absent/ambiguous
+  // exchange response as REJECTED.
+  const noOrderSent=new Set(['LIVE_DISABLED','CREDENTIALS_NOT_CONFIGURED','INVALID_INTENT',
+    'UNKNOWN_ASSET','BELOW_SIZE_PRECISION','NO_POSITION_TO_REDUCE','REDUCE_EXCEEDS_POSITION',
+    'OPPOSITE_POSITION_EXISTS','LEVERAGE_APPROVAL_MISSING','LEVERAGE_MODE_NOT_APPROVED',
+    'ASSET_MAX_LEVERAGE_BELOW_10X','EXISTING_POSITION_LEVERAGE_MISMATCH',
+    'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER','LEVERAGE_UPDATE_REJECTED_NO_ORDER',
+    'BELOW_STRATEGY_MIN_NOTIONAL','PRE_ORDER_ACCOUNT_READ_FAILED_NO_ORDER']);
+  if ((receipt.status==='REJECTED'||noOrderSent.has(receipt.status)) && !receipt.executed) {
+    return {ledger:markRejected(ledger,intent.id,now,'NO_ORDER_OR_EXCHANGE_REJECTED:'+receipt.status),outcome:'REJECTED',reason:'EXCHANGE_REJECTED'};
   }
   return {ledger:markUnknown(ledger,intent.id,now,'AMBIGUOUS_OR_UNFILLED_EXCHANGE_RESPONSE'),outcome:'UNKNOWN',reason:'RECONCILE_BEFORE_RETRY'};
 }
