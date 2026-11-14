@@ -7,7 +7,7 @@ import {planAndReserve, beginSubmission, applyTrustedReceipt} from './live-copy-
 import {assertPositionOwned, markUnknown} from './live-copy-ledger-v2.3';
 import {emptyLiveLedger, type LiveLedger} from './live-copy-ledger-v2.3';
 import {readLiveAccount, executeLiveIoc, type LiveCopyEnv} from './live-copy-execution-v2.3';
-import {closeOwnedPosition, closeAllOwned, type CloseAdapter} from './live-copy-manual-close-v2.3-stage12';
+import {closeOwnedPosition, closeAllOwned, type CloseAdapter} from './live-copy-manual-close-v2.3-stage12-EMPTY-FIX';
 import {reconcileCopyLedger} from './live-copy-reconciliation-v2.3';
 
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
@@ -471,8 +471,65 @@ export class LiveCopyControllerStage7 {
       if(metadataError){if(this.isRateLimited(metadataError)){const retryAt=await this.deferRateLimit('METADATA');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
         await this.halt('METADATA_UNAVAILABLE');return json({ok:false,error:'METADATA_UNAVAILABLE',detail:metadataError,cursor,stopped:true},503);}
       const precisions=new Map<string,number>(metadata.universe.map((a:any)=>[a.name,a.szDecimals]));
+      // PRE-FLIGHT: source rowid is ingestion order, not the whale fill chain.
+      // Validate the whole bounded batch before ANY trading side effect. A chain
+      // with a missing/ambiguous link halts rather than guessing or skipping.
+      const sourceRows=rows.results||[];
+      type SourceRow=typeof sourceRows[number];
+      const groups=new Map<string,SourceRow[]>();
+      const parsed=new Map<number,any>();
+      let chainFailure:any=null;
+      for(const row of sourceRows){
+        let e:any;try{e=JSON.parse(row.payload);}catch{chainFailure={error:'BAD_SOURCE_PAYLOAD',rowid:row.rowid};break;}
+        parsed.set(row.rowid,e);
+        const a=groups.get(row.coin)||[];a.push(row);groups.set(row.coin,a);
+      }
+      const orderedByCoin=new Map<string,SourceRow[]>();
+      const currentState=await this.load();
+      const epsilon=1e-7;
+      if(!chainFailure)for(const [coin,items] of groups){
+        const chain=items.filter(r=>{
+          const e=parsed.get(r.rowid);
+          return !new Set(['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL']).has(r.action)
+            && e?.source==='HYPERLIQUID_PUBLIC_FILL'
+            && e?.recovered_from_verified_skipped_fill!==true;
+        });
+        const ordered:SourceRow[]=[];
+        const remaining=[...chain];
+        const old=currentState.coins[coin];
+        let expected=old?.lastWhaleTarget;
+        let previousTime=old?.lastEventAt??-Infinity;
+        while(remaining.length){
+          // For an unseen coin we can only safely use the earliest ingested
+          // event as an anchor; if its predecessor arrives later, HALT.
+          const candidates=expected===undefined?[remaining[0]]:remaining.filter(r=>Math.abs(Number(parsed.get(r.rowid)?.target_before)-expected!)<=epsilon);
+          if(candidates.length!==1){chainFailure={error:candidates.length?'AMBIGUOUS_TARGET_CHAIN':'TARGET_CHAIN_GAP',coin,expected_before:expected,remaining_rowids:remaining.map(r=>r.rowid)};break;}
+          const next=candidates[0],e=parsed.get(next.rowid);
+          if(!Number.isFinite(Number(e?.target_before))||!Number.isFinite(Number(e?.target_after))){chainFailure={error:'INVALID_TARGET_CHAIN',coin,rowid:next.rowid};break;}
+          if(next.at<previousTime){chainFailure={error:'TARGET_CHAIN_TIME_REGRESSION',coin,rowid:next.rowid,previous_time:previousTime,event_time:next.at};break;}
+          previousTime=next.at;expected=Number(e.target_after);
+          ordered.push(next);remaining.splice(remaining.indexOf(next),1);
+        }
+        if(chainFailure)break;
+        orderedByCoin.set(coin,ordered);
+      }
+      if(chainFailure){
+        const state=await this.load();this.audit(state,'TARGET_CHAIN_PREFLIGHT_FAILED',chainFailure.coin,JSON.stringify(chainFailure).slice(0,350));await this.save(state);
+        await this.halt('SYNC_CHAIN_PREFLIGHT_FAILED');
+        return json({ok:false,error:'SYNC_CHAIN_PREFLIGHT_FAILED',failure:chainFailure,cursor,exchange_order_sent:false,stopped:true},409);
+      }
+      // Retain original cross-coin ordering slots, but use validated per-coin
+      // chain order within each slot. Non-fill bookkeeping rows remain ignored.
+      const offsets=new Map<string,number>();
+      const reordered=sourceRows.map(row=>{
+        const e=parsed.get(row.rowid);
+        if(new Set(['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL']).has(row.action)||e?.source!=='HYPERLIQUID_PUBLIC_FILL'||e?.recovered_from_verified_skipped_fill===true)return row;
+        const index=offsets.get(row.coin)||0;offsets.set(row.coin,index+1);
+        return orderedByCoin.get(row.coin)?.[index]||row;
+      });
       let processed=0,ignored=0;let failure:any=null;
-      for(const row of rows.results||[]){
+      const originalCursor=cursor;
+      for(const row of reordered){
         // A changed watcher session must not be spliced into the old target chain.
         if(cursor.session && row.session_id!==cursor.session){failure={error:'WATCHER_SESSION_CHANGED_REQUIRES_REARM',rowid:row.rowid};break;}
         let e:any;try{e=JSON.parse(row.payload);}catch{failure={error:'BAD_SOURCE_PAYLOAD',rowid:row.rowid};break;}
@@ -484,7 +541,6 @@ export class LiveCopyControllerStage7 {
         if(!row.fill_id || typeof row.fill_id!=='string' || !row.session_id) {failure={error:'INVALID_D1_FILL_ID',rowid:row.rowid};break;}
         if(nonFillActions.has(row.action)||e?.source!=='HYPERLIQUID_PUBLIC_FILL'||e?.recovered_from_verified_skipped_fill===true){
           ignored++;cursor={session:row.session_id,rowid:row.rowid};
-          await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
           continue;
         }
         if(!Number.isFinite(Number(e.target_before))||!Number.isFinite(Number(e.target_after))||!Number.isFinite(Number(e.price))){
@@ -499,10 +555,10 @@ export class LiveCopyControllerStage7 {
         if(result.ignored)ignored++;else processed++;
         if(row.action==='REVERSAL'){const latest=await this.load();this.audit(latest,result.ignored?'REVERSAL_IGNORED':'REVERSAL_HANDLED',row.coin,`rowid=${row.rowid} reason=${result.reason||result.proposal?.reason||'accepted'}`);await this.save(latest);}
         cursor={session:row.session_id,rowid:row.rowid};
-        // Commit after each processed event to avoid skipping events on crash.
-        await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
+        // Commit only after the entire validated batch has succeeded.
       }
-      if(failure)await this.halt('SYNC_FAILED:'+String(failure.error));
+      if(failure){cursor=originalCursor;await this.halt('SYNC_FAILED:'+String(failure.error));}
+      else {cursor={session:originalCursor.session,rowid:sourceRows[sourceRows.length-1].rowid};await this.state.storage.put('live_copy_v23_d1_cursor',cursor);}
       return json({ok:!failure,trading_enabled:this.liveAuthorized(await this.load()),processed,ignored,cursor,failure,has_more:(rows.results||[]).length===100},failure?409:200);
     }
     if(path==='/reconcile'){
@@ -548,6 +604,35 @@ export class LiveCopyControllerStage7 {
         const result=path==='/close'
           ? await closeOwnedPosition({coin:body.coin,commandId,store,exchange})
           : await closeAllOwned({commandId,store,exchange});
+        // Empty exchange position list is not a successful close execution.
+        // Only clear stale confirmed quantities after TWO fresh, successful reads
+        // of the master wallet, while STOPPED and with no unresolved intents.
+        if(path==='/close-all' && 'results' in result && result.results.length===0){
+          const first=await readLiveAccount(this.env);
+          const second=await readLiveAccount(this.env);
+          const flat=first.positions.length===0 && second.positions.length===0;
+          const current=await this.ledger();
+          const unresolved=Object.values(current.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+          if(flat&&!unresolved){
+            const stale=Object.entries(current.confirmedByCoin).filter(([,q])=>Math.abs(q)>1e-9);
+            if(stale.length){
+              const confirmedByCoin={...current.confirmedByCoin};
+              const suspendedCoins={...current.suspendedCoins};
+              for(const [coin] of stale){confirmedByCoin[coin]=0;suspendedCoins[coin]=true;}
+              await this.state.storage.put('live_copy_v23_ledger',{
+                ...current,confirmedByCoin,suspendedCoins,lastReconciledAt:Date.now()
+              });
+              this.audit(s,'CLOSE_ALL_EMPTY_EXCHANGE_LEDGER_ZEROED',undefined,
+                `coins=${stale.map(([coin])=>coin).join(',')}; command=${commandId}; verified_twice=true`);
+            }
+            result.allConfirmedClosed=true;
+            this.audit(s,'CLOSE_ALL_ALREADY_FLAT',undefined,`command=${commandId}; verified_twice=true`);
+          }else{
+            result.allConfirmedClosed=false;
+            this.audit(s,'CLOSE_ALL_EMPTY_NOT_VERIFIED',undefined,
+              `flat=${flat}; unresolved=${unresolved}; command=${commandId}`);
+          }
+        }
         let overview_reset:any=null;
         if(path==='/close-all'){
           const updated=await this.ledger();
