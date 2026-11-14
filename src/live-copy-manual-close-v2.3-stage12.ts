@@ -66,5 +66,5 @@ export async function closeAllOwned(input:{store:LedgerStore;exchange:CloseAdapt
     try{results.push(await closeOwnedPosition({...input,coin:p.coin}));}
     catch(e){results.push({coin:p.coin,status:'BLOCKED',reason:String(e)});}
   }
-  return {results,allConfirmedClosed:results.every(x=>x.status==='FILLED'||x.status==='NO_POSITION')};
+  return {results,allConfirmedClosed:results.length>0&&results.every(x=>x.status==='FILLED'||x.status==='NO_POSITION')};
 }
