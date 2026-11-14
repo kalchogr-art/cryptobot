@@ -627,29 +627,69 @@ export type CloseResult={coin:string;status:string;intentId?:string;filledQty?:n
 const safeCoin=(s:string)=>/^[A-Z0-9]{2,20}$/.test(s);
 const quantize=(q:number,d:number)=>Math.floor((q+1e-12)*10**d)/10**d;
 /** Must be invoked after STOP is durably saved. One call at a time per DO. */
-export async function closeOwnedPosition(input:{coin:string;store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number}):Promise<CloseResult>{
+export async function closeOwnedPosition(input:{coin:string;store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number;recoveryCloseAll?:boolean}):Promise<CloseResult>{
   const {coin,store,exchange,commandId}=input;const now=input.now||Date.now;
   if(!safeCoin(coin)||!/^[-A-Za-z0-9_:]{8,150}$/.test(commandId))throw Error('INVALID_CLOSE_COMMAND');
   const id=`MANUAL:${commandId}:${coin}`;
   let ledger=await store.load();
   const existing=ledger.intents[id];
   if(existing)return {coin,status:existing.status,intentId:id,reason:'EXISTING_COMMAND_NO_RESUBMIT'};
-  if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
+  const unresolved=Object.values(ledger.intents).filter(i=>i.coin===coin&&
+    ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+  // Explicit CLOSE ALL is an emergency *reduce-only* close. Old UNKNOWN
+  // writes may block copying but must not permanently prevent risk reduction.
+  // Never send a second close while a recent exchange write might still settle.
+  if(unresolved.length && !input.recoveryCloseAll)
     return {coin,status:'BLOCKED',reason:'UNRESOLVED_INTENT'};
+  if(input.recoveryCloseAll && unresolved.some(i=>i.status!=='PREPARED' &&
+    (!Number.isFinite(i.updatedAt)||now()-i.updatedAt<180000)))
+    return {coin,status:'BLOCKED',reason:'RECENT_UNRESOLVED_ORDER_WAIT_FOR_SETTLEMENT'};
   const positions=await exchange.positions();
   const p=positions.find(x=>x.coin===coin);
   if(!p||!Number.isFinite(p.qty)||p.qty===0){
-    if(Math.abs(ledger.confirmedByCoin[coin]||0)>1e-9)throw Error('LEDGER_EXCHANGE_POSITION_MISMATCH');
+    if(!input.recoveryCloseAll && Math.abs(ledger.confirmedByCoin[coin]||0)>1e-9)
+      throw Error('LEDGER_EXCHANGE_POSITION_MISMATCH');
     return {coin,status:'NO_POSITION'};
   }
-  if(!Number.isFinite(p.markPrice)||p.markPrice<=0||!Number.isInteger(p.szDecimals)||p.szDecimals<0||p.szDecimals>8)throw Error('INVALID_EXCHANGE_METADATA');
-  assertPositionOwned(ledger,coin,p.qty,p.szDecimals);
+  if(!Number.isFinite(p.markPrice)||p.markPrice<=0||!Number.isInteger(p.szDecimals)||p.szDecimals<0||p.szDecimals>8)
+    throw Error('INVALID_EXCHANGE_METADATA');
+  if(input.recoveryCloseAll){
+    // A shared Hyperliquid wallet may hold unrelated positions. Only permit
+    // this command on coins with a persisted LIVE COPY ownership footprint.
+    if(!Object.prototype.hasOwnProperty.call(ledger.confirmedByCoin,coin) &&
+       !Object.values(ledger.intents).some(i=>i.coin===coin))
+      return {coin,status:'SKIPPED',reason:'COIN_NOT_OWNED_BY_LIVE_COPY'};
+    // Constrain unknown writes to their recorded maximum possible signed fill.
+    // A position outside those bounds may include someone else's trades.
+    let lower=ledger.confirmedByCoin[coin]||0;
+    let upper=lower;
+    for(const i of unresolved){
+      if(i.status==='PREPARED')continue; // PREPARED never reached exchange.
+      const outstanding=Math.max(0,i.requestedQty-i.confirmedFillQty);
+      const signed=(i.side==='BUY'?1:-1)*outstanding;
+      lower+=Math.min(0,signed);
+      upper+=Math.max(0,signed);
+    }
+    const tol=0.51*10**(-p.szDecimals);
+    if(p.qty<lower-tol || p.qty>upper+tol)
+      return {coin,status:'BLOCKED',reason:'EXCHANGE_POSITION_OUTSIDE_LIVE_COPY_INTENT_BOUNDS'};
+  }else{
+    assertPositionOwned(ledger,coin,p.qty,p.szDecimals);
+  }
   const quantity=quantize(Math.abs(p.qty),p.szDecimals);
   if(quantity<=0)throw Error('QUANTITY_BELOW_PRECISION');
-  ledger=prepareIntent(ledger,{id,coin,kind:'MANUAL_CLOSE',side:p.qty>0?'SELL':'BUY',reduceOnly:true,requestedQty:quantity,sourceFillId:`manual:${commandId}`},now());
-  await store.save(ledger); // durable reservation BEFORE the write
+  const initial={id,coin,kind:'MANUAL_CLOSE' as const,side:(p.qty>0?'SELL':'BUY') as 'BUY'|'SELL',
+    reduceOnly:true,requestedQty:quantity,confirmedFillQty:0,sourceFillId:`manual:${commandId}`,
+    status:'PREPARED' as const,createdAt:now(),updatedAt:now()};
+  // Normal close keeps prepareIntent's standard guard. CLOSE ALL uses a
+  // durable, uniquely identified reduce-only intent without clearing the
+  // historical UNKNOWN, whose outcome must remain auditable.
+  ledger=input.recoveryCloseAll ? {...ledger,intents:{...ledger.intents,[id]:initial}}
+    : prepareIntent(ledger,{id,coin,kind:'MANUAL_CLOSE',side:initial.side,reduceOnly:true,
+      requestedQty:quantity,sourceFillId:initial.sourceFillId},now());
+  await store.save(ledger); // persist PREPARED BEFORE the exchange write
   ledger=markSubmitting(ledger,id,now());
-  await store.save(ledger); // persist SUBMITTING BEFORE the write
+  await store.save(ledger); // persist SUBMITTING BEFORE the exchange write
   let receipt:{status:string;executed:boolean;filledQty?:number;requestedQty?:number;oid?:string|number};
   try{
     receipt=await exchange.execute({intentId:id,coin,direction:p.qty>0?'LONG':'SHORT',quantity,reduceOnly:true,referencePrice:p.markPrice});
@@ -669,13 +709,17 @@ export async function closeOwnedPosition(input:{coin:string;store:LedgerStore;ex
 /** Never issue parallel close orders. Caller must first STOP auto-copy. */
 export async function closeAllOwned(input:{store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number}){
   const positions=await input.exchange.positions();
+  // Reuse the batch's verified snapshot for planning; executeLiveIoc still
+  // obtains a fresh account snapshot immediately before every real order.
+  // This prevents additional allMids/meta/account reads for every coin.
+  const exchange={...input.exchange,positions:async()=>positions};
   const results:CloseResult[]=[];
   for(const p of positions){
     const ledger=await input.store.load();
     if(!Object.prototype.hasOwnProperty.call(ledger.confirmedByCoin,p.coin)){
       results.push({coin:p.coin,status:'SKIPPED',reason:'NOT_OWNED_BY_LIVE_COPY'});continue;
     }
-    try{results.push(await closeOwnedPosition({...input,coin:p.coin}));}
+    try{results.push(await closeOwnedPosition({...input,exchange,coin:p.coin,recoveryCloseAll:true}));}
     catch(e){results.push({coin:p.coin,status:'BLOCKED',reason:String(e)});}
   }
   return {results,allConfirmedClosed:results.length>0&&results.every(x=>x.status==='FILLED'||x.status==='NO_POSITION')};
@@ -1242,7 +1286,7 @@ export class LiveCopyControllerStage7 {
     }
     if(request.method==='GET'&&path==='/status'){
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CLOSE_ALL_VERIFIED_RESET',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CLOSE_ALL_RECOVERY_OWNERSHIP_GUARD',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1252,7 +1296,16 @@ export class LiveCopyControllerStage7 {
     }
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
     if(path==='/start'&&s.mode==='RUNNING')return json({ok:false,error:'ALREADY_RUNNING_STOP_FIRST'},409);
-    if(path==='/start'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(!report.safeToTrade)return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
+    if(path==='/start'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(report.rows.some(r=>r.status!=='MATCH'&&r.status!=='UNOWNED_POSITION'))
+        return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);
+        // Protect unrelated pre-existing positions on a shared wallet.
+        // They are never adopted as copied positions and never traded into.
+        const unowned=report.rows.filter(r=>r.status==='UNOWNED_POSITION');
+        if(unowned.length){
+          await this.state.storage.put('live_copy_v23_ledger',{
+            ...ledger,suspendedCoins:{...ledger.suspendedCoins,
+              ...Object.fromEntries(unowned.map(r=>[r.coin,true]))}});
+        }}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
       // Fail closed on restart: never silently backfill a stopped interval.
       // Existing owned positions require explicit reconciliation/handling, not a fresh anchor.
       if(this.liveEnabled()){
@@ -1442,7 +1495,14 @@ export class LiveCopyControllerStage7 {
     if(path==='/close'||path==='/close-all'){
       // Close commands are independent of auto-sync, but require STOP persisted first.
       // This explicit second flag prevents accidental live writes on deployment.
-      if(s.mode!=='STOPPED')return json({ok:false,error:'STOP_REQUIRED_BEFORE_MANUAL_CLOSE'},409);
+      if(s.mode!=='STOPPED'){
+        if(path!=='/close-all')return json({ok:false,error:'STOP_REQUIRED_BEFORE_MANUAL_CLOSE'},409);
+        s.mode='STOPPED';this.liveArmAt=null;
+        await this.state.storage.put('live_copy_v23_durable_arm',null);
+        this.audit(s,'CLOSE_ALL_AUTO_STOP');await this.save(s);
+        if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
+      }
+      if(this.syncBusy)return json({ok:false,error:'SYNC_IN_PROGRESS_RETRY_CLOSE_ALL_WHEN_IDLE',retryable:true},409);
       if(this.env.LIVE_COPY_TRADING_ENABLED!=='true'||(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED!=='true')
         return json({ok:false,error:'LIVE_MANUAL_CLOSE_DISABLED',positions_untouched:true},409);
       if(body.confirm!=='CLOSE_REAL_HYPERLIQUID_POSITION')return json({ok:false,error:'EXPLICIT_CONFIRMATION_REQUIRED'},400);
@@ -1494,8 +1554,17 @@ export class LiveCopyControllerStage7 {
             // One-time checks on CLOSE ALL, not part of the 15s polling loop.
             const a=await readLiveAccount(this.env);
             const b=await readLiveAccount(this.env);
+            // Other strategies can share this wallet; they must not be closed
+            // or prevent a clean LIVE COPY session reset.
+            const managedCoins=new Set<string>([
+              ...Object.keys(current.confirmedByCoin),
+              ...Object.values(current.intents).map(i=>i.coin),
+              ...Object.keys(current.suspendedCoins)
+            ]);
+            const managedPosition=(p:{coin:string})=>managedCoins.has(p.coin);
             const flat=a.masterAccount===b.masterAccount &&
-              a.positions.length===0 && b.positions.length===0;
+              !a.positions.some(managedPosition) && !b.positions.some(managedPosition);
+            const otherPositions=b.positions.filter((p:any)=>!managedCoins.has(p.coin));
             if(!flat){
               reset={completed:false,reason:'EXCHANGE_POSITIONS_NOT_CONFIRMED_FLAT',
                 first_positions:a.positions.map((p:any)=>({coin:p.coin,qty:p.qty})),
@@ -1508,20 +1577,23 @@ export class LiveCopyControllerStage7 {
               if(!response.ok)throw Error('CLOSE_ALL_OPEN_ORDERS_HTTP_'+response.status);
               const orders:any=await response.json();
               if(!Array.isArray(orders))throw Error('CLOSE_ALL_OPEN_ORDERS_RESPONSE_INVALID');
-              if(orders.length){
-                reset={completed:false,reason:'ACCOUNT_HAS_OPEN_ORDERS',open_order_count:orders.length};
+              const conflictingOrders=orders.filter((o:any)=>
+                typeof o?.coin!=='string' || managedCoins.has(o.coin));
+              if(conflictingOrders.length){
+                reset={completed:false,reason:'MANAGED_COIN_HAS_OPEN_ORDERS',
+                  open_order_count:conflictingOrders.length};
               }else if(this.syncBusy){
                 reset={completed:false,reason:'SYNC_STARTED_DURING_CLOSE_ALL'};
               }else{
                 // Obtain a truthful new capital snapshot BEFORE changing ledger
                 // or UI state. On API failure, leave it intact and allow a safe retry.
                 const capital=b.spotUsdcTotal;
-                if(typeof capital!=='number'||!Number.isFinite(capital)||capital<0)
-                  throw Error('CLOSE_ALL_CAPITAL_SNAPSHOT_UNAVAILABLE');
                 const now=Date.now();
                 const previous=await this.overview();
-                overview_reset={capital,startedAt:now,source:'spotClearinghouseState.USDC.total',
-                  resetCount:(previous?.resetCount||0)+1};
+                if(typeof capital==='number'&&Number.isFinite(capital)&&capital>=0){
+                  overview_reset={capital,startedAt:now,source:'spotClearinghouseState.USDC.total',
+                    resetCount:(previous?.resetCount||0)+1};
+                }
                 // Keep immutable evidence of every previous order intent,
                 // including legacy UNKNOWN, without contaminating a new session.
                 const archiveKey='live_copy_v23_closeall_archive:'+now+':'+commandId;
@@ -1530,7 +1602,8 @@ export class LiveCopyControllerStage7 {
                   prior_ledger:current,unresolved_at_close:unfinished.map(i=>({
                     coin:i.coin,id:i.id,status:i.status,exchangeOid:i.exchangeOid||null,
                     exchangeCloid:i.exchangeCloid||null})),
-                  verification:'TWO_FLAT_MASTER_POSITION_READS_AND_NO_OPEN_ORDERS',
+                  verification:'TWO_FLAT_MANAGED_POSITION_READS_AND_NO_MANAGED_OPEN_ORDERS',
+                  unrelated_positions_untouched:otherPositions.map((p:any)=>({coin:p.coin,qty:p.qty})),
                   note:'Historical UNKNOWN outcomes remain UNKNOWN in archive; not asserted unfilled.'
                 });
                 await this.state.storage.put('live_copy_v23_ledger',{
@@ -1541,7 +1614,7 @@ export class LiveCopyControllerStage7 {
                 await this.state.storage.put('live_copy_v23_session_baseline',{session:'',rowid:0,startedAt:0});
                 await this.state.storage.put('live_copy_v23_dashboard_account',{at:now,account:b});
                 await this.state.storage.put('live_copy_v23_accounting_snapshot',null);
-                await this.state.storage.put('live_copy_v23_overview',overview_reset);
+                if(overview_reset)await this.state.storage.put('live_copy_v23_overview',overview_reset);
                 await this.paperReset(now);
                 this.liveArmAt=null;
                 await this.state.storage.put('live_copy_v23_durable_arm',null);
@@ -1550,14 +1623,17 @@ export class LiveCopyControllerStage7 {
                 s.coins={};s.seen={};s.recent=[];s.startedAt=null;
                 s.sessionKind='DRY_RUN';s.mode='STOPPED';
                 (result as any).allConfirmedClosed=true;
-                reset={completed:true,verified_flat:true,open_orders:0,
+                reset={completed:true,verified_flat:true,managed_open_orders:0,
+                  other_positions_untouched:otherPositions.map((p:any)=>({coin:p.coin,qty:p.qty})),
+                  overview_capital_updated:!!overview_reset,
                   archived_intents:Object.keys(current.intents).length,
                   archived_unresolved:unfinished.length,archive_key:archiveKey,
                   new_ledger_intents:0};
                 this.audit(s,'CLOSE_ALL_VERIFIED_FLAT_SESSION_RESET',undefined,
                   `command=${commandId}; archived_unresolved=${unfinished.length}; new_ledger_intents=0`);
-                this.audit(s,'OVERVIEW_CAPITAL_RESET',undefined,
-                  'Fresh verified USDC snapshot after exchange flat');
+                this.audit(s,overview_reset?'OVERVIEW_CAPITAL_RESET':'OVERVIEW_CAPITAL_UNAVAILABLE',undefined,
+                  overview_reset?'Fresh verified USDC snapshot after managed positions flat':
+                    'USDC capital not verified; session safely reset, prior overview baseline retained');
               }
             }
           }
