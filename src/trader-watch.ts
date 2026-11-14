@@ -1464,7 +1464,38 @@ export class TraderWatch {
   async alarm(): Promise<void> {
     const multi = new MultiCoinEngine(this.ctx.storage,this.env.DB);
     const mc = await multi.get();
-    if(mc?.active){await multi.poll();await this.ctx.storage.setAlarm(Date.now()+10000);return;}
+    if(mc?.active){
+      // Event-driven handoff: only notify the LIVE controller after newly committed D1 fills.
+      // Keep the original 10-second polling and never allow a notification failure to
+      // interrupt watcher ingestion. Service Binding is optional until configured.
+      try {
+        const before:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
+        await multi.poll();
+        const after:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
+        if(Number(after?.id||0)>Number(before?.id||0)){
+          const service=this.env.LIVE_COPY_WORKER as {fetch(request:Request):Promise<Response>}|undefined;
+          const token=this.env.LIVE_COPY_ADMIN_TOKEN as string|undefined;
+          if(service&&token){
+            // Controller /sync retains all LIVE ARM, chain, deduplication and
+            // real-order safeguards; this is a wake-up, not an order instruction.
+            const response=await service.fetch(new Request('https://live-copy.internal/sync',{
+              method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:'{}'
+            }));
+            if(!response.ok){
+              const body=await response.text().catch(()=>'');
+              this.s.lastError='LIVE_COPY_NOTIFY_HTTP_'+response.status+':'+body.slice(0,240);
+              await this.save();
+            }
+          }
+        }
+      }catch(e){
+        this.s.lastError='MULTI_POLL_OR_NOTIFY: '+String(e);
+        await this.save();
+      }finally{
+        await this.ctx.storage.setAlarm(Date.now()+10000);
+      }
+      return;
+    }
     if(mc && !mc.active) return;
     if (!this.s.active || this.resetBusy) return;
     try {
