@@ -8,6 +8,7 @@
 import { encode } from '@msgpack/msgpack';
 import { bytesToHex, concat, keccak256, recoverTypedDataAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import type { CopyIntent } from './live-copy-ledger-v2.3';
 
 const INFO = 'https://api.hyperliquid.xyz/info';
 const EXCHANGE = 'https://api.hyperliquid.xyz/exchange';
@@ -29,7 +30,7 @@ export type LiveOrderIntent = {
 export type LiveResult = {
   ok: boolean; executed: boolean; status: string; coin: string;
   intentId: string; requestedQty?: number; filledQty?: number;
-  averageFillPrice?: number; oid?: number | string; raw?: unknown;
+  averageFillPrice?: number; oid?: number | string; raw?: unknown; cloid?:string; orderSent?:boolean|'UNKNOWN';
 };
 const n = (x: unknown) => Number(x);
 const validAddress = (x: string) => /^0x[0-9a-fA-F]{40}$/.test(x);
@@ -43,6 +44,11 @@ const post = async (url: string, body: unknown) => {
   return data;
 };
 const info = (body: unknown) => post(INFO, body);
+/** Stable 128-bit client ID: never use an untracked random order identifier. */
+export function cloidForIntent(intentId:string):string {
+  if(!intentId||intentId.length>220)throw Error('INVALID_INTENT_FOR_CLOID');
+  return '0x'+keccak256(bytesToHex(new TextEncoder().encode('LIVE_COPY_V23:'+intentId))).slice(2,34);
+}
 const decimalQty = (q: number, decimals: number) => {
   const factor = 10 ** decimals;
   return Math.floor((q + 1e-12) * factor) / factor;
@@ -114,7 +120,7 @@ export async function readLiveAccount(env: LiveCopyEnv) {
     assetMeta:(meta.universe||[]).map((a:any,i:number)=>({coin:a.name,assetId:i,szDecimals:a.szDecimals,maxLeverage:a.maxLeverage}))};
 }
 export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent): Promise<LiveResult> {
-  const base = {ok:false,executed:false,status:'BLOCKED',coin:intent.coin,intentId:intent.intentId};
+  const base = {ok:false,executed:false,status:'BLOCKED',coin:intent.coin,intentId:intent.intentId,orderSent:false as boolean|'UNKNOWN'};
   if (env.LIVE_COPY_TRADING_ENABLED !== 'true') return {...base,status:'LIVE_DISABLED'};
   const key = normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
@@ -123,7 +129,9 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
       !['LONG','SHORT'].includes(intent.direction) || !Number.isFinite(intent.quantity) ||
       intent.quantity<=0 || !Number.isFinite(intent.referencePrice) || intent.referencePrice<=0)
     return {...base,status:'INVALID_INTENT'};
-  const snapshot = await readLiveAccount(env);
+  let snapshot:Awaited<ReturnType<typeof readLiveAccount>>;
+  try{snapshot=await readLiveAccount(env);}
+  catch(error){return {...base,status:'PRE_ORDER_ACCOUNT_READ_FAILED_NO_ORDER',raw:String(error)};}
   const asset = snapshot.assetMeta.find((a:any)=>a.coin===intent.coin);
   if (!asset) return {...base,status:'UNKNOWN_ASSET'};
   const qty = decimalQty(intent.quantity, asset.szDecimals);
@@ -146,29 +154,109 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
     if (asset.maxLeverage < 10) return {...base,status:'ASSET_MAX_LEVERAGE_BELOW_10X'};
     if (pos && (Number(pos.leverage?.value) !== 10 || pos.leverage?.type !== 'cross'))
       return {...base,status:'EXISTING_POSITION_LEVERAGE_MISMATCH'};
-    // Exchange confirms this action before any opening/add order is submitted.
-    // Failure or ambiguous response => fail closed, never submit the order.
-    let leverageResponse:any;
-    try {
-      leverageResponse = await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
-    } catch (error) {
-      return {...base,status:'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER',raw:String(error)};
+    // Existing live position already provides exchange proof of 10x cross.
+    // Never send a repeated updateLeverage before every ADD.
+    if(!pos){
+      let leverageResponse:any;
+      try {
+        leverageResponse = await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
+      } catch (error) {
+        return {...base,status:'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER',raw:String(error)};
+      }
+      if (leverageResponse?.status !== 'ok' || leverageResponse?.response?.type !== 'default')
+        return {...base,status:'LEVERAGE_UPDATE_REJECTED_NO_ORDER',raw:leverageResponse};
     }
-    if (leverageResponse?.status !== 'ok' || leverageResponse?.response?.type !== 'default')
-      return {...base,status:'LEVERAGE_UPDATE_REJECTED_NO_ORDER',raw:leverageResponse};
   }
   const px = n(intent.referencePrice);
   if (!intent.reduceOnly && qty*px < DEFAULT_MIN_NOTIONAL) return {...base,status:'BELOW_STRATEGY_MIN_NOTIONAL'};
   // IOC price bound relative to the supplied *fresh* reference price.
   // Caller must verify reference freshness and use an account-level serialized executor.
   const limitPx = n(formatPrice(px*(buy?(1+MAX_PRICE_DEVIATION):(1-MAX_PRICE_DEVIATION)),asset.szDecimals));
-  const action = {type:'order',orders:[{a:asset.assetId,b:buy,p:String(limitPx),s:qty.toFixed(asset.szDecimals),r:intent.reduceOnly,t:{limit:{tif:'Ioc'}}}],grouping:'na'};
+  const cloid=cloidForIntent(intent.intentId);
+  const action = {type:'order',orders:[{a:asset.assetId,b:buy,p:String(limitPx),s:qty.toFixed(asset.szDecimals),r:intent.reduceOnly,t:{limit:{tif:'Ioc'}},c:cloid}],grouping:'na'};
   let result:any;
   try { result = await sendAction(action,key as `0x${string}`,master); }
-  catch (e) { return {...base,status:'UNKNOWN_WRITE_OUTCOME_CHECK_EXCHANGE_BEFORE_RETRY',raw:String(e)}; }
+  catch (e) { return {...base,status:'UNKNOWN_WRITE_OUTCOME_CHECK_EXCHANGE_BEFORE_RETRY',cloid,orderSent:'UNKNOWN',raw:String(e)}; }
   const item = result?.response?.data?.statuses?.[0];
   if (item?.filled) return {ok:true,executed:true,status:'FILLED',coin:intent.coin,intentId:intent.intentId,
-    requestedQty:qty,filledQty:n(item.filled.totalSz),averageFillPrice:n(item.filled.avgPx),oid:item.filled.oid,raw:result};
-  if (item?.resting) return {...base,status:'UNEXPECTED_RESTING_ORDER',raw:result};
-  return {...base,status:item?.error?'REJECTED':'NOT_FILLED',raw:result};
+    requestedQty:qty,filledQty:n(item.filled.totalSz),averageFillPrice:n(item.filled.avgPx),oid:item.filled.oid,cloid,orderSent:true,raw:result};
+  if (item?.resting) return {...base,status:'UNEXPECTED_RESTING_ORDER',orderSent:true,raw:result};
+  return {...base,status:item?.error?'REJECTED':'NOT_FILLED',orderSent:true,raw:result};
+}
+
+export type VerifiedOrderResult =
+  | {kind:'VERIFIED';coin:string;oid:string;cloid:string|null;totalFilledQty:number;status:string}
+  | {kind:'UNRESOLVED';reason:string};
+
+/** Order-specific verification. A matching position delta or coincident fill
+ * without the order OID is NEVER sufficient proof of which order executed.
+ * Legacy UNKNOWN intents without OID/CLOID remain quarantined.
+ */
+export async function verifyLiveOrder(env:LiveCopyEnv,intent:CopyIntent):Promise<VerifiedOrderResult>{
+  const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const lookup=intent.exchangeOid||intent.exchangeCloid;
+  if(!lookup)return {kind:'UNRESOLVED',reason:'LEGACY_ORDER_WITHOUT_OID_OR_CLOID'};
+  const r:any=await info({type:'orderStatus',user:master,oid:/^\d+$/.test(lookup)?Number(lookup):lookup});
+  if(r?.status!=='order'||!r?.order?.order)return {kind:'UNRESOLVED',reason:'ORDER_STATUS_UNAVAILABLE_OR_UNKNOWN_OID'};
+  const detail=r.order.order;
+  const status=String(r.order.status||'');
+  const oid=String(detail.oid??'');
+  const rawQty=Number(detail.origSz);
+  if(!/^\d+$/.test(oid)||detail.coin!==intent.coin||
+      detail.side!==(intent.side==='BUY'?'B':'A')||
+      detail.reduceOnly!==intent.reduceOnly||
+      (intent.exchangeCloid&&String(detail.cloid||'').toLowerCase()!==intent.exchangeCloid.toLowerCase())||
+      !Number.isFinite(rawQty)||Math.abs(rawQty-intent.requestedQty)>1e-8)
+    return {kind:'UNRESOLVED',reason:'ORDER_IDENTITY_MISMATCH'};
+  // IOC only. An OPEN order may still be active or unknown: never call it terminal.
+  if(detail.tif!=='Ioc')return {kind:'UNRESOLVED',reason:'NOT_VERIFIED_IOC'};
+  const terminal=/^(filled|canceled|rejected|marginCanceled|vaultWithdrawalCanceled|openInterestCapCanceled|selfTradeCanceled|reduceOnlyCanceled|siblingFilledCanceled|delistedCanceled|liquidatedCanceled|scheduledCancel|tickRejected|minTradeNtlRejected|perpMarginRejected)$/i.test(status);
+  if(!terminal)return {kind:'UNRESOLVED',reason:'ORDER_NOT_TERMINAL:'+status};
+  const orderAt=Number(detail.timestamp);
+  if(!Number.isFinite(orderAt)||orderAt<=0)return {kind:'UNRESOLVED',reason:'ORDER_TIMESTAMP_MISSING'};
+  // Older history may be truncated by Hyperliquid retention. Absence of fills
+  // cannot prove an old IOC was unfilled.
+  if(Date.now()-orderAt>6*60*60*1000||orderAt-Date.now()>30000)
+    return {kind:'UNRESOLVED',reason:'ORDER_OUTSIDE_RELIABLE_RECOVERY_WINDOW'};
+  if(Date.now()-Number(r.order.statusTimestamp||orderAt)<5000)
+    return {kind:'UNRESOLVED',reason:'ORDER_SETTLEMENT_NOT_YET_MATURE'};
+  const from=Math.max(0,orderAt-30000);
+  const until=Math.max(Number(r.order.statusTimestamp)||orderAt,orderAt)+30000;
+  const fills:any=await info({type:'userFillsByTime',user:master,startTime:from,endTime:until,aggregateByTime:false});
+  if(!Array.isArray(fills)||fills.length>=2000)return {kind:'UNRESOLVED',reason:'FILL_HISTORY_INCOMPLETE'};
+  const matches=fills.filter((x:any)=>String(x.oid)===oid);
+  // Invalid/mismatching exchange data -> block rather than credit another order.
+  if(matches.some((x:any)=>x.coin!==intent.coin||x.side!==(intent.side==='BUY'?'B':'A')||
+      !Number.isFinite(Number(x.sz))||Number(x.sz)<=0||
+      !Number.isFinite(Number(x.time))||Number(x.time)<from||Number(x.time)>until||
+      (x.tid===undefined&&x.hash===undefined)))
+    return {kind:'UNRESOLVED',reason:'ORDER_FILL_IDENTITY_MISMATCH'};
+  const seen=new Set<string>();let total=0;
+  for(const x of matches){
+    const unique=String(x.hash??'')+':'+String(x.tid??'');
+    if(seen.has(unique))continue;seen.add(unique);total+=Number(x.sz);
+  }
+  total=Math.round(total*1e10)/1e10;
+  if(total>intent.requestedQty+1e-8||total+1e-8<intent.confirmedFillQty)
+    return {kind:'UNRESOLVED',reason:'FILL_SIZE_INCONSISTENT'};
+  if(status.toLowerCase()==='filled'&&Math.abs(total-intent.requestedQty)>1e-8)
+    return {kind:'UNRESOLVED',reason:'FILLED_STATUS_WITHOUT_COMPLETE_FILLS'};
+  if(status.toLowerCase().includes('reject')&&total>0)
+    return {kind:'UNRESOLVED',reason:'REJECTED_STATUS_WITH_FILLS'};
+  if(total===0&&!/^(rejected|tickRejected|minTradeNtlRejected|perpMarginRejected)$/i.test(status))
+    return {kind:'UNRESOLVED',reason:'NO_FILL_NOT_PROVEN_BY_ORDER_STATUS'};
+  return {kind:'VERIFIED',coin:intent.coin,oid,cloid:intent.exchangeCloid||null,totalFilledQty:total,status};
+}
+/** Lightweight read used only AFTER an order-specific recovery was verified. */
+export async function readLiveCoinQuantity(env:LiveCopyEnv,coin:string):Promise<number>{
+  const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const state:any=await info({type:'clearinghouseState',user:master});
+  const positions=state?.assetPositions;
+  if(!Array.isArray(positions))throw Error('INVALID_EXCHANGE_POSITION_RESPONSE');
+  const found=positions.find((p:any)=>p?.position?.coin===coin);
+  const qty=found===undefined?0:Number(found.position.szi);
+  if(!Number.isFinite(qty))throw Error('INVALID_EXCHANGE_SIGNED_QTY');
+  return qty;
 }
