@@ -3,7 +3,7 @@
  * together before an order is submitted. Never call this from a browser.
  */
 import {planCopyAction, type CopyCoinState, type CopyProposal} from './live-copy-accumulator-v2.3';
-import {prepareIntent, markSubmitting, type LiveLedger, type CopyIntent} from './live-copy-ledger-v2.3';
+import {prepareIntent, markSubmitting, settleVerifiedOrder, type LiveLedger, type CopyIntent} from './live-copy-ledger-v2.3';
 import {settleExchangeReceipt, type ExchangeReceipt} from './live-copy-settlement-v2.3';
 
 export type BridgeResult={state:CopyCoinState;ledger:LiveLedger;proposal:CopyProposal;intent:CopyIntent|null};
@@ -34,4 +34,14 @@ export function applyTrustedReceipt(state:CopyCoinState,ledger:LiveLedger,receip
   const release=result.outcome==='FILLED'||result.outcome==='REJECTED';
   return {state:{...state,confirmedOwnQty:confirmed,pendingIntentId:release?null:receipt.intentId,
     suspended:state.suspended||result.outcome==='UNKNOWN'},ledger:result.ledger,outcome:result.outcome};
+}
+
+/** Unblock a coin only after independently verified terminal IOC + position check.
+ * The caller must persist the returned ledger and state before further events.
+ */
+export function applyVerifiedOrder(state:CopyCoinState,ledger:LiveLedger,input:{intentId:string;totalFilledQty:number;oid:string;exchangeStatus:string},now:number){
+  if(state.pendingIntentId!==input.intentId)throw Error('RECOVERY_INTENT_MISMATCH');
+  const next=settleVerifiedOrder(ledger,input.intentId,input.totalFilledQty,now,input.oid,input.exchangeStatus);
+  return {state:{...state,confirmedOwnQty:next.confirmedByCoin[state.coin]||0,pendingIntentId:null,
+    suspended:!!next.suspendedCoins[state.coin]},ledger:next};
 }
