@@ -1,4 +1,4 @@
-/** V2.3 Stage 10 UI, SAFE CONTROL PANEL.
+/** V2.3 Stage 10 UI, SAFE CONTR.OL PANEL.
  * Mount via serveLiveCopyDashboard(request, env) from your existing Worker's fetch.
  * Requires LIVE_COPY_CONTROLLER Durable Object namespace and LIVE_COPY_ADMIN_TOKEN.
  * START/STOP affect Stage7 DRY RUN ONLY. CLOSE/CLOSE ALL deliberately unavailable.
