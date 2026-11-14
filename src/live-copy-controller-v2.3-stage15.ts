@@ -1,4 +1,4 @@
-/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN BUFFER FIX.
+/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN REPEATED TARGET FIX.
  * Same controller and seven helpers, merged into one TypeScript module.
  * No local ./live-copy-*.ts imports are needed.
  * Requires the existing npm dependencies @msgpack/msgpack and viem.
@@ -809,6 +809,41 @@ export function nextSourceChainV23(input:{rows:BufferedSourceRowV23[];coin:strin
          input.now-first.r.receivedAt<SOURCE_SETTLE_MS_V23)
         return {reason:'WAIT_FOR_PREDECESSOR'};
     }
+  }
+  // Real fills can legitimately revisit exactly the same whale quantity:
+  // A: -64.55 -> -75.60, B: -75.60 -> -64.55, C: -64.55 -> -61.45.
+  // Both A and C match the anchor -64.55. This is NOT an ambiguous branch
+  // when the source timestamps order A before C and a complete, time-ordered
+  // path from A back to -64.55 is already present in the durable queue.
+  // NEVER arbitrarily pick the smaller D1 rowid or invent a missing link.
+  if(anchor && candidates.length>1){
+    if(candidates.some(x=>x.r.at<anchor.at))return {reason:'CHAIN_TIME_REGRESSION'};
+    const ordered=[...candidates].sort((a,b)=>a.r.at-b.r.at||a.r.rowid-b.r.rowid);
+    const earliest=ordered[0],following=ordered[1];
+    // Equal-time competing branches need external sequence evidence; a D1
+    // rowid alone is not proof of exchange execution order.
+    if(earliest.r.at===following.r.at)return {reason:'AMBIGUOUS_SAME_TIMESTAMP'};
+    // Bounded search for a real, time-ordered sequence that returns from the
+    // earliest candidate to the anchor before the later candidate executes.
+    const visited=new Set<number>();
+    let frontier:[number,number][]=[[earliest.after!,earliest.r.at]];
+    let proven=false;
+    for(let depth=0;depth<parsed.length && frontier.length && !proven;depth++){
+      const nextFrontier:[number,number][]=[];
+      for(const [qty,at] of frontier){
+        if(sourceQtyV23(qty,anchor.target)){proven=true;break;}
+        for(const step of parsed){
+          if(!step.valid||step.r.rowid===earliest.r.rowid||step.r.rowid===following.r.rowid||visited.has(step.r.rowid))continue;
+          if(step.r.at<at||step.r.at>following.r.at)continue;
+          if(!sourceQtyV23(step.before!,qty))continue;
+          visited.add(step.r.rowid);
+          nextFrontier.push([step.after!,step.r.at]);
+        }
+      }
+      frontier=nextFrontier;
+    }
+    if(proven)return {row:earliest.r};
+    return {reason:'AMBIGUOUS_CHAIN_NO_PROVEN_ROUND_TRIP'};
   }
   if(candidates.length!==1)return {reason:candidates.length>1?'AMBIGUOUS_CHAIN':'WAIT_FOR_MISSING_LINK'};
   const next=candidates[0];
