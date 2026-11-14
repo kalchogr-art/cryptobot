@@ -1465,35 +1465,45 @@ export class TraderWatch {
     const multi = new MultiCoinEngine(this.ctx.storage,this.env.DB);
     const mc = await multi.get();
     if(mc?.active){
-      // Event-driven handoff: only notify the LIVE controller after newly committed D1 fills.
-      // Keep the original 10-second polling and never allow a notification failure to
-      // interrupt watcher ingestion. Service Binding is optional until configured.
+      // Poll errors and notification errors are independent. The watcher must
+      // continue ingesting fills even when the copy controller is unavailable.
+      let beforeId=0;
+      let afterId=0;
+      let pollSucceeded=false;
       try {
         const before:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
+        beforeId=Number(before?.id||0);
         await multi.poll();
+        pollSucceeded=true;
         const after:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
-        if(Number(after?.id||0)>Number(before?.id||0)){
+        afterId=Number(after?.id||0);
+      }catch(e){
+        this.s.lastError='MULTI_POLL_FAILED: '+String(e);
+        await this.save();
+      }
+      if(pollSucceeded&&afterId>beforeId){
+        try{
           const service=this.env.LIVE_COPY_WORKER as {fetch(request:Request):Promise<Response>}|undefined;
           const token=this.env.LIVE_COPY_ADMIN_TOKEN as string|undefined;
           if(service&&token){
-            // Controller /sync retains all LIVE ARM, chain, deduplication and
-            // real-order safeguards; this is a wake-up, not an order instruction.
             const response=await service.fetch(new Request('https://live-copy.internal/sync',{
               method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:'{}'
             }));
             if(!response.ok){
-              const body=await response.text().catch(()=>'');
-              this.s.lastError='LIVE_COPY_NOTIFY_HTTP_'+response.status+':'+body.slice(0,240);
-              await this.save();
+              const result:any=await response.json().catch(()=>null);
+              // Expected backoff and STOPPED are not watcher failures.
+              if(!(result?.retryable===true&&result?.error==='HYPERLIQUID_RATE_LIMIT_BACKOFF')&&result?.error!=='STOPPED'){
+                this.s.lastError='LIVE_COPY_NOTIFY_HTTP_'+response.status+':'+JSON.stringify(result).slice(0,240);
+                await this.save();
+              }
             }
           }
+        }catch(e){
+          this.s.lastError='LIVE_COPY_NOTIFY_FAILED: '+String(e);
+          await this.save();
         }
-      }catch(e){
-        this.s.lastError='MULTI_POLL_OR_NOTIFY: '+String(e);
-        await this.save();
-      }finally{
-        await this.ctx.storage.setAlarm(Date.now()+10000);
       }
+      await this.ctx.storage.setAlarm(Date.now()+10000);
       return;
     }
     if(mc && !mc.active) return;
