@@ -1,4 +1,4 @@
-/** LIVE COPY STAGE16 - single-source edition.
+/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN BUFFER FIX.
  * Same controller and seven helpers, merged into one TypeScript module.
  * No local ./live-copy-*.ts imports are needed.
  * Requires the existing npm dependencies @msgpack/msgpack and viem.
@@ -764,6 +764,58 @@ type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_M
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
 type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number};
+// ===== SOURCE CHAIN INTAKE (D1 ROWID != WHALE EXECUTION ORDER) =====
+// A durable intake queue commits the D1 ingestion watermark only AFTER all
+// fetched rows are persisted. Each source fill is acknowledged independently;
+// an out-of-order coin never blocks the other coins. No implicit replay of old
+// rows: the queue is created anew at every explicit /start.
+type SourceRowV23={rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string};
+type BufferedSourceRowV23=SourceRowV23 & {receivedAt:number};
+type SourceChainAnchorV23={target:number;at:number;rowid:number};
+type SourceQueueV23={session:string;startedAt:number;rows:BufferedSourceRowV23[];
+  anchors:Record<string,SourceChainAnchorV23>;warnings:Record<string,number>};
+const SOURCE_QUEUE_KEY_V23='live_copy_v23_source_chain_queue_v1';
+const SOURCE_SETTLE_MS_V23=30000;
+const SOURCE_QUEUE_MAX_V23=1200;
+const SOURCE_EPS_V23=1e-7;
+const sourceQtyV23=(a:number,b:number)=>Math.abs(a-b)<=Math.max(SOURCE_EPS_V23,Math.max(Math.abs(a),Math.abs(b))*1e-9);
+const sourceTrustedV23=(r:SourceRowV23,e:any)=>e?.source==='HYPERLIQUID_PUBLIC_FILL' &&
+  e?.recovered_from_verified_skipped_fill!==true &&
+  !['RESYNC_CLOSE','RESYNC_REVERSAL'].includes(r.action);
+export function nextSourceChainV23(input:{rows:BufferedSourceRowV23[];coin:string;
+  anchor?:SourceChainAnchorV23;now:number}):{row?:BufferedSourceRowV23;reason?:string} {
+  const pool=input.rows.filter(r=>r.coin===input.coin);
+  if(!pool.length)return {reason:'NO_PENDING_ROWS'};
+  const parsed=pool.map(r=>{let e:any;try{e=JSON.parse(r.payload);}catch{return {r,valid:false,e:null};}
+    const before=Number(e?.target_before),after=Number(e?.target_after);
+    return {r,e,before,after,valid:sourceTrustedV23(r,e)&&Number.isFinite(before)&&Number.isFinite(after)};});
+  // Bookkeeping rows not connected to an exchange fill are safe to acknowledge
+  // immediately, but must NEVER cause a trade or become an invented anchor.
+  const inert=parsed.filter(x=>!sourceTrustedV23(x.r,x.e));
+  if(inert.length)return {row:inert.sort((a,b)=>a.r.rowid-b.r.rowid)[0].r};
+  if(parsed.some(x=>!x.valid))return {reason:'MALFORMED_TRUSTED_FILL'};
+  const anchor=input.anchor;
+  let candidates=anchor?parsed.filter(x=>sourceQtyV23(x.before!,anchor.target)):[];
+  if(!anchor){
+    // Find the unique chain root independent of D1 insertion order.
+    candidates=parsed.filter(x=>!parsed.some(y=>y!==x&&sourceQtyV23(y.after!,x.before!)));
+    if(candidates.length===1){
+      const first=candidates[0];
+      // When a single inherited fill arrives before its predecessor, wait for
+      // the watcher to finish persisting the chain. A zero-before OPEN, or a
+      // multi-fill connected chain, does not incur the extra settle delay.
+      if(parsed.length===1 && !sourceQtyV23(first.before!,0) &&
+         !(first.r.action==='REVERSAL' && Math.sign(first.before!)!==Math.sign(first.after!) && Math.sign(first.after!)!==0) &&
+         input.now-first.r.receivedAt<SOURCE_SETTLE_MS_V23)
+        return {reason:'WAIT_FOR_PREDECESSOR'};
+    }
+  }
+  if(candidates.length!==1)return {reason:candidates.length>1?'AMBIGUOUS_CHAIN':'WAIT_FOR_MISSING_LINK'};
+  const next=candidates[0];
+  if(anchor && next.r.at<anchor.at)return {reason:'CHAIN_TIME_REGRESSION'};
+  return {row:next.r};
+}
+
 type Snapshot={version:2;mode:'STOPPED'|'RUNNING';sessionKind?:'DRY_RUN'|'LIVE';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[]};
 const KEY='live_copy_v23_stage7';
 const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',startedAt:null,coins:{},seen:{},recent:[]});
@@ -1261,7 +1313,11 @@ export class LiveCopyControllerStage7 {
         const latest=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
         const last=latest?{rowid:latest.rowid,session:latest.session_id,fill_id:latest.fill_id,at:latest.at,coin:latest.coin,action:latest.action}:null;
         const pending=await this.env.DB.prepare('SELECT COUNT(*) AS n FROM mc_watch_events WHERE rowid>?').bind(cursor?.rowid||0).first<{n:number}>();
-        return json({ok:true,read_only:true,mode:s.mode,cursor:cursor||null,latest_source:last,pending_rows:pending?.n??null,watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
+        const buffered=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
+        return json({ok:true,read_only:true,mode:s.mode,cursor:cursor||null,latest_source:last,
+          pending_rows:pending?.n??null,buffered_source_rows:buffered?.rows.length||0,
+          buffered_coins:[...new Set((buffered?.rows||[]).map(r=>r.coin))],
+          watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
       }catch(e){return json({ok:false,error:'D1_DIAGNOSTIC_FAILED',detail:String(e)},503);}
     }
     if(request.method==='GET'&&path==='/recovery-status'){
@@ -1285,8 +1341,9 @@ export class LiveCopyControllerStage7 {
       }catch(e){return json({ok:false,error:'OUR_ACTIVITY_UNAVAILABLE',detail:String(e)},503);}
     }
     if(request.method==='GET'&&path==='/status'){
+      const sourcePending=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CLOSE_ALL_RECOVERY_OWNERSHIP_GUARD',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CHAIN_BUFFER_SAFE_REORDER',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1325,6 +1382,7 @@ export class LiveCopyControllerStage7 {
       const anchor={session:last?.session||'',rowid:last?.rowid||0};
       await this.state.storage.put('live_copy_v23_d1_cursor',anchor);
       await this.state.storage.put('live_copy_v23_session_baseline',{...anchor,startedAt});
+      await this.state.storage.put(SOURCE_QUEUE_KEY_V23,{session:anchor.session,startedAt,rows:[],anchors:{},warnings:{}} as SourceQueueV23);
       s.coins={};s.seen={};s.recent=[];
       if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
@@ -1360,125 +1418,142 @@ export class LiveCopyControllerStage7 {
         await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
         return json({ok:true,bootstrapped:true,session:cursor.session,rowid:cursor.rowid,processed:0,trading_enabled:this.liveEnabled()});
       }
-      const rows=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events WHERE rowid>? ORDER BY rowid ASC LIMIT 100').bind(cursor.rowid).all<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
-      // No fresh D1 fills: do not depend on exchange metadata for an empty sync.
-      if(!(rows.results||[]).length)return json({ok:true,processed:0,ignored:0,cursor,has_more:false,metadata_skipped:'NO_NEW_FILLS'});
-      let metadata:any=null;let metadataError='';
-      try{metadata=await this.cachedMeta();}
-      catch(e){metadataError=String(e);}
-      if(metadataError){if(this.isRateLimited(metadataError)){const retryAt=await this.deferRateLimit('METADATA');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
-        return json({ok:false,error:'METADATA_UNAVAILABLE',detail:metadataError,cursor,retryable:true,exchange_order_sent:false},503);}
-      const precisions=new Map<string,number>(metadata.universe.map((a:any)=>[a.name,a.szDecimals]));
-      // PRE-FLIGHT: source rowid is ingestion order, not the whale fill chain.
-      // Validate the whole bounded batch before ANY trading side effect. A chain
-      // with a missing/ambiguous link halts rather than guessing or skipping.
-      const sourceRows=rows.results||[];
-      type SourceRow=typeof sourceRows[number];
-      const groups=new Map<string,SourceRow[]>();
-      const parsed=new Map<number,any>();
-      let chainFailure:any=null;
-      for(const row of sourceRows){
-        let e:any;try{e=JSON.parse(row.payload);}catch{chainFailure={error:'BAD_SOURCE_PAYLOAD',rowid:row.rowid};break;}
-        parsed.set(row.rowid,e);
-        const a=groups.get(row.coin)||[];a.push(row);groups.set(row.coin,a);
+      // The D1 cursor is ONLY an ingestion high-water mark. It must not be
+      // interpreted as the execution order, and is advanced only after durable
+      // staging of every fetched row (including other coins and bookkeeping).
+      let staged=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
+      if(!staged || staged.startedAt!==s.startedAt || staged.session!==cursor.session){
+        staged={session:cursor.session,startedAt:s.startedAt||0,rows:[],anchors:{},warnings:{}};
+        await this.state.storage.put(SOURCE_QUEUE_KEY_V23,staged);
       }
-      const orderedByCoin=new Map<string,SourceRow[]>();
-      const currentState=await this.load();
-      const epsilon=1e-7;
-      if(!chainFailure)for(const [coin,items] of groups){
-        const chain=items.filter(r=>{
-          const e=parsed.get(r.rowid);
-          return !new Set(['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL']).has(r.action)
-            && e?.source==='HYPERLIQUID_PUBLIC_FILL'
-            && e?.recovered_from_verified_skipped_fill!==true;
-        });
-        const ordered:SourceRow[]=[];
-        const remaining=[...chain];
-        const old=currentState.coins[coin];
-        let expected=old?.lastWhaleTarget;
-        let previousTime=old?.lastEventAt??-Infinity;
-        while(remaining.length){
-          // For an unseen coin we can only safely use the earliest ingested
-          // event as an anchor; if its predecessor arrives later, HALT.
-          const candidates=expected===undefined?[remaining[0]]:remaining.filter(r=>Math.abs(Number(parsed.get(r.rowid)?.target_before)-expected!)<=epsilon);
-          if(candidates.length!==1){chainFailure={error:candidates.length?'AMBIGUOUS_TARGET_CHAIN':'TARGET_CHAIN_GAP',coin,expected_before:expected,remaining_rowids:remaining.map(r=>r.rowid)};break;}
-          const next=candidates[0],e=parsed.get(next.rowid);
-          if(!Number.isFinite(Number(e?.target_before))||!Number.isFinite(Number(e?.target_after))){chainFailure={error:'INVALID_TARGET_CHAIN',coin,rowid:next.rowid};break;}
-          if(next.at<previousTime){chainFailure={error:'TARGET_CHAIN_TIME_REGRESSION',coin,rowid:next.rowid,previous_time:previousTime,event_time:next.at};break;}
-          previousTime=next.at;expected=Number(e.target_after);
-          ordered.push(next);remaining.splice(remaining.indexOf(next),1);
-        }
-        if(chainFailure)break;
-        orderedByCoin.set(coin,ordered);
-      }
-      if(chainFailure){
-        const state=await this.load();this.audit(state,'TARGET_CHAIN_PREFLIGHT_FAILED',chainFailure.coin,JSON.stringify(chainFailure).slice(0,350));await this.save(state);
-        await this.halt('SYNC_CHAIN_PREFLIGHT_FAILED');
-        return json({ok:false,error:'SYNC_CHAIN_PREFLIGHT_FAILED',failure:chainFailure,cursor,exchange_order_sent:false,stopped:true},409);
-      }
-      // Retain original cross-coin ordering slots, but use validated per-coin
-      // chain order within each slot. Non-fill bookkeeping rows remain ignored.
-      const offsets=new Map<string,number>();
-      const reordered=sourceRows.map(row=>{
-        const e=parsed.get(row.rowid);
-        if(new Set(['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL']).has(row.action)||e?.source!=='HYPERLIQUID_PUBLIC_FILL'||e?.recovered_from_verified_skipped_fill===true)return row;
-        const index=offsets.get(row.coin)||0;offsets.set(row.coin,index+1);
-        return orderedByCoin.get(row.coin)?.[index]||row;
-      });
-      let processed=0,ignored=0;let failure:any=null;
-      const originalCursor=cursor;
-      // Never advance a cursor over an event that has not been executed or
-      // explicitly ignored. Reordering is unsafe for per-event commits unless
-      // the source rowids remain monotonic.
-      if(reordered.some((r,i)=>i>0&&r.rowid<=reordered[i-1].rowid)){
-        await this.halt('SYNC_REORDER_REQUIRES_MANUAL_RECONCILIATION');
-        return json({ok:false,error:'SYNC_REORDER_REQUIRES_MANUAL_RECONCILIATION',cursor,exchange_order_sent:false},409);
-      }
-      for(const row of reordered){
-        const activeCooldown=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
-        if(Date.now()<activeCooldown){failure={error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',
-          detail:{retryable:true,retry_at:activeCooldown,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF'}};break;}
-        // A changed watcher session must not be spliced into the old target chain.
-        if(cursor.session && row.session_id!==cursor.session){failure={error:'WATCHER_SESSION_CHANGED_REQUIRES_REARM',rowid:row.rowid};break;}
-        let e:any;try{e=JSON.parse(row.payload);}catch{failure={error:'BAD_SOURCE_PAYLOAD',rowid:row.rowid};break;}
-        // D1 includes virtual bookkeeping and recovery events. Only a genuine
-        // public Hyperliquid fill can be forwarded to the copy controller.
-        // SKIPPED is deliberately NOT excluded: it may mean the *virtual*
-        // simulation lacked margin, even though the whale fill is genuine.
-        const nonFillActions=new Set(['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL']);
-        if(!row.fill_id || typeof row.fill_id!=='string' || !row.session_id) {failure={error:'INVALID_D1_FILL_ID',rowid:row.rowid};break;}
-        if(nonFillActions.has(row.action)||e?.source!=='HYPERLIQUID_PUBLIC_FILL'||e?.recovered_from_verified_skipped_fill===true){
-          ignored++;cursor={session:row.session_id,rowid:row.rowid};
-          await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
-          continue;
-        }
-        if(!Number.isFinite(Number(e.target_before))||!Number.isFinite(Number(e.target_after))||!Number.isFinite(Number(e.price))){
-          failure={error:'INVALID_SOURCE_FILL',rowid:row.rowid};break;
-        }
-        const decimals=precisions.get(row.coin);
-        if(decimals===undefined){failure={error:'UNKNOWN_ASSET_PRECISION',coin:row.coin,rowid:row.rowid};break;}
-        const event={coin:row.coin,fill_id:row.fill_id,source_action:row.action,whale_before_qty:e.target_before,whale_target_qty:e.target_after,price:e.price,sz_decimals:decimals,time:row.at};
-        const response=await this.fetch(new Request('https://live-copy.internal/event',{method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(event)}));
-        const result:any=await response.json();
-        if(!response.ok){failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;}
-        if(result.ignored)ignored++;else processed++;
-        if(row.action==='REVERSAL'){const latest=await this.load();this.audit(latest,result.ignored?'REVERSAL_IGNORED':'REVERSAL_HANDLED',row.coin,`rowid=${row.rowid} reason=${result.reason||result.proposal?.reason||'accepted'}`);await this.save(latest);}
-        cursor={session:row.session_id,rowid:row.rowid};
-        // Commit after each acknowledged event, preventing replay on later failure.
+      const capacity=Math.max(0,SOURCE_QUEUE_MAX_V23-staged.rows.length);
+      const batchLimit=Math.max(0,Math.min(100,capacity));
+      const fetched=batchLimit?await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events WHERE rowid>? ORDER BY rowid ASC LIMIT ${batchLimit}`)
+        .bind(cursor.rowid).all<SourceRowV23>():null;
+      const newRows=fetched?.results||[];
+      if(newRows.length){
+        // A new watcher session needs explicit START. Never join two histories.
+        const mismatch=newRows.find(r=>cursor!.session&&r.session_id!==cursor!.session);
+        if(mismatch){await this.halt('WATCHER_SESSION_CHANGED_REQUIRES_REARM');
+          return json({ok:false,error:'WATCHER_SESSION_CHANGED_REQUIRES_REARM',rowid:mismatch.rowid,stopped:true},409);}
+        if(!staged.session)staged.session=newRows[0].session_id;
+        const existingIds=new Set(staged.rows.map(r=>r.rowid));
+        for(const r of newRows)if(!existingIds.has(r.rowid))staged.rows.push({...r,receivedAt:Date.now()});
+        // Persist first; only then may the ingestion cursor move forward.
+        await this.state.storage.put(SOURCE_QUEUE_KEY_V23,staged);
+        cursor={session:newRows[newRows.length-1].session_id,rowid:newRows[newRows.length-1].rowid};
         await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
       }
-      if(failure){
-        if(failure?.detail?.retryable===true){
-          const retryAt=Number(failure.detail.retry_at)||Date.now()+60000;
-          if(this.state.storage.setAlarm)await this.state.storage.setAlarm(retryAt+1000);
-          return json({ok:false,error:failure.detail.error||'EVENT_RETRYABLE',retryable:true,retry_at:retryAt,
-            failure,cursor,processed,ignored,exchange_order_sent:false},503);
+      if(!staged.rows.length)return json({ok:true,processed:0,ignored:0,cursor,has_more:newRows.length===batchLimit&&batchLimit>0,buffered:0});
+      let metadata:any=null;let metadataError='';
+      try{metadata=await this.cachedMeta();}catch(e){metadataError=String(e);}
+      if(metadataError){if(this.isRateLimited(metadataError)){const retryAt=await this.deferRateLimit('METADATA');
+        return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,cursor,buffered:staged.rows.length,exchange_order_sent:false},503);}
+        return json({ok:false,error:'METADATA_UNAVAILABLE',detail:metadataError,cursor,buffered:staged.rows.length,retryable:true,exchange_order_sent:false},503);}
+      const precisions=new Map<string,number>(metadata.universe.map((a:any)=>[a.name,a.szDecimals]));
+      let processed=0,ignored=0;let sentAnyOrder:boolean|'UNKNOWN'=false;const pendingReasons:Record<string,string>={};
+      const blockedThisCycle=new Set<string>();
+      // Each iteration consumes at most one row, then persists its receipt and
+      // the source chain anchor. Other coins remain eligible when one coin's
+      // predecessor has not arrived or one /event request fails.
+      for(let step=0;step<Math.min(300,SOURCE_QUEUE_MAX_V23);step++){
+        if((await this.load()).mode!=='RUNNING')break;
+        const activeCooldown=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
+        if(Date.now()<activeCooldown){
+          if(this.state.storage.setAlarm)await this.state.storage.setAlarm(activeCooldown+1000);
+          return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:activeCooldown,
+            cursor,buffered:staged.rows.length,processed,ignored,exchange_order_sent:false},503);
         }
-        // Unsafe target-chain/auth failures still stop LIVE; a known unknown
-        // order must return an accepted per-coin quarantine from /event.
-        await this.halt('SYNC_FAILED:'+String(failure.error));
-      }else {await this.state.storage.put('live_copy_v23_d1_cursor',cursor);}
-      return json({ok:!failure,trading_enabled:this.liveAuthorized(await this.load()),processed,ignored,cursor,failure,has_more:(rows.results||[]).length===100},failure?409:200);
+        const state=await this.load();
+        const coins=[...new Set(staged.rows.map(r=>r.coin))].filter(c=>!blockedThisCycle.has(c));
+        const options:{row:BufferedSourceRowV23;reason?:string}[]=[];
+        for(const coin of coins){
+          const anchor=staged.anchors[coin]|| (state.coins[coin]?{
+            target:state.coins[coin].lastWhaleTarget,at:state.coins[coin].lastEventAt,rowid:0}:undefined);
+          const proposal=nextSourceChainV23({rows:staged.rows,coin,anchor,now:Date.now()});
+          if(proposal.row)options.push({row:proposal.row});
+          else {pendingReasons[coin]=proposal.reason||'WAIT_FOR_CHAIN';
+            const oldest=Math.min(...staged.rows.filter(r=>r.coin===coin).map(r=>r.receivedAt));
+            if(Date.now()-oldest>=45000 && Date.now()-(staged.warnings[coin]||0)>=60000){
+              this.audit(state,'TARGET_CHAIN_PENDING',coin,`reason=${pendingReasons[coin]}; rows=${staged.rows.filter(r=>r.coin===coin).map(r=>r.rowid).join(',').slice(0,180)}`);
+              staged.warnings[coin]=Date.now();await this.save(state);await this.state.storage.put(SOURCE_QUEUE_KEY_V23,staged);
+            }
+          }
+        }
+        if(!options.length)break;
+        options.sort((a,b)=>a.row.rowid-b.row.rowid);
+        const row=options[0].row;
+        let e:any;try{e=JSON.parse(row.payload);}catch{
+          blockedThisCycle.add(row.coin);pendingReasons[row.coin]='BAD_SOURCE_PAYLOAD';continue;}
+        if(!row.fill_id || !row.session_id || row.session_id!==cursor.session){
+          blockedThisCycle.add(row.coin);pendingReasons[row.coin]='INVALID_FILL_ID_OR_SESSION';continue;}
+        const genuine=sourceTrustedV23(row,e);
+        const bookkeeping=['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL'].includes(row.action);
+        let acknowledgement:any={ok:true,ignored:true};
+        if(genuine && Number.isFinite(Number(e.target_before)) && Number.isFinite(Number(e.target_after))){
+          if(bookkeeping){
+            // GAP_CLOSE describes a genuine whale fill but a virtual watcher
+            // close. Do NOT place an exchange order for it. However, its real
+            // before/after values bridge the source sequence; subsequent fills
+            // can then be validated without inventing an extra order.
+            const current=await this.load();
+            const seenId=`${row.coin}:${row.fill_id}`;
+            const old=current.coins[row.coin];
+            if(!current.seen[seenId]){
+              if(old){
+                if(row.at<old.lastEventAt || !sourceQtyV23(Number(e.target_before),old.lastWhaleTarget)){
+                  blockedThisCycle.add(row.coin);pendingReasons[row.coin]='BOOKKEEPING_CHAIN_INCONSISTENT';continue;
+                }
+                current.coins[row.coin]={...old,lastWhaleTarget:Number(e.target_after),lastEventAt:row.at,lastFillId:row.fill_id};
+              }
+              current.seen[seenId]=Date.now();
+              this.audit(current,'SOURCE_CHAIN_BRIDGE_NO_ORDER',row.coin,`rowid=${row.rowid} ${e.target_before}->${e.target_after}; action=${row.action}`);
+              await this.save(current);
+            }
+          }else{
+            const decimals=precisions.get(row.coin);
+            if(decimals===undefined){blockedThisCycle.add(row.coin);pendingReasons[row.coin]='UNKNOWN_ASSET_PRECISION';continue;}
+            const response=await this.fetch(new Request('https://live-copy.internal/event',{
+              method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},
+              body:JSON.stringify({coin:row.coin,fill_id:row.fill_id,source_action:row.action,
+                whale_before_qty:Number(e.target_before),whale_target_qty:Number(e.target_after),
+                price:Number(e.price),sz_decimals:decimals,time:row.at})}));
+            acknowledgement=await response.json();
+            if(!response.ok){
+              const reason=String(acknowledgement?.error||'EVENT_REJECTED');
+              if(acknowledgement?.retryable===true || reason==='HYPERLIQUID_RATE_LIMIT_BACKOFF'){
+                const retryAt=Number(acknowledgement?.retry_at)||Date.now()+60000;
+                if(this.state.storage.setAlarm)await this.state.storage.setAlarm(retryAt+1000);
+                return json({ok:false,error:reason,retryable:true,retry_at:retryAt,
+                  cursor,buffered:staged.rows.length,processed,ignored,exchange_order_sent:false},503);
+              }
+              const fresh=await this.load();
+              if(fresh.mode!=='RUNNING')return json({ok:false,error:'LIVE_HALTED_BY_EVENT',reason,stopped:true,cursor},409);
+              blockedThisCycle.add(row.coin);pendingReasons[row.coin]=reason;
+              if(Date.now()-(staged.warnings[row.coin]||0)>60000){
+                this.audit(fresh,'SOURCE_COIN_PENDING_REVIEW',row.coin,`rowid=${row.rowid}; reason=${reason}; no_order_retry`);
+                staged.warnings[row.coin]=Date.now();await this.save(fresh);
+              }
+              continue;
+            }
+            if(row.action==='REVERSAL'){
+              const latest=await this.load();this.audit(latest,acknowledgement.ignored?'REVERSAL_IGNORED':'REVERSAL_HANDLED',row.coin,`rowid=${row.rowid} reason=${acknowledgement.reason||acknowledgement.proposal?.reason||'accepted'}`);await this.save(latest);
+            }
+          }
+          staged.anchors[row.coin]={target:Number(e.target_after),at:row.at,rowid:row.rowid};
+        }else if(genuine){
+          blockedThisCycle.add(row.coin);pendingReasons[row.coin]='INVALID_TARGET_VALUES';continue;
+        }
+        if(acknowledgement.exchange_order_sent==='UNKNOWN')sentAnyOrder='UNKNOWN';
+        else if(acknowledgement.exchange_order_sent===true && sentAnyOrder!=='UNKNOWN')sentAnyOrder=true;
+        if(acknowledgement.ignored)ignored++;else processed++;
+        staged.rows=staged.rows.filter(r=>r.rowid!==row.rowid);
+        await this.state.storage.put(SOURCE_QUEUE_KEY_V23,staged);
+      }
+      return json({ok:true,trading_enabled:this.liveAuthorized(await this.load()),processed,ignored,cursor,
+        buffered:staged.rows.length,pending_coins:[...new Set(staged.rows.map(r=>r.coin))],
+        pending_reasons:pendingReasons,has_more:newRows.length===batchLimit&&batchLimit>0,
+        exchange_order_sent:sentAnyOrder});
       } finally {this.syncBusy=false;}
     }
     if(path==='/reconcile'){
@@ -1610,6 +1685,10 @@ export class LiveCopyControllerStage7 {
                   ...emptyLiveLedger(),lastReconciledAt:now
                 });
                 await this.state.storage.put('live_copy_v23_recovery_probe',{});
+                const sourceQueueBeforeReset=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
+                if(sourceQueueBeforeReset?.rows.length)
+                  await this.state.storage.put(archiveKey+':source_queue',sourceQueueBeforeReset);
+                await this.state.storage.put(SOURCE_QUEUE_KEY_V23,{session:'',startedAt:0,rows:[],anchors:{},warnings:{}} as SourceQueueV23);
                 await this.state.storage.put('live_copy_v23_d1_cursor',{session:'',rowid:0});
                 await this.state.storage.put('live_copy_v23_session_baseline',{session:'',rowid:0,startedAt:0});
                 await this.state.storage.put('live_copy_v23_dashboard_account',{at:now,account:b});
