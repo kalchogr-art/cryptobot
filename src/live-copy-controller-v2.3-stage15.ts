@@ -443,7 +443,25 @@ export class LiveCopyControllerStage7 {
       const anchor={session:last?.session||'',rowid:last?.rowid||0};
       await this.state.storage.put('live_copy_v23_d1_cursor',anchor);
       await this.state.storage.put('live_copy_v23_session_baseline',{...anchor,startedAt});
+      // New START is a new copy episode. Previous manual CLOSE/CLOSE ALL
+      // suspensions must not block a later genuine OPEN or REVERSAL.
+      // This runs ONLY after the pre-start exchange/ledger reconciliation,
+      // zero owned positions, and no unresolved intents have been verified.
+      if(this.liveEnabled()){
+        const current=await this.ledger();
+        const blocked=Object.values(current.confirmedByCoin).some(q=>Math.abs(q)>1e-9)||
+          Object.values(current.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+        if(blocked)return json({ok:false,error:'NEW_SESSION_RESET_BLOCKED_BY_OWNED_POSITION_OR_INTENT'},409);
+        const previouslySuspended=Object.keys(current.suspendedCoins).filter(c=>current.suspendedCoins[c]);
+        if(previouslySuspended.length){
+          await this.state.storage.put('live_copy_v23_ledger',{
+            ...current,suspendedCoins:{},lastReconciledAt:Date.now()
+          });
+          await this.state.storage.put('live_copy_v23_last_cleared_suspensions', {at:Date.now(),coins:previouslySuspended});
+        }
+      }
       s.coins={};s.seen={};s.recent=[];
+      if(this.liveEnabled()){const cleared=await this.state.storage.get<{at:number;coins:string[]}>('live_copy_v23_last_cleared_suspensions');if(cleared?.coins?.length){this.audit(s,'NEW_SESSION_MANUAL_CLOSE_FLAGS_CLEARED',undefined,`coins=${cleared.coins.join(',')}; historical intents preserved`);await this.state.storage.put('live_copy_v23_last_cleared_suspensions',null);}}
       if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
