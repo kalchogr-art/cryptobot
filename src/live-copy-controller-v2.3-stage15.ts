@@ -1242,7 +1242,7 @@ export class LiveCopyControllerStage7 {
     }
     if(request.method==='GET'&&path==='/status'){
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CLOID_ORDER_RECOVERY',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CLOSE_ALL_VERIFIED_RESET',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1471,53 +1471,110 @@ export class LiveCopyControllerStage7 {
         const result=path==='/close'
           ? await closeOwnedPosition({coin:body.coin,commandId,store,exchange})
           : await closeAllOwned({commandId,store,exchange});
-        // Empty exchange position list is not a successful close execution.
-        // Only clear stale confirmed quantities after TWO fresh, successful reads
-        // of the master wallet, while STOPPED and with no unresolved intents.
-        if(path==='/close-all' && 'results' in result && result.results.length===0){
-          const first=await readLiveAccount(this.env);
-          const second=await readLiveAccount(this.env);
-          const flat=first.positions.length===0 && second.positions.length===0;
-          const current=await this.ledger();
-          const unresolved=Object.values(current.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
-          if(flat&&!unresolved){
-            const stale=Object.entries(current.confirmedByCoin).filter(([,q])=>Math.abs(q)>1e-9);
-            if(stale.length){
-              const confirmedByCoin={...current.confirmedByCoin};
-              const suspendedCoins={...current.suspendedCoins};
-              for(const [coin] of stale){confirmedByCoin[coin]=0;suspendedCoins[coin]=true;}
-              await this.state.storage.put('live_copy_v23_ledger',{
-                ...current,confirmedByCoin,suspendedCoins,lastReconciledAt:Date.now()
-              });
-              this.audit(s,'CLOSE_ALL_EMPTY_EXCHANGE_LEDGER_ZEROED',undefined,
-                `coins=${stale.map(([coin])=>coin).join(',')}; command=${commandId}; verified_twice=true`);
-            }
-            result.allConfirmedClosed=true;
-            this.audit(s,'CLOSE_ALL_ALREADY_FLAT',undefined,`command=${commandId}; verified_twice=true`);
-          }else{
-            result.allConfirmedClosed=false;
-            this.audit(s,'CLOSE_ALL_EMPTY_NOT_VERIFIED',undefined,
-              `flat=${flat}; unresolved=${unresolved}; command=${commandId}`);
-          }
-        }
         let overview_reset:any=null;
+        let reset:any=null;
         if(path==='/close-all'){
-          const updated=await this.ledger();
-          const open=Object.values(updated.confirmedByCoin).some(q=>Math.abs(q)>1e-9);
-          const unresolved=Object.values(updated.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
-          if((result as any).allConfirmedClosed===true&&!open&&!unresolved){
-            try{const capital=await this.accountCapital();const previous=await this.overview();
-              overview_reset={capital,startedAt:Date.now(),source:'spotClearinghouseState.USDC.total',resetCount:(previous?.resetCount||0)+1};
-              await this.state.storage.put('live_copy_v23_overview',overview_reset);
-              await this.paperReset(overview_reset.startedAt);
-              this.audit(s,'OVERVIEW_CAPITAL_RESET',undefined,'New verified USDC snapshot after owned positions flat');
-            }catch(e){this.audit(s,'OVERVIEW_RESET_PENDING',undefined,String(e).slice(0,150));}
-          }else this.audit(s,'OVERVIEW_RESET_BLOCKED',undefined,'Owned positions or unresolved intents remain');
+          // CLOSE ALL is a verified session-finalization operation, not just a
+          // sequence of IOC close orders. Even if the wallet is already flat,
+          // old UNKNOWN/SUBMITTING entries must not block the NEXT session forever.
+          // Never mark their historical execution as FILLED or REJECTED: archive
+          // them unchanged. Only discard the *active* ledger after verifying the
+          // whole master account is flat and has no resting orders.
+          if(this.syncBusy)throw Error('SYNC_IN_PROGRESS_RETRY_CLOSE_ALL_WHEN_IDLE');
+          const current=await this.ledger();
+          const unfinished=Object.values(current.intents).filter(i=>
+            ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+          const tooRecent=unfinished.filter(i=>i.status!=='PREPARED' &&
+            (!Number.isFinite(i.updatedAt)||Date.now()-i.updatedAt<180000));
+          if(tooRecent.length){
+            reset={completed:false,reason:'RECENT_UNKNOWN_WRITE_WAIT_FOR_IOC_SETTLEMENT',
+              blocked_intents:tooRecent.map(i=>({coin:i.coin,id:i.id,status:i.status,updatedAt:i.updatedAt}))};
+          }else{
+            // Two independent fresh position reads + a fresh open-orders read.
+            // One-time checks on CLOSE ALL, not part of the 15s polling loop.
+            const a=await readLiveAccount(this.env);
+            const b=await readLiveAccount(this.env);
+            const flat=a.masterAccount===b.masterAccount &&
+              a.positions.length===0 && b.positions.length===0;
+            if(!flat){
+              reset={completed:false,reason:'EXCHANGE_POSITIONS_NOT_CONFIRMED_FLAT',
+                first_positions:a.positions.map((p:any)=>({coin:p.coin,qty:p.qty})),
+                second_positions:b.positions.map((p:any)=>({coin:p.coin,qty:p.qty}))};
+            }else{
+              const response=await fetch('https://api.hyperliquid.xyz/info',{
+                method:'POST',headers:{'content-type':'application/json'},
+                body:JSON.stringify({type:'openOrders',user:a.masterAccount})
+              });
+              if(!response.ok)throw Error('CLOSE_ALL_OPEN_ORDERS_HTTP_'+response.status);
+              const orders:any=await response.json();
+              if(!Array.isArray(orders))throw Error('CLOSE_ALL_OPEN_ORDERS_RESPONSE_INVALID');
+              if(orders.length){
+                reset={completed:false,reason:'ACCOUNT_HAS_OPEN_ORDERS',open_order_count:orders.length};
+              }else if(this.syncBusy){
+                reset={completed:false,reason:'SYNC_STARTED_DURING_CLOSE_ALL'};
+              }else{
+                // Obtain a truthful new capital snapshot BEFORE changing ledger
+                // or UI state. On API failure, leave it intact and allow a safe retry.
+                const capital=b.spotUsdcTotal;
+                if(typeof capital!=='number'||!Number.isFinite(capital)||capital<0)
+                  throw Error('CLOSE_ALL_CAPITAL_SNAPSHOT_UNAVAILABLE');
+                const now=Date.now();
+                const previous=await this.overview();
+                overview_reset={capital,startedAt:now,source:'spotClearinghouseState.USDC.total',
+                  resetCount:(previous?.resetCount||0)+1};
+                // Keep immutable evidence of every previous order intent,
+                // including legacy UNKNOWN, without contaminating a new session.
+                const archiveKey='live_copy_v23_closeall_archive:'+now+':'+commandId;
+                await this.state.storage.put(archiveKey,{
+                  at:now,commandId,previous_started_at:s.startedAt,
+                  prior_ledger:current,unresolved_at_close:unfinished.map(i=>({
+                    coin:i.coin,id:i.id,status:i.status,exchangeOid:i.exchangeOid||null,
+                    exchangeCloid:i.exchangeCloid||null})),
+                  verification:'TWO_FLAT_MASTER_POSITION_READS_AND_NO_OPEN_ORDERS',
+                  note:'Historical UNKNOWN outcomes remain UNKNOWN in archive; not asserted unfilled.'
+                });
+                await this.state.storage.put('live_copy_v23_ledger',{
+                  ...emptyLiveLedger(),lastReconciledAt:now
+                });
+                await this.state.storage.put('live_copy_v23_recovery_probe',{});
+                await this.state.storage.put('live_copy_v23_d1_cursor',{session:'',rowid:0});
+                await this.state.storage.put('live_copy_v23_session_baseline',{session:'',rowid:0,startedAt:0});
+                await this.state.storage.put('live_copy_v23_dashboard_account',{at:now,account:b});
+                await this.state.storage.put('live_copy_v23_accounting_snapshot',null);
+                await this.state.storage.put('live_copy_v23_overview',overview_reset);
+                await this.paperReset(now);
+                this.liveArmAt=null;
+                await this.state.storage.put('live_copy_v23_durable_arm',null);
+                // Only the *active* session is cleared; D1 exchange history and
+                // the archived old ledger remain available for audit.
+                s.coins={};s.seen={};s.recent=[];s.startedAt=null;
+                s.sessionKind='DRY_RUN';s.mode='STOPPED';
+                (result as any).allConfirmedClosed=true;
+                reset={completed:true,verified_flat:true,open_orders:0,
+                  archived_intents:Object.keys(current.intents).length,
+                  archived_unresolved:unfinished.length,archive_key:archiveKey,
+                  new_ledger_intents:0};
+                this.audit(s,'CLOSE_ALL_VERIFIED_FLAT_SESSION_RESET',undefined,
+                  `command=${commandId}; archived_unresolved=${unfinished.length}; new_ledger_intents=0`);
+                this.audit(s,'OVERVIEW_CAPITAL_RESET',undefined,
+                  'Fresh verified USDC snapshot after exchange flat');
+              }
+            }
+          }
+          if(!reset?.completed){
+            (result as any).allConfirmedClosed=false;
+            this.audit(s,'CLOSE_ALL_RESET_BLOCKED',undefined,
+              `command=${commandId}; reason=${reset?.reason||'VERIFICATION_FAILED'}`);
+          }
         }
         this.audit(s,'MANUAL_CLOSE_COMMAND',body.coin,JSON.stringify(result).slice(0,240));
         if(path==='/close-all')for(const [coin,qty] of Object.entries((await this.ledger()).confirmedByCoin))
-          this.audit(s,'CLOSE_ALL_POSITION_RESULT',coin,`remaining_confirmed_qty=${qty}; command=${commandId}`);await this.save(s);
-        return json({ok:true,result,overview_reset,live_write_attempted:true});
+          this.audit(s,'CLOSE_ALL_POSITION_RESULT',coin,`remaining_confirmed_qty=${qty}; command=${commandId}`);
+        await this.save(s);
+        if(path==='/close-all'&&!reset?.completed)
+          return json({ok:false,error:'CLOSE_ALL_RESET_NOT_VERIFIED',result,reset,
+            positions_may_remain:true,live_write_attempted:true},409);
+        return json({ok:true,result,overview_reset,reset,live_write_attempted:true});
       }catch(e){return json({ok:false,error:'MANUAL_CLOSE_FAILED',detail:String(e)},409);}
     }
     if(path!=='/event')return json({ok:false,error:'NOT_FOUND'},404);
