@@ -94,7 +94,7 @@ export class LiveCopyControllerStage7 {
           if(this.state.storage.setAlarm)await this.state.storage.setAlarm(Math.max(Date.now()+1000,Number(result.retry_at)||Date.now()+60000));
           return;
         }
-        const latest=await this.load();this.audit(latest,'AUTO_SYNC_ERROR',undefined,JSON.stringify(result).slice(0,240));
+        const latest=await this.load();this.audit(latest,'AUTO_SYNC_ERROR',undefined,JSON.stringify(result).slice(0,1500));
         latest.mode='STOPPED';await this.save(latest);return;
       }
       const latest=await this.load();
@@ -443,25 +443,7 @@ export class LiveCopyControllerStage7 {
       const anchor={session:last?.session||'',rowid:last?.rowid||0};
       await this.state.storage.put('live_copy_v23_d1_cursor',anchor);
       await this.state.storage.put('live_copy_v23_session_baseline',{...anchor,startedAt});
-      // New START is a new copy episode. Previous manual CLOSE/CLOSE ALL
-      // suspensions must not block a later genuine OPEN or REVERSAL.
-      // This runs ONLY after the pre-start exchange/ledger reconciliation,
-      // zero owned positions, and no unresolved intents have been verified.
-      if(this.liveEnabled()){
-        const current=await this.ledger();
-        const blocked=Object.values(current.confirmedByCoin).some(q=>Math.abs(q)>1e-9)||
-          Object.values(current.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
-        if(blocked)return json({ok:false,error:'NEW_SESSION_RESET_BLOCKED_BY_OWNED_POSITION_OR_INTENT'},409);
-        const previouslySuspended=Object.keys(current.suspendedCoins).filter(c=>current.suspendedCoins[c]);
-        if(previouslySuspended.length){
-          await this.state.storage.put('live_copy_v23_ledger',{
-            ...current,suspendedCoins:{},lastReconciledAt:Date.now()
-          });
-          await this.state.storage.put('live_copy_v23_last_cleared_suspensions', {at:Date.now(),coins:previouslySuspended});
-        }
-      }
       s.coins={};s.seen={};s.recent=[];
-      if(this.liveEnabled()){const cleared=await this.state.storage.get<{at:number;coins:string[]}>('live_copy_v23_last_cleared_suspensions');if(cleared?.coins?.length){this.audit(s,'NEW_SESSION_MANUAL_CLOSE_FLAGS_CLEARED',undefined,`coins=${cleared.coins.join(',')}; historical intents preserved`);await this.state.storage.put('live_copy_v23_last_cleared_suspensions',null);}}
       if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
@@ -547,6 +529,13 @@ export class LiveCopyControllerStage7 {
       });
       let processed=0,ignored=0;let failure:any=null;
       const originalCursor=cursor;
+      // Never advance a cursor over an event that has not been executed or
+      // explicitly ignored. Reordering is unsafe for per-event commits unless
+      // the source rowids remain monotonic.
+      if(reordered.some((r,i)=>i>0&&r.rowid<=reordered[i-1].rowid)){
+        await this.halt('SYNC_REORDER_REQUIRES_MANUAL_RECONCILIATION');
+        return json({ok:false,error:'SYNC_REORDER_REQUIRES_MANUAL_RECONCILIATION',cursor,exchange_order_sent:false},409);
+      }
       for(const row of reordered){
         // A changed watcher session must not be spliced into the old target chain.
         if(cursor.session && row.session_id!==cursor.session){failure={error:'WATCHER_SESSION_CHANGED_REQUIRES_REARM',rowid:row.rowid};break;}
@@ -559,6 +548,7 @@ export class LiveCopyControllerStage7 {
         if(!row.fill_id || typeof row.fill_id!=='string' || !row.session_id) {failure={error:'INVALID_D1_FILL_ID',rowid:row.rowid};break;}
         if(nonFillActions.has(row.action)||e?.source!=='HYPERLIQUID_PUBLIC_FILL'||e?.recovered_from_verified_skipped_fill===true){
           ignored++;cursor={session:row.session_id,rowid:row.rowid};
+          await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
           continue;
         }
         if(!Number.isFinite(Number(e.target_before))||!Number.isFinite(Number(e.target_after))||!Number.isFinite(Number(e.price))){
@@ -573,10 +563,11 @@ export class LiveCopyControllerStage7 {
         if(result.ignored)ignored++;else processed++;
         if(row.action==='REVERSAL'){const latest=await this.load();this.audit(latest,result.ignored?'REVERSAL_IGNORED':'REVERSAL_HANDLED',row.coin,`rowid=${row.rowid} reason=${result.reason||result.proposal?.reason||'accepted'}`);await this.save(latest);}
         cursor={session:row.session_id,rowid:row.rowid};
-        // Commit only after the entire validated batch has succeeded.
+        // Commit after each acknowledged event, preventing replay on later failure.
+        await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
       }
-      if(failure){cursor=originalCursor;await this.halt('SYNC_FAILED:'+String(failure.error));}
-      else {cursor={session:originalCursor.session,rowid:sourceRows[sourceRows.length-1].rowid};await this.state.storage.put('live_copy_v23_d1_cursor',cursor);}
+      if(failure){await this.halt('SYNC_FAILED:'+String(failure.error));}
+      else {await this.state.storage.put('live_copy_v23_d1_cursor',cursor);}
       return json({ok:!failure,trading_enabled:this.liveAuthorized(await this.load()),processed,ignored,cursor,failure,has_more:(rows.results||[]).length===100},failure?409:200);
     }
     if(path==='/reconcile'){
@@ -679,7 +670,7 @@ export class LiveCopyControllerStage7 {
     if(s.sessionKind!=='LIVE'&&this.liveEnabled()){await this.halt('DRY_RUN_CONFIG_CHANGED');return json({ok:false,error:'DRY_RUN_CONFIG_CHANGED',stopped:true},409);}
     if(this.liveAuthorized(s)){
       const eventMs=time<1e11?time*1000:time;
-      if(Date.now()-eventMs>120000||eventMs-Date.now()>30000)
+      if(Date.now()-eventMs>300000||eventMs-Date.now()>30000)
         return json({ok:false,error:'STALE_OR_FUTURE_WHALE_FILL',eventMs},409);
     }
     const id=`${coin}:${fill_id}`;
