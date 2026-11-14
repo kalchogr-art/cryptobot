@@ -1,14 +1,720 @@
+/** LIVE COPY STAGE16 - single-source edition.
+ * Same controller and seven helpers, merged into one TypeScript module.
+ * No local ./live-copy-*.ts imports are needed.
+ * Requires the existing npm dependencies @msgpack/msgpack and viem.
+ * To replace src/live-copy-controller-v2.3-stage15.ts, paste this whole file there.
+ * Preserve the existing Worker entrypoint and bindings. No real orders tested here.
+ */
+import { bytesToHex, concat, keccak256, recoverTypedDataAddress } from 'viem';
+import { encode } from '@msgpack/msgpack';
+import { privateKeyToAccount } from 'viem/accounts';
+
+// ===== live-copy-accumulator-v2.3.ts =====
+namespace __LC_ACCUMULATOR {
+
+/**
+ * LIVE COPY V2.3 — pure, persistence-friendly target accumulator.
+ * No HTTP requests, no wallet access, no exchange orders.
+ * Caller MUST serialize per coin, persist state, and only commit fills that
+ * Hyperliquid confirmed. Never mark a proposed order as filled in advance.
+ */
+export type CopySide = 'LONG'|'SHORT';
+export type CopyCoinState = {
+  coin: string;
+  anchorTargetQty: number;       // latest observed whale target qty
+  scale: number;                 // own base-asset qty / whale base-asset qty
+  confirmedOwnQty: number;       // exchange-confirmed signed position quantity
+  pendingIntentId: string|null;  // one in-flight order per coin
+  suspended: boolean;           // manual close or ambiguous write
+  lastFillId: string|null;
+};
+export type CopyProposal = {
+  kind:'OPEN'|'ADD'|'PARTIAL_CLOSE'|'FULL_CLOSE'|'NONE';
+  coin:string; signedDelta:number; quantity:number; reduceOnly:boolean;
+  desiredOwnQty:number; pendingNotional:number; reason:string;
+};
+const tiny=1e-10;
+const sign=(x:number)=>Math.abs(x)<tiny?0:Math.sign(x);
+const truncate=(q:number,d:number)=>Math.floor(Math.max(0,q)*10**d+1e-9)/10**d;
+const round=(q:number)=>Math.round(q*1e10)/1e10;
+export function planCopyAction(input:{
+  state:CopyCoinState; whaleTargetQty:number; price:number; szDecimals:number;
+  minimumNotional?:number;
+}):CopyProposal {
+  const {state:s,whaleTargetQty:target,price,szDecimals:d}=input;
+  const min=input.minimumNotional??10.40;
+  const none=(reason:string,desiredOwnQty=0,pendingNotional=0):CopyProposal=>({kind:'NONE',coin:s.coin,signedDelta:0,quantity:0,reduceOnly:false,desiredOwnQty,pendingNotional,reason});
+  if(s.suspended)return none('MANUAL_OR_UNKNOWN_WRITE_SUSPENSION');
+  if(s.pendingIntentId)return none('AWAITING_EXCHANGE_CONFIRMATION');
+  if(!Number.isFinite(price)||price<=0||!Number.isFinite(target)||!Number.isFinite(s.scale)||s.scale<=0||!Number.isInteger(d)||d<0||d>8)return none('INVALID_INPUT');
+  const desired=round(target*s.scale);
+  const actual=s.confirmedOwnQty;
+  const delta=round(desired-actual);
+  const quantity=truncate(Math.abs(delta),d);
+  const pendingNotional=Math.abs(delta)*price;
+  if(sign(delta)===0)return none('SYNCED',desired,0);
+  // A close to zero or a reversal is NOT equivalent to a new opening order.
+  // The caller must close first and wait for confirmation before opening reverse.
+  if(sign(actual)!==0 && (sign(desired)===0||sign(desired)!==sign(actual))) {
+    const closeQty=truncate(Math.abs(actual),d);
+    if(closeQty===0)return none('CLOSE_BELOW_PRECISION_REQUIRES_MANUAL_REVIEW',desired,pendingNotional);
+    return {kind:'FULL_CLOSE',coin:s.coin,signedDelta:-actual,quantity:closeQty,reduceOnly:true,desiredOwnQty:desired,pendingNotional,reason:'TARGET_FLAT_OR_REVERSED'};
+  }
+  if(quantity===0||quantity*price+tiny<min)return none('ACCUMULATING_MICRO_DELTAS',desired,pendingNotional);
+  const increasing=sign(actual)===0||sign(delta)===sign(actual);
+  if(!increasing && quantity>Math.abs(actual)+tiny)return none('CLOSE_EXCEEDS_CONFIRMED_POSITION',desired,pendingNotional);
+  return {kind:sign(actual)===0?'OPEN':increasing?'ADD':'PARTIAL_CLOSE',coin:s.coin,
+    signedDelta:round(sign(delta)*quantity),quantity,reduceOnly:!increasing,
+    desiredOwnQty:desired,pendingNotional,reason:'EXECUTABLE_ACCUMULATED_DELTA'};
+}
+export function confirmCopyFill(state:CopyCoinState, signedFillQty:number, intentId:string):CopyCoinState {
+  if(!intentId||state.pendingIntentId!==intentId)throw Error('INTENT_MISMATCH');
+  if(!Number.isFinite(signedFillQty))throw Error('INVALID_FILL');
+  return {...state,confirmedOwnQty:round(state.confirmedOwnQty+signedFillQty),pendingIntentId:null};
+}
+export function markManualClose(state:CopyCoinState):CopyCoinState {
+  // Manual CLOSE stops recopying the same whale position until a fresh, separately
+  // identified opening episode is observed and explicitly rearmed by the controller.
+  return {...state,suspended:true,pendingIntentId:null};
+}
+
+}
+
+// ===== live-copy-ledger-v2.3.ts =====
+namespace __LC_LEDGER {
+
+/** LIVE COPY V2.3 Stage 3: durable intent ledger and conservative reconciliation.
+ * Pure functions only. No trading is performed by importing this module.
+ * All mutations must run in ONE serialized Durable Object and be persisted
+ * before an exchange write. A pending/unknown write is NEVER retried blindly.
+ */
+export type IntentStatus = 'PREPARED'|'SUBMITTING'|'FILLED'|'PARTIAL'|'REJECTED'|'UNKNOWN'|'CANCELLED';
+export type IntentKind = 'OPEN'|'ADD'|'PARTIAL_CLOSE'|'FULL_CLOSE'|'MANUAL_CLOSE';
+export interface CopyIntent {
+  id:string; coin:string; kind:IntentKind; side:'BUY'|'SELL'; reduceOnly:boolean;
+  requestedQty:number; confirmedFillQty:number; status:IntentStatus;
+  createdAt:number; updatedAt:number; sourceFillId:string; exchangeOid?:string;
+  lastError?:string; exchangeCloid?:string;
+}
+export interface LiveLedger {
+  version:1; intents:Record<string,CopyIntent>;
+  /** Signed quantities that were actually confirmed by the exchange. */
+  confirmedByCoin:Record<string,number>;
+  /** Manual close blocks recopy until a NEW flat-to-open whale episode. */
+  suspendedCoins:Record<string,boolean>;
+  /** Last-known exchange state. Do not use as a replacement for fresh reads. */
+  lastReconciledAt:number|null;
+}
+export const emptyLiveLedger=():LiveLedger=>({version:1,intents:{},confirmedByCoin:{},suspendedCoins:{},lastReconciledAt:null});
+const round=(v:number)=>Math.round(v*1e10)/1e10;
+export function prepareIntent(ledger:LiveLedger, intent:Omit<CopyIntent,'status'|'confirmedFillQty'|'createdAt'|'updatedAt'>, now:number):LiveLedger {
+  if (!Number.isFinite(now)||now<=0||!intent.id||!/^[A-Z0-9]{2,20}$/.test(intent.coin)||
+      !Number.isFinite(intent.requestedQty)||intent.requestedQty<=0) throw Error('INVALID_INTENT');
+  if(ledger.intents[intent.id])throw Error('DUPLICATE_INTENT_ID');
+  if(ledger.suspendedCoins[intent.coin])throw Error('COIN_SUSPENDED');
+  if(Object.values(ledger.intents).some(i=>i.coin===intent.coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
+    throw Error('UNRESOLVED_COIN_INTENT');
+  return {...ledger,intents:{...ledger.intents,[intent.id]:{...intent,status:'PREPARED',confirmedFillQty:0,createdAt:now,updatedAt:now}}};
+}
+export function markSubmitting(ledger:LiveLedger,id:string,now:number):LiveLedger {
+  const old=ledger.intents[id];if(!old||old.status!=='PREPARED')throw Error('NOT_PREPARED');
+  return {...ledger,intents:{...ledger.intents,[id]:{...old,status:'SUBMITTING',updatedAt:now}}};
+}
+/** Unknown outcomes must remain blocked until independently verified on Hyperliquid. */
+export function markUnknown(ledger:LiveLedger,id:string,now:number,error:string):LiveLedger {
+  const old=ledger.intents[id];if(!old||old.status!=='SUBMITTING')throw Error('NOT_SUBMITTING');
+  return {...ledger,intents:{...ledger.intents,[id]:{...old,status:'UNKNOWN',lastError:error,updatedAt:now}}};
+}
+/** Call only with exchange-confirmed fill qty, never with a planned qty. */
+export function recordExchangeFill(ledger:LiveLedger,id:string,filledQty:number,now:number,oid?:string):LiveLedger {
+  const old=ledger.intents[id];
+  if(!old||!['SUBMITTING','UNKNOWN','PARTIAL'].includes(old.status))throw Error('INVALID_FILL_STATE');
+  if(!Number.isFinite(filledQty)||filledQty<=0||filledQty>old.requestedQty-old.confirmedFillQty+1e-9)
+    throw Error('INVALID_CONFIRMED_QUANTITY');
+  const total=round(old.confirmedFillQty+filledQty);
+  const status:IntentStatus=total+1e-9>=old.requestedQty?'FILLED':'PARTIAL';
+  const signed=old.side==='BUY'?filledQty:-filledQty;
+  return {...ledger,
+    confirmedByCoin:{...ledger.confirmedByCoin,[old.coin]:round((ledger.confirmedByCoin[old.coin]||0)+signed)},
+    intents:{...ledger.intents,[id]:{...old,confirmedFillQty:total,status,updatedAt:now,exchangeOid:oid||old.exchangeOid}}};
+}
+export function markRejected(ledger:LiveLedger,id:string,now:number,reason:string):LiveLedger {
+  const old=ledger.intents[id];if(!old||old.status!=='SUBMITTING')throw Error('INVALID_REJECTION_STATE');
+  return {...ledger,intents:{...ledger.intents,[id]:{...old,status:'REJECTED',updatedAt:now,lastError:reason}}};
+}
+/** Refuse to run on a coin if the actual account position differs from our ledger.
+ * This prevents touching pre-existing/manual positions on a shared wallet.
+ */
+export function assertPositionOwned(ledger:LiveLedger,coin:string,exchangeSignedQty:number,szDecimals:number):void {
+  if(ledger.suspendedCoins[coin])throw Error('COIN_SUSPENDED');
+  if(!Number.isFinite(exchangeSignedQty)||!Number.isInteger(szDecimals)||szDecimals<0||szDecimals>8)
+    throw Error('INVALID_EXCHANGE_POSITION');
+  const expected=ledger.confirmedByCoin[coin]||0;
+  if(Math.abs(expected-exchangeSignedQty)>0.51*10**(-szDecimals))throw Error('POSITION_OWNERSHIP_MISMATCH');
+  if(Object.values(ledger.intents).some(i=>i.coin===coin&&['SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
+    throw Error('PENDING_EXCHANGE_RECONCILIATION');
+}
+export function suspendCoin(ledger:LiveLedger,coin:string):LiveLedger {
+  return {...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:true}};
+}
+
+/** Resolve ONLY after orderStatus identifies this particular order and its fills
+ * have been independently verified by OID in the correct master account.
+ * A terminal IOC with a partial fill is terminal, not forever PARTIAL.
+ */
+export function settleVerifiedOrder(ledger:LiveLedger,id:string,confirmedTotalQty:number,now:number,oid:string,terminalStatus:string):LiveLedger {
+  const old=ledger.intents[id];
+  if(!old||!['SUBMITTING','UNKNOWN','PARTIAL'].includes(old.status))throw Error('INTENT_NOT_UNRESOLVED');
+  if(!Number.isFinite(now)||now<=0||!oid||!Number.isFinite(confirmedTotalQty)||
+    confirmedTotalQty<0||confirmedTotalQty+1e-9<old.confirmedFillQty||confirmedTotalQty>old.requestedQty+1e-9)
+    throw Error('INVALID_VERIFIED_ORDER_TOTAL');
+  const increment=round(confirmedTotalQty-old.confirmedFillQty);
+  const status:IntentStatus=confirmedTotalQty+1e-9>=old.requestedQty?'FILLED':
+    confirmedTotalQty>0?'CANCELLED':terminalStatus.toLowerCase().includes('reject')?'REJECTED':'CANCELLED';
+  return {...ledger,
+    confirmedByCoin:{...ledger.confirmedByCoin,[old.coin]:round((ledger.confirmedByCoin[old.coin]||0)+(old.side==='BUY'?increment:-increment))},
+    intents:{...ledger.intents,[id]:{...old,status,confirmedFillQty:round(confirmedTotalQty),exchangeOid:oid,
+      updatedAt:now,lastError:'EXCHANGE_VERIFIED_'+terminalStatus.toUpperCase()}}};
+}
+
+/** PREPARED is persisted BEFORE SUBMITTING and BEFORE any exchange write.
+ * It is safe to discard only in this exact state, never SUBMITTING/UNKNOWN.
+ */
+export function cancelNeverSubmittedIntent(ledger:LiveLedger,id:string,now:number):LiveLedger{
+  const old=ledger.intents[id];
+  if(!old||old.status!=='PREPARED'||!Number.isFinite(now)||now<=0)
+    throw Error('NOT_A_NEVER_SUBMITTED_INTENT');
+  return {...ledger,intents:{...ledger.intents,[id]:{...old,status:'CANCELLED',
+    updatedAt:now,lastError:'PREPARED_NEVER_SENT_CLEARED'}}};
+}
+
+}
+
+// ===== live-copy-settlement-v2.3.ts =====
+namespace __LC_SETTLEMENT {
+import LiveLedger = __LC_LEDGER.LiveLedger;
+import recordExchangeFill = __LC_LEDGER.recordExchangeFill;
+import markRejected = __LC_LEDGER.markRejected;
+import markUnknown = __LC_LEDGER.markUnknown;
+/** Stage 5: conservative exchange-result settlement for LIVE COPY.
+ * Pure functions; NEVER sends an exchange order. A confirmed fill is not
+ * inferred from HTTP 200, wallet delta, or an unverified client payload.
+ */
+
+export type ExchangeReceipt = {
+  intentId:string; coin:string; status:string; executed:boolean;
+  filledQty?:number; requestedQty?:number; oid?:number|string;
+};
+export type Settlement = {ledger:LiveLedger; outcome:'FILLED'|'PARTIAL'|'REJECTED'|'UNKNOWN'; reason:string};
+const EPS=1e-9;
+export function settleExchangeReceipt(ledger:LiveLedger, receipt:ExchangeReceipt, now:number):Settlement {
+  const intent=ledger.intents[receipt.intentId];
+  if (!intent || intent.coin!==receipt.coin) throw Error('RECEIPT_INTENT_MISMATCH');
+  if (intent.status!=='SUBMITTING') throw Error('INTENT_NOT_SUBMITTING');
+  if (!Number.isFinite(now)||now<=0) throw Error('INVALID_TIMESTAMP');
+  if (receipt.status==='FILLED' && receipt.executed===true) {
+    const qty=receipt.filledQty;
+    if (typeof qty!=='number'||!Number.isFinite(qty)||qty<=0||qty>intent.requestedQty+EPS)
+      throw Error('INVALID_EXCHANGE_FILL');
+    if (receipt.requestedQty!==undefined && Math.abs(receipt.requestedQty-intent.requestedQty)>EPS)
+      throw Error('REQUESTED_QUANTITY_MISMATCH');
+    // The execution adapter must supply this receipt directly; never accept a browser-supplied receipt.
+    const next=recordExchangeFill(ledger,intent.id,qty,now,receipt.oid===undefined?undefined:String(receipt.oid));
+    const status=next.intents[intent.id].status;
+    return {ledger:next,outcome:status==='FILLED'?'FILLED':'PARTIAL',reason:'EXCHANGE_REPORTED_FILL'};
+  }
+  // Explicit adapter statuses that guarantee NO order request was sent, or a
+  // definitive rejection from the exchange. Do not classify an absent/ambiguous
+  // exchange response as REJECTED.
+  const noOrderSent=new Set(['LIVE_DISABLED','CREDENTIALS_NOT_CONFIGURED','INVALID_INTENT',
+    'UNKNOWN_ASSET','BELOW_SIZE_PRECISION','NO_POSITION_TO_REDUCE','REDUCE_EXCEEDS_POSITION',
+    'OPPOSITE_POSITION_EXISTS','LEVERAGE_APPROVAL_MISSING','LEVERAGE_MODE_NOT_APPROVED',
+    'ASSET_MAX_LEVERAGE_BELOW_10X','EXISTING_POSITION_LEVERAGE_MISMATCH',
+    'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER','LEVERAGE_UPDATE_REJECTED_NO_ORDER',
+    'BELOW_STRATEGY_MIN_NOTIONAL','PRE_ORDER_ACCOUNT_READ_FAILED_NO_ORDER']);
+  if ((receipt.status==='REJECTED'||noOrderSent.has(receipt.status)) && !receipt.executed) {
+    return {ledger:markRejected(ledger,intent.id,now,'NO_ORDER_OR_EXCHANGE_REJECTED:'+receipt.status),outcome:'REJECTED',reason:'EXCHANGE_REJECTED'};
+  }
+  return {ledger:markUnknown(ledger,intent.id,now,'AMBIGUOUS_OR_UNFILLED_EXCHANGE_RESPONSE'),outcome:'UNKNOWN',reason:'RECONCILE_BEFORE_RETRY'};
+}
+
+}
+
+// ===== live-copy-bridge-v2.3-stage6.ts =====
+namespace __LC_BRIDGE {
+import planCopyAction = __LC_ACCUMULATOR.planCopyAction;
+import CopyCoinState = __LC_ACCUMULATOR.CopyCoinState;
+import CopyProposal = __LC_ACCUMULATOR.CopyProposal;
+import prepareIntent = __LC_LEDGER.prepareIntent;
+import markSubmitting = __LC_LEDGER.markSubmitting;
+import settleVerifiedOrder = __LC_LEDGER.settleVerifiedOrder;
+import LiveLedger = __LC_LEDGER.LiveLedger;
+import CopyIntent = __LC_LEDGER.CopyIntent;
+import settleExchangeReceipt = __LC_SETTLEMENT.settleExchangeReceipt;
+import ExchangeReceipt = __LC_SETTLEMENT.ExchangeReceipt;
+/** V2.3 Stage 6: atomic planning/ledger bridge (NO exchange writes).
+ * Call only inside a serialized Durable Object. Persist returned state+ledger
+ * together before an order is submitted. Never call this from a browser.
+ */
+
+
+
+export type BridgeResult={state:CopyCoinState;ledger:LiveLedger;proposal:CopyProposal;intent:CopyIntent|null};
+const terminal=(status:string)=>status==='FILLED'||status==='REJECTED'||status==='CANCELLED';
+const sideFor=(p:CopyProposal):'BUY'|'SELL'=>p.signedDelta>0?'BUY':'SELL';
+export function planAndReserve(input:{state:CopyCoinState;ledger:LiveLedger;whaleTargetQty:number;price:number;szDecimals:number;sourceFillId:string;intentId:string;now:number;minimumNotional?:number}):BridgeResult {
+  const {state,ledger,sourceFillId,intentId,now}=input;
+  if(!sourceFillId||!intentId||!Number.isFinite(now)||now<=0)throw Error('INVALID_EVENT_ID');
+  if(ledger.suspendedCoins[state.coin]||state.suspended)throw Error('COIN_SUSPENDED');
+  const expected=ledger.confirmedByCoin[state.coin]||0;
+  if(Math.abs(expected-state.confirmedOwnQty)>1e-9)throw Error('LEDGER_STATE_MISMATCH');
+  if(Object.values(ledger.intents).some(i=>i.coin===state.coin&&!terminal(i.status)))throw Error('UNRESOLVED_COIN_INTENT');
+  const proposal=planCopyAction({state,whaleTargetQty:input.whaleTargetQty,price:input.price,szDecimals:input.szDecimals,minimumNotional:input.minimumNotional});
+  if(proposal.kind==='NONE')return {state,ledger,proposal,intent:null};
+  const nextLedger=prepareIntent(ledger,{id:intentId,coin:state.coin,kind:proposal.kind,side:sideFor(proposal),reduceOnly:proposal.reduceOnly,requestedQty:proposal.quantity,sourceFillId},now);
+  return {state:{...state,pendingIntentId:intentId},ledger:nextLedger,proposal,intent:nextLedger.intents[intentId]};
+}
+export function beginSubmission(state:CopyCoinState,ledger:LiveLedger,intentId:string,now:number){
+  if(state.pendingIntentId!==intentId)throw Error('INTENT_MISMATCH');
+  return {state,ledger:markSubmitting(ledger,intentId,now)};
+}
+/** Only pass a receipt directly from the trusted exchange adapter, never a UI payload. */
+export function applyTrustedReceipt(state:CopyCoinState,ledger:LiveLedger,receipt:ExchangeReceipt,now:number){
+  if(state.pendingIntentId!==receipt.intentId)throw Error('INTENT_MISMATCH');
+  const result=settleExchangeReceipt(ledger,receipt,now);
+  const confirmed=result.ledger.confirmedByCoin[state.coin]||0;
+  // IOC partial fills are unresolved until exchange reconciliation: do not re-enter.
+  const release=result.outcome==='FILLED'||result.outcome==='REJECTED';
+  return {state:{...state,confirmedOwnQty:confirmed,pendingIntentId:release?null:receipt.intentId,
+    suspended:state.suspended||result.outcome==='UNKNOWN'},ledger:result.ledger,outcome:result.outcome};
+}
+
+/** Unblock a coin only after independently verified terminal IOC + position check.
+ * The caller must persist the returned ledger and state before further events.
+ */
+export function applyVerifiedOrder(state:CopyCoinState,ledger:LiveLedger,input:{intentId:string;totalFilledQty:number;oid:string;exchangeStatus:string},now:number){
+  if(state.pendingIntentId!==input.intentId)throw Error('RECOVERY_INTENT_MISMATCH');
+  const next=settleVerifiedOrder(ledger,input.intentId,input.totalFilledQty,now,input.oid,input.exchangeStatus);
+  return {state:{...state,confirmedOwnQty:next.confirmedByCoin[state.coin]||0,pendingIntentId:null,
+    suspended:!!next.suspendedCoins[state.coin]},ledger:next};
+}
+
+}
+
+// ===== live-copy-reconciliation-v2.3.ts =====
+namespace __LC_RECONCILIATION {
+import LiveLedger = __LC_LEDGER.LiveLedger;
+/** Stage 4: read-only reconciliation of LIVE COPY ledger against Hyperliquid.
+ * Never adopts pre-existing positions, never assumes an order filled from a balance change.
+ */
+
+export type ExchangePosition = { coin:string; qty:number };
+export type ExchangeAsset = { coin:string; szDecimals:number };
+export type ReconciliationRow = { coin:string; expectedQty:number; exchangeQty:number; differenceQty:number; status:'MATCH'|'MISMATCH'|'UNRESOLVED_INTENT'|'UNKNOWN_ASSET'|'UNOWNED_POSITION' };
+export type ReconciliationReport = { safeToTrade:boolean; rows:ReconciliationRow[]; blockers:string[] };
+export function reconcileCopyLedger(ledger:LiveLedger, positions:ExchangePosition[], assets:ExchangeAsset[]):ReconciliationReport {
+  const pos=new Map(positions.map(p=>[p.coin,p.qty]));
+  const meta=new Map(assets.map(a=>[a.coin,a.szDecimals]));
+  const coins=new Set([...Object.keys(ledger.confirmedByCoin),...pos.keys(),...Object.values(ledger.intents).map(i=>i.coin)]);
+  const rows:ReconciliationRow[]=[];const blockers:string[]=[];
+  for(const coin of [...coins].sort()){
+    const expected=ledger.confirmedByCoin[coin]||0, actual=pos.get(coin)||0;
+    const d=meta.get(coin);
+    const unresolved=Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+    let status:ReconciliationRow['status'];
+    if(d===undefined||!Number.isInteger(d)||d<0||d>8)status='UNKNOWN_ASSET';
+    else if(unresolved)status='UNRESOLVED_INTENT';
+    else if(expected===0&&actual!==0)status='UNOWNED_POSITION';
+    else if(Math.abs(expected-actual)>0.51*10**(-d))status='MISMATCH';
+    else status='MATCH';
+    rows.push({coin,expectedQty:expected,exchangeQty:actual,differenceQty:actual-expected,status});
+    if(status!=='MATCH')blockers.push(`${coin}:${status}`);
+  }
+  return {safeToTrade:blockers.length===0,rows,blockers};
+}
+
+}
+
+// ===== live-copy-execution-v2.3.ts =====
+namespace __LC_EXECUTION {
+import CopyIntent = __LC_LEDGER.CopyIntent;
+/**
+ * LIVE COPY V2.3 — isolated Hyperliquid execution adapter.
+ * NOT connected to the watcher or dashboard yet. LIVE writes are gated by
+ * LIVE_COPY_TRADING_ENABLED === 'true' and explicit caller authorization.
+ * Use a Durable Object as the sole serialized caller. Never retry ambiguous writes.
+ * Dependencies: viem, @msgpack/msgpack.
+ */
+
+
+
+
+const INFO = 'https://api.hyperliquid.xyz/info';
+const EXCHANGE = 'https://api.hyperliquid.xyz/exchange';
+const DEFAULT_MIN_NOTIONAL = 10.40; // strategy's conservative threshold, not exchange guarantee
+const MAX_PRICE_DEVIATION = 0.0075;
+const NONCE_LOCK = new Map<string, number>(); // worker-isolate only; DO must serialize requests
+export interface LiveCopyEnv {
+  HYPERLIQUID_API_PRIVATE_KEY?: string;
+  HYPERLIQUID_MASTER_ACCOUNT?: string;
+  LIVE_COPY_TRADING_ENABLED?: string;
+  LIVE_COPY_LEVERAGE_VERIFIED?: string;
+  LIVE_COPY_LEVERAGE_MODE?: string;
+}
+export type Direction = 'LONG' | 'SHORT';
+export type LiveOrderIntent = {
+  intentId: string; coin: string; direction: Direction; quantity: number;
+  reduceOnly: boolean; referencePrice: number;
+};
+export type LiveResult = {
+  ok: boolean; executed: boolean; status: string; coin: string;
+  intentId: string; requestedQty?: number; filledQty?: number;
+  averageFillPrice?: number; oid?: number | string; raw?: unknown; cloid?:string; orderSent?:boolean|'UNKNOWN';
+};
+const n = (x: unknown) => Number(x);
+const validAddress = (x: string) => /^0x[0-9a-fA-F]{40}$/.test(x);
+const keyFormat = (x: string) => /^0x[0-9a-fA-F]{64}$/.test(x);
+const normalizeKey = (x?: string) => x ? (x.startsWith('0x') ? x : `0x${x}`) : '';
+const post = async (url: string, body: unknown) => {
+  const r = await fetch(url, { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(body) });
+  const raw = await r.text();
+  let data: any; try { data = JSON.parse(raw); } catch { throw Error(`NON_JSON_RESPONSE_${r.status}`); }
+  if (!r.ok) throw Error(`HYPERLIQUID_HTTP_${r.status}:${JSON.stringify(data).slice(0,250)}`);
+  return data;
+};
+const info = (body: unknown) => post(INFO, body);
+/** Stable 128-bit client ID: never use an untracked random order identifier. */
+export function cloidForIntent(intentId:string):string {
+  if(!intentId||intentId.length>220)throw Error('INVALID_INTENT_FOR_CLOID');
+  return '0x'+keccak256(bytesToHex(new TextEncoder().encode('LIVE_COPY_V23:'+intentId))).slice(2,34);
+}
+const decimalQty = (q: number, decimals: number) => {
+  const factor = 10 ** decimals;
+  return Math.floor((q + 1e-12) * factor) / factor;
+};
+function formatPrice(px: number, szDecimals: number): string {
+  if (!Number.isFinite(px) || px <= 0) throw Error('INVALID_PRICE');
+  // Hyperliquid perps: <=5 significant digits and <=(6-szDecimals) decimal places.
+  const sig = Number(px.toPrecision(5));
+  const decimals = Math.max(0, 6 - szDecimals);
+  const factor = 10 ** decimals;
+  return String(Math.round(sig * factor) / factor);
+}
+function u64be(v: bigint) {
+  const bytes = new Uint8Array(8);
+  for (let i=7;i>=0;i--) { bytes[i] = Number(v & 255n); v >>= 8n; }
+  return bytes;
+}
+function nonceFor(wallet: string) {
+  const now = Date.now(); const next = Math.max(now, (NONCE_LOCK.get(wallet) || 0) + 1);
+  NONCE_LOCK.set(wallet, next); return next;
+}
+async function sendAction(action: Record<string,unknown>, key: `0x${string}`, master: string) {
+  const account = privateKeyToAccount(key);
+  const nonce = nonceFor(master);
+  const hash = keccak256(concat([bytesToHex(encode(action)), bytesToHex(u64be(BigInt(nonce))), '0x00']));
+  const domain = { chainId:1337, name:'Exchange', verifyingContract:'0x0000000000000000000000000000000000000000', version:'1' } as const;
+  const types = { Agent:[{name:'source',type:'string'},{name:'connectionId',type:'bytes32'}] } as const;
+  const message = {source:'a',connectionId:hash} as const;
+  const signature = await account.signTypedData({domain,types,primaryType:'Agent',message});
+  const recovered = await recoverTypedDataAddress({domain,types,primaryType:'Agent',message,signature});
+  if (recovered.toLowerCase() !== account.address.toLowerCase()) throw Error('SIGNATURE_RECOVERY_FAILED');
+  const hex = signature.slice(2);
+  const rawV = parseInt(hex.slice(128,130),16);
+  const sig = {r:`0x${hex.slice(0,64)}`,s:`0x${hex.slice(64,128)}`,v:rawV<27?rawV+27:rawV};
+  // Never automatically retry: timeout can mean the order was accepted.
+  return post(EXCHANGE, {action,nonce,signature:sig,vaultAddress:null});
+}
+export async function readLiveAccount(env: LiveCopyEnv) {
+  const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
+  if (!validAddress(master)) throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const [state,meta,spotResult] = await Promise.all([
+    info({type:'clearinghouseState',user:master}), info({type:'meta'}),
+    // Unified-account collateral is reported in spotClearinghouseState.
+    // A failed spot read must not silently masquerade as a zero balance.
+    info({type:'spotClearinghouseState',user:master}).then(value=>({ok:true,value} as const),error=>({ok:false,error:String(error)} as const))
+  ]);
+  const positions = (state.assetPositions || []).map((entry:any) => {
+    const p = entry.position || {};
+    return {coin:p.coin, qty:n(p.szi), entry:n(p.entryPx), unrealized:n(p.unrealizedPnl),
+      marginUsed:n(p.marginUsed), leverage:p.leverage, liquidationPx:p.liquidationPx};
+  }).filter((p:any)=>Number.isFinite(p.qty) && p.qty!==0);
+  const spotBalances = spotResult.ok && Array.isArray(spotResult.value?.balances)
+    ? spotResult.value.balances : [];
+  const usdc = spotBalances.find((b:any)=>String(b.coin).toUpperCase()==='USDC');
+  const usdcTotal = usdc ? Number(usdc.total) : null;
+  const usdcHold = usdc ? Number(usdc.hold || 0) : null;
+  // Do not sum perp accountValue and spot USDC: this double-counts unified collateral.
+  // Expose sources separately rather than presenting an unverified equity formula.
+  const spotUsdcTotal = usdcTotal!==null && Number.isFinite(usdcTotal) ? usdcTotal : null;
+  const spotUsdcHold = usdcHold!==null && Number.isFinite(usdcHold) ? usdcHold : null;
+  return {ok:true, mode:'READ_ONLY', masterAccount:master,
+    balanceMode:'UNIFIED_SOURCES_SEPARATE',
+    spotUsdcTotal, spotUsdcHold,
+    spotUsdcAvailable:spotUsdcTotal!==null && spotUsdcHold!==null ? spotUsdcTotal-spotUsdcHold : null,
+    spotBalanceError:spotResult.ok ? null : spotResult.error,
+    spotBalances:spotBalances.map((b:any)=>({coin:b.coin,total:b.total,hold:b.hold})),
+    accountValue:n(state.marginSummary?.accountValue), withdrawable:n(state.withdrawable),
+    totalMarginUsed:n(state.marginSummary?.totalMarginUsed), positions,
+    assetMeta:(meta.universe||[]).map((a:any,i:number)=>({coin:a.name,assetId:i,szDecimals:a.szDecimals,maxLeverage:a.maxLeverage}))};
+}
+export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent): Promise<LiveResult> {
+  const base = {ok:false,executed:false,status:'BLOCKED',coin:intent.coin,intentId:intent.intentId,orderSent:false as boolean|'UNKNOWN'};
+  if (env.LIVE_COPY_TRADING_ENABLED !== 'true') return {...base,status:'LIVE_DISABLED'};
+  const key = normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY);
+  const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
+  if (!keyFormat(key) || !validAddress(master)) return {...base,status:'CREDENTIALS_NOT_CONFIGURED'};
+  if (!intent.intentId || !/^[A-Z0-9]{2,20}$/.test(intent.coin) ||
+      !['LONG','SHORT'].includes(intent.direction) || !Number.isFinite(intent.quantity) ||
+      intent.quantity<=0 || !Number.isFinite(intent.referencePrice) || intent.referencePrice<=0)
+    return {...base,status:'INVALID_INTENT'};
+  let snapshot:Awaited<ReturnType<typeof readLiveAccount>>;
+  try{snapshot=await readLiveAccount(env);}
+  catch(error){return {...base,status:'PRE_ORDER_ACCOUNT_READ_FAILED_NO_ORDER',raw:String(error)};}
+  const asset = snapshot.assetMeta.find((a:any)=>a.coin===intent.coin);
+  if (!asset) return {...base,status:'UNKNOWN_ASSET'};
+  const qty = decimalQty(intent.quantity, asset.szDecimals);
+  if (!(qty>0)) return {...base,status:'BELOW_SIZE_PRECISION'};
+  const pos = snapshot.positions.find((p:any)=>p.coin===intent.coin);
+  const current = pos?.qty || 0;
+  const buy = intent.reduceOnly ? current < 0 : intent.direction === 'LONG';
+  if (intent.reduceOnly) {
+    if (current===0) return {...base,status:'NO_POSITION_TO_REDUCE'};
+    if (qty > Math.abs(current)+1e-10) return {...base,status:'REDUCE_EXCEEDS_POSITION'};
+  } else if (current!==0 && Math.sign(current)!==(buy?1:-1)) {
+    return {...base,status:'OPPOSITE_POSITION_EXISTS'};
+  }
+  // Verify or configure leverage using the exchange itself. An environment flag alone
+  // is NOT evidence of the leverage actually configured on Hyperliquid.
+  // Do not change leverage for reduce-only orders (closing should remain possible).
+  if (!intent.reduceOnly) {
+    if (env.LIVE_COPY_LEVERAGE_VERIFIED !== 'true') return {...base,status:'LEVERAGE_APPROVAL_MISSING'};
+    if (env.LIVE_COPY_LEVERAGE_MODE !== 'cross') return {...base,status:'LEVERAGE_MODE_NOT_APPROVED'};
+    if (asset.maxLeverage < 10) return {...base,status:'ASSET_MAX_LEVERAGE_BELOW_10X'};
+    if (pos && (Number(pos.leverage?.value) !== 10 || pos.leverage?.type !== 'cross'))
+      return {...base,status:'EXISTING_POSITION_LEVERAGE_MISMATCH'};
+    // Existing live position already provides exchange proof of 10x cross.
+    // Never send a repeated updateLeverage before every ADD.
+    if(!pos){
+      let leverageResponse:any;
+      try {
+        leverageResponse = await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
+      } catch (error) {
+        return {...base,status:'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER',raw:String(error)};
+      }
+      if (leverageResponse?.status !== 'ok' || leverageResponse?.response?.type !== 'default')
+        return {...base,status:'LEVERAGE_UPDATE_REJECTED_NO_ORDER',raw:leverageResponse};
+    }
+  }
+  const px = n(intent.referencePrice);
+  if (!intent.reduceOnly && qty*px < DEFAULT_MIN_NOTIONAL) return {...base,status:'BELOW_STRATEGY_MIN_NOTIONAL'};
+  // IOC price bound relative to the supplied *fresh* reference price.
+  // Caller must verify reference freshness and use an account-level serialized executor.
+  const limitPx = n(formatPrice(px*(buy?(1+MAX_PRICE_DEVIATION):(1-MAX_PRICE_DEVIATION)),asset.szDecimals));
+  const cloid=cloidForIntent(intent.intentId);
+  const action = {type:'order',orders:[{a:asset.assetId,b:buy,p:String(limitPx),s:qty.toFixed(asset.szDecimals),r:intent.reduceOnly,t:{limit:{tif:'Ioc'}},c:cloid}],grouping:'na'};
+  let result:any;
+  try { result = await sendAction(action,key as `0x${string}`,master); }
+  catch (e) { return {...base,status:'UNKNOWN_WRITE_OUTCOME_CHECK_EXCHANGE_BEFORE_RETRY',cloid,orderSent:'UNKNOWN',raw:String(e)}; }
+  const item = result?.response?.data?.statuses?.[0];
+  if (item?.filled) return {ok:true,executed:true,status:'FILLED',coin:intent.coin,intentId:intent.intentId,
+    requestedQty:qty,filledQty:n(item.filled.totalSz),averageFillPrice:n(item.filled.avgPx),oid:item.filled.oid,cloid,orderSent:true,raw:result};
+  if (item?.resting) return {...base,status:'UNEXPECTED_RESTING_ORDER',orderSent:true,raw:result};
+  return {...base,status:item?.error?'REJECTED':'NOT_FILLED',orderSent:true,raw:result};
+}
+
+export type VerifiedOrderResult =
+  | {kind:'VERIFIED';coin:string;oid:string;cloid:string|null;totalFilledQty:number;status:string}
+  | {kind:'UNRESOLVED';reason:string};
+
+/** Order-specific verification. A matching position delta or coincident fill
+ * without the order OID is NEVER sufficient proof of which order executed.
+ * Legacy UNKNOWN intents without OID/CLOID remain quarantined.
+ */
+export async function verifyLiveOrder(env:LiveCopyEnv,intent:CopyIntent):Promise<VerifiedOrderResult>{
+  const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const lookup=intent.exchangeOid||intent.exchangeCloid;
+  if(!lookup)return {kind:'UNRESOLVED',reason:'LEGACY_ORDER_WITHOUT_OID_OR_CLOID'};
+  const r:any=await info({type:'orderStatus',user:master,oid:/^\d+$/.test(lookup)?Number(lookup):lookup});
+  if(r?.status!=='order'||!r?.order?.order)return {kind:'UNRESOLVED',reason:'ORDER_STATUS_UNAVAILABLE_OR_UNKNOWN_OID'};
+  const detail=r.order.order;
+  const status=String(r.order.status||'');
+  const oid=String(detail.oid??'');
+  const rawQty=Number(detail.origSz);
+  if(!/^\d+$/.test(oid)||detail.coin!==intent.coin||
+      detail.side!==(intent.side==='BUY'?'B':'A')||
+      detail.reduceOnly!==intent.reduceOnly||
+      (intent.exchangeCloid&&String(detail.cloid||'').toLowerCase()!==intent.exchangeCloid.toLowerCase())||
+      !Number.isFinite(rawQty)||Math.abs(rawQty-intent.requestedQty)>1e-8)
+    return {kind:'UNRESOLVED',reason:'ORDER_IDENTITY_MISMATCH'};
+  // IOC only. An OPEN order may still be active or unknown: never call it terminal.
+  if(detail.tif!=='Ioc')return {kind:'UNRESOLVED',reason:'NOT_VERIFIED_IOC'};
+  const terminal=/^(filled|canceled|rejected|marginCanceled|vaultWithdrawalCanceled|openInterestCapCanceled|selfTradeCanceled|reduceOnlyCanceled|siblingFilledCanceled|delistedCanceled|liquidatedCanceled|scheduledCancel|tickRejected|minTradeNtlRejected|perpMarginRejected)$/i.test(status);
+  if(!terminal)return {kind:'UNRESOLVED',reason:'ORDER_NOT_TERMINAL:'+status};
+  const orderAt=Number(detail.timestamp);
+  if(!Number.isFinite(orderAt)||orderAt<=0)return {kind:'UNRESOLVED',reason:'ORDER_TIMESTAMP_MISSING'};
+  // Older history may be truncated by Hyperliquid retention. Absence of fills
+  // cannot prove an old IOC was unfilled.
+  if(Date.now()-orderAt>6*60*60*1000||orderAt-Date.now()>30000)
+    return {kind:'UNRESOLVED',reason:'ORDER_OUTSIDE_RELIABLE_RECOVERY_WINDOW'};
+  if(Date.now()-Number(r.order.statusTimestamp||orderAt)<5000)
+    return {kind:'UNRESOLVED',reason:'ORDER_SETTLEMENT_NOT_YET_MATURE'};
+  const from=Math.max(0,orderAt-30000);
+  const until=Math.max(Number(r.order.statusTimestamp)||orderAt,orderAt)+30000;
+  const fills:any=await info({type:'userFillsByTime',user:master,startTime:from,endTime:until,aggregateByTime:false});
+  if(!Array.isArray(fills)||fills.length>=2000)return {kind:'UNRESOLVED',reason:'FILL_HISTORY_INCOMPLETE'};
+  const matches=fills.filter((x:any)=>String(x.oid)===oid);
+  // Invalid/mismatching exchange data -> block rather than credit another order.
+  if(matches.some((x:any)=>x.coin!==intent.coin||x.side!==(intent.side==='BUY'?'B':'A')||
+      !Number.isFinite(Number(x.sz))||Number(x.sz)<=0||
+      !Number.isFinite(Number(x.time))||Number(x.time)<from||Number(x.time)>until||
+      (x.tid===undefined&&x.hash===undefined)))
+    return {kind:'UNRESOLVED',reason:'ORDER_FILL_IDENTITY_MISMATCH'};
+  const seen=new Set<string>();let total=0;
+  for(const x of matches){
+    const unique=String(x.hash??'')+':'+String(x.tid??'');
+    if(seen.has(unique))continue;seen.add(unique);total+=Number(x.sz);
+  }
+  total=Math.round(total*1e10)/1e10;
+  if(total>intent.requestedQty+1e-8||total+1e-8<intent.confirmedFillQty)
+    return {kind:'UNRESOLVED',reason:'FILL_SIZE_INCONSISTENT'};
+  if(status.toLowerCase()==='filled'&&Math.abs(total-intent.requestedQty)>1e-8)
+    return {kind:'UNRESOLVED',reason:'FILLED_STATUS_WITHOUT_COMPLETE_FILLS'};
+  if(status.toLowerCase().includes('reject')&&total>0)
+    return {kind:'UNRESOLVED',reason:'REJECTED_STATUS_WITH_FILLS'};
+  if(total===0&&!/^(rejected|tickRejected|minTradeNtlRejected|perpMarginRejected)$/i.test(status))
+    return {kind:'UNRESOLVED',reason:'NO_FILL_NOT_PROVEN_BY_ORDER_STATUS'};
+  return {kind:'VERIFIED',coin:intent.coin,oid,cloid:intent.exchangeCloid||null,totalFilledQty:total,status};
+}
+/** Lightweight read used only AFTER an order-specific recovery was verified. */
+export async function readLiveCoinQuantity(env:LiveCopyEnv,coin:string):Promise<number>{
+  const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const state:any=await info({type:'clearinghouseState',user:master});
+  const positions=state?.assetPositions;
+  if(!Array.isArray(positions))throw Error('INVALID_EXCHANGE_POSITION_RESPONSE');
+  const found=positions.find((p:any)=>p?.position?.coin===coin);
+  const qty=found===undefined?0:Number(found.position.szi);
+  if(!Number.isFinite(qty))throw Error('INVALID_EXCHANGE_SIGNED_QTY');
+  return qty;
+}
+
+}
+
+// ===== live-copy-manual-close-v2.3-stage12.ts =====
+namespace __LC_MANUAL_CLOSE {
+import assertPositionOwned = __LC_LEDGER.assertPositionOwned;
+import markSubmitting = __LC_LEDGER.markSubmitting;
+import markUnknown = __LC_LEDGER.markUnknown;
+import prepareIntent = __LC_LEDGER.prepareIntent;
+import LiveLedger = __LC_LEDGER.LiveLedger;
+import settleExchangeReceipt = __LC_SETTLEMENT.settleExchangeReceipt;
+/** Stage 12 — manual-close command engine. No UI-provided position sizes trusted.
+ * Must be called by the SINGLE serialized Durable Object; persist the ledger
+ * at each transition before an external exchange write. LIVE remains disabled
+ * until the controller routes are integrated and audited.
+ */
+
+
+export type ExchangePosition={coin:string;qty:number;szDecimals:number;markPrice:number};
+export type CloseAdapter={
+  positions():Promise<ExchangePosition[]>;
+  execute(input:{intentId:string;coin:string;direction:'LONG'|'SHORT';quantity:number;reduceOnly:true;referencePrice:number}):Promise<{status:string;executed:boolean;filledQty?:number;requestedQty?:number;oid?:string|number}>;
+};
+export type LedgerStore={load():Promise<LiveLedger>;save(value:LiveLedger):Promise<void>};
+export type CloseResult={coin:string;status:string;intentId?:string;filledQty?:number;reason?:string};
+const safeCoin=(s:string)=>/^[A-Z0-9]{2,20}$/.test(s);
+const quantize=(q:number,d:number)=>Math.floor((q+1e-12)*10**d)/10**d;
+/** Must be invoked after STOP is durably saved. One call at a time per DO. */
+export async function closeOwnedPosition(input:{coin:string;store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number}):Promise<CloseResult>{
+  const {coin,store,exchange,commandId}=input;const now=input.now||Date.now;
+  if(!safeCoin(coin)||!/^[-A-Za-z0-9_:]{8,150}$/.test(commandId))throw Error('INVALID_CLOSE_COMMAND');
+  const id=`MANUAL:${commandId}:${coin}`;
+  let ledger=await store.load();
+  const existing=ledger.intents[id];
+  if(existing)return {coin,status:existing.status,intentId:id,reason:'EXISTING_COMMAND_NO_RESUBMIT'};
+  if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
+    return {coin,status:'BLOCKED',reason:'UNRESOLVED_INTENT'};
+  const positions=await exchange.positions();
+  const p=positions.find(x=>x.coin===coin);
+  if(!p||!Number.isFinite(p.qty)||p.qty===0){
+    if(Math.abs(ledger.confirmedByCoin[coin]||0)>1e-9)throw Error('LEDGER_EXCHANGE_POSITION_MISMATCH');
+    return {coin,status:'NO_POSITION'};
+  }
+  if(!Number.isFinite(p.markPrice)||p.markPrice<=0||!Number.isInteger(p.szDecimals)||p.szDecimals<0||p.szDecimals>8)throw Error('INVALID_EXCHANGE_METADATA');
+  assertPositionOwned(ledger,coin,p.qty,p.szDecimals);
+  const quantity=quantize(Math.abs(p.qty),p.szDecimals);
+  if(quantity<=0)throw Error('QUANTITY_BELOW_PRECISION');
+  ledger=prepareIntent(ledger,{id,coin,kind:'MANUAL_CLOSE',side:p.qty>0?'SELL':'BUY',reduceOnly:true,requestedQty:quantity,sourceFillId:`manual:${commandId}`},now());
+  await store.save(ledger); // durable reservation BEFORE the write
+  ledger=markSubmitting(ledger,id,now());
+  await store.save(ledger); // persist SUBMITTING BEFORE the write
+  let receipt:{status:string;executed:boolean;filledQty?:number;requestedQty?:number;oid?:string|number};
+  try{
+    receipt=await exchange.execute({intentId:id,coin,direction:p.qty>0?'LONG':'SHORT',quantity,reduceOnly:true,referencePrice:p.markPrice});
+  }catch(error){
+    ledger=markUnknown(ledger,id,now(),`WRITE_OUTCOME_UNKNOWN:${String(error).slice(0,100)}`);
+    await store.save(ledger);
+    return {coin,status:'UNKNOWN',intentId:id,reason:'VERIFY_EXCHANGE_BEFORE_ANY_RETRY'};
+  }
+  const result=settleExchangeReceipt(ledger,{intentId:id,coin,...receipt},now());
+  ledger=result.ledger;
+  // Manual CLOSE suspends re-copying until a new, explicit whale episode.
+  // Even a rejected close must not cause an immediate automated re-open.
+  ledger={...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:true}};
+  await store.save(ledger);
+  return {coin,status:result.outcome,intentId:id,filledQty:receipt.filledQty,reason:result.reason};
+}
+/** Never issue parallel close orders. Caller must first STOP auto-copy. */
+export async function closeAllOwned(input:{store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number}){
+  const positions=await input.exchange.positions();
+  const results:CloseResult[]=[];
+  for(const p of positions){
+    const ledger=await input.store.load();
+    if(!Object.prototype.hasOwnProperty.call(ledger.confirmedByCoin,p.coin)){
+      results.push({coin:p.coin,status:'SKIPPED',reason:'NOT_OWNED_BY_LIVE_COPY'});continue;
+    }
+    try{results.push(await closeOwnedPosition({...input,coin:p.coin}));}
+    catch(e){results.push({coin:p.coin,status:'BLOCKED',reason:String(e)});}
+  }
+  return {results,allConfirmedClosed:results.length>0&&results.every(x=>x.status==='FILLED'||x.status==='NO_POSITION')};
+}
+
+}
+
+// ===== LIVE CONTROLLER (existing public export) =====
+import planCopyAction = __LC_ACCUMULATOR.planCopyAction;
+import CopyCoinState = __LC_ACCUMULATOR.CopyCoinState;
+import planAndReserve = __LC_BRIDGE.planAndReserve;
+import beginSubmission = __LC_BRIDGE.beginSubmission;
+import applyTrustedReceipt = __LC_BRIDGE.applyTrustedReceipt;
+import applyVerifiedOrder = __LC_BRIDGE.applyVerifiedOrder;
+import assertPositionOwned = __LC_LEDGER.assertPositionOwned;
+import markUnknown = __LC_LEDGER.markUnknown;
+import cancelNeverSubmittedIntent = __LC_LEDGER.cancelNeverSubmittedIntent;
+import emptyLiveLedger = __LC_LEDGER.emptyLiveLedger;
+import LiveLedger = __LC_LEDGER.LiveLedger;
+import readLiveAccount = __LC_EXECUTION.readLiveAccount;
+import executeLiveIoc = __LC_EXECUTION.executeLiveIoc;
+import cloidForIntent = __LC_EXECUTION.cloidForIntent;
+import verifyLiveOrder = __LC_EXECUTION.verifyLiveOrder;
+import readLiveCoinQuantity = __LC_EXECUTION.readLiveCoinQuantity;
+import LiveCopyEnv = __LC_EXECUTION.LiveCopyEnv;
+import closeOwnedPosition = __LC_MANUAL_CLOSE.closeOwnedPosition;
+import closeAllOwned = __LC_MANUAL_CLOSE.closeAllOwned;
+import CloseAdapter = __LC_MANUAL_CLOSE.CloseAdapter;
+import reconcileCopyLedger = __LC_RECONCILIATION.reconcileCopyLedger;
 /** LIVE COPY V2.3 - real-execution controller, Stage16 recovery patch.
  * Live orders require explicit START, durable authorization and guarded ledger.
  * Unknown results are NEVER blindly resubmitted; isolate the affected coin.
  */
-import {planCopyAction, type CopyCoinState} from './live-copy-accumulator-v2.3';
-import {planAndReserve, beginSubmission, applyTrustedReceipt, applyVerifiedOrder} from './live-copy-bridge-v2.3-stage6';
-import {assertPositionOwned, markUnknown, cancelNeverSubmittedIntent} from './live-copy-ledger-v2.3';
-import {emptyLiveLedger, type LiveLedger} from './live-copy-ledger-v2.3';
-import {readLiveAccount, executeLiveIoc, cloidForIntent, verifyLiveOrder, readLiveCoinQuantity, type LiveCopyEnv} from './live-copy-execution-v2.3';
-import {closeOwnedPosition, closeAllOwned, type CloseAdapter} from './live-copy-manual-close-v2.3-stage12';
-import {reconcileCopyLedger} from './live-copy-reconciliation-v2.3';
+
+
+
+
+
+
 
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
@@ -995,3 +1701,4 @@ export class LiveCopyControllerStage7 {
     return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,exchange_order_sent:orderWasSent,trading_enabled:true});
   }
 }
+
