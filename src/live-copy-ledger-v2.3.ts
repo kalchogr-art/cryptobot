@@ -9,7 +9,7 @@ export interface CopyIntent {
   id:string; coin:string; kind:IntentKind; side:'BUY'|'SELL'; reduceOnly:boolean;
   requestedQty:number; confirmedFillQty:number; status:IntentStatus;
   createdAt:number; updatedAt:number; sourceFillId:string; exchangeOid?:string;
-  lastError?:string;
+  lastError?:string; exchangeCloid?:string;
 }
 export interface LiveLedger {
   version:1; intents:Record<string,CopyIntent>;
@@ -71,4 +71,34 @@ export function assertPositionOwned(ledger:LiveLedger,coin:string,exchangeSigned
 }
 export function suspendCoin(ledger:LiveLedger,coin:string):LiveLedger {
   return {...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:true}};
+}
+
+/** Resolve ONLY after orderStatus identifies this particular order and its fills
+ * have been independently verified by OID in the correct master account.
+ * A terminal IOC with a partial fill is terminal, not forever PARTIAL.
+ */
+export function settleVerifiedOrder(ledger:LiveLedger,id:string,confirmedTotalQty:number,now:number,oid:string,terminalStatus:string):LiveLedger {
+  const old=ledger.intents[id];
+  if(!old||!['SUBMITTING','UNKNOWN','PARTIAL'].includes(old.status))throw Error('INTENT_NOT_UNRESOLVED');
+  if(!Number.isFinite(now)||now<=0||!oid||!Number.isFinite(confirmedTotalQty)||
+    confirmedTotalQty<0||confirmedTotalQty+1e-9<old.confirmedFillQty||confirmedTotalQty>old.requestedQty+1e-9)
+    throw Error('INVALID_VERIFIED_ORDER_TOTAL');
+  const increment=round(confirmedTotalQty-old.confirmedFillQty);
+  const status:IntentStatus=confirmedTotalQty+1e-9>=old.requestedQty?'FILLED':
+    confirmedTotalQty>0?'CANCELLED':terminalStatus.toLowerCase().includes('reject')?'REJECTED':'CANCELLED';
+  return {...ledger,
+    confirmedByCoin:{...ledger.confirmedByCoin,[old.coin]:round((ledger.confirmedByCoin[old.coin]||0)+(old.side==='BUY'?increment:-increment))},
+    intents:{...ledger.intents,[id]:{...old,status,confirmedFillQty:round(confirmedTotalQty),exchangeOid:oid,
+      updatedAt:now,lastError:'EXCHANGE_VERIFIED_'+terminalStatus.toUpperCase()}}};
+}
+
+/** PREPARED is persisted BEFORE SUBMITTING and BEFORE any exchange write.
+ * It is safe to discard only in this exact state, never SUBMITTING/UNKNOWN.
+ */
+export function cancelNeverSubmittedIntent(ledger:LiveLedger,id:string,now:number):LiveLedger{
+  const old=ledger.intents[id];
+  if(!old||old.status!=='PREPARED'||!Number.isFinite(now)||now<=0)
+    throw Error('NOT_A_NEVER_SUBMITTED_INTENT');
+  return {...ledger,intents:{...ledger.intents,[id]:{...old,status:'CANCELLED',
+    updatedAt:now,lastError:'PREPARED_NEVER_SENT_CLEARED'}}};
 }
