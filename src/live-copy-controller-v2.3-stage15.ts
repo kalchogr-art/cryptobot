@@ -1,4 +1,4 @@
-/** LIVE COPY STAGE16 - single-source edition + SOURCE CHAIN + COIN REARM + VERIFIED REVERSAL REPLACE FIX.
+/** LIVE COPY STAGE16 - ONE FILE: SOFT QUARANTINE AUTO RECOVERY + VERIFIED IOC CANCELLATION FIX.
  * Same controller and seven helpers, merged into one TypeScript module.
  * No local ./live-copy-*.ts imports are needed.
  * Requires the existing npm dependencies @msgpack/msgpack and viem.
@@ -583,8 +583,17 @@ export async function verifyLiveOrder(env:LiveCopyEnv,intent:CopyIntent):Promise
     return {kind:'UNRESOLVED',reason:'FILLED_STATUS_WITHOUT_COMPLETE_FILLS'};
   if(status.toLowerCase().includes('reject')&&total>0)
     return {kind:'UNRESOLVED',reason:'REJECTED_STATUS_WITH_FILLS'};
-  if(total===0&&!/^(rejected|tickRejected|minTradeNtlRejected|perpMarginRejected)$/i.test(status))
-    return {kind:'UNRESOLVED',reason:'NO_FILL_NOT_PROVEN_BY_ORDER_STATUS'};
+  // IMPORTANT: a terminal, IDENTIFIED IOC can legitimately be canceled with
+  // ZERO fills. The previous check incorrectly kept every such order UNKNOWN
+  // forever even after orderStatus and bounded userFillsByTime were checked.
+  // Require a mature terminal status plus the independently queried fills;
+  // do not treat unknownOid, a nonterminal order, or missing fill history as
+  // proof of no execution.
+  if(total===0){
+    const safeZeroTerminal=/^(rejected|tickRejected|minTradeNtlRejected|perpMarginRejected|canceled|marginCanceled|vaultWithdrawalCanceled|openInterestCapCanceled|selfTradeCanceled|reduceOnlyCanceled|siblingFilledCanceled|delistedCanceled|liquidatedCanceled|scheduledCancel)$/i.test(status);
+    if(!safeZeroTerminal||Date.now()-(Number(r.order.statusTimestamp)||orderAt)<30000)
+      return {kind:'UNRESOLVED',reason:'ZERO_FILL_TERMINAL_NOT_SUFFICIENTLY_VERIFIED'};
+  }
   return {kind:'VERIFIED',coin:intent.coin,oid,cloid:intent.exchangeCloid||null,totalFilledQty:total,status};
 }
 /** Lightweight read used only AFTER an order-specific recovery was verified. */
@@ -764,7 +773,8 @@ import reconcileCopyLedger = __LC_RECONCILIATION.reconcileCopyLedger;
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
-type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number;forceNewEpisode?:boolean};
+type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number;forceNewEpisode?:boolean;
+  lastSkipReason?:string;lastSkipAt?:number;quarantineReason?:string};
 // ===== SOURCE CHAIN INTAKE (D1 ROWID != WHALE EXECUTION ORDER) =====
 // A durable intake queue commits the D1 ingestion watermark only AFTER all
 // fetched rows are persisted. Each source fill is acknowledged independently;
@@ -1049,28 +1059,37 @@ export class LiveCopyControllerStage7 {
       if(!Number.isInteger(decimal)||decimal<0||decimal>8)continue;
       const expected=candidate.ledger.confirmedByCoin[intent.coin]||0;
       const matched=Math.abs(expected-current)<=0.51*10**(-decimal);
-      const verifiedLedger=matched?candidate.ledger:{...candidate.ledger,
-        suspendedCoins:{...candidate.ledger.suspendedCoins,[intent.coin]:true}};
+      // A resolved UNKNOWN is no longer a reason to keep this coin blocked.
+      // Clear an old soft ledger suspension only after the order is terminal
+      // AND exchange position equals ledger. Preserve explicit MANUAL_CLOSE.
+      const keepManual=Object.values(candidate.ledger.intents).some(i=>
+        i.coin===intent.coin&&i.kind==='MANUAL_CLOSE');
+      const verifiedLedger={...candidate.ledger,suspendedCoins:{
+        ...candidate.ledger.suspendedCoins,[intent.coin]:!matched||keepManual}};
       await this.state.storage.put('live_copy_v23_ledger',verifiedLedger);
       s.coins[intent.coin]={...c,confirmedOwnQty:expected,pendingIntentId:null,
-        suspended:!matched||!!verifiedLedger.suspendedCoins[intent.coin]};
+        suspended:!matched||keepManual,quarantineReason:!matched?'POSITION_OWNERSHIP_MISMATCH':
+          keepManual?'MANUAL_CLOSE':undefined};
       this.audit(s,matched?'LIVE_ORDER_RECOVERED':'COIN_POSITION_MISMATCH_QUARANTINED',intent.coin,
         `intent=${intent.id}; oid=${result.oid}; status=${result.status}; filled=${result.totalFilledQty}; expected=${expected}; actual=${current}`);
       await this.save(s);
     }
   }
 
-  /** A fresh OPEN/REVERSAL may replace a temporarily suspended source target.
-   * The OLD intent is never removed while its exchange outcome is unknown.
-   * Re-arm only after a fresh exchange position and mark-price check, and only
-   * if all intents for this coin are terminal. Never adopt somebody else's
-   * position in a shared Hyperliquid account.
+  /** Lift old SOFT quarantines without discarding exchange intents.
+   *  - An owned, verified position may resume management on any fresh fill.
+   *  - A flat coin may enter only at a fresh OPEN or REVERSAL, never a random
+   *    inherited ADD/PARTIAL_CLOSE from a whale position we did not copy.
+   *  - A manual close requires a new flat->open episode.
+   *  - UNKNOWN/SUBMITTING/PARTIAL/PREPARED writes remain blocked until their
+   *    own exchange outcome has been independently resolved.
+   *  - Last received source price is NOT a release condition: a separate
+   *    mandatory live-mark check runs before any exchange write.
    */
   private async rearmCoinOnVerifiedFreshSignal(s:Snapshot,coin:string,action:string,
-      before:number,price:number,eventTime:number,decimals:number):Promise<boolean>{
-    if(action!=='OPEN'&&action!=='REVERSAL')return false;
-    const eventMs=eventTime<1e11?eventTime*1000:eventTime;
-    if(Date.now()-eventMs>60000||eventMs-Date.now()>30000)return false;
+      before:number,_price:number,eventTime:number,decimals:number):Promise<boolean>{
+    const ms=eventTime<1e11?eventTime*1000:eventTime;
+    if(ms>Date.now()+30000||Date.now()-ms>120000)return false;
     const old=s.coins[coin];
     const ledger=await this.ledger();
     if(!old?.suspended&&!ledger.suspendedCoins[coin])return false;
@@ -1080,33 +1099,29 @@ export class LiveCopyControllerStage7 {
       const pending=ledger.intents[old.pendingIntentId];
       if(!pending||!['FILLED','REJECTED','CANCELLED'].includes(pending.status))return false;
     }
-    // A manual CLOSE must not silently reopen the same whale position. A
-    // genuinely new zero-to-open episode can rearm after a verified flat account.
-    const manual=related.some(i=>i.kind==='MANUAL_CLOSE');
     const expected=ledger.confirmedByCoin[coin]||0;
-    if(manual && !(action==='OPEN'&&Math.abs(before)<1e-10&&Math.abs(expected)<1e-10))return false;
-    let actual:number,mid:number;
-    try{
-      const account=await readLiveAccount(this.env);
-      if(!account.assetMeta.some((a:any)=>a.coin===coin&&a.szDecimals===decimals))return false;
-      actual=account.positions.find((p:any)=>p.coin===coin)?.qty||0;
-      const r=await fetch('https://api.hyperliquid.xyz/info',{
-        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
-      if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
-      const mids=await r.json() as Record<string,string>;
-      mid=Number(mids[coin]);
-    }catch(e){
-      if(this.isRateLimited(e))await this.deferRateLimit('COIN_REARM_READ');
-      return false;
+    const hasOwnedPosition=Math.abs(expected)>0.51*10**(-decimals);
+    if(!hasOwnedPosition&&action!=='OPEN'&&action!=='REVERSAL')return false;
+    const manual=related.some(i=>i.kind==='MANUAL_CLOSE');
+    if(manual&&!(action==='OPEN'&&Math.abs(before)<1e-10&&!hasOwnedPosition))return false;
+    let actual:number;
+    try{actual=await readLiveCoinQuantity(this.env,coin);}
+    catch(e){
+      if(this.isRateLimited(e))await this.deferRateLimit('COIN_AUTO_RECOVERY_READ');
+      this.audit(s,'COIN_REARM_RETRY',coin,'exchange_position_unavailable='+String(e).slice(0,120));
+      await this.save(s);return false;
     }
-    if(!Number.isFinite(actual)||Math.abs(actual-expected)>0.51*10**(-decimals))return false;
-    if(!Number.isFinite(mid)||mid<=0||Math.abs(mid-price)/mid>0.005)return false;
-    const unlocked={...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:false}};
-    await this.state.storage.put('live_copy_v23_ledger',unlocked);
-    if(old)s.coins[coin]={...old,suspended:false,pendingIntentId:null,confirmedOwnQty:expected,
-      forceNewEpisode:Math.abs(expected)<1e-10};
-    this.audit(s,'COIN_REARM_VERIFIED',coin,
-      `trigger=${action}; previous_position=${expected}; exchange_position=${actual}; fresh_mark=${mid}; old_terminal_only=true`);
+    if(!Number.isFinite(actual)||Math.abs(actual-expected)>0.51*10**(-decimals)){
+      this.audit(s,'COIN_REARM_POSITION_MISMATCH',coin,`ledger=${expected}; exchange=${actual}; no_order`);
+      await this.save(s);return false;
+    }
+    await this.state.storage.put('live_copy_v23_ledger',{
+      ...ledger,suspendedCoins:{...ledger.suspendedCoins,[coin]:false}});
+    if(old)s.coins[coin]={...old,suspended:false,pendingIntentId:null,
+      confirmedOwnQty:expected,forceNewEpisode:!hasOwnedPosition,
+      quarantineReason:undefined};
+    this.audit(s,'COIN_AUTO_RECOVERED',coin,
+      `signal=${action}; position=${expected}; verified_exchange=${actual}; flat=${!hasOwnedPosition}; no_old_order_replay=true`);
     await this.save(s);
     return true;
   }
@@ -1349,7 +1364,13 @@ export class LiveCopyControllerStage7 {
       const increasing=Math.abs(actual)>1e-9 && Math.sign(delta)===Math.sign(actual);
       const pendingAddUsd=increasing?Math.max(0,Math.abs(delta)*Number(p.lastPrice)):0;
       const minimumUsd=10.40; // strategy threshold; exchange may impose another minimum
+      const openIntents=intents.filter(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
       return {...p,confirmedOwnQty:actual,addSignals:p.addSignals??null,
+        quarantine_active:!!p.suspended||!!ledger.suspendedCoins[p.coin]||openIntents.length>0,
+        quarantine_reason:openIntents.length?'UNRESOLVED_EXCHANGE_ORDER':
+          ledger.suspendedCoins[p.coin]?'LEDGER_SUSPENSION':
+          p.suspended?(p.quarantineReason||'PREVIOUS_COIN_SUSPENSION'):null,
+        unresolved_intent_count:openIntents.length,
         pendingAddUsd:Math.round(pendingAddUsd*100)/100,
         addRemainingUsd:increasing?Math.round(Math.max(0,minimumUsd-pendingAddUsd)*100)/100:null,
         addMinimumUsd:minimumUsd,filledAdds:adds.length,
@@ -1520,7 +1541,7 @@ export class LiveCopyControllerStage7 {
     if(request.method==='GET'&&path==='/status'){
       const sourcePending=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_CHAIN_BUFFER_SAFE_REORDER',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
+      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_SOFT_QUARANTINE_RECOVERY_V1',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1922,9 +1943,10 @@ export class LiveCopyControllerStage7 {
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
     if(s.sessionKind==='DRY_RUN')await this.paperMark(coin,price);
-    // Old soft quarantines are rearmed only by a NEW, live-priced OPEN/REVERSAL.
-    // A previously transmitted UNKNOWN order is not canceled or erased.
-    if(s.sessionKind==='LIVE' && (source_action==='OPEN'||source_action==='REVERSAL')){
+    // Auto-recovery is attempted on every NEW source change if an owned
+    // position exists, or on OPEN/REVERSAL for an unowned flat coin.
+    // A previously transmitted UNKNOWN order is never erased/re-sent.
+    if(s.sessionKind==='LIVE'){
       const pending=(await this.ledger());
       if(Object.values(pending.intents).some(i=>i.coin===coin&&
         ['SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
@@ -1951,15 +1973,13 @@ export class LiveCopyControllerStage7 {
           await this.save(s);
           return json({ok:true,ignored:true,reason:'STALE_UNTRACKED_FILL_SKIPPED',exchange_order_sent:false});
         }
-        // Do not trade stale fills. Quarantine this coin while preserving the
-        // whale's source target chain, so OTHER coins may proceed.
+        // Late source events cannot create durable exchange quarantines.
+        // No order is sent; preserve the whale target for the next current
+        // event while retaining any EXISTING real-order safety block.
         if(old)s.coins[coin]={...old,lastWhaleTarget:whale_target_qty,
-          lastEventAt:time,lastFillId:fill_id,suspended:true};
-        const staleLedger=await this.ledger();
-        await this.state.storage.put('live_copy_v23_ledger',{
-          ...staleLedger,suspendedCoins:{...staleLedger.suspendedCoins,[coin]:true}});
-        s.seen[id]=Date.now();this.audit(s,'STALE_FILL_COIN_QUARANTINED',coin,`fill=${fill_id}; eventMs=${eventMs}`);
-        await this.save(s);return json({ok:true,ignored:true,quarantined:true,reason:'STALE_FILL_COIN_QUARANTINED'});
+          lastEventAt:time,lastFillId:fill_id,lastSkipReason:'STALE_SOURCE_EVENT',lastSkipAt:Date.now()};
+        s.seen[id]=Date.now();this.audit(s,'STALE_FILL_NO_ORDER',coin,`fill=${fill_id}; eventMs=${eventMs}; no_new_quarantine`);
+        await this.save(s);return json({ok:true,ignored:true,quarantined:false,reason:'STALE_FILL_NO_ORDER'});
       }
       const existingLedger=await this.ledger();
       const unresolved=Object.values(existingLedger.intents).some(i=>i.coin===coin&&
@@ -1973,7 +1993,7 @@ export class LiveCopyControllerStage7 {
       }
     }
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
-    if(old?.suspended)return json({ok:true,ignored:true,reason:'COIN_SUSPENDED',exchange_order_sent:false});
+    if(old?.suspended)return json({ok:true,ignored:true,reason:'COIN_PENDING_VERIFICATION_OR_SUSPENDED',exchange_order_sent:false});
     // A genuine public fill can reverse an inherited whale position.
     // The old side was NEVER owned by LIVE COPY: anchor only the NEW side.
     // Never synthesize a close order for the inherited side.
@@ -2067,15 +2087,18 @@ export class LiveCopyControllerStage7 {
       assertPositionOwned(ledger,coin,account.positions.find((p:any)=>p.coin===coin)?.qty||0,sz_decimals);
     }catch(e){if(this.isRateLimited(e)){const retryAt=await this.deferRateLimit('PRE_TRADE_READ_ONLY_CHECK');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
       const reason=String(e);
-      // An out-of-date source quote or a failed read did NOT send any order.
-      // Do not permanently quarantine the coin for this transient condition.
-      const temporary=/STALE_SOURCE_PRICE|MARK_PRICE_HTTP_|PRE_ORDER_ACCOUNT_READ|ACCOUNT_HTTP_|FETCH_FAILED|NETWORK/i.test(reason);
-      record.suspended=!temporary;
+      // A failed PRE-ORDER read never sends an order. Never turn an ordinary
+      // quote/metadata/network/precision fault into a permanent coin lock.
+      // A verified ownership mismatch is different: DO block this coin.
+      const ownershipMismatch=/POSITION_OWNERSHIP_MISMATCH/i.test(reason);
+      record.suspended=ownershipMismatch;
+      record.quarantineReason=ownershipMismatch?'POSITION_OWNERSHIP_MISMATCH':undefined;
+      record.lastSkipReason=reason.slice(0,150);record.lastSkipAt=Date.now();
       s.coins[coin]=record;s.seen[id]=Date.now();
-      this.audit(s,temporary?'PRE_TRADE_TEMPORARY_SKIP':'PRE_TRADE_COIN_QUARANTINED',coin,reason.slice(0,200));
+      this.audit(s,ownershipMismatch?'COIN_OWNERSHIP_REVIEW_REQUIRED':'PRE_TRADE_NO_ORDER',coin,reason.slice(0,200));
       await this.save(s);
-      return json({ok:true,ignored:true,quarantined:!temporary,
-        reason:temporary?'PRE_TRADE_TEMPORARY_SKIP':'PRE_TRADE_CHECK_FAILED',detail:reason});}
+      return json({ok:true,ignored:true,quarantined:ownershipMismatch,
+        reason:ownershipMismatch?'POSITION_OWNERSHIP_MISMATCH':'PRE_TRADE_NO_ORDER',detail:reason});}
     if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
       s.coins[coin]={...record,suspended:true};s.seen[id]=Date.now();
       this.audit(s,'COIN_UNRESOLVED_BLOCKED',coin,'Previous order still pending verification');await this.save(s);
@@ -2083,9 +2106,17 @@ export class LiveCopyControllerStage7 {
     const intentId=`AUTO:${coin}:${fill_id}`;
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
-    catch(e){record.suspended=true;s.coins[coin]=record;s.seen[id]=Date.now();
-      this.audit(s,'INTENT_PLANNING_COIN_QUARANTINED',coin,String(e).slice(0,120));await this.save(s);
-      return json({ok:true,ignored:true,quarantined:true,reason:'INTENT_PLANNING_FAILED',detail:String(e)});}
+    catch(e){
+      // Planning has sent NO exchange order. Do not add a NEW permanent
+      // quarantine for a validation/precision/transient planner error.
+      // Existing ledger restrictions are preserved, never deleted here.
+      const error=String(e);
+      record.lastSkipReason='PLANNING:'+error.slice(0,130);
+      record.lastSkipAt=Date.now();
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'INTENT_PLANNING_NO_ORDER',coin,error.slice(0,140));await this.save(s);
+      return json({ok:true,ignored:true,quarantined:!!record.suspended||!!ledger.suspendedCoins[coin],
+        reason:'INTENT_PLANNING_NO_ORDER',detail:error});}
     if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason+` pending_usd=${planned.proposal.pendingNotional.toFixed(4)}`);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
     // Persist the reservation and in-flight state BEFORE the exchange request.
     // Persist deterministic exchange client ID BEFORE the order request. A
