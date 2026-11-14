@@ -1,5 +1,5 @@
 /** Stage 12 — manual-close command engine. No UI-provided position sizes trusted.
- * Must be called by the SINGLE serialized Durable Object; persist the ledger
+ * Must be called by the .SINGLE serialized Durable Object; persist the ledger
  * at each transition before an external exchange write. LIVE remains disabled
  * until the controller routes are integrated and audited.
  */
