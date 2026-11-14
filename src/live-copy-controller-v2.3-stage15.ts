@@ -37,7 +37,8 @@ export class LiveCopyControllerStage7 {
   private readonly rateLimitUntilKey='live_copy_v23_rate_limit_until';
   private isRateLimited(e:unknown){return /(?:HTTP_429|META_HTTP_429|RATE_LIMIT|TOO_MANY_REQUESTS)/i.test(String(e));}
   private async deferRateLimit(source:string){
-    const until=Date.now()+60000;
+    const existing=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
+    const until=Math.max(existing,Date.now()+60000);
     await this.state.storage.put(this.rateLimitUntilKey,until);
     const current=await this.load();this.audit(current,'HYPERLIQUID_RATE_LIMIT_BACKOFF',undefined,source+'; retry after 60s; NO ORDERS');await this.save(current);
     return until;
@@ -447,6 +448,14 @@ export class LiveCopyControllerStage7 {
       if(!this.liveEnabled())await this.paperReset(startedAt);
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
+      // Both scheduled polling and event-driven wakeups honor one shared backoff.
+      // A wakeup during cooldown must not query Hyperliquid or send orders.
+      const cooldown=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
+      if(Date.now()<cooldown){
+        if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
+        if(this.state.storage.setAlarm)await this.state.storage.setAlarm(cooldown+1000);
+        return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:cooldown,exchange_order_sent:false},503);
+      }
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){const restored=await this.restoreLiveArm(s);if(!restored.ok){if(restored.reason==='HYPERLIQUID_RATE_LIMIT_RETRY'){const retryAt=await this.deferRateLimit('RESTORE_LIVE_ARM');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
         await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+restored.reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason:restored.reason,stopped:true},409);}}
       if(s.mode==='RUNNING'&&((s.sessionKind==='LIVE'&&!this.liveAuthorized(s))||(s.sessionKind!=='LIVE'&&this.liveEnabled()))){const reason=s.sessionKind==='LIVE'?this.liveAuthorizationReason(s):'DRY_RUN_CONFIGURATION_CHANGED_TO_LIVE';await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED:'+reason);return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',reason,stopped:true},409);}
