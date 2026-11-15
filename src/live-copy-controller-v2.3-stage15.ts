@@ -1,4 +1,4 @@
-/** LIVE COPY STAGE16 - ONE FILE: SOFT QUARANTINE AUTO RECOVERY + VERIFIED IOC CANCELLATION FIX.
+/** LIVE COPY STAGE16 - ONE FILE: SIMPLIFIED SOFT SUSPENSION / OWNED EXIT RETRY.
  * Same controller and seven helpers, merged into one TypeScript module.
  * No local ./live-copy-*.ts imports are needed.
  * Requires the existing npm dependencies @msgpack/msgpack and viem.
@@ -868,6 +868,18 @@ const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',starte
 const json=(v:unknown,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 const finite=(v:unknown)=>typeof v==='number'&&Number.isFinite(v);
 const round=(n:number)=>Math.round(n*1e10)/1e10;
+/** Exposure-reducing source target for a position already confirmed in our ledger.
+ * This is only a classification; exchange ownership and all outstanding writes
+ * must be checked independently before any reduceOnly request is submitted.
+ */
+export function sourceReducesOwnedV23(owned:number,target:number,scale:number,decimals:number):boolean {
+  if(!Number.isFinite(owned)||!Number.isFinite(target)||!Number.isFinite(scale)||scale<=0||
+      !Number.isInteger(decimals)||decimals<0||decimals>8)return false;
+  const unit=10**(-decimals);
+  if(Math.abs(owned)<=0.51*unit)return false;
+  const desired=target*scale;
+  return Math.sign(desired)!==Math.sign(owned)||Math.abs(desired)<Math.abs(owned)-0.51*unit;
+}
 // ZEC ONLY: smallest exchange-valid initial order >= $10.40, with a hard $20 cap.
 // No fallback to larger orders; no catch-up of old whale fills.
 function zecInitialQuantity(price:number,decimals:number):number|null{
@@ -1087,23 +1099,31 @@ export class LiveCopyControllerStage7 {
    *    mandatory live-mark check runs before any exchange write.
    */
   private async rearmCoinOnVerifiedFreshSignal(s:Snapshot,coin:string,action:string,
-      before:number,_price:number,eventTime:number,decimals:number):Promise<boolean>{
+      before:number,target:number,eventTime:number,decimals:number):Promise<boolean>{
     const ms=eventTime<1e11?eventTime*1000:eventTime;
-    if(ms>Date.now()+30000||Date.now()-ms>120000)return false;
     const old=s.coins[coin];
     const ledger=await this.ledger();
     if(!old?.suspended&&!ledger.suspendedCoins[coin])return false;
+    const expected=ledger.confirmedByCoin[coin]||0;
+    // Only FLAT new entries need source freshness to lift a soft lock.
+    // An already owned position must be able to recover on the NEXT source
+    // change regardless of how long a previous soft suspension lasted.
+    // Stale source entries are independently rejected by the /event gate.
+    const hasOwnedPosition=Math.abs(expected)>0.51*10**(-decimals);
+    if(!hasOwnedPosition&&(ms>Date.now()+30000||Date.now()-ms>120000))return false;
     const related=Object.values(ledger.intents).filter(i=>i.coin===coin);
     if(related.some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return false;
     if(old?.pendingIntentId){
       const pending=ledger.intents[old.pendingIntentId];
       if(!pending||!['FILLED','REJECTED','CANCELLED'].includes(pending.status))return false;
     }
-    const expected=ledger.confirmedByCoin[coin]||0;
-    const hasOwnedPosition=Math.abs(expected)>0.51*10**(-decimals);
     if(!hasOwnedPosition&&action!=='OPEN'&&action!=='REVERSAL')return false;
-    const manual=related.some(i=>i.kind==='MANUAL_CLOSE');
-    if(manual&&!(action==='OPEN'&&Math.abs(before)<1e-10&&!hasOwnedPosition))return false;
+    // A manual close is an explicit FLAT episode lock, not a lifetime ban.
+    // Historic MANUAL_CLOSE intents must not block management of a later
+    // independently confirmed owned position.
+    const explicitFlatManualLock=!hasOwnedPosition && !!ledger.suspendedCoins[coin] &&
+      related.some(i=>i.kind==='MANUAL_CLOSE');
+    if(explicitFlatManualLock&&!(action==='OPEN'&&Math.abs(before)<1e-10))return false;
     let actual:number;
     try{actual=await readLiveCoinQuantity(this.env,coin);}
     catch(e){
@@ -1371,6 +1391,8 @@ export class LiveCopyControllerStage7 {
           ledger.suspendedCoins[p.coin]?'LEDGER_SUSPENSION':
           p.suspended?(p.quarantineReason||'PREVIOUS_COIN_SUSPENSION'):null,
         unresolved_intent_count:openIntents.length,
+        owned_position_requires_attention:Math.abs(actual)>1e-9 &&
+          (!!p.suspended||!!ledger.suspendedCoins[p.coin]||openIntents.length>0),
         pendingAddUsd:Math.round(pendingAddUsd*100)/100,
         addRemainingUsd:increasing?Math.round(Math.max(0,minimumUsd-pendingAddUsd)*100)/100:null,
         addMinimumUsd:minimumUsd,filledAdds:adds.length,
@@ -1541,7 +1563,7 @@ export class LiveCopyControllerStage7 {
     if(request.method==='GET'&&path==='/status'){
       const sourcePending=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_SOFT_QUARANTINE_RECOVERY_V1',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
+      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_SIMPLIFIED_OWNED_EXIT_V1',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1956,7 +1978,7 @@ export class LiveCopyControllerStage7 {
         Object.assign(s,latest);
       }
       await this.rearmCoinOnVerifiedFreshSignal(s,coin,source_action,whale_before_qty,
-        price,time,sz_decimals);
+        whale_target_qty,time,sz_decimals);
     }
     const old=s.coins[coin];
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
@@ -1985,11 +2007,35 @@ export class LiveCopyControllerStage7 {
       const unresolved=Object.values(existingLedger.intents).some(i=>i.coin===coin&&
         ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
       if(unresolved||existingLedger.suspendedCoins[coin]||old?.suspended){
-        if(old)s.coins[coin]={...old,lastWhaleTarget:whale_target_qty,lastEventAt:time,lastFillId:fill_id};
+        const owned=existingLedger.confirmedByCoin[coin]||0;
+        const exitWaiting=!!old&&sourceReducesOwnedV23(owned,whale_target_qty,old.scale,sz_decimals);
+        // Never acknowledge a needed exit as "ignored": /sync would drop it
+        // from its durable intake queue and the real exchange position could
+        // remain exposed indefinitely. Keep it pending for order-specific
+        // verification / ownership matching; unrelated coins still progress.
+        // No new exchange write is made here; an UNKNOWN order is not erased.
+        if(exitWaiting){
+          const reason=unresolved?'UNRESOLVED_EXCHANGE_INTENT':
+            existingLedger.suspendedCoins[coin]?'LEDGER_SUSPENSION':'COIN_SUSPENDED';
+          if(old && (old.lastSkipReason!==reason||Date.now()-(old.lastSkipAt||0)>60000)){
+            s.coins[coin]={...old,lastSkipReason:reason,lastSkipAt:Date.now(),quarantineReason:reason};
+            this.audit(s,'OWNED_EXIT_WAITING_FOR_RECONCILIATION',coin,
+              `fill=${fill_id}; ledger_qty=${owned}; target=${whale_target_qty}; reason=${reason}; NOT_ACKNOWLEDGED`);
+            await this.save(s);
+          }
+          return json({ok:false,error:'OWNED_EXIT_PENDING_RECONCILIATION',
+            reason,coin,fill_id,exchange_order_sent:false},409);
+        }
+        // For unrelated new entries continue to suppress exposure, but do NOT
+        // alter the stored whale target/position to pretend we copied the fill.
+        // Existing exchange orders are resolved by recoverPendingOrders().
+        if(old)s.coins[coin]={...old,lastWhaleTarget:whale_target_qty,lastEventAt:time,lastFillId:fill_id,
+          quarantineReason:unresolved?'UNRESOLVED_EXCHANGE_INTENT':
+            existingLedger.suspendedCoins[coin]?'LEDGER_SUSPENSION':'COIN_SUSPENDED'};
         s.seen[id]=Date.now();
-        this.audit(s,'COIN_EVENT_QUARANTINED',coin,`fill=${fill_id}; unresolved=${unresolved}; manual_or_stale_suspend=${!!existingLedger.suspendedCoins[coin]}`);
+        this.audit(s,'COIN_ENTRY_QUARANTINED',coin,`fill=${fill_id}; unresolved=${unresolved}; owned_qty=${owned}`);
         await this.save(s);
-        return json({ok:true,ignored:true,quarantined:true,reason:'COIN_PENDING_VERIFICATION_OR_SUSPENDED'});
+        return json({ok:true,ignored:true,quarantined:true,reason:'COIN_ENTRY_BLOCKED_PENDING_RECONCILIATION'});
       }
     }
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
@@ -2083,27 +2129,56 @@ export class LiveCopyControllerStage7 {
       if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
       const mids=await r.json() as Record<string,string>;
       markPrice=Number(mids[coin]);
-      if(!Number.isFinite(markPrice)||markPrice<=0||Math.abs(markPrice-price)/markPrice>0.005)throw Error('STALE_SOURCE_PRICE');
+      if(!Number.isFinite(markPrice)||markPrice<=0)throw Error('INVALID_CURRENT_MARK_PRICE');
+      // The source fill price is an ENTRY freshness filter, not an exit veto.
+      // If our OWNED position is being reduced, use the current exchange mark
+      // for a reduceOnly close. Never apply this exception to an OPEN or ADD;
+      // the normal adapter and ledger checks below still apply to ALL orders.
+      const reduceOwned=sourceReducesOwnedV23(ledger.confirmedByCoin[coin]||0,
+        whale_target_qty,record.scale,sz_decimals);
+      if(!reduceOwned&&Math.abs(markPrice-price)/markPrice>0.005)throw Error('STALE_SOURCE_PRICE');
       assertPositionOwned(ledger,coin,account.positions.find((p:any)=>p.coin===coin)?.qty||0,sz_decimals);
     }catch(e){if(this.isRateLimited(e)){const retryAt=await this.deferRateLimit('PRE_TRADE_READ_ONLY_CHECK');return json({ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:retryAt,exchange_order_sent:false},503);}
       const reason=String(e);
-      // A failed PRE-ORDER read never sends an order. Never turn an ordinary
-      // quote/metadata/network/precision fault into a permanent coin lock.
-      // A verified ownership mismatch is different: DO block this coin.
+      // If we already own exposure and this source change requires a CLOSE,
+      // do not mark it as processed when a read-only check fails. The durable
+      // source queue can retry, while all other coins continue processing.
+      // Never submit without a fresh, matching exchange position.
+      const ownedExit=sourceReducesOwnedV23(ledger.confirmedByCoin[coin]||0,
+        whale_target_qty,record.scale,sz_decimals);
+      if(ownedExit){
+        if(old){old.lastSkipReason=reason.slice(0,150);old.lastSkipAt=Date.now();}
+        this.audit(s,'OWNED_EXIT_PRECHECK_PENDING',coin,`fill=${fill_id}; reason=${reason.slice(0,150)}; NOT_ACKNOWLEDGED`);
+        await this.save(s);
+        return json({ok:false,error:'OWNED_EXIT_PRECHECK_PENDING',detail:reason,
+          exchange_order_sent:false,coin,fill_id},409);
+      }
+      // A temporary price / read failure did not transmit an order. Skip a
+      // stale ENTRY rather than installing another permanent coin quarantine.
       const ownershipMismatch=/POSITION_OWNERSHIP_MISMATCH/i.test(reason);
-      record.suspended=ownershipMismatch;
-      record.quarantineReason=ownershipMismatch?'POSITION_OWNERSHIP_MISMATCH':undefined;
       record.lastSkipReason=reason.slice(0,150);record.lastSkipAt=Date.now();
+      record.suspended=false;record.quarantineReason=undefined;
       s.coins[coin]=record;s.seen[id]=Date.now();
-      this.audit(s,ownershipMismatch?'COIN_OWNERSHIP_REVIEW_REQUIRED':'PRE_TRADE_NO_ORDER',coin,reason.slice(0,200));
+      this.audit(s,ownershipMismatch?'FOREIGN_POSITION_NO_ORDER':'PRE_TRADE_NO_ORDER',coin,reason.slice(0,200));
       await this.save(s);
-      return json({ok:true,ignored:true,quarantined:ownershipMismatch,
-        reason:ownershipMismatch?'POSITION_OWNERSHIP_MISMATCH':'PRE_TRADE_NO_ORDER',detail:reason});}
+      return json({ok:true,ignored:true,quarantined:false,
+        reason:ownershipMismatch?'FOREIGN_POSITION_NO_ORDER':'PRE_TRADE_NO_ORDER',detail:reason});}
     if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
-      s.coins[coin]={...record,suspended:true};s.seen[id]=Date.now();
-      this.audit(s,'COIN_UNRESOLVED_BLOCKED',coin,'Previous order still pending verification');await this.save(s);
+      const ownedExit=sourceReducesOwnedV23(ledger.confirmedByCoin[coin]||0,
+        whale_target_qty,record.scale,sz_decimals);
+      this.audit(s,'COIN_ORDER_VERIFICATION_PENDING',coin,'Previous order still pending verification');
+      if(ownedExit){await this.save(s);return json({ok:false,error:'OWNED_EXIT_PENDING_RECONCILIATION',
+        coin,fill_id,exchange_order_sent:false},409);}
+      s.seen[id]=Date.now();await this.save(s);
       return json({ok:true,ignored:true,quarantined:true,reason:'UNRESOLVED_INTENT_BEFORE_NEW_ORDER'});}
-    const intentId=`AUTO:${coin}:${fill_id}`;
+    // Only a positively verified NO-ORDER exit may retry the SAME source
+    // change. Give that new attempt a distinct deterministic intent/cloid;
+    // never resubmit a SUBMITTING/UNKNOWN/PARTIAL write.
+    const safeNoOrderAttempts=Object.values(ledger.intents).filter(i=>i.coin===coin&&
+      i.sourceFillId===fill_id&&i.reduceOnly&&i.status==='REJECTED'&&
+      (i.lastError||'').startsWith('NO_ORDER_OR_EXCHANGE_REJECTED:')&&
+      i.lastError!=='NO_ORDER_OR_EXCHANGE_REJECTED:REJECTED');
+    const intentId=`AUTO:${coin}:${fill_id}`+(safeNoOrderAttempts.length?`:RETRY${safeNoOrderAttempts.length}`:'');
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
     catch(e){
@@ -2111,6 +2186,14 @@ export class LiveCopyControllerStage7 {
       // quarantine for a validation/precision/transient planner error.
       // Existing ledger restrictions are preserved, never deleted here.
       const error=String(e);
+      const ownedExit=sourceReducesOwnedV23(ledger.confirmedByCoin[coin]||0,
+        whale_target_qty,record.scale,sz_decimals);
+      if(ownedExit){
+        if(old){old.lastSkipReason='PLANNING:'+error.slice(0,130);old.lastSkipAt=Date.now();}
+        this.audit(s,'OWNED_EXIT_PLANNING_PENDING',coin,error.slice(0,140));await this.save(s);
+        return json({ok:false,error:'OWNED_EXIT_PLANNING_PENDING',detail:error,
+          coin,fill_id,exchange_order_sent:false},409);
+      }
       record.lastSkipReason='PLANNING:'+error.slice(0,130);
       record.lastSkipAt=Date.now();
       s.coins[coin]=record;s.seen[id]=Date.now();
@@ -2140,6 +2223,19 @@ export class LiveCopyControllerStage7 {
     await this.state.storage.put('live_copy_v23_ledger',settled.ledger);
     s.coins[coin]=settled.state as Coin;
     this.audit(s,'LIVE_ORDER_'+settled.outcome,coin,`${planned.proposal.kind} qty=${planned.proposal.quantity} result=${receipt.status} filled=${receipt.filledQty??'unknown'} oid=${receipt.oid??'unknown'} intent=${intentId}`);
+    if(settled.outcome==='REJECTED'&&planned.proposal.reduceOnly&&orderWasSent===false){
+      // The adapter confirms it never submitted an order. Restore the prior
+      // source anchor and keep the close in the durable queue for a fresh
+      // exchange precheck; a terminal REJECTED intent remains auditable.
+      if(old)s.coins[coin]={...old,pendingIntentId:null,
+        confirmedOwnQty:settled.ledger.confirmedByCoin[coin]||0};
+      else delete s.coins[coin];
+      this.audit(s,'OWNED_EXIT_NOT_SENT_RETRY',coin,
+        `fill=${fill_id}; intent=${intentId}; status=${receipt.status}; NOT_ACKNOWLEDGED`);
+      await this.save(s);
+      return json({ok:false,error:'OWNED_EXIT_NOT_SENT_RETRY',
+        coin,fill_id,order_status:receipt.status,exchange_order_sent:false},409);
+    }
     if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'){
       // A failed network response can still represent a real exchange fill.
       // Keep this intent blocked, but NEVER halt other unrelated coins.
