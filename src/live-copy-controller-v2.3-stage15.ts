@@ -833,7 +833,7 @@ namespace __LC_ORDER_FOLLOW {
   export type TargetOrder = {
     source_oid:string; coin:string; at:number; status:string;
     side:'A'|'B'; price:number; orig_sz:number; remaining_sz:number;
-    tif:string; order_type:string; reduce_only:boolean; is_trigger:boolean;
+    tif:string|null; order_type:string|null; reduce_only:boolean|null; is_trigger:boolean|null;
     source_order_time:number; observed_at:number;
   };
   export type Leg={intentId:string;cloid:string;ownOid:string|null;qty:number;filledQty:number;price:number;
@@ -872,11 +872,11 @@ namespace __LC_ORDER_FOLLOW {
       (p.reduceOnly||notional>=10)&&!terminalNow;
     let action='NO_ACTION',reason='NO_MATERIAL_CHANGE';
     if(!p){action='SKIP';reason='NO_TRACKED_ORDER';}
-    else if(p.error){action='SKIP';reason=p.error;}
     else if(terminalNow){
-      if(old){action='CANCEL_OR_FINISH';reason='SOURCE_TERMINAL_'+o.status.toUpperCase();}
+      if(old&&!terminal(old.sourceStatus)){action='CANCEL_OR_FINISH';reason='SOURCE_TERMINAL_'+o.status.toUpperCase();}
       else {action='SKIP';reason='SOURCE_ALREADY_TERMINAL';}
-    }else if(!old){
+    }else if(p.error){action='SKIP';reason=p.error;}
+    else if(!old){
       action=eligible?(o.reduce_only?'CLOSE_CANDIDATE':'OPEN_CANDIDATE'):'SKIP';
       reason=eligible?'REQUIRES_EXCHANGE_OPEN_CONFIRMATION':qty<=0?'ROUNDING_OR_SIZE_ZERO':'BELOW_MINIMUM_NOTIONAL';
     }else if(old.price!==o.price || old.sourceSize!==o.orig_sz || old.reduceOnly!==o.reduce_only){
@@ -1852,28 +1852,98 @@ export class LiveCopyControllerStage7 {
         if(!exists){
           const meta=await this.cachedMeta();const asset=meta?.universe?.find((x:any)=>x.name===o.coin);
           const fromBeforeStart=Number(o.source_order_time||0)>0&&Number(o.source_order_time)<f.startedAt;
-          const valid=!fromBeforeStart&&asset&&(o.order_type==='Limit'||(o.order_type==='Market'&&o.tif==='Ioc'))&&['Gtc','Alo','Ioc'].includes(o.tif)&&!o.is_trigger;
+          const terminalNow=__LC_ORDER_FOLLOW.terminal(o.status);
+          const hasMetadata=typeof o.order_type==='string'&&!!o.order_type&&
+            typeof o.tif==='string'&&!!o.tif&&typeof o.reduce_only==='boolean'&&typeof o.is_trigger==='boolean';
+          const valid=hasMetadata&&!fromBeforeStart&&!!asset&&
+            (o.order_type==='Limit'||(o.order_type==='Market'&&o.tif==='Ioc'))&&
+            ['Gtc','Alo','Ioc'].includes(o.tif||'')&&!o.is_trigger;
+          const pending=!terminalNow&&!fromBeforeStart&&!!asset&&!hasMetadata;
           const scale=f.scales[o.coin]||10.40/(o.orig_sz*o.price);
           const qty=asset?__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,scale,asset.szDecimals,o.price):0;
           if(valid&&!f.scales[o.coin])f.scales[o.coin]=scale;
           f.pairs[o.source_oid]={sourceOid:o.source_oid,sourceAt:o.source_order_time||o.at,
             lastSourceAt:o.at,coin:o.coin,side:o.side,price:o.price,sourceSize:o.orig_sz,
-            remainingSource:o.remaining_sz,scale,reduceOnly:o.reduce_only,tif:(valid?o.tif:'Gtc') as 'Gtc'|'Alo'|'Ioc',
+            remainingSource:o.remaining_sz,scale,reduceOnly:o.reduce_only===true,tif:(valid?o.tif:'Gtc') as 'Gtc'|'Alo'|'Ioc',
             sourceStatus:o.status,sourceFilledQty:0,lastSourceFillAt:0,qtyLimit:valid?qty:0,legs:[],
-            error:valid?'':fromBeforeStart?'ORDER_PREEXISTED_START':'UNSUPPORTED_SOURCE_ORDER',updatedAt:Date.now()};
+            error:fromBeforeStart?'ORDER_PREEXISTED_START':!asset?'UNKNOWN_ASSET':
+              pending?'SOURCE_METADATA_PENDING':terminalNow?'SOURCE_ALREADY_TERMINAL':valid?'':'UNSUPPORTED_SOURCE_ORDER',
+            updatedAt:Date.now()};
         }else if(o.at>exists.lastSourceAt || (o.at===exists.lastSourceAt &&
                    !__LC_ORDER_FOLLOW.terminal(exists.sourceStatus))){
           exists.price=o.price;exists.sourceSize=o.orig_sz;exists.remainingSource=o.remaining_sz;
           const asset=(await this.cachedMeta())?.universe?.find((x:any)=>x.name===o.coin);
-          if(asset)exists.qtyLimit=__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,exists.scale,asset.szDecimals,o.price);
+          if(asset&&exists.error!=='SOURCE_METADATA_PENDING')
+            exists.qtyLimit=__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,exists.scale,asset.szDecimals,o.price);
           exists.sourceStatus=o.status;exists.lastSourceAt=o.at;exists.updatedAt=Date.now();
+          // Recover active orders that an older build mislabeled UNSUPPORTED.
+          if(exists.error==='UNSUPPORTED_SOURCE_ORDER'&&o.status==='open'&&
+             (exists.legs||[]).length===0)exists.error='SOURCE_METADATA_PENDING';
+          if(exists.error==='SOURCE_METADATA_PENDING'&&__LC_ORDER_FOLLOW.terminal(o.status))
+            exists.error='SOURCE_FINISHED_BEFORE_METADATA';
         }
-        // Read-only decision telemetry in BOTH SHADOW and LIVE. No execution side effects.
-        __LC_ORDER_FOLLOW.recordShadow(f,row.rowid,o,f.pairs[o.source_oid]||null,old);
+        // Do not invent OPEN/SKIP decisions before the authoritative REST
+        // metadata is known. A later CANCEL always updates the same source OID.
+        const pair=f.pairs[o.source_oid]||null;
+        if(pair?.error!=='SOURCE_METADATA_PENDING')
+          __LC_ORDER_FOLLOW.recordShadow(f,row.rowid,o,pair,old);
         f.events++;
       }
       f.rowid=row.rowid;await this.saveFollow(f);
     }
+    // The WS BasicOrder payload does not reliably contain TIF, reduceOnly,
+    // orderType or trigger flags. Resolve only still-active candidates via
+    // authoritative orderStatus, never by guessing GTC / reduceOnly=false.
+    // Limit requests per run; pending orders stay in DO storage for next tick.
+    // Terminal orders are NEVER resurrected after a delayed REST response.
+    let metadataChecks=0;
+    const pending=Object.values(f.pairs).filter(p=>p.error==='SOURCE_METADATA_PENDING'&&
+      p.sourceStatus==='open'&&Date.now()-p.lastSourceAt<=30000)
+      .sort((a,b)=>b.lastSourceAt-a.lastSourceAt);
+    for(const p of pending){
+      if(metadataChecks>=8)break;
+      metadataChecks++;
+      let proof:any;
+      try{proof=await __LC_EXECUTION.sourceOrderStatus(sourceWallet,p.sourceOid);}
+      catch(e){
+        if(this.isRateLimited(e)){await this.deferRateLimit('SOURCE_METADATA_LOOKUP');break;}
+        f.coinErrors[p.coin]='SOURCE_METADATA_LOOKUP_FAILED';continue;
+      }
+      const detail=proof?.order?.order;
+      const status=String(proof?.order?.status||'').toLowerCase();
+      // The trader may already have canceled this order; don't place it.
+      if(proof?.status==='order'&&__LC_ORDER_FOLLOW.terminal(status)){
+        p.sourceStatus=status;p.error='SOURCE_EXPIRED_BEFORE_MIRROR';p.updatedAt=Date.now();
+        continue;
+      }
+      if(proof?.status!=='order'||status!=='open'||!detail)continue;
+      const kind=String(detail.orderType||''),tif=String(detail.tif||'');
+      const match=String(detail.oid)===p.sourceOid&&detail.coin===p.coin&&detail.side===p.side&&
+        Math.abs(Number(detail.limitPx)-p.price)<=Math.max(1e-8,p.price*1e-7)&&
+        Number(detail.origSz)>0&&Number(detail.sz)>0&&
+        Number(detail.timestamp)>=f.startedAt&&
+        typeof detail.reduceOnly==='boolean'&&detail.isTrigger===false&&detail.isPositionTpsl!==true&&
+        ((kind==='Limit'&&['Gtc','Alo','Ioc'].includes(tif))||(kind==='Market'&&tif==='Ioc'));
+      if(!match){p.error='SOURCE_METADATA_NOT_SUPPORTED';p.updatedAt=Date.now();continue;}
+      const asset=(await this.cachedMeta())?.universe?.find((a:any)=>a.name===p.coin);
+      if(!asset){p.error='UNKNOWN_ASSET';continue;}
+      p.reduceOnly=detail.reduceOnly;p.tif=tif as 'Gtc'|'Alo'|'Ioc';
+      p.sourceSize=Number(detail.origSz);p.remainingSource=Number(detail.sz);
+      p.sourceAt=Number(detail.timestamp);p.price=Number(detail.limitPx);
+      p.qtyLimit=__LC_ORDER_FOLLOW.quantity(p.coin,p.sourceSize,p.scale,asset.szDecimals,p.price);
+      if(!f.scales[p.coin])f.scales[p.coin]=p.scale;
+      p.error='';p.updatedAt=Date.now();
+      const observed:__LC_ORDER_FOLLOW.TargetOrder={source_oid:p.sourceOid,coin:p.coin,
+        at:p.lastSourceAt,status:'open',side:p.side,price:p.price,orig_sz:p.sourceSize,
+        remaining_sz:p.remainingSource,tif,order_type:kind,reduce_only:p.reduceOnly,
+        is_trigger:false,source_order_time:p.sourceAt,observed_at:Date.now()};
+      // One OPEN candidate per validated original OID; no extra real actions.
+      __LC_ORDER_FOLLOW.recordShadow(f,f.rowid,observed,p,null);
+    }
+    // Expire stale unresolved OPENs instead of allowing a late mirror entry.
+    for(const p of Object.values(f.pairs))if(p.error==='SOURCE_METADATA_PENDING'&&
+        Date.now()-p.lastSourceAt>30000){p.error='SOURCE_METADATA_TOO_LATE';p.updatedAt=Date.now();}
+    await this.saveFollow(f);
     // Source fills are already de-duplicated by source tid/hash in D1.
     const sourceRows=await this.env.DB.prepare(`SELECT source_oid,SUM(sz) AS total,MAX(at) AS last_at
       FROM mc_copy_source_order_fills WHERE session_id=? AND at>=? GROUP BY source_oid`).bind(f.session,f.startedAt).all<any>();
@@ -2100,6 +2170,7 @@ export class LiveCopyControllerStage7 {
         tracked_orders:Object.values(follow?.pairs||{}).slice(-60),source_events:follow?.events||0,
         unresolved_orders:Object.values(follow?.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)).length,
         adjustments:Object.values(follow?.adjustments||{}).slice(-30),coin_errors:follow?.coinErrors||{},
+        metadata_pending:Object.values(follow?.pairs||{}).filter(p=>p.error==='SOURCE_METADATA_PENDING').length,
         shadow_copy_test:{enabled:!!follow&&this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS',
           monitoring_mode:this.liveEnabled()?'LIVE_OBSERVATION':'SHADOW_OBSERVATION',
           scope:'SOURCE_ORDER_LIFECYCLE_ONLY',execution:'TELEMETRY_ONLY_NO_ADDITIONAL_ORDERS',
