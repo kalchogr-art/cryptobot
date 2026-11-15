@@ -1,147 +1,41 @@
-/** LIVE COPY V18 dashboard, read-only order-follow diagnostics added to existing controls.
- * Mount via serveLiveCopyDashboard(request, env) from the existing Worker fetch.
- * Requires LIVE_COPY_CONTROLLER Durable Object namespace and LIVE_COPY_ADMIN_TOKEN.
- * Existing START/STOP/CLOSE handlers are preserved; order-follow-status never sends orders.
- */
-export interface LiveDashboardEnv {
-  LIVE_COPY_ADMIN_TOKEN?: string;
-  LIVE_COPY_CONTROLLER?: { idFromName(name: string): unknown; get(id: unknown): {fetch(request: Request): Promise<Response>} };
-}
-const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hyperliquid LIVE COPY · V18 Dashboard</title><style>
-:root{color-scheme:dark}body{font:14px system-ui;background:#0e1624;color:#e6edf7;max-width:1250px;margin:auto;padding:18px}section{background:#172539;border:1px solid #31445d;border-radius:13px;padding:16px;margin:14px 0}h1{font-size:24px}small,.muted{color:#a8b7cb}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{padding:14px;background:#21334b;border-radius:10px}.card b{font-size:23px;display:block;margin-top:7px}button,input{border-radius:9px;padding:11px;border:1px solid #4a5f7a;color:white;background:#254b80}button{cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}.danger{background:#842e3c}.bar{display:flex;gap:9px;flex-wrap:wrap;align-items:center}table{width:100%;border-collapse:collapse}td,th{padding:10px;text-align:left;border-bottom:1px solid #34465e}th{color:#a8b7cb}#message{white-space:pre-wrap}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:250px;overflow:auto}</style></head><body>
-<h1>HYPERLIQUID · LIVE COPY <small id="liveVersion">V2.3 · проверка на версията…</small></h1><p class="muted">Контролен панел. При ORDERS режим новите ордери постъпват през WebSocket и D1. START/STOP управляват контролера; REFRESH и диагностиката са само за четене. STOP не затваря позиции.</p>
-<section><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="LIVE_COPY_ADMIN_TOKEN"><button id="connect" type="button">🔗 СВЪРЖИ</button><button id="refresh" disabled>↻ REFRESH</button><button id="accountRefresh" disabled>↻ БАЛАНС</button><button id="sync" disabled>↻ SYNC NEW FILLS</button><button id="start" disabled>▶ START · AUTO SYNC</button><button id="stop" disabled>■ STOP</button><button id="all" class="danger" disabled title="Изисква STOP и разрешение за реално затваряне">CLOSE ALL · НЕАКТИВНО</button></div><p id="message" role="status">Въведи администраторския токен и натисни СВЪРЖИ. Това не стартира търговия.</p></section>
-<section><h2>Състояние</h2><div class="cards"><div class="card">MODE<b id="mode">—</b></div><div class="card">REAL EXECUTION<b id="real">—</b></div><div class="card">TRACKED COINS<b id="coins">—</b></div><div class="card">LEDGER INTENTS<b id="intents">—</b></div><div class="card">PROCESSED FILLS<b id="fills">—</b></div></div></section>
-<section id="orderFollowPanel"><h2>V18 · ORDERS — връзка с LIVE контролера</h2>
-<p class="muted">Данни директно от Durable Object чрез <code>order-follow-status</code>. Диагностиката само чете състоянието и не пуска поръчки. Проверява се автоматично на 10 секунди, докато дашбордът е отворен.</p>
-<div class="cards">
-<div class="card">Режим на контролера<b id="of_mode">—</b></div>
-<div class="card">Обработен D1 курсор<b id="of_cursor">—</b></div>
-<div class="card">Обработени ордерни събития<b id="of_events">—</b></div>
-<div class="card">Проследявани ордери<b id="of_tracked">—</b></div>
-<div class="card">Неизяснени ордери<b id="of_unresolved">—</b></div>
-<div class="card">Реално ORDERS изпълнение<b id="of_execution">—</b></div>
-<div class="card">Последна проверка<b id="of_checked">—</b></div>
-<div class="card">Грешки в обработката<b id="of_errors">—</b></div>
-</div><p id="of_note" class="muted">Свържи дашборда, за да видиш дали контролерът обработва новите събития.</p></section>
-<section id="orderCopyTest"><h2>V18 · ORDER COPY MONITOR — LIVE + SHADOW</h2>
-<p class="muted">Ориентировъчни действия при получените ордерни събития. Няма реални поръчки, фиктивни изпълнения или симулирана печалба. OPEN/CLOSE/REPLACE са кандидати, които в LIVE трябва допълнително да бъдат потвърдени на борсата.</p>
-<div class="cards"><div class="card">Режим на теста<b id="ct_mode">—</b></div><div class="card">OPEN кандидати<b id="ct_open">0</b></div><div class="card">CLOSE кандидати (reduceOnly)<b id="ct_close">0</b></div><div class="card">REPLACE кандидати<b id="ct_replace">0</b></div><div class="card">CANCEL/FINISH<b id="ct_cancel">0</b></div><div class="card">PARTIAL FILL наблюдения<b id="ct_partial">0</b></div><div class="card">SKIP<b id="ct_skip">0</b></div></div>
-<p id="ct_note" class="muted">Свържи дашборда за решенията от текущата сесия.</p>
-<div style="overflow:auto"><table><thead><tr><th>Час (София)</th><th>Монета</th><th>Трейдър</th><th>Тестово действие</th><th>Наш кандидат qty / USD</th><th>Цена / Тип</th><th>Причина</th></tr></thead><tbody id="ct_rows"><tr><td colspan="7">Няма заредени решения</td></tr></tbody></table></div>
-</section>
-<section><h2>OVERVIEW · LIVE COPY</h2><p class="muted">Начален капитал: USDC snapshot от Hyperliquid. Непотвърдените показатели се показват като —, а не като измислена печалба. При успешен CLOSE ALL капиталът се обновява само след потвърдено затваряне на всички LIVE COPY позиции.</p><div class="cards"><div class="card">Капитал<b id="ov_capital">—</b></div><div class="card">EQUITY<b id="ov_equity">—</b></div><div class="card">ROI<b id="ov_roi">—</b></div><div class="card">Свободен маржин<b id="ov_free_margin">—</b></div><div class="card">Използван маржин<b id="ov_used_margin">—</b></div><div class="card">Реализиран бруто<b id="ov_realized_gross">—</b></div><div class="card">Такси<b id="ov_fees">—</b></div><div class="card">Реализиран нето<b id="ov_realized_net">—</b></div><div class="card">Нереализиран<b id="ov_unrealized">—</b></div><div class="card">Оборот<b id="ov_turnover">—</b></div><div class="card">НАШИ OPEN POSITIONS<b id="ov_our_open_positions">—</b></div><div class="card">Затворени<b id="ov_closed_trades">—</b></div><div class="card">WIN RATE<b id="ov_win_rate">—</b></div><div class="card">Обработени изпълнения<b id="ov_processed_fills">—</b></div><div class="card">Пропуснати<b id="ov_skipped">—</b></div><div class="card">COPY ACCURACY<b id="ov_copy_accuracy">—</b></div><div class="card">Accuracy sample<b id="ov_accuracy_sample">—</b></div><div class="card">Target Maker fills<b id="ov_target_maker_fills">—</b></div><div class="card">Target Taker fills<b id="ov_target_taker_fills">—</b></div><div class="card">TARGET OPEN ORDERS<b id="ov_target_open_orders">—</b></div><div class="card">TARGET OPEN POSITIONS<b id="ov_target_open_positions">—</b></div></div><p class="muted" id="overviewInfo">Изчаква начален баланс.</p></section>
-<section><h2>Hyperliquid · реален акаунт (само четене)</h2><p class="muted" id="accountState">Натисни СВЪРЖИ, след това БАЛАНС. Не стартира търговия.</p><div class="cards"><div class="card">USDC · UNIFIED (USD)<b id="spotUsdc">—</b></div><div class="card">PERP ACCOUNT VALUE (USD)<b id="accountValue">—</b></div><div class="card">PERP WITHDRAWABLE (USD)<b id="withdrawable">—</b></div><div class="card">MARGIN USED (USD)<b id="marginUsed">—</b></div><div class="card">ОТВОРЕНИ ПОЗИЦИИ<b id="accountPositions">—</b></div></div><p class="muted">USDC се чете от spotClearinghouseState, а позициите и маржинът от clearinghouseState. Стойностите НЕ се събират: при Unified Account това би могло да отчете средствата два пъти. USDC не е оценка на други притежавани активи. <span id="spotDetails"></span></p><div style="overflow:auto"><table><thead><tr><th>Монета</th><th>Количество</th><th>Entry</th><th>Unrealized P/L</th><th>Margin used</th></tr></thead><tbody id="accountRows"><tr><td colspan="5">Няма заредени данни</td></tr></tbody></table></div></section>
-<section><h2>Проследявани монети · LIVE COPY ledger</h2><div style="overflow:auto"><table><thead><tr><th>Монета</th><th>Цел трейдър</th><th>Наше потвърдено количество</th><th>Вход (София)</th><th>Последен ордер</th><th>ADD сигнали</th><th>Натрупан ADD</th><th>До минимум</th><th>Изпълнени ADD</th><th>Чакащ intent</th><th>Статус</th><th>Действие</th></tr></thead><tbody id="positions"><tr><td colspan="12">Няма данни</td></tr></tbody></table></div><p class="muted">Натрупан ADD е изчислен от целевата и потвърдената позиция. Часовете са от LIVE ledger. CLOSE на отделна позиция ще се активира едва след реално потвърдено изпълнение и защитена синхронизация с борсата.</p></section>
-<section><h2>OUR ACTIVITY · нашите действия по монети</h2><p class="muted">Постоянен журнал в D1: сигнал, натрупване, заявка, потвърден FILL и ръчно затваряне. Техническите събития са отделно.</p><div class="bar"><select id="ourCoin" style="background:#254b80;color:white;padding:10px;border-radius:9px"><option value="">Всички монети</option><option>ZEC</option><option>NEAR</option><option>SOL</option><option>XRP</option></select><button id="ourLoad">↻ OUR ACTIVITY</button></div><div style="overflow:auto"><table><thead><tr><th>Час (София)</th><th>Монета</th><th>Събитие</th><th>Подробности</th></tr></thead><tbody id="ourRows"><tr><td colspan="4">Натисни OUR ACTIVITY</td></tr></tbody></table></div></section>
-<section><h2>Последни събития</h2><pre id="recent">—</pre></section>
+/** V19 NET POSITION COPY — full replacement dashboard. */
+export interface LiveDashboardEnv { LIVE_COPY_ADMIN_TOKEN?:string;LIVE_COPY_CONTROLLER?:{idFromName(name:string):unknown;get(id:unknown):{fetch(request:Request):Promise<Response>}}; }
+const PAGE=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/><title>LIVE COPY V19 · NET POSITION</title>
+<style>body{margin:0;background:#0c1220;color:#eef2ff;font:14px system-ui,Arial,sans-serif}main{max-width:1160px;margin:auto;padding:20px}h1{font-size:24px}h2{font-size:17px;margin-top:5px}.muted{color:#9daec5}.box{border:1px solid #334155;background:#162033;border-radius:13px;padding:15px;margin:12px 0}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{border-radius:8px;padding:11px;background:#202c40;color:white;border:1px solid #50627f}input{width:240px}button{cursor:pointer}button:hover{background:#32445e}.danger{background:#8c2630}.green{color:#50d99c}.warn{color:#ffc36c}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.stat{padding:12px;border:1px solid #32405b;border-radius:9px}.num{font-size:23px;font-weight:700}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{padding:9px;text-align:left;border-bottom:1px solid #34415a}th{color:#9daec5;font-weight:600}code{background:#263752;padding:2px 5px;border-radius:4px}#message{white-space:pre-wrap}</style></head><body><main>
+<h1>Hyperliquid · LIVE COPY V19</h1><p class="muted">NET POSITION · Само реални userFills · Натрупване до минимум $10 (консервативен праг $10.40). Не копира OPEN/CANCEL.</p>
+<div class="box"><div class="controls"><input id="token" type="password" placeholder="Admin token" autocomplete="off"/><button id="connect">СВЪРЖИ</button><button id="refresh">ОБНОВИ</button><button id="start">НОВА СЕСИЯ</button><button id="stop">STOP</button><button id="closeall" class="danger">CLOSE ALL</button></div><p id="message" class="muted">Няма връзка</p></div>
+<div class="box"><h2>V19 · СЪСТОЯНИЕ</h2><div class="stats"><div class="stat">Режим<div class="num" id="mode">—</div></div><div class="stat">Изпълнение<div class="num" id="live">—</div></div><div class="stat">Обработени fills<div class="num" id="events">—</div></div><div class="stat">Изпълнени наши ордери<div class="num" id="orders">—</div></div><div class="stat">D1 курсор<div class="num" id="cursor">—</div></div><div class="stat">Изоставане (редове)<div class="num" id="lag">—</div></div><div class="stat">Минимален вход<div class="num" id="minimum">—</div></div><div class="stat">Последна проверка<div class="num" id="lastsync" style="font-size:16px">—</div></div></div></div>
+<div class="box"><h2>Натрупване и целеви позиции по монети</h2><p class="muted">Целевите количества са изчисления; реалното изпълнение се потвърждава отделно на борсата. Стари наследени позиции на трейдъра се игнорират до зануляване.</p><div class="scroll"><table><thead><tr><th>Монета</th><th>Източник qty</th><th>Цел за нас qty</th><th>Цел USD*</th><th>Състояние</th><th>Последен fill</th><th>Проблем</th></tr></thead><tbody id="coins"><tr><td colspan="7">Няма данни</td></tr></tbody></table></div><p class="muted">* По последната наблюдавана цена, ориентировъчно. Няма симулирана печалба.</p></div>
+<div class="box"><h2>Последни решения · натрупване до $10</h2><p class="muted">ACCUMULATE означава, че промяната е твърде малка за нов ордер. CLOSE/REDUCE не чака $10. Решенията в SHADOW са само ориентировъчни.</p><div class="scroll"><table><thead><tr><th>Монета</th><th>Решение</th><th>Натрупано USD</th><th>Количество</th><th>Посока</th></tr></thead><tbody id="decisions"><tr><td colspan="5">Няма решения</td></tr></tbody></table></div></div>
+<div class="box"><h2>Реален Hyperliquid акаунт · само четене</h2><div class="controls"><button id="account">ОБНОВИ АКАУНТА</button><span id="accountinfo" class="muted">—</span></div><div class="scroll"><table><thead><tr><th>Монета</th><th>Реално количество</th><th>Средна цена</th><th>Нереализирано P/L</th></tr></thead><tbody id="positions"><tr><td colspan="4">Не е заредено</td></tr></tbody></table></div></div>
+<div class="box"><h2>Последни реални действия и грешки</h2><div id="errors" class="warn"></div><div class="scroll"><table><thead><tr><th>Час София</th><th>Монета</th><th>Действие</th><th>Детайл</th></tr></thead><tbody id="recent"><tr><td colspan="4">Няма данни</td></tr></tbody></table></div></div>
 <script>
-const OV_KEYS=['capital','equity','roi','free_margin','used_margin','realized_gross','fees','realized_net','unrealized','turnover','our_open_positions','closed_trades','win_rate','processed_fills','skipped','copy_accuracy','accuracy_sample','target_maker_fills','target_taker_fills','target_open_orders','target_open_positions'];let connected=false;const setConnected=ok=>{connected=ok;for(const id of ['refresh','accountRefresh','sync','start','stop'])$(id).disabled=!ok;if(!ok)$('all').disabled=true;$('connect').textContent=ok?'✓ СВЪРЗАНО':'🔗 СВЪРЖИ';};const $=x=>document.getElementById(x);const esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function call(action,method='GET',payload={}){const token=$('token').value.trim();if(!token)throw Error('Въведи LIVE_COPY_ADMIN_TOKEN');const r=await fetch('/live-copy/api/'+action,{method,headers:{authorization:'Bearer '+token,...(method==='POST'?{'content-type':'application/json'}:{})},...(method==='POST'?{body:JSON.stringify(payload)}:{})});const d=await r.json();if(!r.ok)throw Error((d.error||'HTTP '+r.status)+' '+(d.detail||''));return d;}
-async function refresh(){if(!connected){$('message').textContent='Първо натисни СВЪРЖИ.';return;}try{const d=await call('status');controllerModeForOrders=d.mode||'UNKNOWN';$('liveVersion').textContent=d.version||'Версията не е посочена';$('sync').textContent=d.order_follow_mode==='ORDERS'?'FILLS SYNC · само FILLS':'↻ SYNC NEW FILLS';$('sync').disabled=(d.order_follow_mode==='ORDERS');$('mode').textContent=d.mode||'—';$('real').textContent=d.trading_enabled?'LIVE ACTIVE':(d.auto_execution_configured?'LIVE ARMED':'DRY RUN');$('coins').textContent=(d.coins||[]).length;$('intents').textContent=d.ledger_intents??'—';$('fills').textContent=d.processed_event_ids??'—';const ov=d.overview||{};const moneyKeys=new Set(['capital','equity','free_margin','used_margin','realized_gross','fees','realized_net','unrealized','turnover']);const pctKeys=new Set(['roi','win_rate','copy_accuracy']);for(const key of OV_KEYS){const v=ov[key];$('ov_'+key).textContent=v===null||v===undefined?'—':moneyKeys.has(key)?'$'+Number(v).toFixed(2):pctKeys.has(key)?Number(v).toFixed(2)+'%':String(v);} $('overviewInfo').textContent=(ov.accounting_note||'Няма потвърдена борсова отчетност.')+(ov.account_snapshot_at?' · Hyperliquid snapshot: '+timeBG(ov.account_snapshot_at):'')+(ov.capital_at?' · Начален USDC snapshot: '+new Date(ov.capital_at).toLocaleString('bg-BG',{timeZone:'Europe/Sofia'}):'');$('all').disabled=!(d.manual_close_enabled&&d.mode==='STOPPED');$('positions').innerHTML=(d.coins||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.lastWhaleTarget)+'</td><td>'+esc(p.confirmedOwnQty)+'</td><td>'+esc(timeBG(p.openedAt))+'</td><td>'+esc(timeBG(p.lastOrderAt))+'</td><td>'+esc(p.addSignals??'—')+'</td><td>'+esc(p.pendingAddUsd==null?'—':'$'+Number(p.pendingAddUsd).toFixed(2))+'</td><td>'+esc(p.addRemainingUsd==null?'—':'$'+Number(p.addRemainingUsd).toFixed(2))+'</td><td>'+esc(p.filledAdds??'—')+'</td><td>'+esc(p.pendingIntentId||'—')+'</td><td>'+esc(p.suspended?'SUSPENDED':'TRACKING')+'</td><td><button class=\"danger\" data-close=\"'+esc(p.coin)+'\" '+(d.manual_close_enabled&&d.mode==='STOPPED'?'':'disabled')+'>CLOSE</button></td></tr>').join('')||'<tr><td colspan="12">Няма проследявани монети</td></tr>';$('recent').textContent=JSON.stringify(d.recent||[],null,2);$('message').textContent='Последно обновяване: '+new Date().toLocaleTimeString('bg-BG',{timeZone:'Europe/Sofia',hour12:false})+' (София). LIVE изпълнението е '+(d.trading_enabled?'включено':'изключено')+'.';void refreshOrderFollow();}catch(e){setConnected(false);$('message').textContent='Връзката е прекъсната: '+String(e);}}
-// V18 read-only order follow diagnostics. Do not query Hyperliquid or submit orders here.
-let controllerModeForOrders='UNKNOWN';
-let priorOrderCursor=null;
-let priorOrderEventCount=null;
-let orderFollowBusy=false;
-async function refreshOrderFollow(){
- if(!connected||orderFollowBusy||document.hidden)return;
- orderFollowBusy=true;
- try{
-  const d=await call('order-follow-status');
-  if(d.ok!==true)throw Error(d.error||'Невалиден отговор от order-follow-status');
-  const cursor=Number(d.source_cursor||0);
-  const count=Number(d.source_events||0);
-  const tracked=Array.isArray(d.tracked_orders)?d.tracked_orders.length:0;
-  const unresolved=Number(d.unresolved_orders||0);
-  const errors=Number(d.errors||0);
-  $('of_mode').textContent=d.mode||'—';
-  $('of_cursor').textContent=String(cursor);
-  $('of_events').textContent=String(count);
-  $('of_tracked').textContent=String(tracked)+(tracked===60?' (показани до 60)':'');
-  $('of_unresolved').textContent=String(unresolved);
-  $('of_errors').textContent=String(errors);
-  $('of_execution').textContent=d.execution==='EXPLICITLY_ENABLED'?'CONFIG ENABLED':'SHADOW ONLY';
-  $('of_checked').textContent=new Date().toLocaleTimeString('bg-BG',{timeZone:'Europe/Sofia',hour12:false});
-  let note='';
-  if(d.mode!=='ORDERS')note='Контролерът е във FILLS режим: ORDERS няма да обработва ордерите.';
-  else if(controllerModeForOrders!=='RUNNING')note='Контролерът е '+controllerModeForOrders+'. WebSocket може да записва в D1, но START/ORDERS обработката не е активна.';
-  else if(cursor<=0)note='Контролерът е RUNNING, но още няма обработен D1 ред. Провери дали пристигат нови ордери.';
-  else if(priorOrderCursor!==null&&cursor>priorOrderCursor)note='Потвърдено: контролерът обработва нови D1 ордери (+'+(cursor-priorOrderCursor)+' реда от предната проверка).';
-  else if(priorOrderCursor!==null&&cursor<priorOrderCursor)note='Курсорът е нулиран или е започнала нова сесия. Това не доказва грешка.';
-  else if(priorOrderEventCount!==null&&count>priorOrderEventCount)note='Потвърдено: контролерът отчита нови ордерни събития.';
-  else note='Контролерът е RUNNING; няма доказано ново обработено събитие от предната проверка. Това може да е нормално, ако няма нови ордери.';
-  if(d.execution==='EXPLICITLY_ENABLED')note+=' Настройката за ORDERS изпълнение е включена; провери REAL EXECUTION отделно.';
-  $('of_note').textContent=note;
-  const test=d.shadow_copy_test||{};
-  const counts=test.counts||{};
-  $('ct_mode').textContent=!d.shadow_copy_test?'UPDATE CONTROLLER':(!test.enabled?'NO ACTIVE ORDERS SESSION':(test.monitoring_mode==='LIVE_OBSERVATION'?'LIVE MONITOR ACTIVE':'SHADOW MONITOR ACTIVE'));
-  $('ct_open').textContent=String(counts.OPEN_CANDIDATE||0);
-  $('ct_replace').textContent=String(counts.REPLACE_CANDIDATE||0);
-  $('ct_close').textContent=String(counts.CLOSE_CANDIDATE||0);
-  $('ct_cancel').textContent=String(counts.CANCEL_OR_FINISH||0);
-  $('ct_partial').textContent=String(counts.PARTIAL_FILL_OBSERVED||0);
-  $('ct_skip').textContent=String(counts.SKIP||0);
-  const decisions=Array.isArray(test.decisions)?test.decisions:[];
-  $('ct_rows').innerHTML=decisions.slice().reverse().map(x=>'<tr><td>'+esc(timeBG(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.side+' '+x.sourceStatus+' #'+x.sourceOid)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.ourQty)+' / $'+esc(Number(x.notionalUsd||0).toFixed(2))+'</td><td>'+esc(x.price+' / '+x.tif+(x.reduceOnly?' / reduceOnly':''))+'</td><td>'+esc(x.reason)+'</td></tr>').join('')||'<tr><td colspan="7">Все още няма нови наблюдавани решения в текущата сесия</td></tr>';
-  $('ct_note').textContent=test.note||'Изисква обновения V18 контролер; записите ще се появят при нови ордерни събития.';
-  priorOrderCursor=cursor;priorOrderEventCount=count;
- }catch(e){
-  $('of_mode').textContent='НЯМА ОТГОВОР';
-  $('of_checked').textContent='—';
-  $('of_note').textContent='Диагностиката не е достъпна: '+String(e)+'. Това не означава автоматично, че WebSocket е прекъснат.';
- }finally{orderFollowBusy=false;}
-}
-// Refresh only the Durable Object counters; do not spam /account or trigger /start.
-setInterval(()=>{if(connected&&!document.hidden)void refreshOrderFollow();},10000);
-const timeBG=v=>v?new Date(v).toLocaleString('bg-BG',{timeZone:'Europe/Sofia',hour12:false}):'—';
-const usd=v=>Number.isFinite(Number(v))?Number(v).toFixed(4):'—';
-async function refreshAccount(){if(!connected){$('accountState').textContent='Първо натисни СВЪРЖИ.';return;}try{ $('accountState').textContent='Чета Hyperliquid (само четене)...';const d=await call('account','POST');try{await call('overview-init','POST');}catch(e){$('overviewInfo').textContent='Началният капитал не е записан: '+String(e);}await refresh();const a=d.account||{};$('spotUsdc').textContent=a.spotUsdcTotal===null||a.spotUsdcTotal===undefined?'—':usd(a.spotUsdcTotal);$('spotDetails').textContent=a.spotBalanceError?'Грешка при Spot API: '+a.spotBalanceError:(a.spotUsdcTotal===null||a.spotUsdcTotal===undefined?'USDC липсва в Spot API.':'USDC hold: '+usd(a.spotUsdcHold)+' · Други активи: '+(a.spotBalances||[]).filter(x=>x.coin!=='USDC').map(x=>x.coin+': '+x.total).join(', '));$('accountValue').textContent=usd(a.accountValue);$('withdrawable').textContent=usd(a.withdrawable);$('marginUsed').textContent=usd(a.totalMarginUsed);$('accountPositions').textContent=Array.isArray(a.positions)?a.positions.length:'—';$('accountRows').innerHTML=(a.positions||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.qty)+'</td><td>'+usd(p.entry)+'</td><td>'+usd(p.unrealized)+'</td><td>'+usd(p.marginUsed)+'</td></tr>').join('')||'<tr><td colspan="5">Няма отворени позиции</td></tr>';$('accountState').textContent='Прочетено от Hyperliquid · без поръчки.';}catch(e){$('accountState').textContent='Грешка при четене: '+String(e);}}
-$('accountRefresh').onclick=refreshAccount;
-async function control(action){try{const status=await call('status');const live=action==='start'&&status.auto_execution_configured;if(!confirm(live?'ВНИМАНИЕ: START ще изпраща РЕАЛНИ поръчки в Hyperliquid. Продължи?':action==='start'?'Стартирай DRY RUN синхронизацията?':'STOP спира новите ордери, но НЕ затваря позиции. Продължи?'))return;if(live&&!confirm('ПОТВЪРДИ ОТНОВО: реална търговия с 10x ливъридж.'))return;await call(action,'POST',live?{confirm:'START_REAL_HYPERLIQUID_COPY'}:{});await refresh();}catch(e){$('message').textContent='Грешка: '+String(e);}}
-$('connect').onclick=async()=>{setConnected(false);$('message').textContent='Проверявам връзката...';try{const d=await call('status');setConnected(true);await refresh();await refreshAccount();/* refresh() already shows the last update time; preserve it */}catch(e){$('message').textContent='Неуспешно свързване: '+String(e);}};$('token').addEventListener('input',()=>{setConnected(false);$('message').textContent='Токенът е променен. Натисни СВЪРЖИ.';});$('token').addEventListener('keydown',e=>{if(e.key==='Enter')$('connect').click();});$('sync').onclick=async()=>{try{const d=await call('sync','POST');$('message').textContent=JSON.stringify(d,null,2);await refresh();}catch(e){$('message').textContent=String(e);}};$('refresh').onclick=refresh;$('start').onclick=()=>control('start');$('stop').onclick=()=>control('stop');
-async function closeCommand(action,coin){
- if(!confirm('РЕАЛНА ПОРЪЧКА: '+action+' '+(coin||'ALL')+'. Копирането трябва да е спряно. Продължи?'))return;
- if(!confirm('ПОТВЪРДИ ОТНОВО: затваряне на реални позиции в Hyperliquid.'))return;
- try{const command_id='manual-'+crypto.randomUUID();const d=await call(action,'POST',{coin,command_id,confirm:'CLOSE_REAL_HYPERLIQUID_POSITION'});$('message').textContent=JSON.stringify(d,null,2);await refresh();}catch(e){$('message').textContent=String(e);}
-}
-$('all').onclick=()=>closeCommand('close-all');
-async function loadOurActivity(){
- try{
-  const coin=$('ourCoin').value;
-  const d=await call('our-activity'+(coin?'?coin='+encodeURIComponent(coin):''));
-  $('ourRows').innerHTML=(d.events||[]).map(e=>'<tr><td>'+esc(timeBG(e.at))+'</td><td>'+esc(e.coin)+'</td><td>'+esc(e.kind)+'</td><td>'+esc(e.detail)+'</td></tr>').join('')||'<tr><td colspan="4">Няма записани събития за този филтър</td></tr>';
- }catch(e){$('ourRows').innerHTML='<tr><td colspan="4">'+esc(String(e))+'</td></tr>';}
-}
-$('ourLoad').onclick=loadOurActivity;$('ourCoin').onchange=loadOurActivity;
-
-$('positions').addEventListener('click',e=>{const b=e.target.closest('[data-close]');if(b)closeCommand('close',b.getAttribute('data-close'));});
-// Refresh when the page opens/restores, and when the user returns to the tab.
-// Do not store the admin token or start trading automatically.
-let autoRefreshBusy=false;
-async function autoRefreshOnOpen(){
- if(autoRefreshBusy)return;
- if(!connected){
-  if(!$('token').value.trim())return; // Browser has not restored credentials; manual CONNECT required.
-  autoRefreshBusy=true;
-  try{await $('connect').onclick();}finally{autoRefreshBusy=false;}
-  return;
- }
- autoRefreshBusy=true;
- try{await refresh();await refreshAccount();}finally{autoRefreshBusy=false;}
-}
-window.addEventListener('pageshow',()=>{setTimeout(autoRefreshOnOpen,0);});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&connected)autoRefreshOnOpen();});
-</script></body></html>`;
-const json=(value:unknown,status:number)=>new Response(JSON.stringify(value),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let connected=false,busy=false;
+function time(ms){return ms?new Date(ms).toLocaleString('bg-BG',{timeZone:'Europe/Sofia'}):'—'}
+async function api(path,method='GET',payload){const r=await fetch('/live-copy/api/'+path,{method,headers:{authorization:'Bearer '+$('token').value.trim(),'content-type':'application/json'},body:method==='POST'?JSON.stringify(payload||{}):undefined,cache:'no-store'});const j=await r.json();if(!r.ok||j.ok===false)throw Error(j.error||'HTTP_'+r.status+(j.detail?' '+j.detail:''));return j;}
+function show(msg){$('message').textContent=msg}
+async function refresh(){if(!connected||busy)return;busy=true;try{const s=await api('status');if(s.version!=='V19_NET_POSITION')throw Error('CONTROLLER_IS_NOT_V19: '+s.version);
+ $('mode').textContent=s.mode;$('live').textContent=s.live_execution?'REAL LIVE':s.session_kind==='LIVE'?'LIVE NOT AUTHORIZED':'SHADOW';
+ $('events').textContent=s.processed_fills;$('orders').textContent=s.orders_sent_and_filled;$('cursor').textContent=s.cursor;$('lag').textContent=s.lag_rows;$('minimum').textContent='$'+s.minimum_notional_usd;$('lastsync').textContent=time(s.last_sync);
+ $('coins').innerHTML=(s.coins||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.source_qty)+'</td><td>'+esc(p.desired_qty)+'</td><td>$'+(Math.abs(Number(p.desired_qty)*Number(p.last_price))).toFixed(2)+'</td><td>'+esc(p.waiting_flat?'WAIT SOURCE FLAT':p.pending?'PENDING '+p.pending:p.active?'TRACKING':'FLAT')+'</td><td>'+esc(time(p.last_fill_at))+'</td><td>'+esc(p.error)+'</td></tr>').join('')||'<tr><td colspan="7">Чакаме нови изпълнени сделки</td></tr>';
+ $('decisions').innerHTML=(s.decisions||[]).map(d=>'<tr><td>'+esc(d.coin)+'</td><td>'+esc(d.action)+'</td><td>$'+Number(d.usd??d.pending_usd??0).toFixed(2)+'</td><td>'+esc(d.qty??'—')+'</td><td>'+esc(d.direction??'—')+'</td></tr>').join('')||'<tr><td colspan="5">Чакаме нови изпълнени сделки</td></tr>';
+ $('errors').textContent=(s.errors||[]).slice(0,6).join(' | ');
+ $('recent').innerHTML=(s.recent||[]).map(p=>'<tr><td>'+esc(time(p.at))+'</td><td>'+esc(p.coin)+'</td><td>'+esc(p.kind)+'</td><td>'+esc(p.detail)+'</td></tr>').join('')||'<tr><td colspan="4">Няма нови реални действия</td></tr>';
+ show('V19 свързан · '+time(Date.now()));}catch(e){show('Грешка: '+e.message)}finally{busy=false}}
+$('connect').onclick=()=>{if(!$('token').value.trim())return show('Въведи token');connected=true;refresh()};$('refresh').onclick=refresh;
+$('start').onclick=async()=>{if(!connected)return;if(!confirm('НОВА СЕСИЯ. Системата НЕ копира стари fills. За LIVE акаунтът трябва да е без позиции и чакащи ордери. Продължаваме ли?'))return;try{let body={};if(confirm('Това РЕАЛНА сесия ли е с изрично потвърждение за търговия? Избери Отказ за SHADOW конфигурация.'))body.confirm='START_REAL_HYPERLIQUID_COPY';const r=await api('start','POST',body);show('Сесията стартира: '+r.mode+' '+(r.live?'LIVE':'SHADOW'));await refresh();}catch(e){show('START: '+e.message)}};
+$('stop').onclick=async()=>{if(!connected)return;try{const r=await api('stop','POST');show('STOP · текущите позиции остават. '+r.mode);await refresh();}catch(e){show('STOP: '+e.message)}};
+$('closeall').onclick=async()=>{if(!connected||!confirm('ВНИМАНИЕ: CLOSE ALL спира копирането и се опитва да затвори ВСИЧКИ perpetual позиции и чакащи ордери в акаунта, включително от други стратегии. Продължаваме ли?'))return;try{const r=await api('close-all','POST');show(JSON.stringify(r,null,2));await refresh();}catch(e){show('CLOSE ALL: '+e.message)}};
+$('account').onclick=async()=>{if(!connected)return;try{const a=await api('account');$('accountinfo').textContent='Account value '+a.accountValue+' USD · Withdrawable '+a.withdrawable+' USD';$('positions').innerHTML=(a.positions||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.qty)+'</td><td>'+esc(p.entry)+'</td><td>'+esc(p.unrealized)+'</td></tr>').join('')||'<tr><td colspan="4">Няма позиции</td></tr>';}catch(e){$('accountinfo').textContent='Грешка '+e.message}};
+setInterval(()=>{if(connected&&!document.hidden)refresh()},5000);
+</script></main></body></html>`;
+const j=(v:unknown,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 export async function serveLiveCopyDashboard(request:Request,env:LiveDashboardEnv):Promise<Response|null>{
- const url=new URL(request.url);
- if(url.pathname==='/live-copy' && request.method==='GET')return new Response(PAGE,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+ const url=new URL(request.url);if(request.method==='GET'&&url.pathname==='/live-copy')return new Response(PAGE,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"}});
  if(!url.pathname.startsWith('/live-copy/api/'))return null;
- if(!env.LIVE_COPY_ADMIN_TOKEN || request.headers.get('authorization')!==`Bearer ${env.LIVE_COPY_ADMIN_TOKEN}`)return json({ok:false,error:'UNAUTHORIZED'},401);
- const action=url.pathname.slice('/live-copy/api/'.length);
- if(!['status','start','stop','sync','account','close','close-all','overview-init','our-activity','order-follow-status'].includes(action))return json({ok:false,error:'NOT_CONNECTED',detail:'Manual close requires STOP, both server-side flags and explicit confirmation.'},501);
- if((['status','our-activity','order-follow-status'].includes(action)&&request.method!=='GET')||(!['status','our-activity','order-follow-status'].includes(action)&&request.method!=='POST'))return json({ok:false,error:'METHOD_NOT_ALLOWED'},405);
- if(!env.LIVE_COPY_CONTROLLER)return json({ok:false,error:'CONTROLLER_BINDING_MISSING'},503);
- try{const id=env.LIVE_COPY_CONTROLLER.idFromName('live-copy-v23');const stub=env.LIVE_COPY_CONTROLLER.get(id);const upstream=await stub.fetch(new Request('https://live-copy.internal/'+action+url.search,{method:request.method,headers:{authorization:`Bearer ${env.LIVE_COPY_ADMIN_TOKEN}`,...(request.method==='POST'?{'content-type':'application/json'}:{})},...(request.method==='POST'?{body:await request.text()}:{})}));return new Response(upstream.body,{status:upstream.status,headers:{'content-type':'application/json','cache-control':'no-store'}});}catch(e){return json({ok:false,error:'CONTROLLER_UNAVAILABLE',detail:String(e)},503);}
+ if(!env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!=='Bearer '+env.LIVE_COPY_ADMIN_TOKEN)return j({ok:false,error:'UNAUTHORIZED'},401);
+ const name=url.pathname.slice('/live-copy/api/'.length);const GET=['status','v19-status','account','our-activity'];const POST=['start','stop','sync','close-all'];
+ if(!(GET.includes(name)&&request.method==='GET'||POST.includes(name)&&request.method==='POST'))return j({ok:false,error:'ROUTE_NOT_SUPPORTED',name},404);
+ if(!env.LIVE_COPY_CONTROLLER)return j({ok:false,error:'CONTROLLER_BINDING_MISSING'},503);
+ try{const id=env.LIVE_COPY_CONTROLLER.idFromName('live-copy-v23');const stub=env.LIVE_COPY_CONTROLLER.get(id);const r=await stub.fetch(new Request('https://live-copy.internal/'+name,{method:request.method,headers:{authorization:'Bearer '+env.LIVE_COPY_ADMIN_TOKEN,'content-type':'application/json'},...(request.method==='POST'?{body:await request.text()}:{})}));return new Response(r.body,{status:r.status,headers:{'content-type':'application/json','cache-control':'no-store'}});}catch(e){return j({ok:false,error:'CONTROLLER_UNAVAILABLE',detail:String(e)},503);}
 }
