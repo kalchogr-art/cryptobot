@@ -1,5 +1,5 @@
-/** V19 NET POSITION COPY — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
- * Source: mc_v19_fills (userFills only). OPEN/CANCEL are NEVER copied.
+/** V19.1 PROPORTIONAL FILL COPY — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+ * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
  * Live deployment NOT validated against exchange; test SHADOW then small funded live with account flat.
@@ -203,6 +203,7 @@ type Env=__LC_EXECUTION.LiveCopyEnv & {
 };
 type Fill={rowid:number;session_id:string;fill_id:string;at:number;coin:string;side:'A'|'B';sz:number;px:number;start_pos:number;source_oid:string};
 type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episode:number;active:boolean;waitingFlat:boolean;
+  entryPending?:boolean;episodeEntryPx?:number;episodeStartedAt?:number;lastFillKind?:string;
   desired:number;lastPx:number;lastFillAt:number;lastActionAt:number;lastFillId:string;lastError:string;
   pending?:{id:string;cloid:string;status:'SUBMITTING'|'UNKNOWN';at:number;qty:number;direction:string};
   lastConfirmedOwnQty:number;actionCount:number;};
@@ -250,7 +251,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_NET_POSITION',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -268,14 +269,50 @@ export class LiveCopyControllerStage7 {
       // source position replaces the internal estimate; no invented intermediate trades are replayed.
       if(Math.abs(p.sourceQty-before)>Math.max(1e-7,Math.abs(before)*1e-5))p.lastError='SOURCE_POSITION_DISCONTINUITY';
       p.sourceQty=after;p.lastPx=f.px;p.lastFillAt=f.at;p.lastFillId=f.fill_id;s.events++;
-      if(p.waitingFlat){p.desired=0;if(Math.abs(after)<1e-8){p.waitingFlat=false;p.baseline=0;p.lastError='';this.log(s,f.coin,'SOURCE_FLAT','Inherited position reached zero');}continue;}
-      if(!p.active){
-        // Fresh, independent flat->position episode. Scale such that initial mirrored position ≈ $10.
-        if(Math.abs(before)<1e-8&&Math.abs(after)>1e-8){p.scale=MIN/(Math.abs(after)*f.px);p.episode++;p.active=true;p.baseline=0;this.log(s,f.coin,'NEW_EPISODE','scale='+p.scale.toPrecision(7));}
-        else {p.waitingFlat=true;p.desired=0;continue;}
+      if(p.waitingFlat){
+        p.desired=0;
+        if(Math.abs(after)<1e-8){p.waitingFlat=false;p.baseline=0;p.lastError='';this.log(s,f.coin,'SOURCE_FLAT','Inherited position reached zero');}
+        continue;
       }
-      p.desired=round(after*p.scale);
-      if(Math.abs(after)<1e-8){p.desired=0;p.active=false;p.scale=0;this.log(s,f.coin,'SOURCE_FLAT','Target position zero');}
+      const beforeSign=Math.sign(before),afterSign=Math.sign(after);
+      // An episode starts only on actual source fills, NEVER on a resting order.
+      // Initial margin $1.04 at 10x => $10.40 notional. Do not multiply $10.40 by 10 again.
+      const opening=Math.abs(before)<1e-8&&Math.abs(after)>1e-8;
+      const reversal=beforeSign!==0&&afterSign!==0&&beforeSign!==afterSign;
+      if(opening||reversal){
+        p.episode++;p.active=true;p.baseline=0;
+        p.scale=MIN/(Math.abs(after)*f.px); // informational initial scale; not reused for percentage ADDs
+        p.desired=round(afterSign*MIN/f.px);
+        p.entryPending=true;p.episodeEntryPx=f.px;p.episodeStartedAt=f.at;
+        p.lastFillKind=reversal?'REVERSAL':'NEW';p.lastError='';
+        this.log(s,f.coin,reversal?'SOURCE_REVERSAL':'SOURCE_NEW',
+          'initial_notional_usd='+MIN+' source_before='+before+' source_after='+after);
+        continue;
+      }
+      if(Math.abs(after)<1e-8){
+        p.desired=0;p.active=false;p.scale=0;p.entryPending=false;p.lastFillKind='CLOSE';
+        this.log(s,f.coin,'SOURCE_FLAT','Close target 100%, do not wait for ADD minimum');
+        continue;
+      }
+      if(!p.active){
+        // An inherited position cannot be treated as a fresh $10.40 entry.
+        p.waitingFlat=true;p.desired=0;p.lastFillKind='INHERITED';continue;
+      }
+      if(beforeSign!==afterSign || beforeSign===0){
+        p.lastError='SOURCE_EPISODE_UNEXPECTED';continue;
+      }
+      // Percentage from the source position IMMEDIATELY BEFORE this fill.
+      // E.g. source +20% => our desired +20%, followed by a 30% remove => desired -30%.
+      // The open add amount is naturally accumulated as (desired - actual) until >= $10.40.
+      const changeRatio=Math.abs(after)/Math.abs(before);
+      const previousDesired=p.desired;
+      p.desired=round(p.desired*changeRatio);
+      const increased=changeRatio>1+1e-9;
+      p.lastFillKind=increased?'ADD':'REMOVE';
+      // A removal scales unexecuted ADD down as well, so no obsolete catch-up order is sent.
+      this.log(s,f.coin,p.lastFillKind,
+        'source_ratio='+changeRatio.toFixed(8)+' target_before='+previousDesired+' target_after='+p.desired);
+
     }
     return rows.results?.length||0;
   }
@@ -312,26 +349,35 @@ export class LiveCopyControllerStage7 {
       if(live&&p.pending){const confirmed=await this.checkAmbiguous(s,p);
         if(confirmed===null){decisions.push({coin:p.coin,action:'WAIT_PROOF',reason:p.pending?.status});continue;}
         own=confirmed;actual[p.coin]=own;}
+      if(own!==0&&p.active&&Math.sign(own)===Math.sign(p.desired)&&p.entryPending)p.entryPending=false;
       const gap=round(p.desired-own);
       const opposite=own!==0&&(p.desired===0||Math.sign(p.desired)!==Math.sign(own));
       const reduce=own!==0&&(opposite||Math.sign(gap)!==Math.sign(own));
       // IMPORTANT: reduce size is bounded by confirmed actual own position; exits don't wait for $10.
       const raw=opposite?Math.abs(own):reduce?Math.min(Math.abs(gap),Math.abs(own)):Math.abs(gap);
       let qty=trimQty(raw,decimals);
-      // Exchange size step may round a $10.40 target just below $10.
-      // Round UP one precision step only when the unrounded desired notional already reached MIN.
-      if(!reduce&&qty*price<MIN&&raw*price>=MIN-1e-6){
+      // A fresh NEW or REVERSAL sends ONLY the initial $10.40 notional,
+      // even if several ADD fills arrived before the first reconciliation.
+      // Their excess remains in p.desired and is accumulated for a later ADD.
+      const freshEntry=!reduce&&own===0&&p.entryPending===true&&p.active===true;
+      if(freshEntry){
+        const initial=Math.max(0,Number(p.episodeEntryPx||price));
+        const baseQty=MIN/(initial||price);
+        qty=trimQty(Math.min(raw,baseQty),decimals);
+      }
+      // Exchange precision can round a $10.40 initial entry just below minimum.
+      if(!reduce&&qty*price<MIN&&(raw*price>=MIN-1e-6||freshEntry&&raw*price>=MIN-1e-6)){
         const unit=10**(-decimals);const rounded=Math.ceil(MIN/price/unit-1e-9)*unit;
         if(p.coin!=='ZEC'||rounded*price<=20.000001)qty=round(rounded);
       }
       const notional=qty*price;
       if(qty<=0){decisions.push({coin:p.coin,action:'NONE',reason:'SYNCED_OR_BELOW_PRECISION',pending_usd:Math.abs(gap)*price});continue;}
-      if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:'ACCUMULATE',pending_usd:Math.abs(gap)*price});continue;}
+      if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:freshEntry?'NEW_BELOW_EXCHANGE_MIN':'ACCUMULATE_ADD',pending_usd:Math.abs(gap)*price});continue;}
       if(!reduce&&now-p.lastFillAt>MAX_ENTRY_AGE_MS){decisions.push({coin:p.coin,action:'SKIP_STALE_ENTRY',pending_usd:notional});continue;}
-      if(now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE',pending_usd:notional});continue;}
+      if(!reduce&&!freshEntry&&now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE_ADD',pending_usd:notional});continue;}
       if(sent>=MAX_ACTIONS){decisions.push({coin:p.coin,action:'NEXT_TICK',pending_usd:notional});continue;}
       const direction=(opposite?own<0:gap>0)?'LONG':'SHORT';
-      decisions.push({coin:p.coin,action:reduce?'CLOSE_OR_REDUCE':'OPEN_OR_ADD',qty,usd:notional,direction,desired:p.desired,actual:own});
+      decisions.push({coin:p.coin,action:reduce?(opposite?'CLOSE_FOR_REVERSAL_OR_FLAT':'PERCENT_REMOVE'):freshEntry?(p.episode>1?'NEW_OR_REVERSAL_ENTRY':'NEW_ENTRY'):'PERCENT_ADD',qty,usd:notional,direction,desired:p.desired,actual:own,source_last_action:p.lastFillKind});
       if(!live)continue;
       const intentId=`V19:${s.startedAt}:${p.coin}:${++p.actionCount}`;
       const cloid=__LC_EXECUTION.cloidForIntent(intentId);
@@ -359,7 +405,7 @@ export class LiveCopyControllerStage7 {
       const shouldReconcile=elapsed>=20000||(elapsed>=COALESCE_MS&&processed>0);
       const result=shouldReconcile?await this.reconcile(s):{sent:0,decisions:[]};
       if(shouldReconcile){s.lastDecisions=result.decisions;await this.state.storage.put('live_copy_v19_last_reconcile',Date.now());}await this.save(s);
-      return J({ok:true,version:'V19_NET_POSITION',processed,cursor:s.cursor,events:s.events,live:this.authorized(s),...result});
+      return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',processed,cursor:s.cursor,events:s.events,live:this.authorized(s),...result});
     }catch(e){const s=await this.load();this.error(s,e);if(/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e)))s.cooldownUntil=Date.now()+60000;await this.save(s);return J({ok:false,error:'V19_SYNC_FAILED',detail:String(e)},503);}
     finally{this.busy=false;}
   }
@@ -416,12 +462,12 @@ export class LiveCopyControllerStage7 {
     if(method==='POST'&&path==='/close-all')return this.closeAll();
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
-      const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,
+      const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode}));
-      return J({ok:true,version:'V19_NET_POSITION',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,source_session:s.sourceSession,started_at:s.startedAt,
-        coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'NET_POSITION_USERFILLS_ONLY'});
+        coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_NEW_REVERSAL_10_40_ADD_ACCUMULATION'});
     }
     if(method==='GET'&&path==='/account'){try{return J(await __LC_EXECUTION.readLiveAccount(this.env));}catch(e){return J({ok:false,error:String(e)},503);}}
     if(method==='GET'&&path==='/our-activity'){const s=await this.load();return J({ok:true,events:s.recent});}
