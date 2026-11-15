@@ -1,5 +1,5 @@
 // LIVE COPY SOURCE · MULTI-COIN WATCH — WEBSOCKET SINGLE-FILE BUILD
-// Hyperliquid userFills WS is primary; HTTP backfill is recovery.
+// V19: Hyperliquid userFills WS primary, HTTP backfill recovery; no orderUpdates subscription.
 // The independent LIVE COPY CONTROLLER is NOT modified by this file.
 // Generated from current MultiCoin Watch + Trader Watch modules.
 namespace MultiCoinWatchNS {
@@ -79,6 +79,13 @@ export class MultiCoinEngine {
       ON mc_copy_order_updates(session_id,at)`).run();
     // Independent source fill evidence keyed by the exchange order OID.
     // Works even when the virtual fill-position chain is temporarily behind.
+    // V19 fill-only durable stream. One row per distinct exchange fill; no OPEN/CANCEL flood.
+    await this.db.prepare(`CREATE TABLE IF NOT EXISTS mc_v19_fills (
+      session_id TEXT NOT NULL, fill_id TEXT NOT NULL UNIQUE,
+      at INTEGER NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+      sz REAL NOT NULL, px REAL NOT NULL, start_pos REAL NOT NULL,
+      source_oid TEXT NOT NULL, inserted_at INTEGER NOT NULL)`).run();
+    await this.db.prepare(`CREATE INDEX IF NOT EXISTS mc_v19_fills_at ON mc_v19_fills(at)`).run();
     await this.db.prepare(`CREATE TABLE IF NOT EXISTS mc_copy_source_order_fills (
       session_id TEXT NOT NULL, fill_id TEXT NOT NULL, source_oid TEXT NOT NULL,
       at INTEGER NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
@@ -140,6 +147,12 @@ export class MultiCoinEngine {
           !Number.isFinite(at)||!Number.isFinite(sz)||sz<=0||!Number.isFinite(px)||px<=0||
           f?.tid==null)continue;
       const id=wsFid(f);
+      // Only valid fills with authoritative source pre-fill quantity are eligible for V19.
+      const before=Number(f?.startPosition);
+      if(Number.isFinite(before))await this.db.prepare(`INSERT OR IGNORE INTO mc_v19_fills
+        (session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid,inserted_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .bind(session,id,at,coin,side,sz,px,before,oid,Date.now()).run();
       const r:any=await this.db.prepare(`INSERT OR IGNORE INTO mc_copy_source_order_fills
         (session_id,fill_id,source_oid,at,coin,side,sz,px) VALUES(?,?,?,?,?,?,?,?)`)
         .bind(session,id,oid,at,coin,side,sz,px).run();
@@ -565,7 +578,7 @@ export class MultiCoinEngine {
         s.szDecimals=Object.fromEntries((meta.universe||[]).filter((x:any)=>Number.isInteger(x.szDecimals)).map((x:any)=>[x.name,x.szDecimals]));
       }
       // Observe orders first so fills in the same polling cycle can match by oid.
-      try{await this.watchOrders(s);}catch(e){s.errors.push(new Date().toISOString()+' ORDERS '+String(e));s.errors=s.errors.slice(-30);}
+      // V19 position copy does not poll open orders: saves unnecessary Hyperliquid API calls.
       // V1.3.6: fetch a deeper bounded history so rapid partial fills missed by
       // earlier polls can be reconstructed before advancing the virtual ledger.
       // Existing SKIPPED records remain immutable audit records: do not silently
@@ -2213,8 +2226,7 @@ export class TraderWatch {
       void this.runMulti(async()=>{
         const result=await new MultiCoinEngine(this.ctx.storage,this.env.DB).ingestRealtime(batch);
         this.multiWsPending=result.pending;
-        if(result.applied>0)await this.notifyMultiCopy();
-        if(result.stored>0)await this.notifyMultiCopy('order-sync');
+        if(result.stored>0||result.applied>0)await this.notifyMultiCopy('sync');
       }).catch(async e=>{
         this.multiWsLastError='MULTI_WS_INGEST_FAILED: '+String(e);
         await this.ctx.storage.setAlarm(Date.now()+1000).catch(()=>{});
@@ -2235,20 +2247,14 @@ export class TraderWatch {
       if(this.multiWs!==ws)return;
       this.multiWsConnected=true;this.multiWsLastRx=Date.now();
       ws.send(JSON.stringify({method:'subscribe',subscription:{type:'userFills',user:MC_WALLET,aggregateByTime:false}}));
-      ws.send(JSON.stringify({method:'subscribe',subscription:{type:'orderUpdates',user:MC_WALLET}}));
+      // V19: orderUpdates is intentionally unsubscribed (fill-only replication).
     });
     ws.addEventListener('message',(ev:any)=>{
       if(this.multiWs!==ws)return;
       this.multiWsLastRx=Date.now();
       let msg:any;
       try{msg=JSON.parse(String(ev.data))}catch(e){this.multiWsLastError='MULTI_WS_INVALID_JSON';return;}
-      if(msg.channel==='orderUpdates'){
-        void this.runMulti(async()=>{
-          const added=await new MultiCoinEngine(this.ctx.storage,this.env.DB).ingestOrderUpdates(msg.data);
-          if(added>0)await this.notifyMultiCopy('order-sync');
-        }).catch(e=>{this.multiWsLastError='MULTI_ORDER_UPDATES_FAILED: '+String(e)});
-        return;
-      }
+      // V19 listens only to executed fills, never to OPEN/CANCEL events.
       if(msg.channel!=='userFills')return;
       // Snapshot fills are also deduplicated against D1 and filtered by session
       // start. This prevents a reconnect gap from becoming a missed trade.
@@ -2284,6 +2290,7 @@ export class TraderWatch {
       if(now>=this.multiNextBackfill&&(!mc.lastPoll||now-mc.lastPoll>=60000||!this.multiWsConnected)){
         await this.runMulti(async()=>{
           const before:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
+          const beforeV19:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_v19_fills').first();
           await multi.poll();
           const afterPoll=await multi.get();
           if(afterPoll?.lastError){
@@ -2294,7 +2301,8 @@ export class TraderWatch {
           const left:any=await this.env.DB.prepare('SELECT COUNT(*) AS n FROM mc_watch_ws_inbox WHERE session_id=?').bind(mc.id).first();
           this.multiWsPending=Number(left?.n||0);
           const after:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_watch_events').first();
-          if(Number(after?.id||0)>Number(before?.id||0)||recovered>0)await this.notifyMultiCopy();
+          const afterV19:any=await this.env.DB.prepare('SELECT MAX(rowid) AS id FROM mc_v19_fills').first();
+          if(Number(after?.id||0)>Number(before?.id||0)||Number(afterV19?.id||0)>Number(beforeV19?.id||0)||recovered>0)await this.notifyMultiCopy();
         }).catch(e=>{this.multiWsLastError='MULTI_BACKFILL_FAILED: '+String(e)});
       }else if(this.multiWsPending>0){
         await this.runMulti(async()=>{
