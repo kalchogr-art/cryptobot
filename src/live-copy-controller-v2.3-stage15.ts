@@ -846,7 +846,11 @@ namespace __LC_ORDER_FOLLOW {
     status:'SUBMITTING'|'UNKNOWN'|'FILLED'|'REJECTED';cloid:string;ownOid:string|null;lastError:string;at:number};
   export type FollowState={startedAt:number;session:string;rowid:number;scales:Record<string,number>;
     pairs:Record<string,Pair>;adjustments:Record<string,Adjustment>;nextAdjustment:number;
-    coinErrors:Record<string,string>;closing?:boolean;closed?:boolean;events:number;errors:number;};
+    coinErrors:Record<string,string>;closing?:boolean;closed?:boolean;events:number;errors:number;
+    shadowDecisions?:ShadowDecision[];shadowCounts?:Record<string,number>;};
+  export type ShadowDecision={rowid:number;at:number;coin:string;sourceOid:string;action:string;side:string;
+    sourceStatus:string;sourceQty:number;remainingQty:number;price:number;ourQty:number;notionalUsd:number;
+    tif:string;reduceOnly:boolean;reason:string;virtualOnly:true};
   export const fresh=(startedAt:number,session:string,rowid:number):FollowState=>({startedAt,session,rowid,scales:{},pairs:{},adjustments:{},nextAdjustment:0,coinErrors:{},events:0,errors:0});
   export function parse(raw:any):TargetOrder|null{
     const p=raw;
@@ -857,6 +861,41 @@ namespace __LC_ORDER_FOLLOW {
     return {...p,at,price,orig_sz:sz,remaining_sz:left};
   }
   export const terminal=(status:string)=>/^(filled|canceled|cancelled|rejected|.*canceled|.*rejected|liquidatedcanceled|triggered)$/i.test(status);
+  export function recordShadow(f:FollowState,rowid:number,o:TargetOrder,p:Pair|null,old:Pair|null):void{
+    // Shadow never submits, cancels, reserves or asserts ownership of real orders.
+    // This is an indicative decision trace, NOT an exchange-execution backtest.
+    const terminalNow=terminal(o.status);
+    const qty=Number(p?.qtyLimit||0);
+    const remQty=Math.max(0,Number(o.remaining_sz||0));
+    const notional=qty*o.price;
+    const eligible=!!p&&!p.error&&qty>0&&Number.isFinite(notional)&&
+      (p.reduceOnly||notional>=10)&&!terminalNow;
+    let action='NO_ACTION',reason='NO_MATERIAL_CHANGE';
+    if(!p){action='SKIP';reason='NO_TRACKED_ORDER';}
+    else if(p.error){action='SKIP';reason=p.error;}
+    else if(terminalNow){
+      if(old){action='CANCEL_OR_FINISH';reason='SOURCE_TERMINAL_'+o.status.toUpperCase();}
+      else {action='SKIP';reason='SOURCE_ALREADY_TERMINAL';}
+    }else if(!old){
+      action=eligible?(o.reduce_only?'CLOSE_CANDIDATE':'OPEN_CANDIDATE'):'SKIP';
+      reason=eligible?'REQUIRES_EXCHANGE_OPEN_CONFIRMATION':qty<=0?'ROUNDING_OR_SIZE_ZERO':'BELOW_MINIMUM_NOTIONAL';
+    }else if(old.price!==o.price || old.sourceSize!==o.orig_sz || old.reduceOnly!==o.reduce_only){
+      action=eligible?'REPLACE_CANDIDATE':'SKIP';reason=eligible?'PRICE_OR_SIZE_CHANGED_VERIFY_OPEN':'INVALID_REPLACEMENT_SIZE';
+    }else if(remQty<old.remainingSource-1e-9){
+      action='PARTIAL_FILL_OBSERVED';reason='SOURCE_REMAINING_DECREASED_NOT_OUR_FILL';
+    }else if(remQty>old.remainingSource+1e-9){
+      action='SIZE_INCREASE_OBSERVED';reason='SOURCE_REMAINING_INCREASED';
+    }else if(o.status!==old.sourceStatus){
+      action='STATUS_CHANGE';reason='SOURCE_STATUS_'+o.status.toUpperCase();
+    }
+    const decision:ShadowDecision={rowid,at:o.at,coin:o.coin,sourceOid:o.source_oid,
+      action,side:o.side==='B'?'BUY':'SELL',sourceStatus:o.status,sourceQty:o.orig_sz,
+      remainingQty:remQty,price:o.price,ourQty:qty,notionalUsd:notional,tif:o.tif,
+      reduceOnly:o.reduce_only,reason,virtualOnly:true};
+    f.shadowDecisions=[...(f.shadowDecisions||[]),decision].slice(-120);
+    f.shadowCounts ||= {};
+    f.shadowCounts[action]=(f.shadowCounts[action]||0)+1;
+  }
   export function quantity(coin:string,source:number,scale:number,decimals:number,price:number):number {
     const unit=10**(-decimals);
     let q=Math.floor((source*scale+1e-10)/unit)*unit;
@@ -1809,6 +1848,7 @@ export class LiveCopyControllerStage7 {
       const o=__LC_ORDER_FOLLOW.parse(JSON.parse(row.payload));
       if(o&&o.at>=f.startedAt&&o.at<=Date.now()+30000){
         const exists=f.pairs[o.source_oid];
+        const old=exists?{...exists}:null;
         if(!exists){
           const meta=await this.cachedMeta();const asset=meta?.universe?.find((x:any)=>x.name===o.coin);
           const fromBeforeStart=Number(o.source_order_time||0)>0&&Number(o.source_order_time)<f.startedAt;
@@ -1828,6 +1868,7 @@ export class LiveCopyControllerStage7 {
           if(asset)exists.qtyLimit=__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,exists.scale,asset.szDecimals,o.price);
           exists.sourceStatus=o.status;exists.lastSourceAt=o.at;exists.updatedAt=Date.now();
         }
+        if(!live)__LC_ORDER_FOLLOW.recordShadow(f,row.rowid,o,f.pairs[o.source_oid]||null,old);
         f.events++;
       }
       f.rowid=row.rowid;await this.saveFollow(f);
@@ -2058,6 +2099,10 @@ export class LiveCopyControllerStage7 {
         tracked_orders:Object.values(follow?.pairs||{}).slice(-60),source_events:follow?.events||0,
         unresolved_orders:Object.values(follow?.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)).length,
         adjustments:Object.values(follow?.adjustments||{}).slice(-30),coin_errors:follow?.coinErrors||{},
+        shadow_copy_test:{enabled:!!follow&&this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&!this.liveEnabled(),
+          scope:'SOURCE_ORDER_LIFECYCLE_ONLY',execution:'NO_ORDERS_SENT',
+          note:'Indicative candidates only. No own fills, queue position, fees or Hyperliquid source order verification simulated.',
+          counts:follow?.shadowCounts||{},decisions:(follow?.shadowDecisions||[]).slice(-60)},
         errors:follow?.errors||0,execution:this.liveEnabled()?'LIVE_WHEN_STARTED':'SHADOW_ONLY'});
     }
     if(request.method==='GET'&&path==='/recovery-status'){
