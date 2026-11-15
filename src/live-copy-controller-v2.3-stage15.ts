@@ -1,4 +1,4 @@
-/** V19.1 PROPORTIONAL FILL COPY — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.2 INHERITED ADD ACCUMULATION — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -204,6 +204,9 @@ type Env=__LC_EXECUTION.LiveCopyEnv & {
 type Fill={rowid:number;session_id:string;fill_id:string;at:number;coin:string;side:'A'|'B';sz:number;px:number;start_pos:number;source_oid:string};
 type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episode:number;active:boolean;waitingFlat:boolean;
   entryPending?:boolean;episodeEntryPx?:number;episodeStartedAt?:number;lastFillKind?:string;
+  // A pre-existing source position is a reference only. We never copy its absolute size.
+  // Its subsequent ADDs create a virtual USD accumulation until the first $10.40 entry.
+  inheritedMode?:boolean;inheritedPendingUsd?:number;inheritedDirection?:number;
   desired:number;lastPx:number;lastFillAt:number;lastActionAt:number;lastFillId:string;lastError:string;
   pending?:{id:string;cloid:string;status:'SUBMITTING'|'UNKNOWN';at:number;qty:number;direction:string};
   lastConfirmedOwnQty:number;actionCount:number;};
@@ -246,12 +249,12 @@ export class LiveCopyControllerStage7 {
     const latest=await this.latest();const baseline=await this.sourcePositions();const at=Date.now();
     // Every START is fresh; existing V18 storage is intentionally not read or reused.
     const coins:Record<string,CoinState>={};for(const [coin,qty] of Object.entries(baseline))if(Math.abs(qty)>1e-9)
-      coins[coin]={coin,sourceQty:qty,baseline:qty,scale:0,episode:0,active:false,waitingFlat:true,desired:0,lastPx:0,lastFillAt:0,lastActionAt:0,lastFillId:'',lastError:'',lastConfirmedOwnQty:0,actionCount:0};
+      coins[coin]={coin,sourceQty:qty,baseline:qty,scale:0,episode:0,active:false,waitingFlat:false,inheritedMode:true,inheritedPendingUsd:0,inheritedDirection:Math.sign(qty),desired:0,lastPx:0,lastFillAt:0,lastActionAt:0,lastFillId:'',lastError:'',lastConfirmedOwnQty:0,actionCount:0};
     const s:Session={version:19,mode:'RUNNING',live:this.liveConfigured(),startedAt:at,cursor:latest?.rowid||0,
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -263,25 +266,29 @@ export class LiveCopyControllerStage7 {
       if(!s.sourceSession)s.sourceSession=f.session_id;
       if(f.at<s.startedAt||f.at>Date.now()+30000||!finite(f.sz)||f.sz<=0||!finite(f.px)||f.px<=0||!finite(f.start_pos)||!['A','B'].includes(f.side)){s.skipped++;continue;}
       const delta=(f.side==='B'?1:-1)*Number(f.sz);const before=Number(f.start_pos);const after=round(before+delta);
-      let p=s.coins[f.coin];if(p&&p.lastFillAt>0&&f.at<p.lastFillAt){s.skipped++;continue;}if(!p){p={coin:f.coin,sourceQty:before,baseline:before,scale:0,episode:0,active:false,waitingFlat:Math.abs(before)>1e-8,
+      let p=s.coins[f.coin];if(p&&p.lastFillAt>0&&f.at<p.lastFillAt){s.skipped++;continue;}if(!p){p={coin:f.coin,sourceQty:before,baseline:before,scale:0,episode:0,active:false,waitingFlat:false,
+        inheritedMode:Math.abs(before)>1e-8,inheritedPendingUsd:0,inheritedDirection:Math.sign(before),
         desired:0,lastPx:0,lastFillAt:0,lastActionAt:0,lastFillId:'',lastError:'',lastConfirmedOwnQty:0,actionCount:0};s.coins[f.coin]=p;}
+      // In-place migration of an already RUNNING V19.1 session: anchor at its last
+      // accepted source position, NOT the source position at original START.
+      // Historical skipped fills are never replayed and no retroactive order is sent.
+      if(p.waitingFlat===true){
+        p.baseline=p.sourceQty;p.waitingFlat=false;p.inheritedMode=Math.abs(p.sourceQty)>1e-8;
+        p.inheritedPendingUsd=0;p.inheritedDirection=Math.sign(p.sourceQty);
+        p.desired=0;p.active=false;p.entryPending=false;
+      }
       // A source fill contains the authoritative before-position. Unexpected gaps are marked but the latest
       // source position replaces the internal estimate; no invented intermediate trades are replayed.
       if(Math.abs(p.sourceQty-before)>Math.max(1e-7,Math.abs(before)*1e-5))p.lastError='SOURCE_POSITION_DISCONTINUITY';
       p.sourceQty=after;p.lastPx=f.px;p.lastFillAt=f.at;p.lastFillId=f.fill_id;s.events++;
-      if(p.waitingFlat){
-        p.desired=0;
-        if(Math.abs(after)<1e-8){p.waitingFlat=false;p.baseline=0;p.lastError='';this.log(s,f.coin,'SOURCE_FLAT','Inherited position reached zero');}
-        continue;
-      }
       const beforeSign=Math.sign(before),afterSign=Math.sign(after);
-      // An episode starts only on actual source fills, NEVER on a resting order.
-      // Initial margin $1.04 at 10x => $10.40 notional. Do not multiply $10.40 by 10 again.
+      // A completely new source position or a reversal is always an immediate
+      // $10.40 notional entry. Source exposure from before START is never copied.
       const opening=Math.abs(before)<1e-8&&Math.abs(after)>1e-8;
       const reversal=beforeSign!==0&&afterSign!==0&&beforeSign!==afterSign;
       if(opening||reversal){
-        p.episode++;p.active=true;p.baseline=0;
-        p.scale=MIN/(Math.abs(after)*f.px); // informational initial scale; not reused for percentage ADDs
+        p.episode++;p.active=true;p.baseline=0;p.inheritedMode=false;p.inheritedPendingUsd=0;
+        p.inheritedDirection=0;p.scale=MIN/(Math.abs(after)*f.px);
         p.desired=round(afterSign*MIN/f.px);
         p.entryPending=true;p.episodeEntryPx=f.px;p.episodeStartedAt=f.at;
         p.lastFillKind=reversal?'REVERSAL':'NEW';p.lastError='';
@@ -290,13 +297,41 @@ export class LiveCopyControllerStage7 {
         continue;
       }
       if(Math.abs(after)<1e-8){
-        p.desired=0;p.active=false;p.scale=0;p.entryPending=false;p.lastFillKind='CLOSE';
+        p.desired=0;p.active=false;p.scale=0;p.entryPending=false;
+        p.inheritedMode=false;p.inheritedPendingUsd=0;p.inheritedDirection=0;
+        p.lastFillKind='CLOSE';
         this.log(s,f.coin,'SOURCE_FLAT','Close target 100%, do not wait for ADD minimum');
         continue;
       }
       if(!p.active){
-        // An inherited position cannot be treated as a fresh $10.40 entry.
-        p.waitingFlat=true;p.desired=0;p.lastFillKind='INHERITED';continue;
+        // We have no copied position on this coin yet. Source already held a
+        // position at START. Calculate subsequent ADD/REMOVE percentages only.
+        // A pending ADD is a virtual USD amount, not an actual wallet position.
+        if(beforeSign===0||beforeSign!==afterSign){
+          p.lastError='INHERITED_SOURCE_DIRECTION_MISMATCH';continue;
+        }
+        p.inheritedMode=true;p.inheritedDirection=afterSign;
+        const ratio=Math.abs(after)/Math.abs(before);
+        const prior=Math.max(0,Number(p.inheritedPendingUsd||0));
+        // A 20% source ADD contributes 20% of our $10.40 virtual base.
+        // REMOVE scales DOWN pending unexecuted ADD, never triggers a naked short.
+        const updated=ratio>1+1e-9?prior+MIN*(ratio-1):prior*ratio;
+        p.inheritedPendingUsd=Math.max(0,Math.round(updated*1e8)/1e8);
+        p.desired=0;p.lastFillKind=ratio>1+1e-9?'INHERITED_ADD':ratio<1-1e-9?'INHERITED_REMOVE':'INHERITED_UNCHANGED';
+        this.log(s,f.coin,p.lastFillKind,
+          'source_ratio='+ratio.toFixed(8)+' accumulated_usd='+p.inheritedPendingUsd.toFixed(4));
+        if(p.inheritedPendingUsd>=MIN-1e-7){
+          // A threshold ADD opens an initial $10.40 position, with any excess
+          // kept in desired to accumulate for the next genuine ADD order.
+          p.episode++;p.active=true;p.entryPending=true;
+          p.episodeEntryPx=f.px;p.episodeStartedAt=f.at;
+          p.desired=round(afterSign*p.inheritedPendingUsd/f.px);
+          p.inheritedMode=false;p.inheritedPendingUsd=0;
+          p.lastFillKind='INHERITED_ADD_ENTRY';
+          this.log(s,f.coin,'INHERITED_ADD_THRESHOLD',
+            'entry_notional_usd='+MIN+' pending_total_usd='+p.inheritedPendingUsd.toFixed(4));
+        }
+        continue;
       }
       if(beforeSign!==afterSign || beforeSign===0){
         p.lastError='SOURCE_EPISODE_UNEXPECTED';continue;
@@ -343,6 +378,10 @@ export class LiveCopyControllerStage7 {
     });
     let sent=0;const decisions:any[]=[];
     for(const p of sorted){
+      if(!p.active&&p.inheritedMode){
+        decisions.push({coin:p.coin,action:'ACCUMULATE_INHERITED_ADD',pending_usd:Number(p.inheritedPendingUsd||0),source_last_action:p.lastFillKind||'BASELINE'});
+        continue;
+      }
       const asset=meta.universe.find((a:any)=>a.name===p.coin);
       const price=Number(mids[p.coin]||p.lastPx);if(!asset||!finite(price)||price<=0){p.lastError='MISSING_ASSET_OR_PRICE';continue;}
       const decimals=asset.szDecimals;let own=Number(actual[p.coin]||0);
@@ -400,12 +439,20 @@ export class LiveCopyControllerStage7 {
       const s=await this.load();if(s.mode!=='RUNNING')return J({ok:false,error:'STOPPED'},409);
       if((s.cooldownUntil||0)>Date.now())return J({ok:false,error:'API_RATE_LIMIT_BACKOFF',retry_after:s.cooldownUntil},503);
       if(s.live&&!this.authorized(s)&&!(await this.restore(s)))return J({ok:false,error:'LIVE_ARM_NOT_RESTORED'},409);
+      // Upgrade existing V19.1 RUNNING state once, without a new START or
+      // reprocessing old rows. Previously blocked coins begin accumulating from
+      // their last known source quantity on the NEXT new fill.
+      for(const p of Object.values(s.coins))if(p.waitingFlat===true){
+        p.baseline=p.sourceQty;p.waitingFlat=false;p.inheritedMode=Math.abs(p.sourceQty)>1e-8;
+        p.inheritedPendingUsd=0;p.inheritedDirection=Math.sign(p.sourceQty);
+        p.desired=0;p.active=false;p.entryPending=false;
+      }
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const elapsed=Date.now()-Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const shouldReconcile=elapsed>=20000||(elapsed>=COALESCE_MS&&processed>0);
       const result=shouldReconcile?await this.reconcile(s):{sent:0,decisions:[]};
       if(shouldReconcile){s.lastDecisions=result.decisions;await this.state.storage.put('live_copy_v19_last_reconcile',Date.now());}await this.save(s);
-      return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',processed,cursor:s.cursor,events:s.events,live:this.authorized(s),...result});
+      return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',processed,cursor:s.cursor,events:s.events,live:this.authorized(s),...result});
     }catch(e){const s=await this.load();this.error(s,e);if(/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e)))s.cooldownUntil=Date.now()+60000;await this.save(s);return J({ok:false,error:'V19_SYNC_FAILED',detail:String(e)},503);}
     finally{this.busy=false;}
   }
@@ -463,11 +510,11 @@ export class LiveCopyControllerStage7 {
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
       const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
-        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode}));
-      return J({ok:true,version:'V19_1_PERCENTAGE_FILL_COPY',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0}));
+      return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,source_session:s.sourceSession,started_at:s.startedAt,
-        coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_NEW_REVERSAL_10_40_ADD_ACCUMULATION'});
+        coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
     }
     if(method==='GET'&&path==='/account'){try{return J(await __LC_EXECUTION.readLiveAccount(this.env));}catch(e){return J({ok:false,error:String(e)},503);}}
     if(method==='GET'&&path==='/our-activity'){const s=await this.load();return J({ok:true,events:s.recent});}
