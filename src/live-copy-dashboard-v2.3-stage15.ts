@@ -24,10 +24,10 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <div class="card">Последна проверка<b id="of_checked">—</b></div>
 <div class="card">Грешки в обработката<b id="of_errors">—</b></div>
 </div><p id="of_note" class="muted">Свържи дашборда, за да видиш дали контролерът обработва новите събития.</p></section>
-<section id="orderCopyTest"><h2>V18 · ORDER COPY TEST — SHADOW</h2>
+<section id="orderCopyTest"><h2>V18 · ORDER COPY MONITOR — LIVE + SHADOW</h2>
 <p class="muted">Ориентировъчни действия при получените ордерни събития. Няма реални поръчки, фиктивни изпълнения или симулирана печалба. OPEN/CLOSE/REPLACE са кандидати, които в LIVE трябва допълнително да бъдат потвърдени на борсата.</p>
 <div class="cards"><div class="card">Режим на теста<b id="ct_mode">—</b></div><div class="card">OPEN кандидати<b id="ct_open">0</b></div><div class="card">CLOSE кандидати (reduceOnly)<b id="ct_close">0</b></div><div class="card">REPLACE кандидати<b id="ct_replace">0</b></div><div class="card">CANCEL/FINISH<b id="ct_cancel">0</b></div><div class="card">PARTIAL FILL наблюдения<b id="ct_partial">0</b></div><div class="card">SKIP<b id="ct_skip">0</b></div></div>
-<p id="ct_note" class="muted">Свържи дашборда за данните от текущата SHADOW сесия.</p>
+<p id="ct_note" class="muted">Свържи дашборда за решенията от текущата сесия.</p>
 <div style="overflow:auto"><table><thead><tr><th>Час (София)</th><th>Монета</th><th>Трейдър</th><th>Тестово действие</th><th>Наш кандидат qty / USD</th><th>Цена / Тип</th><th>Причина</th></tr></thead><tbody id="ct_rows"><tr><td colspan="7">Няма заредени решения</td></tr></tbody></table></div>
 </section>
 <section><h2>OVERVIEW · LIVE COPY</h2><p class="muted">Начален капитал: USDC snapshot от Hyperliquid. Непотвърдените показатели се показват като —, а не като измислена печалба. При успешен CLOSE ALL капиталът се обновява само след потвърдено затваряне на всички LIVE COPY позиции.</p><div class="cards"><div class="card">Капитал<b id="ov_capital">—</b></div><div class="card">EQUITY<b id="ov_equity">—</b></div><div class="card">ROI<b id="ov_roi">—</b></div><div class="card">Свободен маржин<b id="ov_free_margin">—</b></div><div class="card">Използван маржин<b id="ov_used_margin">—</b></div><div class="card">Реализиран бруто<b id="ov_realized_gross">—</b></div><div class="card">Такси<b id="ov_fees">—</b></div><div class="card">Реализиран нето<b id="ov_realized_net">—</b></div><div class="card">Нереализиран<b id="ov_unrealized">—</b></div><div class="card">Оборот<b id="ov_turnover">—</b></div><div class="card">НАШИ OPEN POSITIONS<b id="ov_our_open_positions">—</b></div><div class="card">Затворени<b id="ov_closed_trades">—</b></div><div class="card">WIN RATE<b id="ov_win_rate">—</b></div><div class="card">Обработени изпълнения<b id="ov_processed_fills">—</b></div><div class="card">Пропуснати<b id="ov_skipped">—</b></div><div class="card">COPY ACCURACY<b id="ov_copy_accuracy">—</b></div><div class="card">Accuracy sample<b id="ov_accuracy_sample">—</b></div><div class="card">Target Maker fills<b id="ov_target_maker_fills">—</b></div><div class="card">Target Taker fills<b id="ov_target_taker_fills">—</b></div><div class="card">TARGET OPEN ORDERS<b id="ov_target_open_orders">—</b></div><div class="card">TARGET OPEN POSITIONS<b id="ov_target_open_positions">—</b></div></div><p class="muted" id="overviewInfo">Изчаква начален баланс.</p></section>
@@ -75,7 +75,7 @@ async function refreshOrderFollow(){
   $('of_note').textContent=note;
   const test=d.shadow_copy_test||{};
   const counts=test.counts||{};
-  $('ct_mode').textContent=test.enabled?'SHADOW ACTIVE':(!d.shadow_copy_test?'UPDATE CONTROLLER':(d.execution==='SHADOW_ONLY'?'NO DATA':'LIVE / NOT SHADOW'));
+  $('ct_mode').textContent=!d.shadow_copy_test?'UPDATE CONTROLLER':(!test.enabled?'NO ACTIVE ORDERS SESSION':(test.monitoring_mode==='LIVE_OBSERVATION'?'LIVE MONITOR ACTIVE':'SHADOW MONITOR ACTIVE'));
   $('ct_open').textContent=String(counts.OPEN_CANDIDATE||0);
   $('ct_replace').textContent=String(counts.REPLACE_CANDIDATE||0);
   $('ct_close').textContent=String(counts.CLOSE_CANDIDATE||0);
@@ -83,7 +83,7 @@ async function refreshOrderFollow(){
   $('ct_partial').textContent=String(counts.PARTIAL_FILL_OBSERVED||0);
   $('ct_skip').textContent=String(counts.SKIP||0);
   const decisions=Array.isArray(test.decisions)?test.decisions:[];
-  $('ct_rows').innerHTML=decisions.slice().reverse().map(x=>'<tr><td>'+esc(timeBG(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.side+' '+x.sourceStatus+' #'+x.sourceOid)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.ourQty)+' / $'+esc(Number(x.notionalUsd||0).toFixed(2))+'</td><td>'+esc(x.price+' / '+x.tif+(x.reduceOnly?' / reduceOnly':''))+'</td><td>'+esc(x.reason)+'</td></tr>').join('')||'<tr><td colspan="7">Все още няма нови SHADOW решения от този контролер</td></tr>';
+  $('ct_rows').innerHTML=decisions.slice().reverse().map(x=>'<tr><td>'+esc(timeBG(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.side+' '+x.sourceStatus+' #'+x.sourceOid)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.ourQty)+' / $'+esc(Number(x.notionalUsd||0).toFixed(2))+'</td><td>'+esc(x.price+' / '+x.tif+(x.reduceOnly?' / reduceOnly':''))+'</td><td>'+esc(x.reason)+'</td></tr>').join('')||'<tr><td colspan="7">Все още няма нови наблюдавани решения в текущата сесия</td></tr>';
   $('ct_note').textContent=test.note||'Изисква обновения V18 контролер; записите ще се появят при нови ордерни събития.';
   priorOrderCursor=cursor;priorOrderEventCount=count;
  }catch(e){
