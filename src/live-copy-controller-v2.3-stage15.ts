@@ -597,6 +597,97 @@ export async function verifyLiveOrder(env:LiveCopyEnv,intent:CopyIntent):Promise
   return {kind:'VERIFIED',coin:intent.coin,oid,cloid:intent.exchangeCloid||null,totalFilledQty:total,status};
 }
 /** Lightweight read used only AFTER an order-specific recovery was verified. */
+// V18 exchange operations for an observed source order.
+export type MirrorOrderRequest={intentId:string;coin:string;side:'A'|'B';price:number;quantity:number;reduceOnly:boolean;tif:'Gtc'|'Alo'|'Ioc';expectedCoinQty:number};
+export type MirrorOrderResponse={kind:'RESTING'|'FILLED'|'REJECTED'|'UNKNOWN'|'NO_ORDER';oid?:string;cloid:string;filledQty?:number;reason?:string};
+export function roundMirrorQty(value:number,decimals:number){return decimalQty(value,decimals);}
+export async function sourceOrderStatus(sourceWallet:string,oid:string):Promise<any>{
+  if(!validAddress(sourceWallet)||!/^\d+$/.test(oid))throw Error('INVALID_SOURCE_ORDER_REFERENCE');
+  return await info({type:'orderStatus',user:sourceWallet,oid:Number(oid)});
+}
+export async function verifiedOwnOrder(env:LiveCopyEnv,cloid:string,coin:string,side:'A'|'B',qty:number):Promise<{kind:'VERIFIED';oid:string;status:string;filledQty:number;remainingQty:number;terminal:boolean}|{kind:'UNRESOLVED';reason:string}>{
+  const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
+  const r:any=await info({type:'orderStatus',user:master,oid:cloid});
+  if(r?.status!=='order'||!r?.order?.order)return {kind:'UNRESOLVED',reason:'OWN_ORDER_NOT_FOUND_BY_CLOID'};
+  const o=r.order.order;const oid=String(o.oid??''),status=String(r.order.status||'').toLowerCase();
+  if(!/^\d+$/.test(oid)||o.coin!==coin||o.side!==side||String(o.cloid||'').toLowerCase()!==cloid.toLowerCase()||
+    !Number.isFinite(Number(o.origSz))||Math.abs(Number(o.origSz)-qty)>1e-7)
+    return {kind:'UNRESOLVED',reason:'OWN_ORDER_IDENTITY_MISMATCH'};
+  const from=Math.max(0,Number(o.timestamp||0)-30000);
+  if(!from||Date.now()-from>6*60*60*1000)return {kind:'UNRESOLVED',reason:'OWN_ORDER_HISTORY_TOO_OLD'};
+  const fills:any=await info({type:'userFillsByTime',user:master,startTime:from,endTime:Date.now(),aggregateByTime:false});
+  if(!Array.isArray(fills)||fills.length>=2000)return {kind:'UNRESOLVED',reason:'OWN_FILL_PAGE_INCOMPLETE'};
+  const seen=new Set<string>();let filled=0;
+  for(const f of fills)if(String(f.oid)===oid){
+    if(f.coin!==coin||f.side!==side||!(Number(f.sz)>0))return {kind:'UNRESOLVED',reason:'OWN_FILL_IDENTITY_MISMATCH'};
+    const id=String(f.hash??'')+':'+String(f.tid??'');if(!seen.has(id)){seen.add(id);filled+=Number(f.sz);}
+  }
+  filled=Math.round(filled*1e10)/1e10;
+  if(filled>qty+1e-7)return {kind:'UNRESOLVED',reason:'OWN_FILLED_MORE_THAN_REQUESTED'};
+  const terminal=/^(filled|canceled|rejected|.*canceled|.*rejected|liquidatedcanceled)$/.test(status);
+  if(status==='filled'&&filled+1e-7<qty)return {kind:'UNRESOLVED',reason:'FILLED_STATUS_FILL_HISTORY_LAG'};
+  if(!terminal&&status!=='open')return {kind:'UNRESOLVED',reason:'UNKNOWN_OWN_ORDER_STATUS:'+status};
+  return {kind:'VERIFIED',oid,status,filledQty:filled,remainingQty:Math.max(0,qty-filled),terminal};
+}
+export async function placeMirrorOrder(env:LiveCopyEnv,request:MirrorOrderRequest):Promise<MirrorOrderResponse>{
+  const cloid=cloidForIntent(request.intentId);
+  const no=(reason:string):MirrorOrderResponse=>({kind:'NO_ORDER',cloid,reason});
+  if(env.LIVE_COPY_TRADING_ENABLED!=='true')return no('LIVE_DISABLED');
+  const key=normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY),master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!keyFormat(key)||!validAddress(master))return no('CREDENTIALS_MISSING');
+  if(!/^[A-Z0-9]{2,20}$/.test(request.coin)||!Number.isFinite(request.price)||request.price<=0||
+    !Number.isFinite(request.quantity)||request.quantity<=0||!['Gtc','Alo','Ioc'].includes(request.tif))return no('INVALID_ORDER');
+  const account=await readLiveAccount(env);
+  const asset=account.assetMeta.find((x:any)=>x.coin===request.coin);
+  if(!asset)return no('UNKNOWN_ASSET');
+  const qty=decimalQty(request.quantity,asset.szDecimals);
+  if(qty<=0||(!request.reduceOnly&&qty*request.price<10))return no('INVALID_SIZE_OR_NOTIONAL');
+  const current=Number(account.positions.find((p:any)=>p.coin===request.coin)?.qty||0);
+  if(Math.abs(current-request.expectedCoinQty)>Math.max(1e-7,2*10**(-asset.szDecimals)))return no('MIRROR_POSITION_MISMATCH');
+  if(request.reduceOnly){
+    if(current===0||Math.sign(current)===(request.side==='B'?1:-1)||qty>Math.abs(current)+1e-7)
+      return no('REDUCE_ONLY_NOT_OWNED_OR_EXCEEDS_POSITION');
+  }else{
+    if(current!==0&&Math.sign(current)!==(request.side==='B'?1:-1))return no('OPPOSITE_POSITION_EXISTS');
+    if(env.LIVE_COPY_LEVERAGE_VERIFIED!=='true'||env.LIVE_COPY_LEVERAGE_MODE!=='cross'||asset.maxLeverage<10)
+      return no('LEVERAGE_NOT_APPROVED');
+    if(current!==0){const p=account.positions.find((p:any)=>p.coin===request.coin);
+      if(p?.leverage?.type!=='cross'||Number(p?.leverage?.value)!==10)return no('POSITION_LEVERAGE_NOT_10X_CROSS');
+    }else{
+      // Once per initial entry into a FLAT coin; no repeated leverage writes on ADD.
+      try {const lv=await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
+        if(lv?.status!=='ok'||lv?.response?.type!=='default')return no('LEVERAGE_NOT_CONFIRMED');}
+      catch(e){return no('LEVERAGE_WRITE_UNCONFIRMED:'+String(e));}
+    }
+  }
+  const price=formatPrice(request.price,asset.szDecimals);
+  const action={type:'order',orders:[{a:asset.assetId,b:request.side==='B',p:price,
+    s:qty.toFixed(asset.szDecimals),r:request.reduceOnly,t:{limit:{tif:request.tif}},c:cloid}],grouping:'na'};
+  let result:any;
+  try{result=await sendAction(action,key as `0x${string}`,master);}
+  catch(e){return {kind:'UNKNOWN',cloid,reason:'ORDER_WRITE_OUTCOME_UNKNOWN:'+String(e)};}
+  const entry=result?.response?.data?.statuses?.[0];
+  if(entry?.resting)return {kind:'RESTING',cloid,oid:String(entry.resting.oid),filledQty:0};
+  if(entry?.filled)return {kind:'FILLED',cloid,oid:String(entry.filled.oid),filledQty:Number(entry.filled.totalSz||0)};
+  if(entry?.error)return {kind:'REJECTED',cloid,reason:String(entry.error)};
+  return {kind:'UNKNOWN',cloid,reason:'UNRECOGNIZED_ORDER_RESPONSE'};
+}
+export async function cancelMirrorOrder(env:LiveCopyEnv,coin:string,cloid:string):Promise<'ACKNOWLEDGED'|'UNKNOWN'|'REJECTED'>{
+  const key=normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY),master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(!keyFormat(key)||!validAddress(master)||!/^0x[0-9a-f]{32}$/i.test(cloid))throw Error('INVALID_CANCEL_CREDENTIALS_OR_CLOID');
+  const meta:any=await info({type:'meta'});
+  const asset=meta?.universe?.findIndex((a:any)=>a.name===coin);
+  if(asset===undefined||asset<0)throw Error('UNKNOWN_CANCEL_ASSET');
+  let r:any;
+  try{r=await sendAction({type:'cancelByCloid',cancels:[{asset,cloid}]},key as `0x${string}`,master);}
+  catch{return 'UNKNOWN';}
+  const result=r?.response?.data?.statuses?.[0];
+  if(result==='success')return 'ACKNOWLEDGED';
+  if(result?.error)return 'REJECTED';
+  return 'UNKNOWN';
+}
+
 export async function readLiveCoinQuantity(env:LiveCopyEnv,coin:string):Promise<number>{
   const master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
   if(!validAddress(master))throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
@@ -736,6 +827,47 @@ export async function closeAllOwned(input:{store:LedgerStore;exchange:CloseAdapt
 
 }
 
+// ========= V17 SOURCE ORDER LIFECYCLE =========
+// Separate from target userFills: never infer a resting order from a fill.
+namespace __LC_ORDER_FOLLOW {
+  export type TargetOrder = {
+    source_oid:string; coin:string; at:number; status:string;
+    side:'A'|'B'; price:number; orig_sz:number; remaining_sz:number;
+    tif:string; order_type:string; reduce_only:boolean; is_trigger:boolean;
+    source_order_time:number; observed_at:number;
+  };
+  export type Leg={intentId:string;cloid:string;ownOid:string|null;qty:number;filledQty:number;price:number;
+    status:'SUBMITTING'|'RESTING'|'CANCELING'|'COMPLETE'|'UNKNOWN'|'NO_ORDER'|'REJECTED';sourceSizeAtPlacement?:number;
+    createdAt:number;lastCheckedAt:number;lastError:string};
+  export type Pair={sourceOid:string;sourceAt:number;lastSourceAt:number;coin:string;side:'A'|'B';price:number;
+    sourceSize:number;remainingSource:number;scale:number;reduceOnly:boolean;tif:'Gtc'|'Alo'|'Ioc';
+    sourceStatus:string;sourceFilledQty:number;lastBalancedSourceFill?:number;lastSourceFillAt:number;qtyLimit:number;legs:Leg[];error:string;updatedAt:number};
+  export type Adjustment={intentId:string;coin:string;side:'A'|'B';qty:number;filledQty:number;reduceOnly:boolean;
+    status:'SUBMITTING'|'UNKNOWN'|'FILLED'|'REJECTED';cloid:string;ownOid:string|null;lastError:string;at:number};
+  export type FollowState={startedAt:number;session:string;rowid:number;scales:Record<string,number>;
+    pairs:Record<string,Pair>;adjustments:Record<string,Adjustment>;nextAdjustment:number;
+    coinErrors:Record<string,string>;closing?:boolean;closed?:boolean;events:number;errors:number;};
+  export const fresh=(startedAt:number,session:string,rowid:number):FollowState=>({startedAt,session,rowid,scales:{},pairs:{},adjustments:{},nextAdjustment:0,coinErrors:{},events:0,errors:0});
+  export function parse(raw:any):TargetOrder|null{
+    const p=raw;
+    if(!p || !/^\d+$/.test(String(p.source_oid||''))||!/^[A-Z0-9]{2,20}$/.test(String(p.coin||'')))return null;
+    const at=Number(p.at),price=Number(p.price),sz=Number(p.orig_sz),left=Number(p.remaining_sz);
+    if(!Number.isFinite(at)||at<=0||!Number.isFinite(price)||price<=0||!Number.isFinite(sz)||sz<=0||
+       !Number.isFinite(left)||left<0||!['A','B'].includes(p.side))return null;
+    return {...p,at,price,orig_sz:sz,remaining_sz:left};
+  }
+  export const terminal=(status:string)=>/^(filled|canceled|cancelled|rejected|.*canceled|.*rejected|liquidatedcanceled|triggered)$/i.test(status);
+  export function quantity(coin:string,source:number,scale:number,decimals:number,price:number):number {
+    const unit=10**(-decimals);
+    let q=Math.floor((source*scale+1e-10)/unit)*unit;
+    if(q*price<10.40 && source*scale*price>=10.40-1e-6){
+      const minimum=Math.ceil((10.40/price)/unit-1e-9)*unit;
+      if(coin!=='ZEC'||minimum*price<=20.000001)q=minimum;
+    }
+    return Math.round(q*1e10)/1e10;
+  }
+}
+
 // ===== LIVE CONTROLLER (existing public export) =====
 import planCopyAction = __LC_ACCUMULATOR.planCopyAction;
 import CopyCoinState = __LC_ACCUMULATOR.CopyCoinState;
@@ -770,7 +902,7 @@ import reconcileCopyLedger = __LC_RECONCILIATION.reconcileCopyLedger;
 
 
 
-type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
+type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_LEVERAGE_MODE?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;LIVE_COPY_ORDER_FOLLOW_MODE?:string;LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
 type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;firstDetectedAt?:number;episode:number;addSignals?:number;lastAddSignalAt?:number;forceNewEpisode?:boolean;
@@ -950,7 +1082,8 @@ export class LiveCopyControllerStage7 {
     const rateLimitUntil=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
     if(Date.now()<rateLimitUntil){if(this.state.storage.setAlarm)await this.state.storage.setAlarm(rateLimitUntil+1000);return;}
     try{
-      const response=await this.fetch(new Request('https://live-copy.internal/sync',{
+      const syncRoute=this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'?'order-sync':'sync';
+      const response=await this.fetch(new Request('https://live-copy.internal/'+syncRoute,{
         method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},body:'{}'
       }));
       const result:any=await response.json();
@@ -1499,7 +1632,7 @@ export class LiveCopyControllerStage7 {
   }
   private async paperSkip(){const a=await this.paper();if(a){a.skipped++;await this.state.storage.put('live_copy_v23_paper_session',a);}}
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
-  private armConfig(){return JSON.stringify({trading:this.env.LIVE_COPY_TRADING_ENABLED,auto:this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED,leverage:this.env.LIVE_COPY_LEVERAGE_VERIFIED,mode:this.env.LIVE_COPY_LEVERAGE_MODE,account:this.env.HYPERLIQUID_MASTER_ACCOUNT});}
+  private armConfig(){return JSON.stringify({trading:this.env.LIVE_COPY_TRADING_ENABLED,auto:this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED,leverage:this.env.LIVE_COPY_LEVERAGE_VERIFIED,mode:this.env.LIVE_COPY_LEVERAGE_MODE,account:this.env.HYPERLIQUID_MASTER_ACCOUNT,orderMode:this.env.LIVE_COPY_ORDER_FOLLOW_MODE,orderExecution:this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED});}
   private async restoreLiveArm(s:Snapshot):Promise<{ok:boolean;reason:string}>{
     if(s.mode!=='RUNNING'||s.sessionKind!=='LIVE'||!this.liveEnabled()||!s.startedAt)return {ok:false,reason:'LIVE_CONFIGURATION_DISABLED_OR_CHANGED'};
     if(this.liveAuthorized(s))return {ok:true,reason:'AUTHORIZED'};
@@ -1524,6 +1657,331 @@ export class LiveCopyControllerStage7 {
     return 'AUTHORIZED';
   }
   private async halt(reason:string,coin?:string){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);const s=await this.load();s.mode='STOPPED';this.audit(s,'LIVE_HALTED',coin,reason);await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();}
+  private async followState(){return await this.state.storage.get<__LC_ORDER_FOLLOW.FollowState>('live_copy_v17_order_follow');}
+  private async saveFollow(f:__LC_ORDER_FOLLOW.FollowState){await this.state.storage.put('live_copy_v17_order_follow',f);}
+  private ownFollowQty(f:__LC_ORDER_FOLLOW.FollowState,coin:string):number{
+    let qty=0;
+    for(const p of Object.values(f.pairs))if(p.coin===coin){
+      const sign=p.side==='B'?1:-1;
+      for(const leg of (p.legs||[]))qty+=sign*Number(leg.filledQty||0);
+    }
+    for(const a of Object.values(f.adjustments||{}))if(a.coin===coin&&a.status==='FILLED')
+      qty+=(a.side==='B'?1:-1)*a.filledQty;
+    return Math.round(qty*1e10)/1e10;
+  }
+  private desiredFollowQty(f:__LC_ORDER_FOLLOW.FollowState,coin:string):number{
+    const rows=Object.values(f.pairs).filter(p=>p.coin===coin).sort((a,b)=>a.sourceAt-b.sourceAt||Number(a.sourceOid)-Number(b.sourceOid));
+    let qty=0;
+    for(const p of rows){
+      const delta=(p.side==='B'?1:-1)*p.sourceFilledQty*p.scale;
+      if(p.reduceOnly){
+        if(qty===0||Math.sign(qty)===Math.sign(delta))continue;
+        qty+=Math.sign(delta)*Math.min(Math.abs(qty),Math.abs(delta));
+      }else qty+=delta;
+    }
+    return Math.round(qty*1e10)/1e10;
+  }
+  private async checkFollowProof(f:__LC_ORDER_FOLLOW.FollowState,p:__LC_ORDER_FOLLOW.Pair,leg:__LC_ORDER_FOLLOW.Leg,force=false){
+    if(leg.status==='NO_ORDER'||leg.status==='REJECTED'||(leg.status==='COMPLETE'&&!force))return;
+    if(!force&&Date.now()-leg.lastCheckedAt<15000)return;
+    let proof:Awaited<ReturnType<typeof __LC_EXECUTION.verifiedOwnOrder>>;
+    try{proof=await __LC_EXECUTION.verifiedOwnOrder(this.env,leg.cloid,p.coin,p.side,leg.qty);}
+    catch(e){if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_ORDER_PROOF');leg.lastError=String(e);leg.lastCheckedAt=Date.now();return;}
+    leg.lastCheckedAt=Date.now();
+    if(proof.kind!=='VERIFIED'){
+      leg.status='UNKNOWN';leg.lastError=proof.reason;return;
+    }
+    // A previously confirmed fill must not disappear from the ledger when the
+    // exchange's finite history response becomes incomplete.
+    if(proof.filledQty+1e-8<leg.filledQty){leg.status='UNKNOWN';leg.lastError='EXCHANGE_FILL_HISTORY_REGRESSED';return;}
+    leg.filledQty=proof.filledQty;leg.ownOid=proof.oid;leg.lastError='';
+    leg.status=proof.terminal?'COMPLETE':leg.status==='CANCELING'?'CANCELING':'RESTING';
+  }
+  private async cancelFollowLeg(f:__LC_ORDER_FOLLOW.FollowState,p:__LC_ORDER_FOLLOW.Pair,leg:__LC_ORDER_FOLLOW.Leg){
+    if(!['RESTING','CANCELING'].includes(leg.status))return;
+    if(leg.status==='RESTING'){
+      // Persist cancellation intention before the network write; no repeating
+      // cancel on timeout until an order-specific status check succeeds.
+      leg.status='CANCELING';await this.saveFollow(f);
+      try{const ack=await __LC_EXECUTION.cancelMirrorOrder(this.env,p.coin,leg.cloid);
+        if(ack!=='ACKNOWLEDGED')leg.lastError='CANCEL_'+ack;}
+      catch(e){leg.lastError='CANCEL_FAILED:'+String(e);if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_CANCEL');}
+      await this.saveFollow(f);
+      const state=await this.load();this.audit(state,'MIRROR_CANCEL_SENT',p.coin,`source_oid=${p.sourceOid}; own_cloid=${leg.cloid}`);await this.save(state);
+    }
+    await this.checkFollowProof(f,p,leg,true);
+    await this.saveFollow(f);
+  }
+  private async newFollowLeg(f:__LC_ORDER_FOLLOW.FollowState,p:__LC_ORDER_FOLLOW.Pair,qty:number){
+    if(p.reduceOnly && this.ownFollowQty(f,p.coin)*(p.side==='B'?1:-1)>=0)return;
+    const version=(p.legs?.length||0)+1;
+    const intentId='MIRROR:'+f.session+':'+p.sourceOid+':'+version;
+    const cloid=__LC_EXECUTION.cloidForIntent(intentId);
+    const leg:__LC_ORDER_FOLLOW.Leg={intentId,cloid,ownOid:null,qty,filledQty:0,price:p.price,
+      status:'SUBMITTING',sourceSizeAtPlacement:p.sourceSize,lastCheckedAt:0,lastError:'',createdAt:Date.now()};
+    p.legs.push(leg);await this.saveFollow(f);
+    let result:__LC_EXECUTION.MirrorOrderResponse;
+    try{result=await __LC_EXECUTION.placeMirrorOrder(this.env,{intentId,coin:p.coin,side:p.side,
+      price:p.price,quantity:qty,tif:p.tif,reduceOnly:p.reduceOnly,expectedCoinQty:this.ownFollowQty(f,p.coin)});}
+    catch(e){leg.status='UNKNOWN';leg.lastError='SUBMIT_FAILED:'+String(e);if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_PLACE');await this.saveFollow(f);return;}
+    leg.ownOid=result.oid||null;leg.lastError=result.reason||'';
+    {const state=await this.load();this.audit(state,result.kind==='UNKNOWN'?'MIRROR_ORDER_UNKNOWN':'MIRROR_ORDER_'+result.kind,
+      p.coin,`source_oid=${p.sourceOid}; own_cloid=${leg.cloid}; qty=${qty}; tif=${p.tif}`);await this.save(state);}
+    if(result.kind==='RESTING')leg.status='RESTING';
+    else if(result.kind==='FILLED'){leg.status='COMPLETE';leg.filledQty=Number(result.filledQty||0);}
+    else if(result.kind==='REJECTED'||result.kind==='NO_ORDER')leg.status=result.kind;
+    else leg.status='UNKNOWN';
+    await this.saveFollow(f);
+  }
+  private async resolveFollowAdjustment(f:__LC_ORDER_FOLLOW.FollowState,a:__LC_ORDER_FOLLOW.Adjustment){
+    if(a.status!=='UNKNOWN'&&a.status!=='SUBMITTING')return;
+    const intent:any={id:a.intentId,coin:a.coin,side:a.side==='B'?'BUY':'SELL',requestedQty:a.qty,
+      confirmedFillQty:a.filledQty,exchangeCloid:a.cloid,exchangeOid:a.ownOid,reduceOnly:a.reduceOnly};
+    try{const proof=await verifyLiveOrder(this.env,intent);
+      if(proof.kind==='VERIFIED'){a.filledQty=proof.totalFilledQty;a.ownOid=proof.oid;
+        a.status=a.filledQty>0?'FILLED':'REJECTED';a.lastError='';}
+      else a.lastError=proof.reason;
+    }catch(e){a.lastError=String(e);if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_ADJUST_PROOF');}
+    await this.saveFollow(f);
+  }
+  private async reconcileFollowCoin(f:__LC_ORDER_FOLLOW.FollowState,coin:string){
+    const pairs=Object.values(f.pairs).filter(p=>p.coin===coin);
+    if(!pairs.length||pairs.some(p=>(p.legs||[]).some(l=>['UNKNOWN','SUBMITTING','CANCELING','RESTING'].includes(l.status))))return;
+    const adjustments=Object.values(f.adjustments||{}).filter(a=>a.coin===coin);
+    if(adjustments.some(a=>a.status==='UNKNOWN'||a.status==='SUBMITTING'))return;
+    let actual:number;
+    try{actual=await readLiveCoinQuantity(this.env,coin);}
+    catch(e){if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_POSITION_READ');return;}
+    const owned=this.ownFollowQty(f,coin);
+    // A foreign position or manually changed quantity must not be adopted.
+    if(Math.abs(actual-owned)>0.00001){f.coinErrors[coin]='OWN_POSITION_MISMATCH';return;}
+    f.coinErrors[coin]='';
+    const target=this.desiredFollowQty(f,coin),delta=target-actual;
+    const meta=await this.cachedMeta();const asset=meta?.universe?.find((x:any)=>x.name===coin);
+    if(!asset)return;
+    const precision=10**(-asset.szDecimals);
+    if(Math.abs(delta)<precision*0.999)return;
+    const reduce=actual!==0&&(Math.sign(delta)!==Math.sign(actual));
+    let qty=reduce?Math.min(Math.abs(actual),Math.abs(delta)):Math.abs(delta);
+    qty=__LC_EXECUTION.roundMirrorQty(qty,asset.szDecimals);
+    if(qty<precision)return;
+    // Exchange/strategy minimum prevents dust OPENs; accumulate source fills
+    // until enough size exists. Reductions of our confirmed position remain allowed.
+    if(!reduce && qty*(pairs.find(p=>p.lastSourceFillAt>0)?.price||0)<10.40)return;
+    // Never chase an old source ENTRY after a disconnect. Necessary exits
+    // still proceed, irrespective of how old the source fill is.
+    const recent=Math.max(0,...pairs.map(p=>p.lastSourceFillAt||0));
+    if(!reduce&&Date.now()-recent>30000){f.coinErrors[coin]='LATE_ENTRY_SKIPPED_NO_CATCHUP';return;}
+    // A verified market price is required for our IOC execution.
+    let price=0;
+    try{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({type:'allMids'})});if(!r.ok)throw Error('MIDS_HTTP_'+r.status);
+      const mids:any=await r.json();price=Number(mids?.[coin]);}
+    catch(e){if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_MARK_PRICE');return;}
+    if(!(price>0))return;
+    const intentId='MIRROR_BALANCE:'+f.session+':'+coin+':'+(++f.nextAdjustment);
+    const a:__LC_ORDER_FOLLOW.Adjustment={intentId,coin,side:delta>0?'B':'A',qty,filledQty:0,
+      reduceOnly:reduce,status:'SUBMITTING',cloid:cloidForIntent(intentId),ownOid:null,lastError:'',at:Date.now()};
+    f.adjustments[intentId]=a;await this.saveFollow(f);
+    try{const r=await executeLiveIoc(this.env,{intentId,coin,direction:delta>0?'LONG':'SHORT',quantity:qty,
+      reduceOnly:reduce,referencePrice:price});
+      a.ownOid=r.oid==null?null:String(r.oid);
+      if(r.executed&&Number(r.filledQty)>0){a.status='FILLED';a.filledQty=Number(r.filledQty);}
+      else if(r.orderSent===false){a.status='REJECTED';a.lastError=r.status;}
+      else {a.status='UNKNOWN';a.lastError=r.status;}
+    }catch(e){a.status='UNKNOWN';a.lastError=String(e);if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_MARKET_ADJUST');}
+    await this.saveFollow(f);
+    const state=await this.load();this.audit(state,a.status==='FILLED'?'MIRROR_ADJUST_FILLED':'MIRROR_ADJUST_'+a.status,
+      coin,`cloid=${a.cloid}; qty=${a.qty}; reduceOnly=${reduce}`);await this.save(state);
+  }
+  private async syncFollowOrders(s:Snapshot):Promise<any>{
+    if(s.mode!=='RUNNING')return {ok:false,error:'STOPPED'};
+    const live=this.liveAuthorized(s) && this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED==='true';
+    if(!this.env.DB)return {ok:false,error:'DB_BINDING_MISSING'};
+    let f=await this.followState();
+    if(!f||f.startedAt!==s.startedAt)return {ok:false,error:'FOLLOW_SESSION_NOT_INITIALIZED'};
+    const raw=await this.env.DB.prepare(`SELECT rowid,session_id,at,source_oid,coin,status,payload
+      FROM mc_copy_order_updates WHERE rowid>? ORDER BY rowid ASC LIMIT 100`).bind(f.rowid).all<any>();
+    const sourceWallet=WATCHED_SOURCE_WALLET_V23;
+    for(const row of raw.results||[]){
+      if(!f.session)f.session=row.session_id;
+      if(row.session_id!==f.session){f.errors++;f.rowid=row.rowid;await this.saveFollow(f);continue;}
+      const o=__LC_ORDER_FOLLOW.parse(JSON.parse(row.payload));
+      if(o&&o.at>=f.startedAt&&o.at<=Date.now()+30000){
+        const exists=f.pairs[o.source_oid];
+        if(!exists){
+          const meta=await this.cachedMeta();const asset=meta?.universe?.find((x:any)=>x.name===o.coin);
+          const fromBeforeStart=Number(o.source_order_time||0)>0&&Number(o.source_order_time)<f.startedAt;
+          const valid=!fromBeforeStart&&asset&&(o.order_type==='Limit'||(o.order_type==='Market'&&o.tif==='Ioc'))&&['Gtc','Alo','Ioc'].includes(o.tif)&&!o.is_trigger;
+          const scale=f.scales[o.coin]||10.40/(o.orig_sz*o.price);
+          const qty=asset?__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,scale,asset.szDecimals,o.price):0;
+          if(valid&&!f.scales[o.coin])f.scales[o.coin]=scale;
+          f.pairs[o.source_oid]={sourceOid:o.source_oid,sourceAt:o.source_order_time||o.at,
+            lastSourceAt:o.at,coin:o.coin,side:o.side,price:o.price,sourceSize:o.orig_sz,
+            remainingSource:o.remaining_sz,scale,reduceOnly:o.reduce_only,tif:(valid?o.tif:'Gtc') as 'Gtc'|'Alo'|'Ioc',
+            sourceStatus:o.status,sourceFilledQty:0,lastSourceFillAt:0,qtyLimit:valid?qty:0,legs:[],
+            error:valid?'':fromBeforeStart?'ORDER_PREEXISTED_START':'UNSUPPORTED_SOURCE_ORDER',updatedAt:Date.now()};
+        }else if(o.at>exists.lastSourceAt || (o.at===exists.lastSourceAt &&
+                   !__LC_ORDER_FOLLOW.terminal(exists.sourceStatus))){
+          exists.price=o.price;exists.sourceSize=o.orig_sz;exists.remainingSource=o.remaining_sz;
+          const asset=(await this.cachedMeta())?.universe?.find((x:any)=>x.name===o.coin);
+          if(asset)exists.qtyLimit=__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,exists.scale,asset.szDecimals,o.price);
+          exists.sourceStatus=o.status;exists.lastSourceAt=o.at;exists.updatedAt=Date.now();
+        }
+        f.events++;
+      }
+      f.rowid=row.rowid;await this.saveFollow(f);
+    }
+    // Source fills are already de-duplicated by source tid/hash in D1.
+    const sourceRows=await this.env.DB.prepare(`SELECT source_oid,SUM(sz) AS total,MAX(at) AS last_at
+      FROM mc_copy_source_order_fills WHERE session_id=? AND at>=? GROUP BY source_oid`).bind(f.session,f.startedAt).all<any>();
+    for(const r of sourceRows.results||[]){const p=f.pairs[String(r.source_oid)];if(!p)continue;
+      const sz=Number(r.total||0),at=Number(r.last_at||0);
+      if(sz>=p.sourceFilledQty){p.sourceFilledQty=sz;p.lastSourceFillAt=at;}
+      else f.coinErrors[p.coin]='SOURCE_FILL_HISTORY_REGRESSED';
+    }
+    await this.saveFollow(f);
+    if(!live)return {ok:true,mode:'ORDERS_SHADOW',cursor:f.rowid,tracked:Object.keys(f.pairs).length,
+      source_fills:sourceRows.results?.length||0,real_orders_sent:false};
+    const cooldown=await this.state.storage.get<number>(this.rateLimitUntilKey)||0;
+    if(Date.now()<cooldown)return {ok:false,error:'HYPERLIQUID_RATE_LIMIT_BACKOFF',retryable:true,retry_at:cooldown};
+    // Work is serialised by the DO. A single coin in UNKNOWN does not block
+    // read-only monitoring or cancellation for independent, proved orders.
+    for(const p of Object.values(f.pairs).slice(-80)){
+      if(p.error)continue;
+      for(const l of p.legs)if(l.status==='UNKNOWN'||l.status==='SUBMITTING'||l.status==='CANCELING'||l.status==='RESTING'){
+        await this.checkFollowProof(f,p,l);
+      }
+      const isTerminal=__LC_ORDER_FOLLOW.terminal(p.sourceStatus);
+      const active=p.legs.find(l=>l.status==='RESTING'||l.status==='CANCELING');
+      const replacement=active&&(Math.abs(active.price-p.price)>1e-8||
+        Math.abs(Number(active.sourceSizeAtPlacement||p.sourceSize)-p.sourceSize)>1e-8||
+        p.reduceOnly&&p.legs.length>0&&p.remainingSource<=0 ||
+        p.sourceFilledQty>Number(p.lastBalancedSourceFill||0)+1e-9);
+      if(active&&(isTerminal||replacement))await this.cancelFollowLeg(f,p,active);
+      if(f.closing||isTerminal||p.tif==='Ioc'||
+          p.sourceFilledQty>Number(p.lastBalancedSourceFill||0)+1e-9||
+          p.legs.some(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)))continue;
+      if(p.legs.some(l=>l.status==='RESTING'))continue;
+      const alreadyFilled=p.legs.reduce((sum,l)=>sum+l.filledQty,0);
+      const outstanding=Math.max(0,p.qtyLimit-alreadyFilled);
+      const asset=(await this.cachedMeta())?.universe?.find((a:any)=>a.name===p.coin);
+      if(!asset)continue;
+      let qty=__LC_EXECUTION.roundMirrorQty(Math.min(outstanding,p.remainingSource*p.scale),asset.szDecimals);
+      if(p.legs.length===0&&p.sourceFilledQty===0&&!p.reduceOnly&&
+          p.remainingSource*p.scale*p.price>=10.40-1e-6&&qty*p.price<10.40){
+        const unit=10**(-asset.szDecimals);
+        const rounded=Math.ceil((10.40/p.price)/unit-1e-9)*unit;
+        if(p.coin!=='ZEC'||rounded*p.price<=20.000001)qty=Math.round(rounded*1e10)/1e10;
+      }
+      if(qty<=0||(qty*p.price<10&&!p.reduceOnly)||Date.now()-p.lastSourceAt>180000)continue;
+      // Verify that the source order is still open at the exchange before
+      // placing our matching limit, not merely open in a delayed WS message.
+      let source:any;
+      try{source=await __LC_EXECUTION.sourceOrderStatus(sourceWallet,p.sourceOid);}
+      catch(e){if(this.isRateLimited(e))await this.deferRateLimit('SOURCE_ORDER_VERIFY');continue;}
+      const sourceInfo=source?.order?.order;
+      if(source?.status!=='order'||String(source?.order?.status||'').toLowerCase()!=='open'||
+          String(sourceInfo?.oid)!==p.sourceOid||sourceInfo?.coin!==p.coin||sourceInfo?.side!==p.side||
+          sourceInfo?.reduceOnly!==p.reduceOnly||!(Number(sourceInfo?.limitPx)>0))continue;
+      if(p.reduceOnly&&this.ownFollowQty(f,p.coin)*(p.side==='B'?1:-1)>=0)continue;
+      await this.newFollowLeg(f,p,qty);
+    }
+    // Resolve mirror positions only after all outstanding limit quantities for
+    // that coin are terminal, and after own-order-specific fill verification.
+    const coins=[...new Set(Object.values(f.pairs).map(p=>p.coin))];
+    for(const coin of coins){
+      if(f.closing)continue;
+      for(const a of Object.values(f.adjustments||{}).filter(a=>a.coin===coin&&['UNKNOWN','SUBMITTING'].includes(a.status)))
+        await this.resolveFollowAdjustment(f,a);
+      await this.reconcileFollowCoin(f,coin);
+      const openRest=Object.values(f.pairs).filter(p=>p.coin===coin).some(p=>p.legs.some(l=>['RESTING','CANCELING','UNKNOWN','SUBMITTING'].includes(l.status)));
+      if(!openRest && !Object.values(f.adjustments).some(a=>a.coin===coin&&['UNKNOWN','SUBMITTING'].includes(a.status))){
+        for(const p of Object.values(f.pairs).filter(p=>p.coin===coin))p.lastBalancedSourceFill=p.sourceFilledQty;
+      }
+    }
+    await this.saveFollow(f);
+    return {ok:true,mode:'ORDERS_LIFECYCLE',cursor:f.rowid,tracked:Object.keys(f.pairs).length,
+      resting:Object.values(f.pairs).flatMap(p=>p.legs).filter(l=>l.status==='RESTING').length,
+      unresolved:Object.values(f.pairs).flatMap(p=>p.legs).filter(l=>l.status==='UNKNOWN').length+
+        Object.values(f.adjustments).filter(a=>a.status==='UNKNOWN').length,
+      coin_errors:f.coinErrors,real_orders_sent:true};
+  }
+
+  private async cancelAllMirrorResting(f:__LC_ORDER_FOLLOW.FollowState):Promise<string[]>{
+    const outstanding:string[]=[];
+    for(const p of Object.values(f.pairs))for(const leg of p.legs){
+      if(['RESTING','CANCELING'].includes(leg.status))await this.cancelFollowLeg(f,p,leg);
+      if(['SUBMITTING','UNKNOWN','RESTING','CANCELING'].includes(leg.status)){
+        await this.checkFollowProof(f,p,leg,true);
+        if(['SUBMITTING','UNKNOWN','RESTING','CANCELING'].includes(leg.status))outstanding.push(p.coin+':'+leg.cloid);
+      }
+    }
+    await this.saveFollow(f);return outstanding;
+  }
+  private async closeAllMirrorOrders(s:Snapshot):Promise<any>{
+    const f=await this.followState();
+    if(!f)return {ok:false,error:'NO_MIRROR_SESSION'};
+    if(this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED!=='true'||!this.liveAuthorized(s))
+      return {ok:false,error:'MIRROR_CLOSE_REQUIRES_LIVE_AUTHORIZATION'};
+    f.closing=true;await this.saveFollow(f);
+    // Cancel our own remaining resting limit orders FIRST. A cancel
+    // acknowledgement alone does not prove that the order did not fill.
+    const outstanding=await this.cancelAllMirrorResting(f);
+    if(outstanding.length)return {ok:false,error:'OPEN_ORDERS_NOT_YET_TERMINAL',outstanding,
+      note:'No blind second close: order status and fills must be verified first.'};
+    for(const a of Object.values(f.adjustments))if(['UNKNOWN','SUBMITTING'].includes(a.status))
+      await this.resolveFollowAdjustment(f,a);
+    if(Object.values(f.adjustments).some(a=>['UNKNOWN','SUBMITTING'].includes(a.status)))
+      return {ok:false,error:'UNRESOLVED_MARKET_ADJUSTMENT',unresolved:Object.values(f.adjustments).filter(a=>a.status==='UNKNOWN').map(a=>a.cloid)};
+    for(const coin of new Set(Object.values(f.pairs).map(p=>p.coin))){
+      let actual:number;
+      try{actual=await readLiveCoinQuantity(this.env,coin);}
+      catch(e){return {ok:false,error:'POSITION_READ_FAILED',coin,detail:String(e)};}
+      if(Math.abs(actual-this.ownFollowQty(f,coin))>1e-5){
+        if(Math.abs(actual)<1e-9){
+          // Exchange has been manually flattened. Archive the discrepancy;
+          // never invent an exchange execution to make the ledger agree.
+          f.coinErrors[coin]='MANUAL_FLAT_CONFIRMED_ARCHIVED';await this.saveFollow(f);
+          continue;
+        }
+        return {ok:false,error:'POSITION_NOT_OWNED_OR_MANUAL_CHANGE',coin,exchange:actual,expected:this.ownFollowQty(f,coin)};
+      }
+      if(Math.abs(actual)<1e-9)continue;
+      const result:any=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
+      if(!result.ok)return {ok:false,error:'MARK_PRICE_READ_FAILED',coin};
+      const mids:any=await result.json();const price=Number(mids?.[coin]);
+      if(!(price>0))return {ok:false,error:'MARK_PRICE_MISSING',coin};
+      const intentId='MIRROR_CLOSE_ALL:'+f.session+':'+coin+':'+(++f.nextAdjustment);
+      const a:__LC_ORDER_FOLLOW.Adjustment={intentId,coin,side:actual>0?'A':'B',qty:Math.abs(actual),filledQty:0,
+        reduceOnly:true,status:'SUBMITTING',cloid:cloidForIntent(intentId),ownOid:null,lastError:'',at:Date.now()};
+      f.adjustments[intentId]=a;await this.saveFollow(f);
+      try{const r=await executeLiveIoc(this.env,{intentId,coin,direction:actual>0?'SHORT':'LONG',
+        quantity:Math.abs(actual),reduceOnly:true,referencePrice:price});
+        a.ownOid=r.oid==null?null:String(r.oid);
+        if(r.executed&&Number(r.filledQty)>0){a.status='FILLED';a.filledQty=Number(r.filledQty);}
+        else if(r.orderSent===false){a.status='REJECTED';a.lastError=r.status;}
+        else {a.status='UNKNOWN';a.lastError=r.status;}
+      }catch(e){a.status='UNKNOWN';a.lastError=String(e);}
+      await this.saveFollow(f);
+      if(a.status!=='FILLED')return {ok:false,error:'CLOSE_ALL_NOT_CONFIRMED',coin,status:a.status,reason:a.lastError};
+    }
+    // Verify the actual exchange positions after applying known fills.
+    for(const coin of new Set(Object.values(f.pairs).map(p=>p.coin))){
+      const qty=await readLiveCoinQuantity(this.env,coin);
+      if(Math.abs(qty)>1e-6)return {ok:false,error:'CLOSE_ALL_POSITION_NOT_FLAT',coin,qty};
+    }
+    f.closed=true;await this.saveFollow(f);
+    await this.state.storage.put('live_copy_v18_last_closed_order_follow',f);
+    // Only after verified FLAT and no resting orders may a subsequent START
+    // receive a completely fresh order-follow state.
+    await this.state.storage.put('live_copy_v17_order_follow',__LC_ORDER_FOLLOW.fresh(0,'',0));
+    s.mode='STOPPED';this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);
+    this.audit(s,'MIRROR_CLOSE_ALL_VERIFIED');await this.save(s);
+    if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
+    return {ok:true,mode:'STOPPED',mirror_closed:true,verified_flat:true};
+  }
+
   async fetch(request:Request):Promise<Response>{
     if(!this.env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!==`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`)return json({ok:false,error:'UNAUTHORIZED'},401);
     const path=new URL(request.url).pathname;
@@ -1541,6 +1999,15 @@ export class LiveCopyControllerStage7 {
           buffered_coins:[...new Set((buffered?.rows||[]).map(r=>r.coin))],
           watcher_session_matches:!cursor?.session||!latest||cursor.session===latest.session_id,warning:'Older source rows are never replayed as real trades.'});
       }catch(e){return json({ok:false,error:'D1_DIAGNOSTIC_FAILED',detail:String(e)},503);}
+    }
+    if(request.method==='GET'&&path==='/order-follow-status'){
+      const follow=await this.state.storage.get<__LC_ORDER_FOLLOW.FollowState>('live_copy_v17_order_follow');
+      return json({ok:true,mode:this.env.LIVE_COPY_ORDER_FOLLOW_MODE||'FILLS',read_only:true,
+        started_at:follow?.startedAt||null,source_session:follow?.session||null,source_cursor:follow?.rowid||0,
+        tracked_orders:Object.values(follow?.pairs||{}).slice(-60),source_events:follow?.events||0,
+        unresolved_orders:Object.values(follow?.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)).length,
+        adjustments:Object.values(follow?.adjustments||{}).slice(-30),coin_errors:follow?.coinErrors||{},
+        errors:follow?.errors||0,execution:this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED==='true'?'EXPLICITLY_ENABLED':'SHADOW_ONLY'});
     }
     if(request.method==='GET'&&path==='/recovery-status'){
       const ledger=await this.ledger();
@@ -1565,7 +2032,13 @@ export class LiveCopyControllerStage7 {
     if(request.method==='GET'&&path==='/status'){
       const sourcePending=await this.state.storage.get<SourceQueueV23>(SOURCE_QUEUE_KEY_V23);
       if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s))await this.restoreLiveArm(s);
-      return json({ok:true,overview:await this.overviewStatus(s),version:'V2.3_STAGE_16_OWNED_EXIT_RECOVERY_V2',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
+      const follow=await this.followState();
+      const mirrorSummary=follow?{tracked:Object.keys(follow.pairs||{}).length,
+        resting:Object.values(follow.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>l.status==='RESTING').length,
+        unresolved:Object.values(follow.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)).length+
+          Object.values(follow.adjustments||{}).filter(a=>['UNKNOWN','SUBMITTING'].includes(a.status)).length,
+        coin_errors:follow.coinErrors||{},owned_positions:Object.fromEntries([...new Set(Object.values(follow.pairs||{}).map(p=>p.coin))].map(c=>[c,this.ownFollowQty(follow,c)]))}:null;
+      return json({ok:true,mirror:mirrorSummary,overview:await this.overviewStatus(s),order_follow_mode:this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'?'ORDERS':'FILLS',order_follow_real_execution_enabled:this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED==='true'&&this.liveAuthorized(s),version:'V2.3_STAGE_18_ORDER_LIFECYCLE',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:15,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),live_authorization_reason:this.liveAuthorizationReason(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'?this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED==='true'&&this.liveAuthorized(s):this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:this.coinDetails(s,await this.ledger()),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,source_pending_rows:sourcePending?.rows.length||0,source_pending_coins:[...new Set((sourcePending?.rows||[]).map(r=>r.coin))]});
     }
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
@@ -1573,7 +2046,23 @@ export class LiveCopyControllerStage7 {
       try{const overview=await this.ensureOverview();return json({ok:true,overview,read_only:true});}
       catch(e){return json({ok:false,error:'OVERVIEW_CAPITAL_UNAVAILABLE',detail:String(e)},503);}
     }
+    if(this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&path==='/close-all'){
+      if(this.syncBusy)return json({ok:false,error:'SYNC_BUSY_RETRY'},409);
+      this.syncBusy=true;
+      try{const result=await this.closeAllMirrorOrders(s);return json(result,result.ok?200:409);}
+      catch(e){return json({ok:false,error:'MIRROR_CLOSE_ALL_FAILED',detail:String(e)},503);}
+      finally{this.syncBusy=false;}
+    }
+    if(this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&path==='/stop'&&s.mode==='RUNNING'){
+      const f=await this.followState();if(f){f.closing=true;await this.saveFollow(f);
+        const waiting=await this.cancelAllMirrorResting(f);
+        if(waiting.length)return json({ok:false,error:'MIRROR_CANCEL_PENDING_RETRY',waiting},409);
+      }
+    }
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
+    if(path==='/start'&&this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&this.liveEnabled()&&
+        this.env.LIVE_COPY_ORDER_FOLLOW_EXECUTION_ENABLED!=='true')
+      return json({ok:false,error:'ORDER_FOLLOW_EXECUTION_EXPLICIT_ENABLE_REQUIRED'},409);
     if(path==='/start'&&s.mode==='RUNNING')return json({ok:false,error:'ALREADY_RUNNING_STOP_FIRST'},409);
     if(path==='/start'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_durable_arm',null);if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(report.rows.some(r=>r.status!=='MATCH'&&r.status!=='UNOWNED_POSITION'))
         return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);
@@ -1607,7 +2096,35 @@ export class LiveCopyControllerStage7 {
       await this.state.storage.put(SOURCE_QUEUE_KEY_V23,{session:anchor.session,startedAt,rows:[],anchors:{},warnings:{}} as SourceQueueV23);
       s.coins={};s.seen={};s.recent=[];
       if(!this.liveEnabled())await this.paperReset(startedAt);
+      if(this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'){
+        const old=await this.followState();
+        if(old&&Object.values(old.pairs||{}).some(p=>(p.legs||[]).some(l=>
+           ['RESTING','CANCELING','SUBMITTING','UNKNOWN'].includes(l.status))))
+          return json({ok:false,error:'PRIOR_MIRROR_ORDERS_REQUIRE_RECONCILIATION'},409);
+        if(old&&(Object.values(old.pairs||{}).some(p=>(p.legs||[]).some(l=>l.filledQty>0))||
+          Object.values(old.adjustments||{}).some(a=>a.filledQty>0)))
+          return json({ok:false,error:'PRIOR_MIRROR_POSITIONS_REQUIRE_CLOSE_ALL'},409);
+        const current=await this.env.DB.prepare('SELECT rowid,session_id FROM mc_copy_order_updates ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string}>().catch(()=>null);
+        await this.state.storage.put('live_copy_v17_order_follow',__LC_ORDER_FOLLOW.fresh(startedAt,current?.session_id||'',current?.rowid||0));
+      }
       s.mode='RUNNING';s.startedAt=startedAt;s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_durable_arm',{startedAt:s.startedAt,config:this.armConfig()});this.liveArmAt=s.startedAt;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
+    if(path==='/order-sync'){
+      if(this.env.LIVE_COPY_ORDER_FOLLOW_MODE!=='ORDERS')return json({ok:true,ignored:true,reason:'ORDER_MODE_NOT_SELECTED'});
+      if(s.mode==='RUNNING'&&s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){
+        const restored=await this.restoreLiveArm(s);
+        if(!restored.ok)return json({ok:false,error:'ORDER_FOLLOW_ARM_RESTORE_REQUIRED',reason:restored.reason,
+          retryable:restored.reason==='HYPERLIQUID_RATE_LIMIT_RETRY'},503);
+      }
+      if(this.syncBusy)return json({ok:true,already_running:true},202);
+      this.syncBusy=true;
+      try{const result=await this.syncFollowOrders(s);
+        return json(result,result.ok?200:result.retryable?503:409);}
+      catch(e){if(this.isRateLimited(e))await this.deferRateLimit('MIRROR_ORDER_SYNC');
+        return json({ok:false,error:'ORDER_FOLLOW_SYNC_FAILED',detail:String(e),retryable:true},503);}
+      finally{this.syncBusy=false;}
+    }
+    if(path==='/sync' && this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS')
+      return json({ok:true,mode:'ORDERS',processed:0,ignored:0,legacy_fill_orders_disabled:true});
     if(path==='/sync'){
       if(this.syncBusy)return json({ok:true,already_running:true,processed:0,ignored:0},202);
       this.syncBusy=true;
