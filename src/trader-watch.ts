@@ -109,13 +109,18 @@ export class MultiCoinEngine {
       const price=Number(o?.limitPx),origSz=Number(o?.origSz),sz=Number(o?.sz);
       if(!['A','B'].includes(side)||!Number.isFinite(price)||price<=0||
          !Number.isFinite(origSz)||origSz<=0||!Number.isFinite(sz)||sz<0)continue;
-      const tif=String(o?.tif||'');
-      const kind=String(o?.orderType||'');
-      // A missing TIF is preserved as missing; the executor must refuse to infer it.
+       // WS BasicOrder omits these fields on Hyperliquid. Keep missing fields
+       // explicitly UNKNOWN: false would incorrectly describe reduce-only and
+       // TP/SL source orders. The controller resolves ACTIVE orders by OID.
+       const tif=typeof o?.tif==='string'&&o.tif?o.tif:null;
+       const kind=typeof o?.orderType==='string'&&o.orderType?o.orderType:null;
+       const reduceOnly=typeof o?.reduceOnly==='boolean'?o.reduceOnly:null;
+       const isTrigger=typeof o?.isTrigger==='boolean'?o.isTrigger:null;
       const eventId=[oid,at,status,sz,price,side].join(':');
       const payload={source_oid:oid,coin,at,status,side,price,orig_sz:origSz,
-        remaining_sz:sz,tif,order_type:kind,reduce_only:o?.reduceOnly===true,
-        is_trigger:o?.isTrigger===true,source_order_time:Number(o?.timestamp||0),
+        remaining_sz:sz,tif,order_type:kind,reduce_only:reduceOnly,
+         is_trigger:isTrigger,metadata_complete:!!(tif&&kind&&reduceOnly!==null&&isTrigger!==null),
+         source_order_time:Number(o?.timestamp||0),
         source_cloid:typeof o?.cloid==='string'?o.cloid:null,
         observed_at:Date.now(),channel:'orderUpdates'};
       const r=await this.db.prepare(`INSERT OR IGNORE INTO mc_copy_order_updates
