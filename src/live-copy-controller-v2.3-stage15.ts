@@ -1868,7 +1868,8 @@ export class LiveCopyControllerStage7 {
           if(asset)exists.qtyLimit=__LC_ORDER_FOLLOW.quantity(o.coin,o.orig_sz,exists.scale,asset.szDecimals,o.price);
           exists.sourceStatus=o.status;exists.lastSourceAt=o.at;exists.updatedAt=Date.now();
         }
-        if(!live)__LC_ORDER_FOLLOW.recordShadow(f,row.rowid,o,f.pairs[o.source_oid]||null,old);
+        // Read-only decision telemetry in BOTH SHADOW and LIVE. No execution side effects.
+        __LC_ORDER_FOLLOW.recordShadow(f,row.rowid,o,f.pairs[o.source_oid]||null,old);
         f.events++;
       }
       f.rowid=row.rowid;await this.saveFollow(f);
@@ -2099,9 +2100,10 @@ export class LiveCopyControllerStage7 {
         tracked_orders:Object.values(follow?.pairs||{}).slice(-60),source_events:follow?.events||0,
         unresolved_orders:Object.values(follow?.pairs||{}).flatMap(p=>p.legs||[]).filter(l=>['UNKNOWN','SUBMITTING','CANCELING'].includes(l.status)).length,
         adjustments:Object.values(follow?.adjustments||{}).slice(-30),coin_errors:follow?.coinErrors||{},
-        shadow_copy_test:{enabled:!!follow&&this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS'&&!this.liveEnabled(),
-          scope:'SOURCE_ORDER_LIFECYCLE_ONLY',execution:'NO_ORDERS_SENT',
-          note:'Indicative candidates only. No own fills, queue position, fees or Hyperliquid source order verification simulated.',
+        shadow_copy_test:{enabled:!!follow&&this.env.LIVE_COPY_ORDER_FOLLOW_MODE==='ORDERS',
+          monitoring_mode:this.liveEnabled()?'LIVE_OBSERVATION':'SHADOW_OBSERVATION',
+          scope:'SOURCE_ORDER_LIFECYCLE_ONLY',execution:'TELEMETRY_ONLY_NO_ADDITIONAL_ORDERS',
+          note:'Read-only order decision trace in both LIVE and SHADOW. Does not send additional orders, verify actual own fills, queue position or fees.',
           counts:follow?.shadowCounts||{},decisions:(follow?.shadowDecisions||[]).slice(-60)},
         errors:follow?.errors||0,execution:this.liveEnabled()?'LIVE_WHEN_STARTED':'SHADOW_ONLY'});
     }
