@@ -1,4 +1,4 @@
-/** V19.2 INHERITED ADD ACCUMULATION — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.3 INFO RATE LIMIT FIX — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -217,6 +217,11 @@ type Session={version:19;mode:'RUNNING'|'STOPPED';live:boolean;startedAt:number;
 const KEY='live_copy_v19_net_position';
 const MIN=10.40; // User's $10 accumulator with $0.40 buffer against min notional/precision.
 const BATCH=500;const MAX_ACTIONS=2;const COALESCE_MS=1800;const MAX_ENTRY_AGE_MS=12000;
+// Limit automatic INFO polling; stream fills independently even when INFO is rate limited.
+const INFO_RECONCILE_MIN_MS=15000;
+const INFO_RECONCILE_IDLE_MS=30000;
+const INFO_MIDS_TTL_MS=12000;
+const INFO_BACKOFF_MS=90000;
 const J=(v:any,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 const postInfo=async(body:any)=>{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('INFO_HTTP_'+r.status);return await r.json() as any;};
 const finite=(n:any)=>Number.isFinite(Number(n));
@@ -234,6 +239,17 @@ export class LiveCopyControllerStage7 {
   private log(s:Session,coin:string,kind:string,detail:string){s.recent.unshift({at:Date.now(),coin,kind,detail});s.recent=s.recent.slice(0,120);}
   private async meta(){const key='v19_meta';const x=await this.state.storage.get(key);if(x&&Date.now()-x.at<30*60*1000)return x.data;const data=await postInfo({type:'meta'});if(!Array.isArray(data?.universe))throw Error('INVALID_META');await this.state.storage.put(key,{at:Date.now(),data});return data;}
   private async positions(wallet:string){const d=await postInfo({type:'clearinghouseState',user:wallet});if(!Array.isArray(d?.assetPositions))throw Error('INVALID_POSITIONS');const out:Record<string,number>={};for(const p of d.assetPositions){const coin=String(p?.position?.coin||'');const q=Number(p?.position?.szi);if(coin&&Number.isFinite(q))out[coin]=q;}return out;}
+  private async midsForReconcile():Promise<Record<string,string>>{
+    // Never cache own wallet positions for execution decisions. Prices, unlike
+    // wallet quantity, may be briefly cached and are only a reference price;
+    // the IOC adapter retains its independent price/deviation verification.
+    const cached=await this.state.storage.get('live_copy_v19_mids_cache') as {at:number;data:Record<string,string>}|undefined;
+    if(cached&&Date.now()-cached.at<INFO_MIDS_TTL_MS)return cached.data;
+    const data=await postInfo({type:'allMids'});
+    if(!data||typeof data!=='object'||Array.isArray(data))throw Error('INVALID_MIDS');
+    await this.state.storage.put('live_copy_v19_mids_cache',{at:Date.now(),data});
+    return data;
+  }
   private async ownPositions(){const w=this.env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';if(!/^0x[0-9a-f]{40}$/i.test(w))throw Error('MASTER_ADDRESS_MISSING');return this.positions(w);}
   private async sourcePositions(){const w=this.env.LIVE_COPY_SOURCE_WALLET?.trim()||'0x34fb5ec7d4e939161946340ea2a1f29254b893de';if(!/^0x[0-9a-f]{40}$/i.test(w))throw Error('SOURCE_ADDRESS_INVALID');return this.positions(w);}
   private async latest(){return await this.env.DB.prepare('SELECT rowid,session_id FROM mc_v19_fills ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string}>();}
@@ -254,7 +270,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -368,8 +384,16 @@ export class LiveCopyControllerStage7 {
   }
   private async reconcile(s:Session):Promise<any>{
     const now=Date.now();const live=this.authorized(s);
+    // No exchange calls when only passive inherited positions are tracked and
+    // there is no active own-side target or unresolved order to reconcile.
+    const actionable=Object.values(s.coins).some(p=>p.lastFillAt>0&&
+      (p.active===true||!!p.pending||Math.abs(p.desired)>1e-10));
+    if(!actionable)return {sent:0,decisions:Object.values(s.coins).filter(p=>p.lastFillAt>0&&p.inheritedMode)
+      .map(p=>({coin:p.coin,action:'ACCUMULATE_INHERITED_ADD',pending_usd:Number(p.inheritedPendingUsd||0)})).slice(0,100)};
+    // Read a FRESH wallet snapshot for any real execution. Never trade from
+    // a cached position while a prior fill or uncertain write may have landed.
     const actual=live?await this.ownPositions():{} as Record<string,number>;
-    const meta=await this.meta();const mids=await postInfo({type:'allMids'});
+    const meta=await this.meta();const mids=await this.midsForReconcile();
     const sorted=Object.values(s.coins).filter(p=>p.lastFillAt>0).sort((a,b)=>{
       const aa=actual[a.coin]||0,bb=actual[b.coin]||0;
       const aExit=aa!==0&&(a.desired===0||Math.sign(aa)!==Math.sign(a.desired)||Math.abs(a.desired)<Math.abs(aa)-1e-9);
@@ -435,26 +459,59 @@ export class LiveCopyControllerStage7 {
   }
   private async sync():Promise<Response>{
     if(this.busy)return J({ok:true,busy:true});this.busy=true;
+    let s:Session|undefined;
     try{
-      const s=await this.load();if(s.mode!=='RUNNING')return J({ok:false,error:'STOPPED'},409);
-      if((s.cooldownUntil||0)>Date.now())return J({ok:false,error:'API_RATE_LIMIT_BACKOFF',retry_after:s.cooldownUntil},503);
+      s=await this.load();if(s.mode!=='RUNNING')return J({ok:false,error:'STOPPED'},409);
       if(s.live&&!this.authorized(s)&&!(await this.restore(s)))return J({ok:false,error:'LIVE_ARM_NOT_RESTORED'},409);
-      // Upgrade existing V19.1 RUNNING state once, without a new START or
-      // reprocessing old rows. Previously blocked coins begin accumulating from
-      // their last known source quantity on the NEXT new fill.
+      // Once-only V19.1 upgrade. Do not replay historical fills.
       for(const p of Object.values(s.coins))if(p.waitingFlat===true){
         p.baseline=p.sourceQty;p.waitingFlat=false;p.inheritedMode=Math.abs(p.sourceQty)>1e-8;
         p.inheritedPendingUsd=0;p.inheritedDirection=Math.sign(p.sourceQty);
         p.desired=0;p.active=false;p.entryPending=false;
       }
+      // D1 fills MUST advance during an INFO 429 backoff. The exchange's
+      // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
-      const elapsed=Date.now()-Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
-      const shouldReconcile=elapsed>=20000||(elapsed>=COALESCE_MS&&processed>0);
-      const result=shouldReconcile?await this.reconcile(s):{sent:0,decisions:[]};
-      if(shouldReconcile){s.lastDecisions=result.decisions;await this.state.storage.put('live_copy_v19_last_reconcile',Date.now());}await this.save(s);
-      return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',processed,cursor:s.cursor,events:s.events,live:this.authorized(s),...result});
-    }catch(e){const s=await this.load();this.error(s,e);if(/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e)))s.cooldownUntil=Date.now()+60000;await this.save(s);return J({ok:false,error:'V19_SYNC_FAILED',detail:String(e)},503);}
-    finally{this.busy=false;}
+      const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
+      if(cooldown>now)return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,
+        cursor:s.cursor,events:s.events,exchange_deferred:true,
+        reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
+      const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
+      const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
+      if(now-last<interval)return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,
+        cursor:s.cursor,events:s.events,exchange_deferred:true,
+        reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
+      // Reserve the INFO polling slot before sending requests. A WebSocket
+      // burst cannot trigger dozens of overlapping/excessive reconciliations.
+      await this.state.storage.put('live_copy_v19_last_reconcile',now);
+      try{
+        const result=await this.reconcile(s);s.lastDecisions=result.decisions;
+        // Successful INFO read resets previous API error display and cooldown.
+        s.cooldownUntil=0;
+        s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
+        await this.save(s);
+        return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,cursor:s.cursor,
+          events:s.events,live:this.authorized(s),...result});
+      }catch(e){
+        const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
+        if(rateLimited){
+          s.cooldownUntil=Date.now()+INFO_BACKOFF_MS;
+          // Keep just one rate-limit message; status exposes retry_after.
+          s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
+          s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
+          await this.save(s);
+          return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,cursor:s.cursor,
+            events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
+            retry_after:s.cooldownUntil,real_orders_sent:0});
+        }
+        this.error(s,e);await this.save(s);
+        return J({ok:false,error:'V19_RECONCILE_FAILED',detail:String(e),
+          processed,cursor:s.cursor,events:s.events},503);
+      }
+    }catch(e){
+      if(s){this.error(s,e);await this.save(s);}
+      return J({ok:false,error:'V19_FILL_SYNC_FAILED',detail:String(e)},503);
+    }finally{this.busy=false;}
   }
   private async closeAll():Promise<Response>{
     const s=await this.load();s.mode='STOPPED';s.stoppedReason='CLOSE_ALL';await this.save(s);
@@ -511,9 +568,9 @@ export class LiveCopyControllerStage7 {
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
       const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0}));
-      return J({ok:true,version:'V19_2_INHERITED_ADD_COPY',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
-        skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,source_session:s.sourceSession,started_at:s.startedAt,
+        skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
     }
     if(method==='GET'&&path==='/account'){try{return J(await __LC_EXECUTION.readLiveAccount(this.env));}catch(e){return J({ok:false,error:String(e)},503);}}
