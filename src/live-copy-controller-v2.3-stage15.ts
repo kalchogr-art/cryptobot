@@ -1,4 +1,4 @@
-/** V19.4 EXCHANGE REJECTION DIAGNOSTICS — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.5 REMOVE ACCUMULATION & DUST MONITOR — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -215,7 +215,8 @@ type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episod
   desired:number;lastPx:number;lastFillAt:number;lastActionAt:number;lastFillId:string;lastError:string;
   pending?:{id:string;cloid:string;status:'SUBMITTING'|'UNKNOWN';at:number;qty:number;direction:string};
   lastConfirmedOwnQty:number;actionCount:number;
-  lastRejectedSignature?:string;lastRejectedUntil?:number;lastRejectReason?:string;};
+  lastRejectedSignature?:string;lastRejectedUntil?:number;lastRejectReason?:string;
+  pendingReduceUsd?:number;reduceState?:string;dustCloseBlockedQty?:number;dustCloseReason?:string;};
 type Session={version:19;mode:'RUNNING'|'STOPPED';live:boolean;startedAt:number;cursor:number;
   coins:Record<string,CoinState>;events:number;syncs:number;skipped:number;orders:number;lastSync:number;
   errors:string[];recent:Array<{at:number;coin:string;kind:string;detail:string}>;sourceSession:string;
@@ -237,6 +238,22 @@ const postInfo=async(body:any)=>{const r=await fetch('https://api.hyperliquid.xy
 const finite=(n:any)=>Number.isFinite(Number(n));
 const round=(n:number)=>Math.round(n*1e10)/1e10;
 function trimQty(n:number,d:number){return Math.floor(Math.max(0,n)*10**d+1e-9)/10**d;}
+// Pure preflight for reduce-only actions. A partial REMOVE is not submitted
+// until >= $10.40, and must not create a residual position below $10.40.
+// A full CLOSE can be attempted once even for sub-minimum dust; an exchange
+// rejection is then explicitly surfaced instead of retried indefinitely.
+export function planV19Reduce(ownQty:number, reduceQty:number, px:number, fullClose:boolean,
+  alreadyRejectedDust:boolean):{action:'SEND_REMOVE'|'SEND_CLOSE'|'ACCUMULATE_REMOVE'|'AVOID_DUST'|'DUST_CLOSE_REJECTED';notional:number;remainingUsd:number}{
+  const own=Math.abs(ownQty), qty=Math.min(own,Math.abs(reduceQty));
+  const notional=qty*px, remainingUsd=Math.max(0,own-qty)*px;
+  if(fullClose && own>0){
+    if(alreadyRejectedDust && own*px<MIN)return {action:'DUST_CLOSE_REJECTED',notional,remainingUsd};
+    return {action:'SEND_CLOSE',notional,remainingUsd};
+  }
+  if(notional<MIN)return {action:'ACCUMULATE_REMOVE',notional,remainingUsd};
+  if(remainingUsd>0 && remainingUsd<MIN)return {action:'AVOID_DUST',notional,remainingUsd};
+  return {action:'SEND_REMOVE',notional,remainingUsd};
+}
 export class LiveCopyControllerStage7 {
   private busy=false;
   private arm:number|null=null;
@@ -280,7 +297,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -419,6 +436,12 @@ export class LiveCopyControllerStage7 {
       const asset=meta.universe.find((a:any)=>a.name===p.coin);
       const price=Number(mids[p.coin]||p.lastPx);if(!asset||!finite(price)||price<=0){p.lastError='MISSING_ASSET_OR_PRICE';continue;}
       const decimals=asset.szDecimals;let own=Number(actual[p.coin]||0);
+      // A confirmed account position change allows re-evaluating a prior dust
+      // failure; merely receiving another source fill does not.
+      if(p.dustCloseBlockedQty!=null &&
+         Math.abs(Math.abs(own)-Number(p.dustCloseBlockedQty))>=Math.pow(10,-decimals)*0.5){
+        p.dustCloseBlockedQty=undefined;p.dustCloseReason=undefined;
+      }
       if(live&&p.pending){const confirmed=await this.checkAmbiguous(s,p);
         if(confirmed===null){decisions.push({coin:p.coin,action:'WAIT_PROOF',reason:p.pending?.status});continue;}
         own=confirmed;actual[p.coin]=own;}
@@ -444,7 +467,26 @@ export class LiveCopyControllerStage7 {
         if(p.coin!=='ZEC'||rounded*price<=20.000001)qty=round(rounded);
       }
       const notional=qty*price;
-      if(qty<=0){decisions.push({coin:p.coin,action:'NONE',reason:'SYNCED_OR_BELOW_PRECISION',pending_usd:Math.abs(gap)*price});continue;}
+      // The gap already accumulates all unexecuted REMOVE fills, so no separate
+      // D1 queue or double-counting accumulator is required.
+      p.pendingReduceUsd=reduce?Math.abs(gap)*price:0;
+      if(qty<=0){p.reduceState=reduce?'BELOW_QTY_PRECISION':'NONE';decisions.push({coin:p.coin,action:'NONE',reason:'SYNCED_OR_BELOW_PRECISION',pending_usd:Math.abs(gap)*price});continue;}
+      if(reduce){
+        const fullClose=opposite||Math.abs(p.desired)<=1e-10||qty>=Math.abs(own)-1e-10;
+        const dustBlocked=Number(p.dustCloseBlockedQty||0)>0&&
+          Math.abs(Number(p.dustCloseBlockedQty)-Math.abs(own))<Math.pow(10,-decimals)*0.5;
+        const plan=planV19Reduce(own,qty,price,fullClose,dustBlocked);
+        p.reduceState=plan.action;
+        if(plan.action==='ACCUMULATE_REMOVE'||plan.action==='AVOID_DUST'||plan.action==='DUST_CLOSE_REJECTED'){
+          const reason=plan.action==='ACCUMULATE_REMOVE'?'Waiting for combined reduce >= $10.40':
+            plan.action==='AVOID_DUST'?'Partial remove would strand a position below $10.40':
+            p.dustCloseReason||'Full dust close previously rejected by Hyperliquid';
+          // This state is visible per coin and recalculated on each source fill.
+          decisions.push({coin:p.coin,action:plan.action,pending_usd:p.pendingReduceUsd,
+            remaining_usd:plan.remainingUsd,reason,desired:p.desired,actual:own});
+          continue;
+        }
+      }else{p.pendingReduceUsd=0;p.reduceState='NONE';}
       if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:freshEntry?'NEW_BELOW_EXCHANGE_MIN':'ACCUMULATE_ADD',pending_usd:Math.abs(gap)*price});continue;}
       if(!reduce&&now-p.lastFillAt>MAX_ENTRY_AGE_MS){decisions.push({coin:p.coin,action:'SKIP_STALE_ENTRY',pending_usd:notional});continue;}
       if(!reduce&&!freshEntry&&now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE_ADD',pending_usd:notional});continue;}
@@ -472,6 +514,7 @@ export class LiveCopyControllerStage7 {
         p.pending=undefined;p.lastError='';p.lastRejectedSignature=undefined;
         p.lastRejectedUntil=0;p.lastRejectReason=undefined;
         p.lastConfirmedOwnQty=own+(direction==='LONG'?1:-1)*Number(result.filledQty);
+        p.dustCloseBlockedQty=undefined;p.dustCloseReason=undefined;
         s.orders++;this.log(s,p.coin,reduce?'REDUCE_FILLED':'OPEN_FILLED','qty='+result.filledQty);
       }else if(result.orderSent==='UNKNOWN'||result.orderSent===true&&result.status==='UNEXPECTED_RESTING_ORDER'){
         p.pending!.status='UNKNOWN';p.lastError=result.status;this.log(s,p.coin,'WRITE_UNCERTAIN',result.status);
@@ -483,6 +526,15 @@ export class LiveCopyControllerStage7 {
         // Only a confirmed exchange rejection is retry-suppressed. Network
         // uncertainty retains its existing order-specific proof path.
         if(result.status==='REJECTED'&&result.orderSent===true){
+          // If even an entire position cannot be closed because its value is
+          // below the exchange minimum, keep it visible and do not spam 429/REJECTED.
+          if(reduce && opposite && /minimum value of \$?10|MinTradeNtl/i.test(reason)
+              && Math.abs(own)*price<MIN){
+            p.dustCloseBlockedQty=Math.abs(own);p.dustCloseReason=detailed;
+            p.reduceState='DUST_CLOSE_REJECTED';
+            this.log(s,p.coin,'DUST_CLOSE_REJECTED',detailed+'; own_qty='+own+
+              '; manual exchange resolution may be required');
+          }
           p.lastRejectedSignature=rejectSignature;
           p.lastRejectedUntil=Date.now()+(reduce?REJECT_RETRY_REDUCE_MS:REJECT_RETRY_ENTRY_MS);
           p.lastRejectReason=detailed;
@@ -510,12 +562,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -527,7 +579,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -537,7 +589,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -604,8 +656,10 @@ export class LiveCopyControllerStage7 {
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
       const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
-        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0,rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
+          pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
+          dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0,rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
+      return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
