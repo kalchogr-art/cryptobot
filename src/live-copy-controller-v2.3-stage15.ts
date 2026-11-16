@@ -1,4 +1,4 @@
-/** V19.3 INFO RATE LIMIT FIX — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.4 EXCHANGE REJECTION DIAGNOSTICS — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -40,7 +40,7 @@ export type LiveOrderIntent = {
 export type LiveResult = {
   ok: boolean; executed: boolean; status: string; coin: string;
   intentId: string; requestedQty?: number; filledQty?: number;
-  averageFillPrice?: number; oid?: number | string; raw?: unknown; cloid?:string; orderSent?:boolean|'UNKNOWN';
+  averageFillPrice?: number; oid?: number | string; raw?: unknown; cloid?:string; orderSent?:boolean|'UNKNOWN'; rejectReason?:string;
 };
 const n = (x: unknown) => Number(x);
 const validAddress = (x: string) => /^0x[0-9a-fA-F]{40}$/.test(x);
@@ -191,7 +191,12 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
   if (item?.filled) return {ok:true,executed:true,status:'FILLED',coin:intent.coin,intentId:intent.intentId,
     requestedQty:qty,filledQty:n(item.filled.totalSz),averageFillPrice:n(item.filled.avgPx),oid:item.filled.oid,cloid,orderSent:true,raw:result};
   if (item?.resting) return {...base,status:'UNEXPECTED_RESTING_ORDER',orderSent:true,raw:result};
-  return {...base,status:item?.error?'REJECTED':'NOT_FILLED',orderSent:true,raw:result};
+  // Preserve the exchange's per-order rejection message; HTTP 200 does not mean
+  // the nested exchange status is a successful fill.
+  const rejection = item?.error;
+  const rejectReason = typeof rejection === 'string' ? rejection.slice(0,280)
+    : rejection != null ? JSON.stringify(rejection).slice(0,280) : undefined;
+  return {...base,status:rejection!=null?'REJECTED':'NOT_FILLED',rejectReason,orderSent:true,raw:result};
 }
 
 }
@@ -209,7 +214,8 @@ type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episod
   inheritedMode?:boolean;inheritedPendingUsd?:number;inheritedDirection?:number;
   desired:number;lastPx:number;lastFillAt:number;lastActionAt:number;lastFillId:string;lastError:string;
   pending?:{id:string;cloid:string;status:'SUBMITTING'|'UNKNOWN';at:number;qty:number;direction:string};
-  lastConfirmedOwnQty:number;actionCount:number;};
+  lastConfirmedOwnQty:number;actionCount:number;
+  lastRejectedSignature?:string;lastRejectedUntil?:number;lastRejectReason?:string;};
 type Session={version:19;mode:'RUNNING'|'STOPPED';live:boolean;startedAt:number;cursor:number;
   coins:Record<string,CoinState>;events:number;syncs:number;skipped:number;orders:number;lastSync:number;
   errors:string[];recent:Array<{at:number;coin:string;kind:string;detail:string}>;sourceSession:string;
@@ -222,6 +228,10 @@ const INFO_RECONCILE_MIN_MS=15000;
 const INFO_RECONCILE_IDLE_MS=30000;
 const INFO_MIDS_TTL_MS=12000;
 const INFO_BACKOFF_MS=90000;
+// Suppress only identical *confirmed* exchange rejections. A changed target,
+// direction, quantity or reduceOnly remains eligible immediately.
+const REJECT_RETRY_ENTRY_MS=120000;
+const REJECT_RETRY_REDUCE_MS=30000;
 const J=(v:any,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 const postInfo=async(body:any)=>{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('INFO_HTTP_'+r.status);return await r.json() as any;};
 const finite=(n:any)=>Number.isFinite(Number(n));
@@ -270,7 +280,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -440,6 +450,15 @@ export class LiveCopyControllerStage7 {
       if(!reduce&&!freshEntry&&now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE_ADD',pending_usd:notional});continue;}
       if(sent>=MAX_ACTIONS){decisions.push({coin:p.coin,action:'NEXT_TICK',pending_usd:notional});continue;}
       const direction=(opposite?own<0:gap>0)?'LONG':'SHORT';
+      // Account balance and desired target are part of the signature; a new
+      // REMOVE/CLOSE/REVERSAL is never held behind an old rejected ADD.
+      const rejectSignature=[p.coin,direction,reduce?'R':'O',qty.toFixed(decimals),
+        own.toFixed(decimals),p.desired.toFixed(decimals)].join('|');
+      if(live&&p.lastRejectedSignature===rejectSignature&&Number(p.lastRejectedUntil||0)>now){
+        decisions.push({coin:p.coin,action:'REJECT_RETRY_DEFERRED',qty,usd:notional,
+          reason:p.lastRejectReason||'EXCHANGE_REJECTED',retry_at:p.lastRejectedUntil});
+        continue;
+      }
       decisions.push({coin:p.coin,action:reduce?(opposite?'CLOSE_FOR_REVERSAL_OR_FLAT':'PERCENT_REMOVE'):freshEntry?(p.episode>1?'NEW_OR_REVERSAL_ENTRY':'NEW_ENTRY'):'PERCENT_ADD',qty,usd:notional,direction,desired:p.desired,actual:own,source_last_action:p.lastFillKind});
       if(!live)continue;
       const intentId=`V19:${s.startedAt}:${p.coin}:${++p.actionCount}`;
@@ -449,10 +468,28 @@ export class LiveCopyControllerStage7 {
       const result=await __LC_EXECUTION.executeLiveIoc(this.env,{intentId,coin:p.coin,direction:direction as 'LONG'|'SHORT',quantity:qty,
         reduceOnly:reduce,referencePrice:price});
       p.lastActionAt=now;
-      if(result.executed&&result.filledQty&&result.filledQty>0){p.pending=undefined;p.lastError='';p.lastConfirmedOwnQty=own+(direction==='LONG'?1:-1)*Number(result.filledQty);s.orders++;this.log(s,p.coin,reduce?'REDUCE_FILLED':'OPEN_FILLED','qty='+result.filledQty);}
-      else if(result.orderSent==='UNKNOWN'||result.orderSent===true&&result.status==='UNEXPECTED_RESTING_ORDER'){
+      if(result.executed&&result.filledQty&&result.filledQty>0){
+        p.pending=undefined;p.lastError='';p.lastRejectedSignature=undefined;
+        p.lastRejectedUntil=0;p.lastRejectReason=undefined;
+        p.lastConfirmedOwnQty=own+(direction==='LONG'?1:-1)*Number(result.filledQty);
+        s.orders++;this.log(s,p.coin,reduce?'REDUCE_FILLED':'OPEN_FILLED','qty='+result.filledQty);
+      }else if(result.orderSent==='UNKNOWN'||result.orderSent===true&&result.status==='UNEXPECTED_RESTING_ORDER'){
         p.pending!.status='UNKNOWN';p.lastError=result.status;this.log(s,p.coin,'WRITE_UNCERTAIN',result.status);
-      }else{p.pending=undefined;p.lastError=result.status;this.log(s,p.coin,'NO_FILL',result.status);}
+      }else{
+        p.pending=undefined;
+        const reason=(result.rejectReason||'').replace(/[\r\n\t]+/g,' ').slice(0,220);
+        const detailed=result.status==='REJECTED'&&reason?'REJECTED: '+reason:result.status;
+        p.lastError=detailed;
+        // Only a confirmed exchange rejection is retry-suppressed. Network
+        // uncertainty retains its existing order-specific proof path.
+        if(result.status==='REJECTED'&&result.orderSent===true){
+          p.lastRejectedSignature=rejectSignature;
+          p.lastRejectedUntil=Date.now()+(reduce?REJECT_RETRY_REDUCE_MS:REJECT_RETRY_ENTRY_MS);
+          p.lastRejectReason=detailed;
+          this.log(s,p.coin,'EXCHANGE_REJECTED',detailed+'; qty='+qty+'; reduceOnly='+reduce+
+            '; retry_after='+new Date(p.lastRejectedUntil).toISOString());
+        }else this.log(s,p.coin,'NO_FILL',detailed);
+      }
       await this.save(s);sent++;
     }
     return {sent,decisions:decisions.slice(0,100)};
@@ -473,12 +510,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -490,7 +527,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -500,7 +537,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -567,8 +604,8 @@ export class LiveCopyControllerStage7 {
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
       const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
-        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0}));
-      return J({ok:true,version:'V19_3_INFO_RATE_LIMIT_FIX',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+        last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0,rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
+      return J({ok:true,version:'V19_4_EXCHANGE_REJECTION_DETAILS',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
