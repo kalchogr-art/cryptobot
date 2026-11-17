@@ -1,4 +1,4 @@
-/** V19.6 PARTIAL INITIAL ENTRY TRACKING — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.7 EXPOSURE CAP + PARTIAL INITIAL ENTRY TRACKING — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -23,6 +23,7 @@ namespace __LC_EXECUTION {
 const INFO = 'https://api.hyperliquid.xyz/info';
 const EXCHANGE = 'https://api.hyperliquid.xyz/exchange';
 const DEFAULT_MIN_NOTIONAL = 10.40; // strategy's conservative threshold, not exchange guarantee
+const MAX_COIN_NOTIONAL_USD = 31.20; // per-coin risk cap, all NEW/REVERSAL/ADD orders
 const MAX_PRICE_DEVIATION = 0.0075;
 const NONCE_LOCK = new Map<string, number>(); // worker-isolate only; DO must serialize requests
 export interface LiveCopyEnv {
@@ -182,6 +183,18 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
   // IOC price bound relative to the supplied *fresh* reference price.
   // Caller must verify reference freshness and use an account-level serialized executor.
   const limitPx = n(formatPrice(px*(buy?(1+MAX_PRICE_DEVIATION):(1-MAX_PRICE_DEVIATION)),asset.szDecimals));
+  // Final exchange-side gate: planner's position snapshot can be stale by the
+  // time of submission. Never let an opening/ADD order bypass the coin cap.
+  // Use the higher of reference and limit prices for a conservative valuation.
+  // Reduce-only CLOSE/REMOVE are intentionally exempt.
+  if (!intent.reduceOnly) {
+    const riskPx=Math.max(px,limitPx);
+    const alreadySameSide=Math.max(0, current*(buy?1:-1));
+    const projected=(alreadySameSide+qty)*riskPx;
+    if (!Number.isFinite(projected)||projected>MAX_COIN_NOTIONAL_USD+1e-8)
+      return {...base,status:'POSITION_CAP_NO_ORDER',raw:{capUsd:MAX_COIN_NOTIONAL_USD,
+        ownQty:current,requestedQty:qty,riskPx,projectedUsd:projected}};
+  }
   const cloid=cloidForIntent(intent.intentId);
   const action = {type:'order',orders:[{a:asset.assetId,b:buy,p:String(limitPx),s:qty.toFixed(asset.szDecimals),r:intent.reduceOnly,t:{limit:{tif:'Ioc'}},c:cloid}],grouping:'na'};
   let result:any;
@@ -227,6 +240,19 @@ type Session={version:19;mode:'RUNNING'|'STOPPED';live:boolean;startedAt:number;
   stoppedReason:string;lastDecisions?:any[];cooldownUntil?:number;};
 const KEY='live_copy_v19_net_position';
 const MIN=10.40; // User's $10 accumulator with $0.40 buffer against min notional/precision.
+const MAX_POSITION_USD=31.20; // notional per coin (approx. $3.12 margin at 10x)
+/** Truncate only risk-increasing quantities; never restrict reduceOnly exits. */
+export function planV19CoinCap(ownQty:number, proposedQty:number, refPrice:number, limitDeviation:number, decimals:number) {
+  if(!Number.isFinite(refPrice)||refPrice<=0||!Number.isFinite(ownQty)||!Number.isFinite(proposedQty)||proposedQty<=0)
+    return {qty:0,reason:'INVALID_CAP_INPUT',remainingUsd:0};
+  const riskPrice=refPrice*(1+Math.max(0,limitDeviation));
+  const unit=10**(-decimals);
+  const room=Math.max(0,MAX_POSITION_USD/riskPrice-Math.abs(ownQty));
+  const cappedQty=Math.floor(Math.min(proposedQty,room)/unit+1e-9)*unit;
+  const qty=Math.round(Math.max(0,cappedQty)*1e10)/1e10;
+  if(qty*riskPrice<MIN-1e-8) return {qty:0,reason:'CAP_ROOM_BELOW_MIN_ORDER',remainingUsd:room*riskPrice};
+  return {qty,reason:qty<proposedQty-1e-10?'CAPPED':'WITHIN_CAP',remainingUsd:room*riskPrice};
+}
 const BATCH=500;const MAX_ACTIONS=2;const COALESCE_MS=1800;const MAX_ENTRY_AGE_MS=12000;
 // Limit automatic INFO polling; stream fills independently even when INFO is rate limited.
 const INFO_RECONCILE_MIN_MS=15000;
@@ -328,7 +354,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_7_POSITION_CAP',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -543,7 +569,7 @@ export class LiveCopyControllerStage7 {
         const unit=10**(-decimals);const rounded=Math.ceil(MIN/price/unit-1e-9)*unit;
         if(p.coin!=='ZEC'||rounded*price<=20.000001)qty=round(rounded);
       }
-      const notional=qty*price;
+      let notional=qty*price;
       // The gap already accumulates all unexecuted REMOVE fills, so no separate
       // D1 queue or double-counting accumulator is required.
       p.pendingReduceUsd=reduce?Math.abs(gap)*price:0;
@@ -563,7 +589,22 @@ export class LiveCopyControllerStage7 {
             remaining_usd:plan.remainingUsd,reason,desired:p.desired,actual:own});
           continue;
         }
-      }else{p.pendingReduceUsd=0;p.reduceState='NONE';}
+      }else{
+        p.pendingReduceUsd=0;p.reduceState='NONE';
+        // Never exceed $31.20 in total exposure for this coin. Existing
+        // over-cap positions stay untouched; risk-reducing actions remain free.
+        const cap=planV19CoinCap(own,qty,price,0.0075,decimals);
+        if(cap.qty<=0){
+          decisions.push({coin:p.coin,action:'POSITION_CAP_HOLD',
+            pending_usd:Math.abs(gap)*price,cap_usd:MAX_POSITION_USD,
+            current_usd:Math.abs(own)*price,room_usd:cap.remainingUsd,
+            reason:cap.reason});
+          continue;
+        }
+        qty=cap.qty;notional=qty*price;
+        if(cap.reason==='CAPPED')this.log(s,p.coin,'POSITION_CAP_APPLIED',
+          'planned_usd='+notional.toFixed(2)+' limit_usd='+MAX_POSITION_USD);
+      }
       if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:freshEntry?'PARTIAL_ENTRY_WAIT_MIN':'ACCUMULATE_ADD',pending_usd:Math.abs(gap)*price});continue;}
       if(!reduce&&now-p.lastFillAt>MAX_ENTRY_AGE_MS){decisions.push({coin:p.coin,action:'SKIP_STALE_ENTRY',pending_usd:notional});continue;}
       if(!reduce&&!freshEntry&&now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE_ADD',pending_usd:notional});continue;}
@@ -652,12 +693,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_7_POSITION_CAP',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_7_POSITION_CAP',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -669,7 +710,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_7_POSITION_CAP',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -679,7 +720,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_7_POSITION_CAP',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -749,9 +790,9 @@ export class LiveCopyControllerStage7 {
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
           dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_7_POSITION_CAP',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
-        skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
+        skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
     }
     if(method==='GET'&&path==='/account'){try{return J(await __LC_EXECUTION.readLiveAccount(this.env));}catch(e){return J({ok:false,error:String(e)},503);}}
