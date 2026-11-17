@@ -1,4 +1,4 @@
-/** V19.5 REMOVE ACCUMULATION & DUST MONITOR — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
+/** V19.6 PARTIAL INITIAL ENTRY TRACKING — standalone replacement for src/live-copy-controller-v2.3-stage15.ts.
  * Source: mc_v19_fills (userFills only). Fresh NEW/REVERSAL=$10.40 notional ($1.04 margin at 10x). ADD/REMOVE are percentage scaled. OPEN/CANCEL are NEVER copied.
  * One DO serializes decisions. Live trading requires explicit existing flags + START confirmation.
  * Data validation, dedupe, write uncertainty and exchange reality are kept separate from obsolete V18 ledger.
@@ -209,6 +209,10 @@ type Env=__LC_EXECUTION.LiveCopyEnv & {
 type Fill={rowid:number;session_id:string;fill_id:string;at:number;coin:string;side:'A'|'B';sz:number;px:number;start_pos:number;source_oid:string};
 type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episode:number;active:boolean;waitingFlat:boolean;
   entryPending?:boolean;episodeEntryPx?:number;episodeStartedAt?:number;lastFillKind?:string;
+  // Initial NEW/REVERSAL is an independent episode target. An IOC may be
+  // partially filled, including below the exchange's $10 minimum.
+  entryTargetQty?:number;entryConfirmedQty?:number;entryStatus?:string;
+  entryRemainingUsd?:number;entryLastObservedAt?:number;
   // A pre-existing source position is a reference only. We never copy its absolute size.
   // Its subsequent ADDs create a virtual USD accumulation until the first $10.40 entry.
   inheritedMode?:boolean;inheritedPendingUsd?:number;inheritedDirection?:number;
@@ -233,6 +237,33 @@ const INFO_BACKOFF_MS=90000;
 // direction, quantity or reduceOnly remains eligible immediately.
 const REJECT_RETRY_ENTRY_MS=120000;
 const REJECT_RETRY_REDUCE_MS=30000;
+// Entry deficit is never silently converted into a sub-minimum ADD.
+// Price and size precision can prevent reaching the exact $10.40 target.
+export function planV19InitialEntry(ownQty:number,targetQty:number,desiredQty:number,price:number,decimals:number,ageMs:number){
+  const current=Math.max(0,Math.abs(ownQty));
+  const target=Math.max(0,targetQty);
+  const desired=Math.max(0,Math.abs(desiredQty));
+  const unit=10**(-decimals);
+  const remaining=Math.max(0,Math.min(target,desired)-current);
+  const remainingUsd=remaining*price;
+  if(current>=target-unit*0.5)return {action:'COMPLETE',remainingUsd:0,qty:0};
+  if(desired<=current+unit*0.5)return {action:'TARGET_REDUCED',remainingUsd:0,qty:0};
+  const gap=Math.max(0,desired-current);
+  const raw=remainingUsd>=MIN-1e-6?remaining:gap;
+  let qty=trimQty(raw,decimals);
+  // At NEW the exchange size step may round a $10.40 request just below
+  // the minimum. One precision step up is allowed only for a fresh zero-position
+  // entry and only when the original unrounded request was >= $10.40.
+  if(current===0&&qty*price<MIN&&raw*price>=MIN-1e-6){
+    qty=Math.round(Math.ceil(MIN/price/unit-1e-9)*unit*1e10)/1e10;
+  }
+  if(qty<=0)return {action:'BELOW_QTY_PRECISION',remainingUsd,qty:0};
+  if(qty*price<MIN-1e-6)return {action:current>0?'PARTIAL_ENTRY_WAIT_MIN':'NEW_BELOW_EXCHANGE_MIN',remainingUsd,qty:0};
+  if(ageMs>MAX_ENTRY_AGE_MS)return {action:'STALE_PARTIAL_ENTRY',remainingUsd,qty:0};
+  // If the source subsequently ADDED enough, this is a combined executable
+  // residual. It is never an independent order for less than exchange minimum.
+  return {action:current>0?'CONTINUE_PARTIAL_ENTRY':'NEW_ENTRY',remainingUsd,qty};
+}
 const J=(v:any,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 const postInfo=async(body:any)=>{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('INFO_HTTP_'+r.status);return await r.json() as any;};
 const finite=(n:any)=>Number.isFinite(Number(n));
@@ -297,7 +328,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -334,6 +365,8 @@ export class LiveCopyControllerStage7 {
         p.inheritedDirection=0;p.scale=MIN/(Math.abs(after)*f.px);
         p.desired=round(afterSign*MIN/f.px);
         p.entryPending=true;p.episodeEntryPx=f.px;p.episodeStartedAt=f.at;
+        p.entryTargetQty=round(MIN/f.px);p.entryConfirmedQty=0;p.entryRemainingUsd=MIN;
+        p.entryStatus='PENDING';p.entryLastObservedAt=0;
         p.lastFillKind=reversal?'REVERSAL':'NEW';p.lastError='';
         this.log(s,f.coin,reversal?'SOURCE_REVERSAL':'SOURCE_NEW',
           'initial_notional_usd='+MIN+' source_before='+before+' source_after='+after);
@@ -341,6 +374,7 @@ export class LiveCopyControllerStage7 {
       }
       if(Math.abs(after)<1e-8){
         p.desired=0;p.active=false;p.scale=0;p.entryPending=false;
+        p.entryStatus='CLOSED';p.entryRemainingUsd=0;
         p.inheritedMode=false;p.inheritedPendingUsd=0;p.inheritedDirection=0;
         p.lastFillKind='CLOSE';
         this.log(s,f.coin,'SOURCE_FLAT','Close target 100%, do not wait for ADD minimum');
@@ -368,6 +402,8 @@ export class LiveCopyControllerStage7 {
           // kept in desired to accumulate for the next genuine ADD order.
           p.episode++;p.active=true;p.entryPending=true;
           p.episodeEntryPx=f.px;p.episodeStartedAt=f.at;
+          p.entryTargetQty=round(MIN/f.px);p.entryConfirmedQty=0;p.entryRemainingUsd=MIN;
+          p.entryStatus='PENDING';p.entryLastObservedAt=0;
           p.desired=round(afterSign*p.inheritedPendingUsd/f.px);
           p.inheritedMode=false;p.inheritedPendingUsd=0;
           p.lastFillKind='INHERITED_ADD_ENTRY';
@@ -445,24 +481,65 @@ export class LiveCopyControllerStage7 {
       if(live&&p.pending){const confirmed=await this.checkAmbiguous(s,p);
         if(confirmed===null){decisions.push({coin:p.coin,action:'WAIT_PROOF',reason:p.pending?.status});continue;}
         own=confirmed;actual[p.coin]=own;}
-      if(own!==0&&p.active&&Math.sign(own)===Math.sign(p.desired)&&p.entryPending)p.entryPending=false;
+      // Do NOT clear entryPending just because there is any fill in our direction.
+      // A $10.40 IOC can partially fill for $0.90; that is NOT a complete entry.
+      // Only exchange-confirmed own quantity can settle the initial target.
+      if(p.entryPending && p.active && Math.sign(p.desired)!==0){
+        const target=Math.max(0,Number(p.entryTargetQty||MIN/Number(p.episodeEntryPx||price)));
+        p.entryTargetQty=target;
+        const ownAligned=Math.sign(own)===Math.sign(p.desired)?Math.abs(own):0;
+        const precisionUnit=10**(-decimals);
+        p.entryConfirmedQty=ownAligned;
+        p.entryRemainingUsd=Math.max(0,target-ownAligned)*price;
+        p.entryLastObservedAt=now;
+        if(ownAligned>=target-precisionUnit*0.5){
+          p.entryPending=false;p.entryStatus='COMPLETE';p.entryRemainingUsd=0;
+          this.log(s,p.coin,'INITIAL_ENTRY_COMPLETE','own_qty='+ownAligned+' target_qty='+target);
+        }else if(ownAligned>0){
+          p.entryStatus='PARTIAL';
+        }else{p.entryStatus='PENDING';}
+      }
       const gap=round(p.desired-own);
       const opposite=own!==0&&(p.desired===0||Math.sign(p.desired)!==Math.sign(own));
       const reduce=own!==0&&(opposite||Math.sign(gap)!==Math.sign(own));
+      if(reduce&&p.entryPending){
+        // The source has reduced/closed/reversed while our initial IOC was
+        // partial. Never top it up against a newer shrinking source target.
+        p.entryPending=false;p.entryStatus='SUPERSEDED_BY_REMOVE';
+        p.entryRemainingUsd=0;
+      }
       // IMPORTANT: reduce size is bounded by confirmed actual own position; exits don't wait for $10.
       const raw=opposite?Math.abs(own):reduce?Math.min(Math.abs(gap),Math.abs(own)):Math.abs(gap);
       let qty=trimQty(raw,decimals);
       // A fresh NEW or REVERSAL sends ONLY the initial $10.40 notional,
       // even if several ADD fills arrived before the first reconciliation.
       // Their excess remains in p.desired and is accumulated for a later ADD.
-      const freshEntry=!reduce&&own===0&&p.entryPending===true&&p.active===true;
+      const freshEntry=!reduce&&p.entryPending===true&&p.active===true;
+      let entryPlanAction:string|null=null;
       if(freshEntry){
         const initial=Math.max(0,Number(p.episodeEntryPx||price));
-        const baseQty=MIN/(initial||price);
-        qty=trimQty(Math.min(raw,baseQty),decimals);
+        const baseQty=Number(p.entryTargetQty||MIN/(initial||price));
+        const plan=planV19InitialEntry(own,baseQty,p.desired,price,decimals,
+          now-Number(p.lastFillAt||p.episodeStartedAt));
+        entryPlanAction=plan.action;
+        p.entryRemainingUsd=plan.remainingUsd;
+        if(plan.action==='COMPLETE'){
+          p.entryPending=false;p.entryStatus='COMPLETE';
+        }else if(plan.action==='TARGET_REDUCED'){
+          p.entryPending=false;p.entryStatus='TARGET_REDUCED';
+        }else if(plan.action==='NEW_ENTRY'||plan.action==='CONTINUE_PARTIAL_ENTRY'){
+          qty=plan.qty;
+        }else{
+          p.entryStatus=plan.action;
+          // Remain an incomplete initial episode; never relabel the deficit ADD.
+          decisions.push({coin:p.coin,action:plan.action,
+            pending_usd:plan.remainingUsd,initial_target_usd:MIN,
+            confirmed_usd:Math.abs(own)*price,reason:'Unfilled initial order remainder; no sub-minimum IOC'});
+          continue;
+        }
       }
       // Exchange precision can round a $10.40 initial entry just below minimum.
-      if(!reduce&&qty*price<MIN&&(raw*price>=MIN-1e-6||freshEntry&&raw*price>=MIN-1e-6)){
+      if(!reduce&&qty*price<MIN&&(raw*price>=MIN-1e-6)&&(!freshEntry||Math.abs(own)<1e-10)){
         const unit=10**(-decimals);const rounded=Math.ceil(MIN/price/unit-1e-9)*unit;
         if(p.coin!=='ZEC'||rounded*price<=20.000001)qty=round(rounded);
       }
@@ -487,7 +564,7 @@ export class LiveCopyControllerStage7 {
           continue;
         }
       }else{p.pendingReduceUsd=0;p.reduceState='NONE';}
-      if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:freshEntry?'NEW_BELOW_EXCHANGE_MIN':'ACCUMULATE_ADD',pending_usd:Math.abs(gap)*price});continue;}
+      if(!reduce&&notional<MIN){decisions.push({coin:p.coin,action:freshEntry?'PARTIAL_ENTRY_WAIT_MIN':'ACCUMULATE_ADD',pending_usd:Math.abs(gap)*price});continue;}
       if(!reduce&&now-p.lastFillAt>MAX_ENTRY_AGE_MS){decisions.push({coin:p.coin,action:'SKIP_STALE_ENTRY',pending_usd:notional});continue;}
       if(!reduce&&!freshEntry&&now-p.lastActionAt<COALESCE_MS){decisions.push({coin:p.coin,action:'COALESCE_ADD',pending_usd:notional});continue;}
       if(sent>=MAX_ACTIONS){decisions.push({coin:p.coin,action:'NEXT_TICK',pending_usd:notional});continue;}
@@ -501,7 +578,7 @@ export class LiveCopyControllerStage7 {
           reason:p.lastRejectReason||'EXCHANGE_REJECTED',retry_at:p.lastRejectedUntil});
         continue;
       }
-      decisions.push({coin:p.coin,action:reduce?(opposite?'CLOSE_FOR_REVERSAL_OR_FLAT':'PERCENT_REMOVE'):freshEntry?(p.episode>1?'NEW_OR_REVERSAL_ENTRY':'NEW_ENTRY'):'PERCENT_ADD',qty,usd:notional,direction,desired:p.desired,actual:own,source_last_action:p.lastFillKind});
+      decisions.push({coin:p.coin,action:reduce?(opposite?'CLOSE_FOR_REVERSAL_OR_FLAT':'PERCENT_REMOVE'):freshEntry?(Math.abs(own)>0?'CONTINUE_PARTIAL_ENTRY':p.episode>1?'NEW_OR_REVERSAL_ENTRY':'NEW_ENTRY'):'PERCENT_ADD',qty,usd:notional,direction,desired:p.desired,actual:own,source_last_action:p.lastFillKind,initial_remaining_usd:p.entryRemainingUsd||0});
       if(!live)continue;
       const intentId=`V19:${s.startedAt}:${p.coin}:${++p.actionCount}`;
       const cloid=__LC_EXECUTION.cloidForIntent(intentId);
@@ -515,6 +592,19 @@ export class LiveCopyControllerStage7 {
         p.lastRejectedUntil=0;p.lastRejectReason=undefined;
         p.lastConfirmedOwnQty=own+(direction==='LONG'?1:-1)*Number(result.filledQty);
         p.dustCloseBlockedQty=undefined;p.dustCloseReason=undefined;
+        if(!reduce && freshEntry){
+          const filled=Number(result.filledQty);
+          const total=Math.abs(own)+filled;
+          p.entryConfirmedQty=total;
+          p.entryRemainingUsd=Math.max(0,Number(p.entryTargetQty||0)-total)*price;
+          const unit=10**(-decimals);
+          const complete=total>=Number(p.entryTargetQty||0)-unit*0.5;
+          p.entryPending=!complete;
+          p.entryStatus=complete?'COMPLETE':'PARTIAL';
+          this.log(s,p.coin,complete?'INITIAL_ENTRY_COMPLETE':'PARTIAL_ENTRY_FILLED',
+            'requested_qty='+qty+' filled_qty='+filled+' cumulative_qty='+total+
+            ' initial_target_qty='+p.entryTargetQty+' remaining_usd='+p.entryRemainingUsd.toFixed(4));
+        }
         s.orders++;this.log(s,p.coin,reduce?'REDUCE_FILLED':'OPEN_FILLED','qty='+result.filledQty);
       }else if(result.orderSent==='UNKNOWN'||result.orderSent===true&&result.status==='UNEXPECTED_RESTING_ORDER'){
         p.pending!.status='UNKNOWN';p.lastError=result.status;this.log(s,p.coin,'WRITE_UNCERTAIN',result.status);
@@ -562,12 +652,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -579,7 +669,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -589,7 +679,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -658,8 +748,8 @@ export class LiveCopyControllerStage7 {
       const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
-          dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.lastConfirmedOwnQty!==0,rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_5_REMOVE_ACCUMULATION_DUST',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+          dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
+      return J({ok:true,version:'V19_6_PARTIAL_ENTRY_FIX',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
