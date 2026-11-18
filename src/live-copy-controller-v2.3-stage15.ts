@@ -300,7 +300,38 @@ type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episod
 type Session={version:19;mode:'RUNNING'|'STOPPED';live:boolean;startedAt:number;cursor:number;
   coins:Record<string,CoinState>;events:number;syncs:number;skipped:number;orders:number;lastSync:number;
   errors:string[];recent:Array<{at:number;coin:string;kind:string;detail:string}>;sourceSession:string;
-  stoppedReason:string;lastDecisions?:any[];cooldownUntil?:number;};
+  stoppedReason:string;lastDecisions?:any[];cooldownUntil?:number;sessionCapital?:number;sessionEquityBasis?:string;};
+
+/** Single equity source: NEVER add unified spot USDC to perps account value. */
+function v19SessionEquity(a:Awaited<ReturnType<typeof __LC_EXECUTION.readLiveAccount>>):{value:number;basis:string}|null {
+  if(a.spotUsdcTotal!==null&&Number.isFinite(a.spotUsdcTotal)&&a.spotUsdcTotal>=0)
+    return {value:a.spotUsdcTotal,basis:'UNIFIED_SPOT_USDC'};
+  if(!a.spotBalanceError&&Number.isFinite(a.accountValue)&&a.accountValue>0)
+    return {value:a.accountValue,basis:'PERP_ACCOUNT_VALUE'};
+  return null;
+}
+/** Computes completed position episodes, not per-order wins. A missing/truncated history stays unknown. */
+export function v19SessionWinRate(rows:any[],since:number){
+  if(!Array.isArray(rows)||rows.length>=2000)
+    return {closed:null,wins:null,losses:null,winRate:null,reason:'FILL_HISTORY_TRUNCATED'};
+  const fills=rows.filter(x=>Number(x.time)>=since).sort((a,b)=>Number(a.time)-Number(b.time)||Number(a.tid||0)-Number(b.tid||0));
+  const ep:Record<string,{pnl:number;known:boolean}>={};let closed=0,wins=0,losses=0;
+  for(const f of fills){
+    if(!f.coin||!['A','B'].includes(f.side))continue;
+    const before=Number(f.startPosition),sz=Number(f.sz),fee=Number(f.fee||0),pnl=Number(f.closedPnl||0);
+    if(!Number.isFinite(before)||!Number.isFinite(sz)||sz<=0||!Number.isFinite(pnl)||!Number.isFinite(fee))continue;
+    const after=before+(f.side==='B'?sz:-sz),cross=before*after< -1e-8,flat=Math.abs(after)<1e-8;
+    let current=ep[f.coin];if(!current)current=ep[f.coin]={pnl:0,known:Math.abs(before)<1e-8};
+    const closeShare=cross?Math.min(1,Math.abs(before)/sz):1;
+    current.pnl+=pnl-fee*closeShare;
+    if((flat||cross)&&Math.abs(before)>1e-8){
+      if(current.known){closed++;if(current.pnl>1e-7)wins++;else if(current.pnl< -1e-7)losses++;}
+      delete ep[f.coin];
+    }
+    if(cross)ep[f.coin]={pnl:-fee*(1-closeShare),known:true};
+  }
+  return {closed,wins,losses,winRate:closed?wins*100/closed:null,reason:closed?'':'NO_COMPLETED_TRADES'};
+}
 const KEY='live_copy_v19_net_position';
 export function canAddAtMark(ownQty:number, entryPrice:number,markPrice:number):boolean {
   if(!Number.isFinite(ownQty)||!Number.isFinite(entryPrice)||!Number.isFinite(markPrice)||
@@ -422,11 +453,13 @@ export class LiveCopyControllerStage7 {
         return J({ok:false,error:'ACCOUNT_NOT_FLAT_USE_CLOSE_ALL_FIRST',positions:own,open_orders:Array.isArray(open)?open.length:null},409);
     }
     const latest=await this.latest();const baseline=await this.sourcePositions();const at=Date.now();
+    const capitalRecord=v19SessionEquity(await __LC_EXECUTION.readLiveAccount(this.env));
+    if(!capitalRecord||capitalRecord.value<=0)return J({ok:false,error:'CAPITAL_SNAPSHOT_UNAVAILABLE_NO_START'},503);
     // Every START is fresh; existing V18 storage is intentionally not read or reused.
     const coins:Record<string,CoinState>={};for(const [coin,qty] of Object.entries(baseline))if(Math.abs(qty)>1e-9)
       coins[coin]={coin,sourceQty:qty,baseline:qty,scale:0,episode:0,active:false,waitingFlat:false,inheritedMode:true,inheritedPendingUsd:0,inheritedDirection:Math.sign(qty),desired:0,lastPx:0,lastFillAt:0,lastActionAt:0,lastFillId:'',lastError:'',lastConfirmedOwnQty:0,actionCount:0};
     const s:Session={version:19,mode:'RUNNING',live:this.liveConfigured(),startedAt:at,cursor:latest?.rowid||0,
-      sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:''};
+      sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:'',sessionCapital:capitalRecord.value,sessionEquityBasis:capitalRecord.basis};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
     return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
@@ -1155,6 +1188,31 @@ export class LiveCopyControllerStage7 {
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,stop_loss_roe_pct:25,no_add_to_losing:true,safety_source_audit_interval_ms:SAFETY_AUDIT_INTERVAL_MS,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
+    }
+    if(method==='GET'&&path==='/performance'){
+      const s=await this.load();
+      const base={ok:true,capital_usd:s.sessionCapital??null,equity_usd:null as number|null,roi_pct:null as number|null,
+        equity_basis:s.sessionEquityBasis||null,win_rate_pct:null as number|null,closed_trades:null as number|null,
+        wins:null as number|null,losses:null as number|null,reason:''};
+      if(!(Number(s.sessionCapital)>0))return J({...base,reason:'CAPITAL_WILL_BE_SAVED_AT_NEXT_START'});
+      const cache=await this.state.storage.get('v19_performance_cached') as {session:number;at:number;data:any}|undefined;
+      if(cache&&cache.session===s.startedAt&&Date.now()-cache.at<60000)return J(cache.data);
+      try{
+        const source=v19SessionEquity(await __LC_EXECUTION.readLiveAccount(this.env));
+        if(source&&source.basis===s.sessionEquityBasis){
+          base.equity_usd=source.value;base.roi_pct=(source.value/Number(s.sessionCapital)-1)*100;
+        }else base.reason='EQUITY_SOURCE_UNAVAILABLE';
+      }catch(e){base.reason='EQUITY_READ_ERROR';}
+      try{
+        const fills=await postInfo({type:'userFillsByTime',user:this.env.HYPERLIQUID_MASTER_ACCOUNT,
+          startTime:s.startedAt,aggregateByTime:false});
+        const x=v19SessionWinRate(fills,s.startedAt);
+        base.closed_trades=x.closed;base.wins=x.wins;base.losses=x.losses;base.win_rate_pct=x.winRate;
+        if(x.reason)base.reason=x.reason;
+      }catch(e){base.reason='FILL_HISTORY_READ_ERROR';}
+      const data={...base,calculated_at:Date.now()};
+      await this.state.storage.put('v19_performance_cached',{session:s.startedAt,at:Date.now(),data});
+      return J(data);
     }
     if(method==='GET'&&path==='/account'){try{return J(await __LC_EXECUTION.readLiveAccount(this.env));}catch(e){return J({ok:false,error:String(e)},503);}}
     if(method==='GET'&&path==='/our-activity'){const s=await this.load();return J({ok:true,events:s.recent});}
