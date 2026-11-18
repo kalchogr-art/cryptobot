@@ -442,7 +442,27 @@ export class LiveCopyControllerStage7 {
   }
   private async ownPositions(){const w=this.env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';if(!/^0x[0-9a-f]{40}$/i.test(w))throw Error('MASTER_ADDRESS_MISSING');return this.positions(w);}
   private async sourcePositions(){const w=this.env.LIVE_COPY_SOURCE_WALLET?.trim()||'0x34fb5ec7d4e939161946340ea2a1f29254b893de';if(!/^0x[0-9a-f]{40}$/i.test(w))throw Error('SOURCE_ADDRESS_INVALID');return this.positions(w);}
-  private async latest(){return await this.env.DB.prepare('SELECT rowid,session_id FROM mc_v19_fills ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string}>();}
+  // Retry only read-only D1 queries on transient Cloudflare internal faults.
+  // No execution/order submission is included in this retry scope.
+  private async d1Read<T>(label:string,read:()=>Promise<T>):Promise<T>{
+    for(let attempt=0;attempt<3;attempt++){
+      try{const result=await read();
+        const previous=await this.state.storage.get('live_copy_v19_d1_diagnostic') as {status?:string;error?:string}|undefined;
+        if(attempt>0||previous?.status==='FAILED'||previous?.status==='RETRYING')
+          await this.state.storage.put('live_copy_v19_d1_diagnostic',
+            {status:'RECOVERED',query:label,attempts:attempt+1,at:Date.now(),previous_error:previous?.error||null});
+        return result;
+      }catch(e){const message=String(e);
+        const transient=/D1_ERROR|internal error|SQLITE_BUSY|database is locked|temporarily unavailable/i.test(message);
+        await this.state.storage.put('live_copy_v19_d1_diagnostic',
+          {status:transient&&attempt<2?'RETRYING':'FAILED',query:label,attempts:attempt+1,at:Date.now(),error:message});
+        if(!transient||attempt===2)throw e;
+        await new Promise<void>(resolve=>setTimeout(resolve,250*(2**attempt)));
+      }
+    }
+    throw Error('D1_READ_RETRIES_EXHAUSTED');
+  }
+  private async latest(){return this.d1Read('LATEST_FILL',()=>this.env.DB.prepare('SELECT rowid,session_id FROM mc_v19_fills ORDER BY rowid DESC LIMIT 1').bind().first<{rowid:number;session_id:string}>());}
   private error(s:Session,e:any){s.errors.unshift(String(e));s.errors=s.errors.slice(0,20);}
   private async start(body:any){
     const old=await this.load();if(this.liveConfigured()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return J({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);
@@ -462,11 +482,11 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:'',sessionCapital:capitalRecord.value,sessionEquityBasis:capitalRecord.basis};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
-    const rows=await this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
-      FROM mc_v19_fills WHERE rowid>? ORDER BY rowid ASC LIMIT ${BATCH}`).bind(s.cursor).all<Fill>();
+    const rows=await this.d1Read('PROCESS_FILLS',()=>this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
+      FROM mc_v19_fills WHERE rowid>? ORDER BY rowid ASC LIMIT ${BATCH}`).bind(s.cursor).all<Fill>());
     for(const f of rows.results||[]){
       // Row-id is a durable processing cursor; never replay an already accepted fill.
       s.cursor=f.rowid;
@@ -1080,24 +1100,27 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
       // burst cannot trigger dozens of overlapping/excessive reconciliations.
       await this.state.storage.put('live_copy_v19_last_reconcile',now);
       try{
-        const result=await this.reconcile(s);s.lastDecisions=result.decisions;
+        const result=await this.reconcile(s);s.lastDecisions=(result.decisions||[]).map((d:any)=>({
+          ...d,at:Number(s!.coins[d.coin]?.lastActionAt||s!.coins[d.coin]?.lastFillAt||Date.now()),
+          active:s!.coins[d.coin]?.active===true
+        })).sort((a:any,b:any)=>Number(b.at)-Number(a.at));
         // Successful INFO read resets previous API error display and cooldown.
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -1107,7 +1130,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -1173,7 +1196,7 @@ export class LiveCopyControllerStage7 {
     if(method==='POST'&&path==='/close-all')return this.closeAll();
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
-      const s=await this.load();const latest=await this.latest().catch(()=>null);const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
+      const s=await this.load();const latest=await this.latest().catch(()=>null);const d1Diagnostic=await this.state.storage.get('live_copy_v19_d1_diagnostic')||null;const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
         exit_barrier:p.exitBarrier===true,exit_barrier_reason:p.exitBarrierReason||null,
         source_chain_fault:p.sourceChainFault===true,
         stop_status:p.stopStatus||null,stop_cloid:p.stopCloid||null,stop_trigger:p.stopPx||null,
@@ -1184,8 +1207,8 @@ export class LiveCopyControllerStage7 {
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
           dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_9_LOSS_STOP_SAFETY_AUDIT',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
-        cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:Math.max(0,(latest?.rowid||0)-s.cursor),processed_fills:s.events,orders_sent_and_filled:s.orders,
+      return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+        cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:latest?Math.max(0,latest.rowid-s.cursor):null,d1_diagnostic:d1Diagnostic,processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,stop_loss_roe_pct:25,no_add_to_losing:true,safety_source_audit_interval_ms:SAFETY_AUDIT_INTERVAL_MS,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
     }
