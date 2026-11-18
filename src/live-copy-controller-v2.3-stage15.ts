@@ -482,7 +482,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:'',sessionCapital:capitalRecord.value,sessionEquityBasis:capitalRecord.basis};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.d1Read('PROCESS_FILLS',()=>this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -1100,12 +1100,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -1120,7 +1120,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -1130,7 +1130,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -1207,10 +1207,57 @@ export class LiveCopyControllerStage7 {
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
           dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_11_D1_RETRY_PAGINATION',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:latest?Math.max(0,latest.rowid-s.cursor):null,d1_diagnostic:d1Diagnostic,processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,stop_loss_roe_pct:25,no_add_to_losing:true,safety_source_audit_interval_ms:SAFETY_AUDIT_INTERVAL_MS,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
+    }
+    // V19.12 READ-ONLY Hyperliquid account-based exchange request quota.
+    // This endpoint never submits/cancels an order and never modifies strategy state.
+    if(method==='GET'&&path==='/api-quota'){
+      const wallet=String(this.env.HYPERLIQUID_MASTER_ACCOUNT||'').trim();
+      if(!/^0x[a-fA-F0-9]{40}$/.test(wallet))return J({ok:false,error:'HYPERLIQUID_MASTER_ACCOUNT_INVALID'},422);
+      type QuotaCache={at:number;ok:boolean;data:any};
+      const cacheKey='live_copy_v19_hl_quota_cache';
+      const prior=await this.state.storage.get(cacheKey) as QuotaCache|undefined;
+      const now=Date.now();
+      const recent=(await this.load()).recent||[];
+      const rateEvents=recent.filter(x=>/429|RATE_LIMIT|TOO_MANY_REQUESTS|quota|limit exceeded/i.test(String(x.kind)+' '+String(x.detail)));
+      // This history is bounded to 120 events; do not interpret counts as total missed trades.
+      const observations={rate_limit_events_in_recent_history:rateEvents.length,
+        recent_history_size:recent.length,
+        recent_rate_limit_event:rateEvents[0]||null,
+        caveat:'Recent events are a bounded diagnostic, not a count of missed trades; IP limits are separate.'};
+      if(prior&&now-prior.at<(prior.ok?60000:20000))
+        return J({...prior.data,...observations,cached:true,age_seconds:Math.floor((now-prior.at)/1000)});
+      try{
+        const r=await fetch('https://api.hyperliquid.xyz/info',{
+          method:'POST',headers:{'content-type':'application/json'},
+          body:JSON.stringify({type:'userRateLimit',user:wallet})
+        });
+        if(!r.ok)throw Error('INFO_HTTP_'+r.status);
+        const q=await r.json() as any;
+        const used=Number(q?.nRequestsUsed),cap=Number(q?.nRequestsCap),surplus=Number(q?.nRequestsSurplus);
+        const volume=Number(q?.cumVlm);
+        if(![used,cap,surplus,volume].every(Number.isFinite)||cap<0||used<0||surplus<0)
+          throw Error('INVALID_USER_RATE_LIMIT_RESPONSE');
+        // Treat surplus separately; available cap is not evidence of successful order placement.
+        const remaining=Math.max(0,cap-used);
+        const data={ok:true,address:wallet.slice(0,6)+'…'+wallet.slice(-4),
+          cum_volume_usd:volume,requests_used:used,requests_cap:cap,
+          requests_surplus:surplus,remaining_requests:remaining,
+          remaining_percent:cap>0?100*remaining/cap:null,
+          usage_percent:cap>0?100*used/cap:null,
+          state:remaining===0?'EXHAUSTED':cap>0&&remaining/cap<=0.05?'CRITICAL':cap>0&&remaining/cap<=0.15?'WARNING':'OK',
+          checked_at:now,scope:'ACCOUNT_EXCHANGE_REQUESTS_ONLY',
+          ip_rate_limit_included:false,websocket_limit_included:false};
+        await this.state.storage.put(cacheKey,{at:now,ok:true,data});
+        return J({...data,...observations,cached:false,age_seconds:0});
+      }catch(e){
+        const data={ok:false,error:'HYPERLIQUID_QUOTA_UNAVAILABLE',detail:String(e),checked_at:now,scope:'ACCOUNT_EXCHANGE_REQUESTS_ONLY'};
+        await this.state.storage.put(cacheKey,{at:now,ok:false,data});
+        return J({...data,...observations,cached:false},503);
+      }
     }
     if(method==='GET'&&path==='/performance'){
       const s=await this.load();
