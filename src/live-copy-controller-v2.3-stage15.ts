@@ -7,6 +7,65 @@
 import { bytesToHex, concat, keccak256, recoverTypedDataAddress } from 'viem';
 import { encode } from '@msgpack/msgpack';
 import { privateKeyToAccount } from 'viem/accounts';
+
+/** V19.13 READ ONLY IP REST instrumentation.
+ * Counts only REST requests actually observed in this Worker isolate. Cloudflare may use
+ * different outbound IPs and other processes may consume the same IP budget.
+ * Data is process-memory only and starts again on isolate restart. Not an exchange quota.
+ */
+type HLRestObservation={at:number;endpoint:'info'|'exchange';operation:string;weight:number;status:number;elapsed_ms:number;error?:string};
+const HL_REST_BOOT_AT=Date.now();
+const HL_REST_LIMIT=1200;
+const HL_REST_OBSERVATIONS:HLRestObservation[]=[];
+const HL_REST_KEEP_MS=24*60*60*1000;
+function hlWeight(endpoint:'info'|'exchange',body:any):number{
+  if(endpoint==='exchange'){
+    const a=body?.action;
+    const count=Array.isArray(a?.orders)?a.orders.length:Array.isArray(a?.cancels)?a.cancels.length:Array.isArray(a?.modifies)?a.modifies.length:1;
+    return 1+Math.floor(Math.max(1,count)/40);
+  }
+  const op=String(body?.type||'unknown');
+  if(['l2Book','allMids','clearinghouseState','orderStatus','spotClearinghouseState','exchangeStatus'].includes(op))return 2;
+  if(op==='userRole')return 60;
+  // Endpoint-dependent response-length surcharge is not included: lower-bound estimate.
+  return 20;
+}
+async function hlObservedFetch(url:string,body:any):Promise<Response>{
+  const endpoint:'info'|'exchange'=url.endsWith('/exchange')?'exchange':'info';
+  const operation=endpoint==='exchange'?String(body?.action?.type||'exchange_action'):String(body?.type||'info_unknown');
+  const weight=hlWeight(endpoint,body),started=Date.now();
+  let status=0,error='';
+  try{
+    const response=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    status=response.status;
+    return response;
+  }catch(e){error=String(e).slice(0,150);throw e;}
+  finally{
+    HL_REST_OBSERVATIONS.push({at:Date.now(),endpoint,operation,weight,status,elapsed_ms:Date.now()-started,...(error?{error}:{})});
+    const cutoff=Date.now()-HL_REST_KEEP_MS;
+    while(HL_REST_OBSERVATIONS.length&&(HL_REST_OBSERVATIONS[0].at<cutoff||HL_REST_OBSERVATIONS.length>6000))HL_REST_OBSERVATIONS.shift();
+  }
+}
+function hlIpRestSnapshot(){
+  const now=Date.now(),last60=HL_REST_OBSERVATIONS.filter(x=>x.at>now-60000),lastHour=HL_REST_OBSERVATIONS.filter(x=>x.at>now-3600000),lastDay=HL_REST_OBSERVATIONS.filter(x=>x.at>now-86400000);
+  const sum=(xs:HLRestObservation[])=>xs.reduce((n,x)=>n+x.weight,0);
+  const n429=(xs:HLRestObservation[])=>xs.filter(x=>x.status===429).length;
+  const knownWeight=sum(last60),infoWeight=sum(last60.filter(x=>x.endpoint==='info'));
+  return {ok:true,mode:'READ_ONLY',scope:'WORKER_ISOLATE_OBSERVED_REST_ONLY',estimated:true,
+    boot_at:HL_REST_BOOT_AT,checked_at:now,ip_limit_weight_per_minute:HL_REST_LIMIT,
+    observed_weight_60s:knownWeight,observed_info_weight_60s:infoWeight,
+    observed_exchange_weight_60s:knownWeight-infoWeight,
+    observed_requests_60s:last60.length,
+    observed_weight_pct_60s:Math.round(10000*knownWeight/HL_REST_LIMIT)/100,
+    http_429_60m:n429(lastHour),http_429_24h:n429(lastDay),
+    observed_requests_60m:lastHour.length,observed_weight_60m:sum(lastHour),
+    recent_http_429:lastDay.filter(x=>x.status===429).slice(-30).reverse(),
+    recent_rest_failures:lastDay.filter(x=>x.status===429||x.status===0||x.status>=500).slice(-30).reverse(),
+    response_item_surcharges_not_counted:true,other_cloudflare_isolates_and_external_ip_traffic_not_counted:true,
+    exact_remaining_ip_quota:null,websocket_usage_not_counted:true,
+    warning:'Observed weight is a lower-bound estimate for one Worker isolate, NOT total IP consumption. 429 does not prove a missed trade.'};
+}
+
 namespace __LC_EXECUTION {
 
 /**
@@ -48,7 +107,7 @@ const validAddress = (x: string) => /^0x[0-9a-fA-F]{40}$/.test(x);
 const keyFormat = (x: string) => /^0x[0-9a-fA-F]{64}$/.test(x);
 export const normalizeKey = (x?: string) => x ? (x.startsWith('0x') ? x : `0x${x}`) : '';
 const post = async (url: string, body: unknown) => {
-  const r = await fetch(url, { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(body) });
+  const r = await hlObservedFetch(url,body);
   const raw = await r.text();
   let data: any; try { data = JSON.parse(raw); } catch { throw Error(`NON_JSON_RESPONSE_${r.status}`); }
   if (!r.ok) throw Error(`HYPERLIQUID_HTTP_${r.status}:${JSON.stringify(data).slice(0,250)}`);
@@ -397,7 +456,7 @@ export function planV19InitialEntry(ownQty:number,targetQty:number,desiredQty:nu
   return {action:current>0?'CONTINUE_PARTIAL_ENTRY':'NEW_ENTRY',remainingUsd,qty};
 }
 const J=(v:any,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
-const postInfo=async(body:any)=>{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error('INFO_HTTP_'+r.status);return await r.json() as any;};
+const postInfo=async(body:any)=>{const r=await hlObservedFetch('https://api.hyperliquid.xyz/info',body);if(!r.ok)throw Error('INFO_HTTP_'+r.status);return await r.json() as any;};
 const finite=(n:any)=>Number.isFinite(Number(n));
 const round=(n:number)=>Math.round(n*1e10)/1e10;
 function trimQty(n:number,d:number){return Math.floor(Math.max(0,n)*10**d+1e-9)/10**d;}
@@ -482,7 +541,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:'',sessionCapital:capitalRecord.value,sessionEquityBasis:capitalRecord.basis};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_13_IP_REST_MONITOR',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.d1Read('PROCESS_FILLS',()=>this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -1100,12 +1159,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -1120,7 +1179,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -1130,7 +1189,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -1207,11 +1266,13 @@ export class LiveCopyControllerStage7 {
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
           dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_12_HL_API_QUOTA_MONITOR',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_13_IP_REST_MONITOR',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:latest?Math.max(0,latest.rowid-s.cursor):null,d1_diagnostic:d1Diagnostic,processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,stop_loss_roe_pct:25,no_add_to_losing:true,safety_source_audit_interval_ms:SAFETY_AUDIT_INTERVAL_MS,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
     }
+    // V19.13 OBSERVATIONAL DIAGNOSTICS ONLY: no extra Hyperliquid network request.
+    if(method==='GET'&&path==='/ip-rest-monitor')return J(hlIpRestSnapshot());
     // V19.12 READ-ONLY Hyperliquid account-based exchange request quota.
     // This endpoint never submits/cancels an order and never modifies strategy state.
     if(method==='GET'&&path==='/api-quota'){
@@ -1231,10 +1292,7 @@ export class LiveCopyControllerStage7 {
       if(prior&&now-prior.at<(prior.ok?60000:20000))
         return J({...prior.data,...observations,cached:true,age_seconds:Math.floor((now-prior.at)/1000)});
       try{
-        const r=await fetch('https://api.hyperliquid.xyz/info',{
-          method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({type:'userRateLimit',user:wallet})
-        });
+        const r=await hlObservedFetch('https://api.hyperliquid.xyz/info',{type:'userRateLimit',user:wallet});
         if(!r.ok)throw Error('INFO_HTTP_'+r.status);
         const q=await r.json() as any;
         const used=Number(q?.nRequestsUsed),cap=Number(q?.nRequestsCap),surplus=Number(q?.nRequestsSurplus);
