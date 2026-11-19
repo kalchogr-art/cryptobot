@@ -694,6 +694,33 @@ export class LiveCopyControllerStage7 {
     if(typeof coin!=='string'||!/^[A-Z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
+    // STAGE18 ZEC EXCLUSION: Never create/increase ZEC exposure.
+    // Existing confirmed ZEC exposure must still be allowed to reduce/close.
+    // Ignored source events are acknowledged, so D1 cursor progresses normally.
+    if(coin==='ZEC'){
+      const zecLedger=await this.ledger();
+      const zecOwned=Math.abs(zecLedger.confirmedByCoin['ZEC']||0);
+      const zecPending=Object.values(zecLedger.intents).some(i=>i.coin==='ZEC'&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+      const zecBefore=Math.abs(whale_before_qty);
+      const zecAfter=Math.abs(whale_target_qty);
+      const zecIncreasing=zecAfter>zecBefore+1e-10&&(
+        Math.abs(whale_before_qty)<1e-10 || Math.sign(whale_before_qty)===Math.sign(whale_target_qty)
+      );
+      if((zecOwned<1e-9&&!zecPending)||zecIncreasing){
+        // Keep the original source chain continuous for any existing ZEC position,
+        // so a subsequent reduction can still close it safely.
+        const zecCoin=s.coins['ZEC'];
+        if(zecCoin){
+          zecCoin.lastWhaleTarget=whale_target_qty;
+          zecCoin.lastEventAt=time;
+          zecCoin.lastFillId=fill_id;
+        }
+        s.seen[id]=Date.now();
+        this.audit(s,'ZEC_EXCLUDED',coin,zecIncreasing?'OPEN_OR_ADD_BLOCKED':'NEW_EXPOSURE_BLOCKED');
+        await this.save(s);
+        return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED',exchange_order_sent:false});
+      }
+    }
     const old=s.coins[coin];
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
@@ -738,6 +765,15 @@ export class LiveCopyControllerStage7 {
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
     catch(e){await this.halt('INTENT_PLANNING_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'INTENT_PLANNING_FAILED',detail:String(e)},409);}
+    // Defense in depth: a ZEC order that would increase exposure is never submitted,
+    // even if the target has changed through earlier ignored source events.
+    // Reductions and full closes of existing ZEC exposure remain permitted.
+    if(coin==='ZEC'&&planned.intent&&!planned.proposal.reduceOnly){
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'ZEC_EXCLUDED',coin,'ENTRY_OR_ADD_NOT_SUBMITTED');
+      await this.save(s);
+      return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED_NO_NEW_EXPOSURE',exchange_order_sent:false});
+    }
     if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
     // Persist the reservation and in-flight state BEFORE the exchange request.
     await this.state.storage.put('live_copy_v23_ledger',planned.ledger);
@@ -967,6 +1003,33 @@ export class LiveCopyControllerStage7 {
     }
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
+    // STAGE18 ZEC EXCLUSION: Never create/increase ZEC exposure.
+    // Existing confirmed ZEC exposure must still be allowed to reduce/close.
+    // Ignored source events are acknowledged, so D1 cursor progresses normally.
+    if(coin==='ZEC'){
+      const zecLedger=await this.ledger();
+      const zecOwned=Math.abs(zecLedger.confirmedByCoin['ZEC']||0);
+      const zecPending=Object.values(zecLedger.intents).some(i=>i.coin==='ZEC'&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+      const zecBefore=Math.abs(whale_before_qty);
+      const zecAfter=Math.abs(whale_target_qty);
+      const zecIncreasing=zecAfter>zecBefore+1e-10&&(
+        Math.abs(whale_before_qty)<1e-10 || Math.sign(whale_before_qty)===Math.sign(whale_target_qty)
+      );
+      if((zecOwned<1e-9&&!zecPending)||zecIncreasing){
+        // Keep the original source chain continuous for any existing ZEC position,
+        // so a subsequent reduction can still close it safely.
+        const zecCoin=s.coins['ZEC'];
+        if(zecCoin){
+          zecCoin.lastWhaleTarget=whale_target_qty;
+          zecCoin.lastEventAt=time;
+          zecCoin.lastFillId=fill_id;
+        }
+        s.seen[id]=Date.now();
+        this.audit(s,'ZEC_EXCLUDED',coin,zecIncreasing?'OPEN_OR_ADD_BLOCKED':'NEW_EXPOSURE_BLOCKED');
+        await this.save(s);
+        return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED',exchange_order_sent:false});
+      }
+    }
     const old=s.coins[coin];
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
@@ -1014,6 +1077,15 @@ export class LiveCopyControllerStage7 {
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
     catch(e){await this.halt('INTENT_PLANNING_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'INTENT_PLANNING_FAILED',detail:String(e)},409);}
+    // Defense in depth: a ZEC order that would increase exposure is never submitted,
+    // even if the target has changed through earlier ignored source events.
+    // Reductions and full closes of existing ZEC exposure remain permitted.
+    if(coin==='ZEC'&&planned.intent&&!planned.proposal.reduceOnly){
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'ZEC_EXCLUDED',coin,'ENTRY_OR_ADD_NOT_SUBMITTED');
+      await this.save(s);
+      return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED_NO_NEW_EXPOSURE',exchange_order_sent:false});
+    }
     if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
     // Persist the reservation and in-flight state BEFORE the exchange request.
     await this.state.storage.put('live_copy_v23_ledger',planned.ledger);
