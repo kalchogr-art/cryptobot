@@ -606,6 +606,7 @@ function classifySourceFullTrade(f:any):FullTradeEvent|null {
 const FT_KEY='v19_full_trade_v1916';
 type FTOrder={cloid:string;coin:string;at:number;qty:number;reduceOnly:boolean;state:'SUBMITTING'|'OPEN'|'CANCELING'};
 type FTState={active:boolean;halted:boolean;started:number;reason:string;coin:string;sourceQty:number;target:number;scale:number;
+  lastFlatVerifiedAt?:number;restBackoffUntil?:number;lastRest429At?:number;rest429Count?:number;
   episode:number;episodeAt:number;lastActionAt:number;lastFillAt:number;lastEntryAttemptAt:number;
   order?:FTOrder;stop?:{cloid:string;qty:number;at:number;status:'SUBMITTING'|'RESTING'};
   pendingReversal?:{qty:number;px:number;at:number};seen:string[];ignoredCoins:string[];
@@ -1386,6 +1387,10 @@ export class LiveCopyControllerStage7 {
   }
 
   /* V19.16 FULL TRADE LIVE -- isolated state, same existing Durable Object. */
+  // V19.16.3: isolate-local cache for expensive READ-ONLY dashboard history.
+  // This cache never influences trading decisions, order states or safety checks.
+  private ftReportCache:{statistics:any;fullTradeAudit:any}|null=null;
+  private ftReportNextAt=0;
   private ftWs:WebSocket|null=null;
   private ftWsReady=false;
   private ftQueue:Promise<void>=Promise.resolve();
@@ -1501,13 +1506,19 @@ export class LiveCopyControllerStage7 {
       return J({ok:false,error:'FULL_TRADE_API_KEY_INVALID_FORMAT'},409);
     if(LIMIT_TEST_SOURCE.toLowerCase()===this.env.HYPERLIQUID_MASTER_ACCOUNT.toLowerCase())return J({ok:false,error:'SOURCE_CANNOT_BE_OWN_ACCOUNT'},409);
     const old=await this.load();if(old.mode==='RUNNING')return J({ok:false,error:'STOP_OLD_COPY_FIRST'},409);
-    const prev=await this.ltLoad();if(prev.active||prev.order||prev.halted||prev.coin)return J({ok:false,error:'FULL_TRADE_PREVIOUS_UNRESOLVED'},409);
-    const {flat,account,orders}=await this.ltFlat();if(!flat)return J({ok:false,error:'FULL_TRADE_ACCOUNT_NOT_FLAT',positions:account.positions,openOrders:orders},409);
+    const prev=await this.ltLoad();
+    if(prev.active||prev.order||prev.stop)return J({ok:false,error:'FULL_TRADE_PREVIOUS_UNRESOLVED'},409);
+    const {flat,account,orders}=await this.ltFlat();
+    if(!flat)return J({ok:false,error:'FULL_TRADE_ACCOUNT_NOT_FLAT',positions:account.positions,openOrders:orders},409);
+    // Explicit START confirmation + exchange-verified flat resets a previous
+    // read-only 429 HALT. Never reset a live pending maker/stop order.
+    // Old session state stays in storage until the new start is confirmed.
+
     // Unified account: perp accountValue can be 0 even with usable spot USDC collateral.
     // Do not reject START based on perp accountValue; exchange enforces margin on order placement.
     const source=await postInfo({type:'clearinghouseState',user:LIMIT_TEST_SOURCE});
     if(!Array.isArray(source?.assetPositions))throw Error('FULL_TRADE_SOURCE_INVALID');
-    const now=Date.now(),t=ftDefault();t.started=now;t.active=true;t.reason='CONNECTING';
+    const now=Date.now(),t=ftDefault();t.started=now;t.active=true;t.reason='CONNECTING';t.lastFlatVerifiedAt=now;
     t.ignoredCoins=source.assetPositions.filter((x:any)=>Math.abs(Number(x?.position?.szi||0))>0).map((x:any)=>String(x.position.coin));
     this.ltLog(t,'START','Awaiting confirmed Hyperliquid userFills WebSocket; 10 full-trade episodes; max $31.20 exposure');
     await this.ltSave(t);await this.ftConnect();await this.state.storage.setAlarm(now+1000);
@@ -1521,25 +1532,41 @@ export class LiveCopyControllerStage7 {
     return J({ok:true,entry_stopped:true,positions_may_remain:true,requires_flat_verification:true});
   }
   private async ltStatus():Promise<Response>{
-    const t=await this.ltLoad();let statistics:any={};
-    if(t.started){try{
-      const f=await postInfo({type:'userFillsByTime',user:this.env.HYPERLIQUID_MASTER_ACCOUNT,startTime:t.started,aggregateByTime:false});
-      const fills=(Array.isArray(f)?f:[]).filter((x:any)=>Number(x.time)>=t.started);
-      const fee=fills.reduce((a:number,x:any)=>a+Number(x.fee||0),0);
-      const pnl=fills.reduce((a:number,x:any)=>a+Number(x.closedPnl||0),0);
-      statistics={fills:fills.length,total_fees_usd:fee,realized_gross_usd:pnl,realized_net_ex_funding_usd:pnl-fee,
-        maker_fills:fills.filter((x:any)=>x.crossed===false).length,taker_fills:fills.filter((x:any)=>x.crossed===true).length,
-        caveat:'All account fills since START; keep old bot stopped and account dedicated to this test. Funding excluded.'};
-    }catch(e){statistics={error:String(e)};}}
-    let fullTradeAudit:any={};try{
-      const raw=await postInfo({type:'userFillsByTime',user:LIMIT_TEST_SOURCE,startTime:Date.now()-900000,aggregateByTime:false});
-      const events=(Array.isArray(raw)?raw:[]).map(classifySourceFullTrade).filter(Boolean)
-        .sort((a:any,b:any)=>b.at-a.at).slice(0,100);
-      fullTradeAudit={mode:'SOURCE_FILLS',events,observed_events:events.length};
-    }catch(e){fullTradeAudit={error:String(e)};}
-    return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',source:LIMIT_TEST_SOURCE,
+    const t=await this.ltLoad();
+    let statistics:any={},fullTradeAudit:any={};
+    if(t.started){
+      const now=Date.now();
+      // Historical fills are costly (weight 20 + response-size surcharge each).
+      // Dashboard refresh is every 5 s, but history is only fetched at most once
+      // per 60 s per Durable Object instance. On errors use a 90 s cooldown.
+      if(!this.ftReportCache||now>=this.ftReportNextAt){
+        let errored=false;
+        try{
+          const f=await postInfo({type:'userFillsByTime',user:this.env.HYPERLIQUID_MASTER_ACCOUNT,startTime:t.started,aggregateByTime:false});
+          const fills=(Array.isArray(f)?f:[]).filter((x:any)=>Number(x.time)>=t.started);
+          const fee=fills.reduce((a:number,x:any)=>a+Number(x.fee||0),0);
+          const pnl=fills.reduce((a:number,x:any)=>a+Number(x.closedPnl||0),0);
+          statistics={fills:fills.length,total_fees_usd:fee,realized_gross_usd:pnl,realized_net_ex_funding_usd:pnl-fee,
+            maker_fills:fills.filter((x:any)=>x.crossed===false).length,taker_fills:fills.filter((x:any)=>x.crossed===true).length,
+            caveat:'All account fills since START; funding excluded. Snapshot cached for up to 60 seconds.'};
+        }catch(e){errored=true;statistics={error:String(e)};}
+        try{
+          const raw=await postInfo({type:'userFillsByTime',user:LIMIT_TEST_SOURCE,startTime:Date.now()-900000,aggregateByTime:false});
+          const events=(Array.isArray(raw)?raw:[]).map(classifySourceFullTrade).filter(Boolean)
+            .sort((a:any,b:any)=>b.at-a.at).slice(0,100);
+          fullTradeAudit={mode:'SOURCE_FILLS',events,observed_events:events.length};
+        }catch(e){errored=true;fullTradeAudit={error:String(e)};}
+        this.ftReportCache={statistics,fullTradeAudit};
+        this.ftReportNextAt=Date.now()+(errored?90000:60000);
+      }
+      statistics=this.ftReportCache?.statistics||{};
+      fullTradeAudit=this.ftReportCache?.fullTradeAudit||{};
+    }
+    return J({ok:true,version:'V19_16_4_IDLE_BACKOFF',source:LIMIT_TEST_SOURCE,
       trade_scope:'LONG_SHORT_ADD_PARTIAL_CLOSE_CLOSE_REVERSAL',live_start_available:true,
-      websocket_connected:this.ftWsReady&&this.ftWs?.readyState===1,statistics,fullTradeAudit,...t});
+      websocket_connected:this.ftWsReady&&this.ftWs?.readyState===1,rest_backoff_until:t.restBackoffUntil||0,last_rest_429_at:t.lastRest429At||0,rest_429_count:t.rest429Count||0,statistics,fullTradeAudit,
+      report_next_refresh_at:this.ftReportNextAt,report_cache_interval_ms:60000,
+      ...t});
   }
   private async ftEnsureProtection(t:FTState,qty:number,entry:number,orders:any[]):Promise<boolean>{
     if(!qty){return true;}
@@ -1613,7 +1640,18 @@ export class LiveCopyControllerStage7 {
     try{
       if(!t.started)return J({ok:true,idle:true});
       const now=Date.now();
+      // V19.16.4: No REST polling storm while completely idle. Fresh source
+      // fills bypass this throttle, and active exposure/orders are NEVER cached.
+      if(t.restBackoffUntil&&now<t.restBackoffUntil)return J({ok:true,rest_cooldown:true,retry_after_ms:t.restBackoffUntil-now});
+      const flatIdle=t.active&&!t.coin&&!t.order&&!t.stop&&!t.hadExposure&&t.target===0;
+      if(flatIdle&&t.lastFlatVerifiedAt&&now-t.lastFlatVerifiedAt<10000)
+        return J({ok:true,ws_only_idle:true,next_flat_check_ms:10000-(now-t.lastFlatVerifiedAt)});
       const snapshot=await this.ltFlat(),actual=snapshot.account.positions;
+      if(!actual.length&&!snapshot.orders.length){
+        t.lastFlatVerifiedAt=now;t.restBackoffUntil=0;t.rest429Count=0;
+        if(t.reason==='REST_429_COOLDOWN')t.reason='RUNNING';
+      }
+
       if(actual.length>1||actual.some((p:any)=>t.coin&&p.coin!==t.coin)||(!t.coin&&actual.length)){
         await this.ftFatal('UNEXPECTED_ACCOUNT_POSITION');return J({ok:false,error:'UNEXPECTED_ACCOUNT_POSITION'},503);
       }
@@ -1716,12 +1754,29 @@ export class LiveCopyControllerStage7 {
         const msg=String(e);await this.ftFatal('MAKER_SEND_OR_ACK_UNCERTAIN '+msg);
         return J({ok:false,error:'MAKER_UNCERTAIN',detail:msg},503);
       }
-    }catch(e){await this.ftFatal('SYNC_FAILED '+String(e));return J({ok:false,error:'FULL_TRADE_SAFETY_HALT',detail:String(e)},503);}
+    }catch(e){
+      const message=String(e),now=Date.now();
+      const transient429=/\b429\b|HTTP_429/i.test(message);
+      // Only a verified-flat, no-intent account may wait out a read-only 429.
+      // If an order/position might exist, retain the safety halt: never guess.
+      const safeIdle=t.active&&!t.coin&&!t.order&&!t.stop&&!t.hadExposure&&t.target===0&&
+        !!t.lastFlatVerifiedAt&&now-t.lastFlatVerifiedAt<20000;
+      if(transient429&&safeIdle){
+        t.lastRest429At=now;t.rest429Count=(t.rest429Count||0)+1;
+        t.restBackoffUntil=now+Math.min(90000,15000*Math.pow(2,Math.min(3,t.rest429Count-1)));
+        t.reason='REST_429_COOLDOWN';
+        this.ltLog(t,'REST_429_COOLDOWN','INFO temporarily limited; no position/order known; waiting for cooldown');
+        await this.ltSave(t);
+        return J({ok:true,rest_rate_limited:true,retry_after_ms:t.restBackoffUntil-now});
+      }
+      await this.ftFatal('SYNC_FAILED '+message);
+      return J({ok:false,error:'FULL_TRADE_SAFETY_HALT',detail:message},503);
+    }
     finally{this.busy=false;}
   }
 
   async alarm():Promise<void>{const lt=await this.ltLoad();if(lt.started&&(lt.active||lt.order||lt.coin||lt.stop)){
-    if(lt.active&&(!this.ftWs||this.ftWs.readyState>1))await this.ftConnect();
+    if(lt.active&&(!this.ftWs||this.ftWs.readyState>1)){try{await this.ftConnect();}catch(e){await this.ftFatal('WS_CONNECT_FAILED '+String(e));}}
     await this.ftSync();const next=await this.ltLoad();
     if(next.started&&(next.active||next.order||next.coin||next.stop))await this.state.storage.setAlarm(Date.now()+(next.halted?5000:1000));
     return;
