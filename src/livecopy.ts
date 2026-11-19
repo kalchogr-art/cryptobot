@@ -578,7 +578,7 @@ namespace M_live_copy_controller_v2_3_stage14 {
 type Env=LiveCopyEnv & {LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
-type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;episode:number};
+type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;episode:number;needsSourceRebase?:boolean};
 type Snapshot={version:2;mode:'STOPPED'|'RUNNING';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[]};
 const KEY='live_copy_v23_stage7';
 const fresh=():Snapshot=>({version:2,mode:'STOPPED',startedAt:null,coins:{},seen:{},recent:[]});
@@ -849,7 +849,7 @@ namespace M_live_copy_controller_v2_3_stage15 {
 type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;LIVE_COPY_ADMIN_TOKEN?:string;DB?:{prepare(sql:string):{bind(...args:any[]):{first<T>():Promise<T|null>;all<T>():Promise<{results:T[]}>}}}};
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
-type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;episode:number};
+type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;episode:number;needsSourceRebase?:boolean};
 type Snapshot={version:2;mode:'STOPPED'|'RUNNING';sessionKind?:'DRY_RUN'|'LIVE';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[]};
 const KEY='live_copy_v23_stage7';
 const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',startedAt:null,coins:{},seen:{},recent:[]});
@@ -860,6 +860,44 @@ export class LiveCopyControllerStage7 {
   // Intentionally volatile: a DO restart/hibernation revokes LIVE permission.
   private liveArmAt:number|null=null;
   private markCache:{at:number;mids:Record<string,string>}|null=null;
+  // A bad source signal is not an exchange-order failure. Drop its local copy
+  // history only when no confirmed exchange exposure or unresolved order exists.
+  // Never erase ledger fills or pretend an open Hyperliquid position is flat.
+  private async cancelBadSignal(coin:string,fillId:string,reason:string){
+    const s=await this.load();
+    const ledger=await this.ledger();
+    const unresolved=Object.values(ledger.intents).some(i=>i.coin===coin&&
+      ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+    if(unresolved){
+      this.audit(s,'SIGNAL_CANCEL_REQUIRES_RECONCILIATION',coin,reason);
+      await this.save(s);
+      return false;
+    }
+    const ownQty=ledger.confirmedByCoin[coin]||0;
+    if(Math.abs(ownQty)>1e-9){
+      // A rejected *source* fill must not suspend an already live coin.
+      // Keep exchange-confirmed quantity and the ledger. Re-anchor only from
+      // the NEXT fresh source fill, so old queued fills cannot trigger catch-up orders.
+      if(s.coins[coin]){
+        s.coins[coin].needsSourceRebase=true;
+        this.audit(s,'SIGNAL_CANCELLED_POSITION_CONTINUES',coin,
+          `${reason}; own_qty=${ownQty}; next_fresh_fill_rebases`);
+      }else{
+        // A ledger position without a matching controller state is NOT safe
+        // to recreate from a source fill: we lack its last execution anchor.
+        this.audit(s,'SIGNAL_CANCEL_REQUIRES_RECONCILIATION',coin,
+          `${reason}; own_qty=${ownQty}; missing_coin_state`);
+        await this.save(s);
+        return false;
+      }
+    }else{
+      delete s.coins[coin];
+      this.audit(s,'SIGNAL_CANCELLED_COIN_RESET',coin,reason);
+    }
+    s.seen[`${coin}:${fillId}`]=Date.now();
+    await this.save(s);
+    return true;
+  }
   private readonly RATE_KEY='live_copy_v23_stage15_read_rate_retry_after';
   private async markMids():Promise<Record<string,string>>{
     if(this.markCache&&Date.now()-this.markCache.at<2000)return this.markCache.mids;
@@ -930,12 +968,24 @@ export class LiveCopyControllerStage7 {
       // Existing owned positions require explicit reconciliation/handling, not a fresh anchor.
       if(this.liveEnabled()){
         const ledger=await this.ledger();
-        if(Object.values(ledger.confirmedByCoin).some(q=>Math.abs(q)>1e-9))
-          return json({ok:false,error:'OWNED_POSITIONS_REQUIRE_CONTINUOUS_SESSION_OR_MANUAL_CLOSE'},409);
-        if(!this.env.DB)return json({ok:false,error:'DB_BINDING_MISSING'},503);
-        const latest=await this.env.DB.prepare('SELECT session_id AS session, rowid FROM mc_watch_events ORDER BY rowid DESC LIMIT 1').bind().first<{session:string;rowid:number}>();
-        await this.state.storage.put('live_copy_v23_d1_cursor',{session:latest?.session||'',rowid:latest?.rowid||0});
-        s.coins={};s.seen={};
+        const openCoins=Object.entries(ledger.confirmedByCoin)
+          .filter(([,q])=>Math.abs(q)>1e-9).map(([coin])=>coin);
+        if(openCoins.length){
+          // A LIVE session stopped by a cancelled source fill may be restarted
+          // without abandoning real positions or resetting their execution history.
+          // The existing pre-start exchange reconciliation has already passed.
+          if(openCoins.some(coin=>!s.coins[coin]||ledger.suspendedCoins[coin]))
+            return json({ok:false,error:'OWNED_POSITION_STATE_RECONCILIATION_REQUIRED'},409);
+          if(!await this.state.storage.get('live_copy_v23_d1_cursor'))
+            return json({ok:false,error:'MISSING_D1_CURSOR_FOR_LIVE_RESUME'},409);
+          for(const coin of openCoins)s.coins[coin].needsSourceRebase=true;
+          this.audit(s,'LIVE_RESUME_WITH_OWNED_POSITIONS',undefined,openCoins.join(','));
+        }else{
+          if(!this.env.DB)return json({ok:false,error:'DB_BINDING_MISSING'},503);
+          const latest=await this.env.DB.prepare('SELECT session_id AS session, rowid FROM mc_watch_events ORDER BY rowid DESC LIMIT 1').bind().first<{session:string;rowid:number}>();
+          await this.state.storage.put('live_copy_v23_d1_cursor',{session:latest?.session||'',rowid:latest?.rowid||0});
+          s.coins={};s.seen={};
+        }
       }
       s.mode='RUNNING';s.startedAt=Date.now();s.sessionKind=this.liveEnabled()?'LIVE':'DRY_RUN';this.audit(s,s.sessionKind==='LIVE'?'START_AUTO_SYNC_LIVE':'START_AUTO_SYNC_DRY_RUN');await this.save(s);if(s.sessionKind==='LIVE'){await this.state.storage.put('live_copy_v23_stage15_live_arm',{startedAt:s.startedAt});this.liveArmAt=s.startedAt;}else{await this.state.storage.put('live_copy_v23_stage15_live_arm',null);this.liveArmAt=null;}await this.state.storage.setAlarm(Date.now()+1000);return json({ok:true,mode:s.mode,trading_enabled:this.liveAuthorized(s)});}
     if(path==='/sync'){
@@ -1014,6 +1064,18 @@ export class LiveCopyControllerStage7 {
             // Do not acknowledge the failing fill. It is retried from this same D1 row.
             return json({ok:true,deferred:true,reason:'HYPERLIQUID_HTTP_429',retry_after:result.retry_after,
               processed,ignored,cursor,pending_rowid:row.rowid,has_more:true});
+          }
+          // Source-signal rejection is local to one coin, not a reason to stop LIVE.
+          // Order-submission/settlement errors still use the original halt path.
+          const cancelable=new Set(['STALE_OR_FUTURE_WHALE_FILL','OUT_OF_ORDER_EVENT',
+            'TARGET_CHAIN_GAP','INVALID_SCALE','STALE_SOURCE_PRICE']);
+          if(cancelable.has(result.error)){
+            if(await this.cancelBadSignal(row.coin,row.fill_id,result.error)){
+              ignored++;cursor={session:row.session_id,rowid:row.rowid};
+              await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
+              continue;
+            }
+            // An unresolved exchange intent cannot be erased as a source signal.
           }
           failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;
         }
@@ -1110,6 +1172,49 @@ export class LiveCopyControllerStage7 {
       }
     }
     const old=s.coins[coin];
+    // Upgrade sessions suspended by the previous source-cancel patch: a
+    // confirmed, active position is still trackable unless the ledger itself
+    // has a suspension or unresolved exchange intent.
+    if(old?.suspended){
+      const l=await this.ledger();
+      const unresolved=Object.values(l.intents).some(i=>i.coin===coin&&
+        ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+      if(!l.suspendedCoins[coin]&&!unresolved&&Math.abs(l.confirmedByCoin[coin]||0)>1e-9){
+        old.suspended=false;
+        old.needsSourceRebase=true;
+        this.audit(s,'PREVIOUS_SIGNAL_SUSPENSION_RECOVERED',coin);
+      }
+    }
+    // When one bad source fill was cancelled, the next FRESH fill resumes the
+    // existing real position. Rebase the source target instead of suspending
+    // the coin or executing the delayed backlog as an accumulated catch-up.
+    if(old?.needsSourceRebase){
+      const liveLedger=await this.ledger();
+      const unresolved=Object.values(liveLedger.intents).some(i=>i.coin===coin&&
+        ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+      if(unresolved)return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED'},409);
+      const actual=liveLedger.confirmedByCoin[coin]||0;
+      if(Math.abs(actual)>1e-9){
+        // Rebase against the SOURCE position immediately before this fresh fill.
+        // Actual is read from the confirmed ledger, never inferred from the whale.
+        const baseline=Math.abs(whale_before_qty)>1e-10
+          ? Math.abs(whale_before_qty) : Math.abs(whale_target_qty);
+        if(baseline>1e-10){
+          old.scale=Math.abs(actual)/baseline;
+          old.anchorTargetQty=whale_before_qty;
+        }
+      }else if(Math.abs(whale_before_qty)>1e-10){
+        // No open exchange position: a fresh ADD may act as a new entry.
+        old.scale=(Math.ceil(10.40/price*10**sz_decimals-1e-9)/10**sz_decimals)
+          /Math.abs(whale_target_qty||whale_before_qty);
+        old.anchorTargetQty=whale_before_qty;
+      }
+      old.confirmedOwnQty=actual;
+      old.lastWhaleTarget=whale_before_qty;
+      old.lastEventAt=time;
+      old.needsSourceRebase=false;
+      this.audit(s,'COIN_SOURCE_REBASED',coin,`confirmed_qty=${actual}; source_before=${whale_before_qty}`);
+    }
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
     if(old?.suspended)return json({ok:true,ignored:true,reason:'COIN_SUSPENDED',exchange_order_sent:false});
@@ -1178,6 +1283,8 @@ export class LiveCopyControllerStage7 {
         const retryAfter=await this.deferRateLimit(coin,detail);
         return json({ok:false,error:'READ_RATE_LIMIT_RETRY',retry_after:retryAfter,detail},503);
       }
+      if(detail.includes('STALE_SOURCE_PRICE'))
+        return json({ok:false,error:'STALE_SOURCE_PRICE',detail},409);
       await this.halt('PRE_TRADE_CHECK_FAILED:'+detail.slice(0,120),coin);
       return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail},409);
     }
