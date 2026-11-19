@@ -340,11 +340,22 @@ async function sendAction(action: Record<string,unknown>, key: `0x${string}`, ma
   // Never automatically retry: timeout can mean the order was accepted.
   return post(EXCHANGE, {action,nonce,signature:sig,vaultAddress:null});
 }
+// Metadata is independent of an account's positions. Cache it without caching
+// clearinghouseState, which must remain fresh before every exchange write.
+let liveCopyMetaCache: {value:any; expiresAt:number}|null=null;
+let liveCopyMetaInFlight: Promise<any>|null=null;
+async function cachedLiveCopyMeta():Promise<any>{
+  if(liveCopyMetaCache && Date.now()<liveCopyMetaCache.expiresAt)return liveCopyMetaCache.value;
+  if(!liveCopyMetaInFlight)liveCopyMetaInFlight=info({type:'meta'}).then(value=>{
+    liveCopyMetaCache={value,expiresAt:Date.now()+10*60_000};return value;
+  }).finally(()=>{liveCopyMetaInFlight=null;});
+  return liveCopyMetaInFlight;
+}
 export async function readLiveAccount(env: LiveCopyEnv) {
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
   if (!validAddress(master)) throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
   const [state,meta] = await Promise.all([
-    info({type:'clearinghouseState',user:master}), info({type:'meta'})
+    info({type:'clearinghouseState',user:master}), cachedLiveCopyMeta()
   ]);
   const positions = (state.assetPositions || []).map((entry:any) => {
     const p = entry.position || {};
@@ -356,7 +367,7 @@ export async function readLiveAccount(env: LiveCopyEnv) {
     totalMarginUsed:n(state.marginSummary?.totalMarginUsed), positions,
     assetMeta:(meta.universe||[]).map((a:any,i:number)=>({coin:a.name,assetId:i,szDecimals:a.szDecimals,maxLeverage:a.maxLeverage}))};
 }
-export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent): Promise<LiveResult> {
+export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent, precheckedAccount?: Awaited<ReturnType<typeof readLiveAccount>>): Promise<LiveResult> {
   const base = {ok:false,executed:false,status:'BLOCKED',coin:intent.coin,intentId:intent.intentId};
   if (env.LIVE_COPY_TRADING_ENABLED !== 'true') return {...base,status:'LIVE_DISABLED'};
   const key = normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY);
@@ -366,7 +377,9 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
       !['LONG','SHORT'].includes(intent.direction) || !Number.isFinite(intent.quantity) ||
       intent.quantity<=0 || !Number.isFinite(intent.referencePrice) || intent.referencePrice<=0)
     return {...base,status:'INVALID_INTENT'};
-  const snapshot = await readLiveAccount(env);
+  // An account snapshot checked in the same serialized Durable Object event may be reused.
+  // Manual orders and reversal second legs still fetch fresh exchange positions.
+  const snapshot = precheckedAccount ?? await readLiveAccount(env);
   const asset = snapshot.assetMeta.find((a:any)=>a.coin===intent.coin);
   if (!asset) return {...base,status:'UNKNOWN_ASSET'};
   const qty = decimalQty(intent.quantity, asset.szDecimals);
@@ -846,6 +859,21 @@ const round=(n:number)=>Math.round(n*1e10)/1e10;
 export class LiveCopyControllerStage7 {
   // Intentionally volatile: a DO restart/hibernation revokes LIVE permission.
   private liveArmAt:number|null=null;
+  private markCache:{at:number;mids:Record<string,string>}|null=null;
+  private readonly RATE_KEY='live_copy_v23_stage15_read_rate_retry_after';
+  private async markMids():Promise<Record<string,string>>{
+    if(this.markCache&&Date.now()-this.markCache.at<2000)return this.markCache.mids;
+    const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
+    if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
+    const mids=await r.json() as Record<string,string>;
+    this.markCache={at:Date.now(),mids};return mids;
+  }
+  private async deferRateLimit(coin:string,detail:string){
+    const retryAfter=Date.now()+60_000;
+    await this.state.storage.put(this.RATE_KEY,retryAfter);
+    const latest=await this.load();this.audit(latest,'HYPERLIQUID_RATE_LIMIT_BACKOFF',coin,detail.slice(0,160));await this.save(latest);
+    return retryAfter;
+  }
   constructor(private state:State,private env:Env){}
   private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
   private async save(s:Snapshot){await this.state.storage.put(KEY,s);}
@@ -864,13 +892,17 @@ export class LiveCopyControllerStage7 {
         latest.mode='STOPPED';await this.save(latest);return;
       }
       const latest=await this.load();
-      this.audit(latest,'AUTO_SYNC_OK',undefined,`processed=${result.processed||0} ignored=${result.ignored||0}`);
+      this.audit(latest,result.deferred?'AUTO_SYNC_DEFERRED':'AUTO_SYNC_OK',undefined,
+        result.deferred?`${result.reason||'RATE_LIMIT'} retry_after=${result.retry_after}`:`processed=${result.processed||0} ignored=${result.ignored||0}`);
       await this.save(latest);
     }catch(error){
       const latest=await this.load();this.audit(latest,'AUTO_SYNC_EXCEPTION',undefined,String(error).slice(0,240));
       latest.mode='STOPPED';await this.save(latest);return;
     }
-    if((await this.load()).mode==='RUNNING'&&this.state.storage.setAlarm)await this.state.storage.setAlarm(Date.now()+5000);
+    if((await this.load()).mode==='RUNNING'&&this.state.storage.setAlarm){
+      const retryAfter=await this.state.storage.get<number>(this.RATE_KEY)||0;
+      await this.state.storage.setAlarm(Math.max(Date.now()+5000,retryAfter));
+    }
   }
   private async ledger(){return await this.state.storage.get<LiveLedger>('live_copy_v23_ledger')||emptyLiveLedger();}
   private liveEnabled(){return this.env.LIVE_COPY_TRADING_ENABLED==='true'&&this.env.LIVE_COPY_AUTO_EXECUTION_ENABLED==='true'&&this.env.LIVE_COPY_LEVERAGE_VERIFIED==='true'&&this.env.LIVE_COPY_LEVERAGE_MODE==='cross';}
@@ -910,6 +942,8 @@ export class LiveCopyControllerStage7 {
       if(s.mode==='RUNNING'&&((s.sessionKind==='LIVE'&&!this.liveAuthorized(s))||(s.sessionKind!=='LIVE'&&this.liveEnabled()))){await this.halt('LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED');return json({ok:false,error:'LIVE_SESSION_NOT_AUTHORIZED_OR_CONFIGURATION_CHANGED',stopped:true},409);}
       if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
       if(!this.env.DB){await this.halt('DB_BINDING_MISSING');return json({ok:false,error:'DB_BINDING_MISSING',stopped:true},503);}
+      const rateRetryAfter=await this.state.storage.get<number>(this.RATE_KEY)||0;
+      if(Date.now()<rateRetryAfter)return json({ok:true,deferred:true,reason:'HYPERLIQUID_HTTP_429',retry_after:rateRetryAfter,processed:0,ignored:0});
       type Cursor={session:string;rowid:number};
       let cursor=await this.state.storage.get<Cursor>('live_copy_v23_d1_cursor');
       // The first sync is intentionally anchored to the most recent row.
@@ -975,7 +1009,14 @@ export class LiveCopyControllerStage7 {
         const event={coin:row.coin,fill_id:row.fill_id,whale_before_qty:e.target_before,whale_target_qty:e.target_after,price:e.price,sz_decimals:decimals,time:row.at};
         const response=await this.fetch(new Request('https://live-copy.internal/event',{method:'POST',headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(event)}));
         const result:any=await response.json();
-        if(!response.ok){failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;}
+        if(!response.ok){
+          if(result.error==='READ_RATE_LIMIT_RETRY'){
+            // Do not acknowledge the failing fill. It is retried from this same D1 row.
+            return json({ok:true,deferred:true,reason:'HYPERLIQUID_HTTP_429',retry_after:result.retry_after,
+              processed,ignored,cursor,pending_rowid:row.rowid,has_more:true});
+          }
+          failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;
+        }
         if(result.ignored)ignored++;else processed++;
         cursor={session:row.session_id,rowid:row.rowid};
         // Commit after each processed event to avoid skipping events on crash.
@@ -1112,19 +1153,34 @@ export class LiveCopyControllerStage7 {
       await this.save(s);
       return json({ok:true,mode:s.mode,proposal,exchange_order_sent:false,trading_enabled:false});
     }
-    // No exchange write unless the wallet is freshly reconciled and the current
-    // exchange mark is close to the source reference. All live writes are opt-in.
+    // Most incoming fills only move a few cents in copied notional. Decide
+    // whether an order is executable BEFORE asking Hyperliquid for any live data.
+    // This preserves the original accumulator and avoids API bursts per micro-fill.
+    const preview=planCopyAction({state:record,whaleTargetQty:whale_target_qty,price,szDecimals:sz_decimals});
+    if(preview.kind==='NONE'){
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'LIVE_ACCUMULATING',coin,preview.reason);await this.save(s);
+      return json({ok:true,proposal:preview,exchange_order_sent:false,trading_enabled:true});
+    }
+    // Preserve the original fresh account ownership and mark-price checks
+    // whenever there really IS an exchange order to submit.
     let account:Awaited<ReturnType<typeof readLiveAccount>>;
     let markPrice:number;
     try{
       account=await readLiveAccount(this.env);
-      const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
-      if(!r.ok)throw Error('MARK_PRICE_HTTP_'+r.status);
-      const mids=await r.json() as Record<string,string>;
+      const mids=await this.markMids();
       markPrice=Number(mids[coin]);
       if(!Number.isFinite(markPrice)||markPrice<=0||Math.abs(markPrice-price)/markPrice>0.005)throw Error('STALE_SOURCE_PRICE');
       assertPositionOwned(ledger,coin,account.positions.find(p=>p.coin===coin)?.qty||0,sz_decimals);
-    }catch(e){await this.halt('PRE_TRADE_CHECK_FAILED:'+String(e).slice(0,120),coin);return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail:String(e)},409);}
+    }catch(e){
+      const detail=String(e);
+      if(/(?:HTTP_429|429)/.test(detail)){
+        const retryAfter=await this.deferRateLimit(coin,detail);
+        return json({ok:false,error:'READ_RATE_LIMIT_RETRY',retry_after:retryAfter,detail},503);
+      }
+      await this.halt('PRE_TRADE_CHECK_FAILED:'+detail.slice(0,120),coin);
+      return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail},409);
+    }
     if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){await this.halt('UNRESOLVED_INTENT_BEFORE_NEW_ORDER',coin);return json({ok:false,error:'UNRESOLVED_INTENT_BEFORE_NEW_ORDER'},409);}
     const intentId=`AUTO:${coin}:${fill_id}`;
     let planned;
@@ -1147,7 +1203,7 @@ export class LiveCopyControllerStage7 {
     await this.state.storage.put('live_copy_v23_ledger',submitting.ledger);
     let receipt;
     try{
-      const result=await executeLiveIoc(this.env,{intentId,coin,direction:planned.proposal.signedDelta>0?'LONG':'SHORT',quantity:planned.proposal.quantity,reduceOnly:planned.proposal.reduceOnly,referencePrice:markPrice});
+      const result=await executeLiveIoc(this.env,{intentId,coin,direction:planned.proposal.signedDelta>0?'LONG':'SHORT',quantity:planned.proposal.quantity,reduceOnly:planned.proposal.reduceOnly,referencePrice:markPrice},account);
       receipt={intentId,coin,status:result.status,executed:result.executed,filledQty:result.filledQty,requestedQty:result.requestedQty,oid:result.oid};
     }catch(e){receipt={intentId,coin,status:'UNKNOWN_WRITE_OUTCOME',executed:false};}
     let settled;
