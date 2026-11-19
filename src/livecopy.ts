@@ -1072,20 +1072,35 @@ export class LiveCopyControllerStage7 {
     if(old&&time<old.lastEventAt)return json({ok:false,error:'OUT_OF_ORDER_EVENT'},409);
     if(old&&Math.abs(whale_before_qty-old.lastWhaleTarget)>1e-7)return json({ok:false,error:'TARGET_CHAIN_GAP'},409);
     if(old?.suspended)return json({ok:true,ignored:true,reason:'COIN_SUSPENDED',exchange_order_sent:false});
-    if(!old && (Math.abs(whale_before_qty)>1e-10||Math.abs(whale_target_qty)<1e-10)){
+    // Stage18 entry correction: start a new copy on an inherited ADD or
+    // a genuine whale REVERSAL. Existing inherited reductions remain ignored.
+    const whaleReversal=whale_before_qty*whale_target_qty<0;
+    const inheritedAdd=Math.abs(whale_before_qty)>1e-10 &&
+      Math.sign(whale_before_qty)===Math.sign(whale_target_qty) &&
+      Math.abs(whale_target_qty)>Math.abs(whale_before_qty)+1e-10;
+    if(!old && Math.abs(whale_before_qty)>1e-10 && !inheritedAdd && !whaleReversal){
       s.seen[id]=Date.now();this.audit(s,'SKIP_INHERITED',coin);await this.save(s);
-      return json({ok:true,ignored:true,reason:'WAIT_NEW_FLAT_TO_OPEN',exchange_order_sent:false});
+      return json({ok:true,ignored:true,reason:'INHERITED_REDUCTION_OR_CLOSE',exchange_order_sent:false});
     }
+    if(!old && Math.abs(whale_target_qty)<1e-10){
+      s.seen[id]=Date.now();this.audit(s,'SKIP_INHERITED',coin);await this.save(s);
+      return json({ok:true,ignored:true,reason:'WAIT_NEW_NONZERO_TARGET',exchange_order_sent:false});
+    }
+    if(!old && inheritedAdd)this.audit(s,'INHERITED_ADD_ENTRY',coin);
+    if(!old && whaleReversal)this.audit(s,'INHERITED_REVERSAL_ENTRY',coin);
     // A new episode after a confirmed flat target gets a fresh scaling anchor.
     // Refuse to rearm when the previous position is still open or unresolved.
-    const newEpisode=!!old&&Math.abs(old.lastWhaleTarget)<1e-10&&Math.abs(whale_target_qty)>1e-10;
+    const newEpisode=!!old&&((Math.abs(old.lastWhaleTarget)<1e-10&&Math.abs(whale_target_qty)>1e-10)||
+      (whaleReversal&&Math.abs(old.confirmedOwnQty)<1e-9));
     if(newEpisode){
       const prior=await this.ledger();
       if(prior.suspendedCoins[coin])return json({ok:false,error:'MANUAL_CLOSE_SUSPENSION_REQUIRES_REARM'},409);
       if(Math.abs(prior.confirmedByCoin[coin]||0)>1e-9 || Object.values(prior.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))
         return json({ok:false,error:'PRIOR_EPISODE_NOT_CLOSED'},409);
     }
-    const scale=(!old||newEpisode)?10.40/(Math.abs(whale_target_qty)*price):old.scale;
+    const entryLot=10**sz_decimals;
+    const initialQty=Math.ceil(10.40/price*entryLot-1e-9)/entryLot;
+    const scale=(!old||newEpisode)?initialQty/Math.abs(whale_target_qty):old.scale;
     if(!Number.isFinite(scale)||scale<=0)return json({ok:false,error:'INVALID_SCALE'},400);
     const record:Coin=(old&&!newEpisode)?{...old,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,lastFillId:fill_id}:{coin,anchorTargetQty:whale_target_qty,scale,confirmedOwnQty:0,pendingIntentId:null,suspended:false,lastFillId:fill_id,lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,episode:(old?.episode||0)+1};
     const ledger=await this.ledger();
@@ -1144,6 +1159,59 @@ export class LiveCopyControllerStage7 {
     if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'){
       s.mode='STOPPED';await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
       return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:settled.outcome,intentId},409);
+    }
+    // A reversal of an already copied position requires two exchange legs:
+    // close the old side first, then open the new side on this same fill.
+    // Otherwise the old Stage18 only closed and never opened the new direction.
+    if(whaleReversal && old && planned.proposal.kind==='FULL_CLOSE' && settled.outcome==='FILLED'){
+      const remaining=settled.ledger.confirmedByCoin[coin]||0;
+      if(Math.abs(remaining)<1e-9){
+        const reverseScale=10.40/(Math.abs(whale_target_qty)*markPrice);
+        const reverseRecord:Coin={coin,anchorTargetQty:whale_target_qty,scale:reverseScale,
+          confirmedOwnQty:remaining,pendingIntentId:null,suspended:false,lastFillId:fill_id,
+          lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,episode:(old.episode||0)+1};
+        const reverseId=`AUTO:${coin}:${fill_id}:REV_OPEN`;
+        let reversePlanned;
+        try{reversePlanned=planAndReserve({state:reverseRecord,ledger:settled.ledger,
+          whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,
+          sourceFillId:fill_id,intentId:reverseId,now:Date.now()});}
+        catch(e){await this.halt('REVERSAL_OPEN_PLANNING_FAILED:'+String(e).slice(0,120),coin);
+          return json({ok:false,error:'REVERSAL_OPEN_PLANNING_FAILED',detail:String(e)},409);}
+        if(reversePlanned.intent){
+          await this.state.storage.put('live_copy_v23_ledger',reversePlanned.ledger);
+          s.coins[coin]=reversePlanned.state as Coin;await this.save(s);
+          const reverseSubmitting=beginSubmission(reversePlanned.state,reversePlanned.ledger,reverseId,Date.now());
+          await this.state.storage.put('live_copy_v23_ledger',reverseSubmitting.ledger);
+          let reverseReceipt;
+          try{
+            const result=await executeLiveIoc(this.env,{intentId:reverseId,coin,
+              direction:reversePlanned.proposal.signedDelta>0?'LONG':'SHORT',
+              quantity:reversePlanned.proposal.quantity,reduceOnly:false,referencePrice:markPrice});
+            reverseReceipt={intentId:reverseId,coin,status:result.status,executed:result.executed,
+              filledQty:result.filledQty,requestedQty:result.requestedQty,oid:result.oid};
+          }catch(e){reverseReceipt={intentId:reverseId,coin,status:'UNKNOWN_WRITE_OUTCOME',executed:false};}
+          let reverseSettled;
+          try{reverseSettled=applyTrustedReceipt(reverseSubmitting.state,reverseSubmitting.ledger,reverseReceipt,Date.now());}
+          catch(e){await this.halt('REVERSAL_OPEN_SETTLEMENT_FAILED:'+String(e).slice(0,120),coin);
+            return json({ok:false,error:'REVERSAL_OPEN_SETTLEMENT_FAILED',detail:String(e)},409);}
+          await this.state.storage.put('live_copy_v23_ledger',reverseSettled.ledger);
+          s.coins[coin]=reverseSettled.state as Coin;
+          this.audit(s,'REVERSAL_OPEN_'+reverseSettled.outcome,coin,reverseId);
+          if(reverseSettled.outcome==='UNKNOWN'||reverseSettled.outcome==='PARTIAL'){
+            s.mode='STOPPED';await this.save(s);
+            if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
+            return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:reverseSettled.outcome,intentId:reverseId},409);
+          }
+          s.seen[id]=Date.now();await this.save(s);
+          return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,
+            reversal_open:reversePlanned.proposal,reversal_open_outcome:reverseSettled.outcome,
+            exchange_order_sent:true,trading_enabled:true});
+        }
+        s.coins[coin]=reverseRecord;
+        this.audit(s,'REVERSAL_OPEN_ACCUMULATING',coin,reversePlanned.proposal.reason);
+      }else{
+        this.audit(s,'REVERSAL_CLOSE_RESIDUAL',coin,String(remaining));
+      }
     }
     s.seen[id]=Date.now();await this.save(s);
     return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,exchange_order_sent:true,trading_enabled:true});
