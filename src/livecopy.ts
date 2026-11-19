@@ -1180,6 +1180,12 @@ export class LiveCopyControllerStage7 {
             }
             // An unresolved exchange intent cannot be erased as a source signal.
           }
+          if(result.error==='MANUALLY_CLOSED_COIN_REQUIRES_REARM'||
+             result.error==='MANUAL_CLOSE_SUSPENSION_REQUIRES_REARM'){
+            ignored++;cursor={session:row.session_id,rowid:row.rowid};
+            await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
+            continue;
+          }
           if(result.error==='EXCHANGE_RECONCILIATION_REQUIRED' && result.intentId){
             await this.isolateExchangeCoin(row.coin,result.intentId,result.outcome||'UNKNOWN');
             ignored++;cursor={session:row.session_id,rowid:row.rowid};
@@ -1280,6 +1286,45 @@ export class LiveCopyControllerStage7 {
         this.audit(s,'ZEC_EXCLUDED',coin,zecIncreasing?'OPEN_OR_ADD_BLOCKED':'NEW_EXPOSURE_BLOCKED');
         await this.save(s);
         return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED',exchange_order_sent:false});
+      }
+    }
+    // A previously manually-closed coin must not halt the global sync.
+    // If a new source entry arrives and OUR exchange position is confirmed flat,
+    // clear only its manual-close suspension and start a fresh copy episode.
+    const manualLedger=await this.ledger();
+    if(manualLedger.suspendedCoins[coin]){
+      const hasUnresolved=Object.values(manualLedger.intents).some(i=>i.coin===coin&&
+        ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+      const isNewIncrease=Math.abs(whale_target_qty)>Math.abs(whale_before_qty)+1e-10 &&
+        (Math.abs(whale_before_qty)<1e-10||Math.sign(whale_before_qty)===Math.sign(whale_target_qty));
+      const isReversal=whale_before_qty*whale_target_qty<0;
+      if(!hasUnresolved && (isNewIncrease||isReversal) && Math.abs(manualLedger.confirmedByCoin[coin]||0)<1e-9){
+        let actualQty:number;
+        try{
+          const live=await readLiveAccount(this.env);
+          actualQty=live.positions.find(p=>p.coin===coin)?.qty||0;
+        }catch(err){
+          const detail=String(err);
+          if(/(?:HTTP_429|429)/.test(detail)){
+            const retryAfter=await this.deferRateLimit(coin,detail);
+            return json({ok:false,error:'READ_RATE_LIMIT_RETRY',retry_after:retryAfter,detail},503);
+          }
+          // Leave this D1 fill unacknowledged until account state can be checked.
+          return json({ok:false,error:'READ_RATE_LIMIT_RETRY',retry_after:Date.now()+5000,detail},503);
+        }
+        if(Math.abs(actualQty)<1e-9){
+          delete manualLedger.suspendedCoins[coin];
+          await this.state.storage.put('live_copy_v23_ledger',manualLedger);
+          delete s.coins[coin];
+          this.audit(s,'MANUAL_CLOSE_FLAT_REARMED',coin,'new source entry; exchange flat');
+          await this.save(s);
+        }
+      }
+      if(manualLedger.suspendedCoins[coin]){
+        s.seen[id]=Date.now();
+        this.audit(s,'MANUAL_CLOSE_COIN_SKIPPED',coin,'awaiting confirmed flat/new entry');
+        await this.save(s);
+        return json({ok:true,ignored:true,reason:'MANUAL_CLOSE_COIN_NOT_REARMED',exchange_order_sent:false});
       }
     }
     const old=s.coins[coin];
