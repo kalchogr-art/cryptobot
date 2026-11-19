@@ -1,10 +1,17 @@
-/** V19.13 FULL dashboard — inherited ADD accumulator, new/reversal, source fills. */
+/** V19.14 FULL dashboard — inherited ADD accumulator, new/reversal, source fills. */
 export interface LiveDashboardEnv { LIVE_COPY_ADMIN_TOKEN?:string;LIVE_COPY_CONTROLLER?:{idFromName(name:string):unknown;get(id:unknown):{fetch(request:Request):Promise<Response>}}; }
-const PAGE=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/><title>LIVE COPY V19.13 · POSITION COPY</title>
+const PAGE=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/><title>LIVE COPY V19.16 · FULL TRADE LIVE</title>
 <style>body{margin:0;background:#0c1220;color:#eef2ff;font:14px system-ui,Arial,sans-serif}main{max-width:1160px;margin:auto;padding:20px}h1{font-size:24px}h2{font-size:17px;margin-top:5px}.muted{color:#9daec5}.box{border:1px solid #334155;background:#162033;border-radius:13px;padding:15px;margin:12px 0}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{border-radius:8px;padding:11px;background:#202c40;color:white;border:1px solid #50627f}input{width:240px}button{cursor:pointer}button:hover{background:#32445e}button:disabled{opacity:.4;cursor:default}.pager{display:flex;gap:5px;align-items:center;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}.pager button{padding:5px 10px}.pager .selected{background:#416aa5;border-color:#77a8ec}.danger{background:#8c2630}.green{color:#50d99c}.warn{color:#ffc36c}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.stat{padding:12px;border:1px solid #32405b;border-radius:9px}.num{font-size:23px;font-weight:700}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{padding:9px;text-align:left;border-bottom:1px solid #34415a}th{color:#9daec5;font-weight:600}code{background:#263752;padding:2px 5px;border-radius:4px}#message{white-space:pre-wrap}</style></head><body><main>
-<h1>Hyperliquid · LIVE COPY V19.13</h1><p class="muted">NEW / REVERSAL: директен вход $10.40 позиция ($1.04 маржин × 10x). ADD: само към позиции без загуба, с таван $31.20. Борсов Stop Market при -25% ROE и постоянна проверка на синхронизацията. REMOVE / CLOSE: намаляване на реалната позиция. Само изпълнени userFills.</p>
+<h1>Hyperliquid · LIVE COPY V19.16</h1><p class="muted">NEW / REVERSAL: директен вход $10.40 позиция ($1.04 маржин × 10x). ADD: само към позиции без загуба, с таван $31.20. Борсов Stop Market при -25% ROE и постоянна проверка на синхронизацията. REMOVE / CLOSE: намаляване на реалната позиция. Само изпълнени userFills.</p>
 <div class="box"><div class="controls"><input id="token" type="password" placeholder="Admin token" autocomplete="off"/><button id="connect">СВЪРЖИ</button><button id="refresh">ОБНОВИ</button><label style="display:flex;align-items:center;gap:6px;padding:8px;border:1px solid #50627f;border-radius:8px"><input id="liveConfirm" type="checkbox" style="width:auto"/> <span>Потвърждавам РЕАЛНА търговия</span></label><button id="start">НОВА СЕСИЯ</button><button id="stop">STOP</button><button id="closeall" class="danger">CLOSE ALL</button></div><p id="message" class="muted">Няма връзка</p></div>
 <div class="box"><h2>Реален Hyperliquid акаунт · само четене</h2><div class="controls"><button id="account">ОБНОВИ АКАУНТА</button><span id="accountinfo" class="muted">—</span></div><div class="scroll"><table><thead><tr><th>Монета</th><th>Реално количество</th><th>Средна цена</th><th>Нереализирано P/L</th></tr></thead><tbody id="positions"><tr><td colspan="4">Не е заредено</td></tr></tbody></table></div></div>
+<div class="box"><h2>LIMIT COPY · FULL TRADE LIVE (V19.16)</h2>
+<p class="muted">Източник: 0xbb160c…143ad · REAL FULL TRADE · LONG / SHORT / ADD / PARTIAL CLOSE / CLOSE / REVERSAL. Реален LIMIT ALO Maker вход/изход; при неизпълнен изход е възможно защитно reduce-only IOC (Taker). Максимум 10 приключени позиции, $10.40 начален номинал, 10x cross, таван $31.20. START изисква старият бот да е спрян и реалният акаунт да е изцяло празен. WebSocket прекъсване спира новите входове. Риск: реална загуба е възможна.</p>
+<div class="controls"><button id="ltRefresh">ОБНОВИ LIMIT TEST</button><button id="ltStart">START · НОВИЯ ТРЕЙДЪР · РЕАЛНИ СДЕЛКИ</button><button id="ltStop">STOP LIMIT ВХОДОВЕТЕ</button></div>
+<div class="stats"><div class="stat">Режим<div id="ltMode" class="num">—</div></div><div class="stat">Приключени<div id="ltCompleted" class="num">—</div></div><div class="stat">Maker fills<div id="ltMaker" class="num">—</div></div><div class="stat">Taker fills<div id="ltTaker" class="num">—</div></div><div class="stat">Такси<div id="ltFees" class="num">—</div></div><div class="stat">NET P/L без funding<div id="ltNet" class="num">—</div></div></div><p class="warn" id="ltWarning">Не е свързан</p>
+<p class="muted" id="ltAuditInfo">Последни 15 минути · изчаква данни от източника</p>
+<div class="scroll"><table><thead><tr><th>Час</th><th>Монета</th><th>Действие</th><th>Преди → След</th><th>Цена</th><th>Размер</th></tr></thead><tbody id="ltAuditRows"><tr><td colspan="6">Не са заредени изпълнения</td></tr></tbody></table></div>
+<div class="scroll"><table><thead><tr><th>Време</th><th>Монета</th><th>Събитие</th><th>Подробности</th></tr></thead><tbody id="ltHistory"><tr><td colspan="4">Няма събития</td></tr></tbody></table></div></div>
 <div class="box"><h2>V19 · СЪСТОЯНИЕ</h2><div class="stats"><div class="stat">Режим<div class="num" id="mode">—</div></div><div class="stat">Изпълнение<div class="num" id="live">—</div></div><div class="stat">Обработени fills<div class="num" id="events">—</div></div><div class="stat">Изпълнени наши ордери<div class="num" id="orders">—</div></div><div class="stat">D1 курсор<div class="num" id="cursor">—</div></div><div class="stat">Изоставане (редове)<div class="num" id="lag">—</div></div><div class="stat" style="grid-column:1/-1">D1 диагностика<div id="d1error" class="warn" style="font-size:12px;overflow-wrap:anywhere">—</div></div>
 <div class="stat" style="grid-column:1/-1">Капитал при нова сесия<div class="num" id="capital">—</div><span class="muted" style="font-size:11px">Фиксиран при START</span></div>
 <div class="stat">EQUITY<div class="num" id="equity">—</div></div>
@@ -99,13 +106,13 @@ async function updateIpMonitor(force=false){
   $('ipFailures').innerHTML=failures.map(x=>'<tr><td>'+esc(time(x.at))+'</td><td>'+esc(x.endpoint)+'</td><td>'+esc(x.operation)+'</td><td>'+esc(x.status||'NETWORK')+'</td><td>'+esc(x.weight)+'</td><td>'+esc(x.elapsed_ms)+'</td></tr>').join('')||'<tr><td colspan="6">Няма регистрирани откази в този Worker isolate</td></tr>';
  }catch(e){$('ipDiag').textContent='IP монитор: '+e.message;}
 }
-async function refresh(){if(!connected||busy)return;busy=true;try{const s=await api('status');if(!['V19_NET_POSITION','V19_1_PERCENTAGE_FILL_COPY','V19_2_INHERITED_ADD_COPY','V19_3_INFO_RATE_LIMIT_FIX','V19_4_EXCHANGE_REJECTION_DETAILS','V19_6_PARTIAL_ENTRY_FIX','V19_7_POSITION_CAP','V19_9_LOSS_STOP_SAFETY_AUDIT','V19_13_IP_REST_MONITOR'].includes(s.version))throw Error('CONTROLLER_IS_NOT_V19: '+s.version);
+async function refresh(){if(!connected||busy)return;busy=true;try{const s=await api('status');if(!['V19_NET_POSITION','V19_1_PERCENTAGE_FILL_COPY','V19_2_INHERITED_ADD_COPY','V19_3_INFO_RATE_LIMIT_FIX','V19_4_EXCHANGE_REJECTION_DETAILS','V19_6_PARTIAL_ENTRY_FIX','V19_7_POSITION_CAP','V19_9_LOSS_STOP_SAFETY_AUDIT','V19_13_IP_REST_MONITOR','V19_14_LIMIT_TEST_INTEGRATED','V19_16_FULL_TRADE_LIVE_CANDIDATE'].includes(s.version))throw Error('CONTROLLER_IS_NOT_V19: '+s.version);
  $('mode').textContent=s.mode;$('live').textContent=s.live_execution?'REAL LIVE':s.session_kind==='LIVE'?'LIVE NOT AUTHORIZED':'SHADOW';
  $('events').textContent=s.processed_fills??'—';$('orders').textContent=s.orders_sent_and_filled??'—';$('cursor').textContent=s.cursor??'—';$('lag').textContent=s.lag_rows??'—';$('d1error').textContent=s.d1_diagnostic?(s.d1_diagnostic.status+' · '+s.d1_diagnostic.query+' · опити '+s.d1_diagnostic.attempts+' · '+time(s.d1_diagnostic.at)+(s.d1_diagnostic.error?' · '+s.d1_diagnostic.error:s.d1_diagnostic.previous_error?' · предишна: '+s.d1_diagnostic.previous_error:'')):'Няма отчетена D1 грешка';
  // V19.1 returns minimum_notional_usd. Its execution adapter uses fixed 10x,
  // with $10.40 notional = $1.04 initial margin. Never render undefined.
  const addUsd=Number(s.add_threshold_usd??s.minimum_notional_usd);
- const lev=Number(s.leverage??(['V19_1_PERCENTAGE_FILL_COPY','V19_2_INHERITED_ADD_COPY','V19_3_INFO_RATE_LIMIT_FIX','V19_4_EXCHANGE_REJECTION_DETAILS','V19_6_PARTIAL_ENTRY_FIX','V19_7_POSITION_CAP','V19_9_LOSS_STOP_SAFETY_AUDIT','V19_13_IP_REST_MONITOR'].includes(s.version)?10:NaN));
+ const lev=Number(s.leverage??(['V19_1_PERCENTAGE_FILL_COPY','V19_2_INHERITED_ADD_COPY','V19_3_INFO_RATE_LIMIT_FIX','V19_4_EXCHANGE_REJECTION_DETAILS','V19_6_PARTIAL_ENTRY_FIX','V19_7_POSITION_CAP','V19_9_LOSS_STOP_SAFETY_AUDIT','V19_13_IP_REST_MONITOR','V19_14_LIMIT_TEST_INTEGRATED','V19_16_FULL_TRADE_LIVE_CANDIDATE'].includes(s.version)?10:NaN));
  const mar=Number(s.initial_margin_usd??(Number.isFinite(addUsd)&&Number.isFinite(lev)&&lev>0?addUsd/lev:NaN));
  $('minimum').textContent=Number.isFinite(addUsd)?'$'+addUsd.toFixed(2):'—';
  $('margin').textContent=Number.isFinite(mar)?'$'+mar.toFixed(2):'—';
@@ -121,7 +128,31 @@ async function refresh(){if(!connected||busy)return;busy=true;try{const s=await 
  renderPage('coins');renderPage('decisions');
  $('errors').textContent=(s.errors||[]).slice(0,6).join(' | ');
  pageData.recent=(s.recent||[]).slice().sort((a,b)=>Number(b.at||0)-Number(a.at||0));renderPage('recent');
- show('Контролер ' + s.version + ' свързан · '+time(Date.now()));await updatePerformance();await updateQuota();await updateIpMonitor();}catch(e){show('Грешка: '+e.message)}finally{busy=false}}
+ show('Контролер ' + s.version + ' свързан · '+time(Date.now()));await updatePerformance();await updateQuota();await updateIpMonitor();await ltUpdate();}catch(e){show('Грешка: '+e.message)}finally{busy=false}}
+
+async function ltUpdate(){if(!connected)return;try{const q=await api('limit-test/status');
+ $('ltMode').textContent=q.halted?'HALTED':q.active?(q.websocket_connected?'LIVE ACTIVE':'CONNECTING'):'STOPPED';$('start').disabled=Boolean(q.active||q.order||q.coin||q.halted);$('ltCompleted').textContent=q.completed+'/10';
+ $('ltMaker').textContent=q.statistics?.maker_fills??'—';$('ltTaker').textContent=q.statistics?.taker_fills??'—';
+ $('ltFees').textContent=q.statistics?.total_fees_usd==null?'—':'$'+Number(q.statistics.total_fees_usd).toFixed(4);
+ $('ltNet').textContent=q.statistics?.realized_net_ex_funding_usd==null?'—':'$'+Number(q.statistics.realized_net_ex_funding_usd).toFixed(4);
+ $('ltWarning').textContent='FULL TRADE · WS: '+(q.websocket_connected?'CONNECTED':'DISCONNECTED')+' · Coin: '+(q.coin||'—')+' · Target: '+Number(q.target||0).toFixed(6)+' · '+q.reason+' · '+(q.errors||[]).slice(0,2).join(' | ')+' · P/L без funding; другите стратегии трябва да са STOP.';
+ $('ltAuditInfo').textContent=q.fullTradeAudit?.error?('Грешка при четене на source fills: '+q.fullTradeAudit.error):('Изпълнения от последните 15 минути: '+(q.fullTradeAudit?.observed_events??0)+' · непълни за класифициране: '+(q.fullTradeAudit?.unclassified_fills??0)+' · Само реални source fills, без симулирани изпълнения.');
+ $('ltAuditRows').innerHTML=(q.fullTradeAudit?.events||[]).map(x=>'<tr><td>'+esc(time(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.action)+'</td><td>'+esc(x.before)+' → '+esc(x.after)+'</td><td>'+esc(x.price)+'</td><td>'+esc(x.delta)+'</td></tr>').join('')||'<tr><td colspan="6">Няма класифицирани изпълнения</td></tr>';
+ $('ltHistory').innerHTML=(q.history||[]).slice(0,30).map(x=>'<tr><td>'+esc(time(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.event)+'</td><td>'+esc(x.detail)+'</td></tr>').join('')||'<tr><td colspan="4">Няма събития</td></tr>';
+ }catch(e){$('ltWarning').textContent='LIMIT TEST: '+e.message;}}
+$('ltRefresh').onclick=ltUpdate;
+$('ltStart').onclick=async()=>{
+ if(!connected)return show('Първо свържи контролера');
+ if(!$('liveConfirm').checked)return show('Потвърди РЕАЛНА търговия с отметката най-горе');
+ if(!confirm('РЕАЛНИ ПАРИ: Старият LIVE COPY е спрян? Hyperliquid няма отворени позиции и поръчки? Новият бот може да понесе загуби, а защитният CLOSE може да е Taker. Да изпратя START?'))return;
+ const phrase=prompt('Въведи точно START FULL TRADE LIVE, за да потвърдиш');
+ if(phrase!=='START FULL TRADE LIVE')return show('START отменен: липсва потвърждение');
+ try{const q=await api('limit-test/start','POST',{confirm:'START_FULL_TRADE_LIVE_10_TRADES'});
+   $('liveConfirm').checked=false;show('FULL TRADE START: '+q.mode+' · '+(q.warning||''));await ltUpdate();
+ }catch(e){show('FULL TRADE START ОТКАЗАН: '+e.message);await ltUpdate();}
+};
+$('ltStop').onclick=async()=>{if(!connected)return;try{const r=await api('limit-test/stop','POST');show('LIMIT STOP: забранени нови входове. Провери позициите в Hyperliquid!');await ltUpdate();}catch(e){show('LIMIT STOP: '+e.message);}};
+
 $('quotaRefresh').onclick=()=>updateQuota(true);
 $('ipRefresh').onclick=()=>updateIpMonitor(true);
 $('connect').onclick=()=>{if(!$('token').value.trim())return show('Въведи token');connected=true;refresh()};$('refresh').onclick=refresh;
@@ -136,7 +167,7 @@ export async function serveLiveCopyDashboard(request:Request,env:LiveDashboardEn
  const url=new URL(request.url);if(request.method==='GET'&&url.pathname==='/live-copy')return new Response(PAGE,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"}});
  if(!url.pathname.startsWith('/live-copy/api/'))return null;
  if(!env.LIVE_COPY_ADMIN_TOKEN||request.headers.get('authorization')!=='Bearer '+env.LIVE_COPY_ADMIN_TOKEN)return j({ok:false,error:'UNAUTHORIZED'},401);
- const name=url.pathname.slice('/live-copy/api/'.length);const GET=['status','v19-status','account','our-activity','performance','api-quota','ip-rest-monitor'];const POST=['start','stop','sync','close-all'];
+ const name=url.pathname.slice('/live-copy/api/'.length);const GET=['status','v19-status','account','our-activity','performance','api-quota','ip-rest-monitor','limit-test/status'];const POST=['start','stop','sync','close-all','limit-test/start','limit-test/stop','limit-test/sync'];
  if(!(GET.includes(name)&&request.method==='GET'||POST.includes(name)&&request.method==='POST'))return j({ok:false,error:'ROUTE_NOT_SUPPORTED',name},404);
  if(!env.LIVE_COPY_CONTROLLER)return j({ok:false,error:'CONTROLLER_BINDING_MISSING'},503);
  try{const id=env.LIVE_COPY_CONTROLLER.idFromName('live-copy-v23');const stub=env.LIVE_COPY_CONTROLLER.get(id);const r=await stub.fetch(new Request('https://live-copy.internal/'+name,{method:request.method,headers:{authorization:'Bearer '+env.LIVE_COPY_ADMIN_TOKEN,'content-type':'application/json'},...(request.method==='POST'?{body:await request.text()}:{})}));return new Response(r.body,{status:r.status,headers:{'content-type':'application/json','cache-control':'no-store'}});}catch(e){return j({ok:false,error:'CONTROLLER_UNAVAILABLE',detail:String(e)},503);}
