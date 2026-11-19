@@ -4,6 +4,8 @@
  * Original index-stage15-preserved-all-projects.ts is intentionally excluded.
  * Stage15 controller and dashboard are active; Stage14 is retained as an isolated legacy implementation.
  * This is a source consolidation, NOT a production deployment or trading safety certification.
+ * STAGE18 PATCH: Allow mixed-case Hyperliquid asset symbols (e.g. kPEPE)
+ * consistently in event validation, order intents, ledger and manual close.
  * Required NPM dependencies: viem, @msgpack/msgpack.
  * Existing Cloudflare DO bindings, D1 bindings, routes and migrations still need project configuration.
  */
@@ -111,7 +113,7 @@ export interface LiveLedger {
 export const emptyLiveLedger=():LiveLedger=>({version:1,intents:{},confirmedByCoin:{},suspendedCoins:{},lastReconciledAt:null});
 const round=(v:number)=>Math.round(v*1e10)/1e10;
 export function prepareIntent(ledger:LiveLedger, intent:Omit<CopyIntent,'status'|'confirmedFillQty'|'createdAt'|'updatedAt'>, now:number):LiveLedger {
-  if (!Number.isFinite(now)||now<=0||!intent.id||!/^[A-Z0-9]{2,20}$/.test(intent.coin)||
+  if (!Number.isFinite(now)||now<=0||!intent.id||!/^[A-Za-z0-9]{2,20}$/.test(intent.coin)||
       !Number.isFinite(intent.requestedQty)||intent.requestedQty<=0) throw Error('INVALID_INTENT');
   if(ledger.intents[intent.id])throw Error('DUPLICATE_INTENT_ID');
   if(ledger.suspendedCoins[intent.coin])throw Error('COIN_SUSPENDED');
@@ -360,7 +362,7 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent):
   const key = normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
   if (!keyFormat(key) || !validAddress(master)) return {...base,status:'CREDENTIALS_NOT_CONFIGURED'};
-  if (!intent.intentId || !/^[A-Z0-9]{2,20}$/.test(intent.coin) ||
+  if (!intent.intentId || !/^[A-Za-z0-9]{2,20}$/.test(intent.coin) ||
       !['LONG','SHORT'].includes(intent.direction) || !Number.isFinite(intent.quantity) ||
       intent.quantity<=0 || !Number.isFinite(intent.referencePrice) || intent.referencePrice<=0)
     return {...base,status:'INVALID_INTENT'};
@@ -472,7 +474,7 @@ export type CloseAdapter={
 };
 export type LedgerStore={load():Promise<LiveLedger>;save(value:LiveLedger):Promise<void>};
 export type CloseResult={coin:string;status:string;intentId?:string;filledQty?:number;reason?:string};
-const safeCoin=(s:string)=>/^[A-Z0-9]{2,20}$/.test(s);
+const safeCoin=(s:string)=>/^[A-Za-z0-9]{2,20}$/.test(s);
 const quantize=(q:number,d:number)=>Math.floor((q+1e-12)*10**d)/10**d;
 /** Must be invoked after STOP is durably saved. One call at a time per DO. */
 export async function closeOwnedPosition(input:{coin:string;store:LedgerStore;exchange:CloseAdapter;commandId:string;now?:()=>number}):Promise<CloseResult>{
@@ -691,7 +693,7 @@ export class LiveCopyControllerStage7 {
     if(path!=='/event')return json({ok:false,error:'NOT_FOUND'},404);
     if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
     const {coin,fill_id,whale_target_qty,whale_before_qty,price,sz_decimals,time}=body;
-    if(typeof coin!=='string'||!/^[A-Z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
+    if(typeof coin!=='string'||!/^[A-Za-z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
     // STAGE18 ZEC EXCLUSION: Never create/increase ZEC exposure.
@@ -1002,7 +1004,7 @@ export class LiveCopyControllerStage7 {
     if(path!=='/event')return json({ok:false,error:'NOT_FOUND'},404);
     if(s.mode!=='RUNNING')return json({ok:false,error:'STOPPED'},409);
     const {coin,fill_id,whale_target_qty,whale_before_qty,price,sz_decimals,time}=body;
-    if(typeof coin!=='string'||!/^[A-Z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
+    if(typeof coin!=='string'||!/^[A-Za-z0-9]{2,20}$/.test(coin)||typeof fill_id!=='string'||!fill_id||fill_id.length>180||!finite(whale_target_qty)||!finite(whale_before_qty)||!finite(price)||price<=0||!Number.isInteger(sz_decimals)||sz_decimals<0||sz_decimals>8||!finite(time)||time<=0)return json({ok:false,error:'INVALID_EVENT'},400);
     if(s.sessionKind==='LIVE'&&!this.liveAuthorized(s)){await this.halt('LIVE_EVENT_NOT_AUTHORIZED');return json({ok:false,error:'LIVE_EVENT_NOT_AUTHORIZED',stopped:true},409);}
     if(s.sessionKind!=='LIVE'&&this.liveEnabled()){await this.halt('DRY_RUN_CONFIG_CHANGED');return json({ok:false,error:'DRY_RUN_CONFIG_CHANGED',stopped:true},409);}
     if(this.liveAuthorized(s)){
