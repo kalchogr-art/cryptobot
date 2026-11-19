@@ -921,9 +921,36 @@ export class LiveCopyControllerStage7 {
         return json({ok:true,bootstrapped:true,session:cursor.session,rowid:cursor.rowid,processed:0,trading_enabled:this.liveEnabled()});
       }
       const rows=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events WHERE rowid>? ORDER BY rowid ASC LIMIT 100').bind(cursor.rowid).all<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
-      const metadata=await (async()=>{try{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'meta'})});if(!r.ok)throw Error('META_HTTP_'+r.status);return await r.json() as any;}catch{return null;}})();
-      if(!metadata?.universe){await this.halt('METADATA_UNAVAILABLE');return json({ok:false,error:'METADATA_UNAVAILABLE',cursor,stopped:true},503);}
-      const precisions=new Map<string,number>(metadata.universe.map((a:any)=>[a.name,a.szDecimals]));
+      // Fetch metadata ONLY when source fills are waiting. A dashboard REFRESH
+      // is read-only and must never trigger a /meta request or stop LIVE.
+      if(!(rows.results||[]).length)return json({ok:true,trading_enabled:this.liveAuthorized(s),processed:0,ignored:0,cursor,has_more:false});
+      const META_KEY='live_copy_v23_stage15_metadata_cache';
+      const META_RETRY_KEY='live_copy_v23_stage15_meta_retry_after';
+      const now=Date.now();
+      const cached=await this.state.storage.get<{at:number;universe:Array<{name:string;szDecimals:number}>}>(META_KEY);
+      let universe=(cached&&now-cached.at<10*60*1000&&Array.isArray(cached.universe))?cached.universe:null;
+      if(!universe){
+        const retryAfter=await this.state.storage.get<number>(META_RETRY_KEY)||0;
+        if(now<retryAfter)return json({ok:true,deferred:true,reason:'METADATA_BACKOFF',retry_after:retryAfter,processed:0,ignored:0,cursor,trading_enabled:this.liveAuthorized(s)});
+        try{
+          const response=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'meta'})});
+          if(!response.ok)throw Error('META_HTTP_'+response.status);
+          const data:any=await response.json();
+          if(!Array.isArray(data?.universe)||!data.universe.length||!data.universe.every((x:any)=>typeof x.name==='string'&&Number.isInteger(x.szDecimals)&&x.szDecimals>=0))throw Error('META_INVALID_RESPONSE');
+          universe=data.universe;
+          await this.state.storage.put(META_KEY,{at:now,universe});
+          await this.state.storage.put(META_RETRY_KEY,0);
+        }catch(error){
+          const retry=now+90_000;
+          await this.state.storage.put(META_RETRY_KEY,retry);
+          const latest=await this.load();
+          this.audit(latest,'METADATA_RETRY',undefined,String(error).slice(0,120));
+          await this.save(latest);
+          // No cursor advance, no simulated fill, no order. The next alarm retries.
+          return json({ok:true,deferred:true,reason:'METADATA_TEMPORARILY_UNAVAILABLE',retry_after:retry,processed:0,ignored:0,cursor,trading_enabled:this.liveAuthorized(latest)});
+        }
+      }
+      const precisions=new Map<string,number>(universe!.map(a=>[a.name,a.szDecimals]));
       let processed=0,ignored=0;let failure:any=null;
       for(const row of rows.results||[]){
         // A changed watcher session must not be spliced into the old target chain.
