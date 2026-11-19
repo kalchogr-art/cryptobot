@@ -1503,8 +1503,8 @@ export class LiveCopyControllerStage7 {
     const old=await this.load();if(old.mode==='RUNNING')return J({ok:false,error:'STOP_OLD_COPY_FIRST'},409);
     const prev=await this.ltLoad();if(prev.active||prev.order||prev.halted||prev.coin)return J({ok:false,error:'FULL_TRADE_PREVIOUS_UNRESOLVED'},409);
     const {flat,account,orders}=await this.ltFlat();if(!flat)return J({ok:false,error:'FULL_TRADE_ACCOUNT_NOT_FLAT',positions:account.positions,openOrders:orders},409);
-    if(!Number.isFinite(Number(account.accountValue))||Number(account.accountValue)<5)
-      return J({ok:false,error:'FULL_TRADE_INSUFFICIENT_ACCOUNT_VALUE',minimum_usd:5,account_value:account.accountValue},409);
+    // Unified account: perp accountValue can be 0 even with usable spot USDC collateral.
+    // Do not reject START based on perp accountValue; exchange enforces margin on order placement.
     const source=await postInfo({type:'clearinghouseState',user:LIMIT_TEST_SOURCE});
     if(!Array.isArray(source?.assetPositions))throw Error('FULL_TRADE_SOURCE_INVALID');
     const now=Date.now(),t=ftDefault();t.started=now;t.active=true;t.reason='CONNECTING';
