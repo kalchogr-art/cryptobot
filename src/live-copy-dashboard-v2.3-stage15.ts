@@ -1,13 +1,21 @@
 /** V19.14 FULL dashboard — inherited ADD accumulator, new/reversal, source fills. */
 export interface LiveDashboardEnv { LIVE_COPY_ADMIN_TOKEN?:string;LIVE_COPY_CONTROLLER?:{idFromName(name:string):unknown;get(id:unknown):{fetch(request:Request):Promise<Response>}}; }
-const PAGE=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/><title>LIVE COPY V19.16 · FULL TRADE LIVE</title>
+const PAGE=`<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/><title>LIVE COPY V19.16.1 · START UI FIX</title>
 <style>body{margin:0;background:#0c1220;color:#eef2ff;font:14px system-ui,Arial,sans-serif}main{max-width:1160px;margin:auto;padding:20px}h1{font-size:24px}h2{font-size:17px;margin-top:5px}.muted{color:#9daec5}.box{border:1px solid #334155;background:#162033;border-radius:13px;padding:15px;margin:12px 0}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{border-radius:8px;padding:11px;background:#202c40;color:white;border:1px solid #50627f}input{width:240px}button{cursor:pointer}button:hover{background:#32445e}button:disabled{opacity:.4;cursor:default}.pager{display:flex;gap:5px;align-items:center;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}.pager button{padding:5px 10px}.pager .selected{background:#416aa5;border-color:#77a8ec}.danger{background:#8c2630}.green{color:#50d99c}.warn{color:#ffc36c}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.stat{padding:12px;border:1px solid #32405b;border-radius:9px}.num{font-size:23px;font-weight:700}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:760px}th,td{padding:9px;text-align:left;border-bottom:1px solid #34415a}th{color:#9daec5;font-weight:600}code{background:#263752;padding:2px 5px;border-radius:4px}#message{white-space:pre-wrap}</style></head><body><main>
-<h1>Hyperliquid · LIVE COPY V19.16</h1><p class="muted">NEW / REVERSAL: директен вход $10.40 позиция ($1.04 маржин × 10x). ADD: само към позиции без загуба, с таван $31.20. Борсов Stop Market при -25% ROE и постоянна проверка на синхронизацията. REMOVE / CLOSE: намаляване на реалната позиция. Само изпълнени userFills.</p>
+<h1>Hyperliquid · LIVE COPY V19.16.1</h1><p class="muted">NEW / REVERSAL: директен вход $10.40 позиция ($1.04 маржин × 10x). ADD: само към позиции без загуба, с таван $31.20. Борсов Stop Market при -25% ROE и постоянна проверка на синхронизацията. REMOVE / CLOSE: намаляване на реалната позиция. Само изпълнени userFills.</p>
 <div class="box"><div class="controls"><input id="token" type="password" placeholder="Admin token" autocomplete="off"/><button id="connect">СВЪРЖИ</button><button id="refresh">ОБНОВИ</button><label style="display:flex;align-items:center;gap:6px;padding:8px;border:1px solid #50627f;border-radius:8px"><input id="liveConfirm" type="checkbox" style="width:auto"/> <span>Потвърждавам РЕАЛНА търговия</span></label><button id="start">НОВА СЕСИЯ</button><button id="stop">STOP</button><button id="closeall" class="danger">CLOSE ALL</button></div><p id="message" class="muted">Няма връзка</p></div>
 <div class="box"><h2>Реален Hyperliquid акаунт · само четене</h2><div class="controls"><button id="account">ОБНОВИ АКАУНТА</button><span id="accountinfo" class="muted">—</span></div><div class="scroll"><table><thead><tr><th>Монета</th><th>Реално количество</th><th>Средна цена</th><th>Нереализирано P/L</th></tr></thead><tbody id="positions"><tr><td colspan="4">Не е заредено</td></tr></tbody></table></div></div>
 <div class="box"><h2>LIMIT COPY · FULL TRADE LIVE (V19.16)</h2>
 <p class="muted">Източник: 0xbb160c…143ad · REAL FULL TRADE · LONG / SHORT / ADD / PARTIAL CLOSE / CLOSE / REVERSAL. Реален LIMIT ALO Maker вход/изход; при неизпълнен изход е възможно защитно reduce-only IOC (Taker). Максимум 10 приключени позиции, $10.40 начален номинал, 10x cross, таван $31.20. START изисква старият бот да е спрян и реалният акаунт да е изцяло празен. WebSocket прекъсване спира новите входове. Риск: реална загуба е възможна.</p>
-<div class="controls"><button id="ltRefresh">ОБНОВИ LIMIT TEST</button><button id="ltStart">START · НОВИЯ ТРЕЙДЪР · РЕАЛНИ СДЕЛКИ</button><button id="ltStop">STOP LIMIT ВХОДОВЕТЕ</button></div>
+<div class="controls"><button id="ltRefresh">ОБНОВИ LIMIT TEST</button><button id="ltStart" type="button">START · НОВИЯ ТРЕЙДЪР · РЕАЛНИ СДЕЛКИ</button><button id="ltStop">STOP LIMIT ВХОДОВЕТЕ</button></div>
+<div id="ltStartPanel" class="box" style="display:none;border-color:#b58a46" aria-live="polite">
+<p><strong>Потвърждение на LIVE тест</strong> · Реални средства. Преди потвърждение старият LIVE COPY трябва да е STOP и Hyperliquid акаунтът да няма активни позиции и поръчки.</p>
+<label style="display:block;margin:8px 0"><input type="checkbox" id="ltAcceptRisk" style="width:auto"/> Потвърждавам, че старият бот е спрян и проверих реалните позиции и поръчки</label>
+<label style="display:block;margin:8px 0">Въведи точно <code>START FULL TRADE LIVE</code></label>
+<input id="ltPhrase" type="text" placeholder="START FULL TRADE LIVE" autocomplete="off" autocapitalize="characters" style="max-width:100%;box-sizing:border-box"/>
+<div class="controls" style="margin-top:10px"><button id="ltConfirmStart" type="button">ПОТВЪРДИ И ИЗПРАТИ START</button><button id="ltCancelStart" type="button">ОТКАЖИ</button></div>
+</div>
+<p id="ltStartStatus" class="warn" role="status" aria-live="polite">START още не е заявен.</p>
 <div class="stats"><div class="stat">Режим<div id="ltMode" class="num">—</div></div><div class="stat">Приключени<div id="ltCompleted" class="num">—</div></div><div class="stat">Maker fills<div id="ltMaker" class="num">—</div></div><div class="stat">Taker fills<div id="ltTaker" class="num">—</div></div><div class="stat">Такси<div id="ltFees" class="num">—</div></div><div class="stat">NET P/L без funding<div id="ltNet" class="num">—</div></div></div><p class="warn" id="ltWarning">Не е свързан</p>
 <p class="muted" id="ltAuditInfo">Последни 15 минути · изчаква данни от източника</p>
 <div class="scroll"><table><thead><tr><th>Час</th><th>Монета</th><th>Действие</th><th>Преди → След</th><th>Цена</th><th>Размер</th></tr></thead><tbody id="ltAuditRows"><tr><td colspan="6">Не са заредени изпълнения</td></tr></tbody></table></div>
@@ -141,15 +149,35 @@ async function ltUpdate(){if(!connected)return;try{const q=await api('limit-test
  $('ltHistory').innerHTML=(q.history||[]).slice(0,30).map(x=>'<tr><td>'+esc(time(x.at))+'</td><td>'+esc(x.coin)+'</td><td>'+esc(x.event)+'</td><td>'+esc(x.detail)+'</td></tr>').join('')||'<tr><td colspan="4">Няма събития</td></tr>';
  }catch(e){$('ltWarning').textContent='LIMIT TEST: '+e.message;}}
 $('ltRefresh').onclick=ltUpdate;
-$('ltStart').onclick=async()=>{
- if(!connected)return show('Първо свържи контролера');
- if(!$('liveConfirm').checked)return show('Потвърди РЕАЛНА търговия с отметката най-горе');
- if(!confirm('РЕАЛНИ ПАРИ: Старият LIVE COPY е спрян? Hyperliquid няма отворени позиции и поръчки? Новият бот може да понесе загуби, а защитният CLOSE може да е Taker. Да изпратя START?'))return;
- const phrase=prompt('Въведи точно START FULL TRADE LIVE, за да потвърдиш');
- if(phrase!=='START FULL TRADE LIVE')return show('START отменен: липсва потвърждение');
- try{const q=await api('limit-test/start','POST',{confirm:'START_FULL_TRADE_LIVE_10_TRADES'});
-   $('liveConfirm').checked=false;show('FULL TRADE START: '+q.mode+' · '+(q.warning||''));await ltUpdate();
- }catch(e){show('FULL TRADE START ОТКАЗАН: '+e.message);await ltUpdate();}
+$('ltStart').onclick=()=>{
+  $('ltStartPanel').style.display='block';
+  $('ltStartStatus').textContent='Попълни потвърждението тук, под START. Не е изпратена заявка.';
+  $('ltStartPanel').scrollIntoView({behavior:'smooth',block:'nearest'});
+};
+$('ltCancelStart').onclick=()=>{
+  $('ltStartPanel').style.display='none';
+  $('ltStartStatus').textContent='START отменен. Не е изпращана заявка.';
+};
+$('ltConfirmStart').onclick=async()=>{
+  const status=$('ltStartStatus'),button=$('ltConfirmStart');
+  if(!connected){status.textContent='НЕ Е ИЗПРАТЕН: първо натисни СВЪРЖИ с валиден Admin token.';return;}
+  if(!$('liveConfirm').checked){status.textContent='НЕ Е ИЗПРАТЕН: отметни „Потвърждавам РЕАЛНА търговия“ най-горе.';return;}
+  if(!$('ltAcceptRisk').checked){status.textContent='НЕ Е ИЗПРАТЕН: потвърди проверката на стария бот, позициите и ордерите.';return;}
+  if($('ltPhrase').value.trim()!=='START FULL TRADE LIVE'){
+    status.textContent='НЕ Е ИЗПРАТЕН: точният текст е START FULL TRADE LIVE (латински букви).';return;
+  }
+  button.disabled=true;
+  status.textContent='Изпращам START към контролера…';
+  try{
+    const q=await api('limit-test/start','POST',{confirm:'START_FULL_TRADE_LIVE_10_TRADES'});
+    status.textContent='START ПРИЕТ: '+(q.mode||'STARTING')+' · '+(q.warning||'Проверявай WebSocket статуса и реалната сметка.');
+    $('liveConfirm').checked=false;
+    $('ltPhrase').value='';$('ltStartPanel').style.display='none';
+    await ltUpdate();
+  }catch(e){
+    status.textContent='START ОТКАЗАН: '+e.message+' · Няма потвърден успешен старт.';
+    try{await ltUpdate()}catch(_){}
+  }finally{button.disabled=false;}
 };
 $('ltStop').onclick=async()=>{if(!connected)return;try{const r=await api('limit-test/stop','POST');show('LIMIT STOP: забранени нови входове. Провери позициите в Hyperliquid!');await ltUpdate();}catch(e){show('LIMIT STOP: '+e.message);}};
 
