@@ -156,6 +156,84 @@ export async function sendAction(action: Record<string,unknown>, key: `0x${strin
   // Never automatically retry: timeout can mean the order was accepted.
   return post(EXCHANGE, {action,nonce,signature:sig,vaultAddress:null});
 }
+
+/** V19.16: bidirectional, strictly post-only maker order. Order may rest or fail;
+ * accepted != filled. Durable Object must persist cloid before calling this.
+ */
+export async function makerFullTradeOrder(env:LiveCopyEnv,coin:string,qtyWanted:number,
+    direction:'LONG'|'SHORT',reduceOnly:boolean,intentId:string):Promise<{cloid:string;qty:number;price:number;oid:number|string|null;responseStatus:string}>{
+  const key=normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY),master=env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+  if(env.LIVE_COPY_TRADING_ENABLED!=='true'||env.LIVE_COPY_LEVERAGE_VERIFIED!=='true'||env.LIVE_COPY_LEVERAGE_MODE!=='cross')throw Error('FULL_TRADE_FLAGS_NOT_ENABLED');
+  if(!keyFormat(key)||!validAddress(master))throw Error('FULL_TRADE_CREDENTIALS_INVALID');
+  const [account,book]=await Promise.all([readLiveAccount(env),info({type:'l2Book',coin})]);
+  const asset=account.assetMeta.find((x:any)=>x.coin===coin);
+  if(!asset)throw Error('FULL_TRADE_UNKNOWN_ASSET');
+  const bid=Number(book?.levels?.[0]?.[0]?.px),ask=Number(book?.levels?.[1]?.[0]?.px);
+  if(!(bid>0&&ask>bid)||Date.now()-Number(book.time||0)>1800)throw Error('FULL_TRADE_STALE_BOOK');
+  const current=Number(account.positions.find((x:any)=>x.coin===coin)?.qty||0);
+  if(account.positions.some((x:any)=>x.coin!==coin))throw Error('FULL_TRADE_FOREIGN_POSITION');
+  const buy=direction==='LONG';
+  if(reduceOnly){if(current===0||Math.sign(current)===(buy?1:-1))throw Error('FULL_TRADE_INVALID_REDUCE');}
+  else if(current!==0&&Math.sign(current)!==(buy?1:-1))throw Error('FULL_TRADE_CROSS_SIDE_BLOCKED');
+  const qty=decimalQty(reduceOnly?Math.min(Math.abs(current),qtyWanted):qtyWanted,asset.szDecimals);
+  const price=Number(formatPrice(buy?bid:ask,asset.szDecimals));
+  if(!(qty>0&&price>0))throw Error('FULL_TRADE_BELOW_PRECISION');
+  if((buy&&price>=ask)||(!buy&&price<=bid))throw Error('FULL_TRADE_WOULD_CROSS');
+  if(!reduceOnly){
+    const total=(Math.abs(current)+qty)*Math.max(price,ask);
+    if(qty*price<10.0)throw Error('FULL_TRADE_BELOW_EXCHANGE_MINIMUM');
+    if(total>31.20+1e-8)throw Error('FULL_TRADE_NOTIONAL_CAP');
+    if(asset.maxLeverage<10)throw Error('FULL_TRADE_LEVERAGE_UNSUPPORTED');
+    const existing=account.positions.find((x:any)=>x.coin===coin);
+    if(existing && (Number(existing.leverage?.value)!==10||existing.leverage?.type!=='cross'))throw Error('FULL_TRADE_EXISTING_LEVERAGE_MISMATCH');
+    if(!existing){
+      const lr=await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
+      if(lr?.status!=='ok'||lr?.response?.type!=='default')throw Error('FULL_TRADE_LEVERAGE_NOT_VERIFIED');
+    }
+  }
+  const cloid=cloidForIntent(intentId);
+  const action={type:'order',orders:[{a:asset.assetId,b:buy,p:String(price),s:qty.toFixed(asset.szDecimals),r:reduceOnly,t:{limit:{tif:'Alo'}},c:cloid}],grouping:'na'};
+  const r=await sendAction(action,key as `0x${string}`,master);
+  const status=r?.response?.data?.statuses?.[0];
+  if(r?.status!=='ok'||!status||status.error)throw Error('FULL_TRADE_ORDER_REJECTED:'+JSON.stringify(status||r).slice(0,260));
+  if(!status.resting&&!status.filled)throw Error('FULL_TRADE_ORDER_UNKNOWN_STATUS');
+  return {cloid,qty,price,oid:status.resting?.oid??status.filled?.oid??null,responseStatus:status.resting?'resting':'filled'};
+}
+
+/** V19.14 legacy SHORT-only order adapter (not activated for V19.15). ALO cannot execute taker. */
+export async function makerShortOrder(env:LiveCopyEnv, coin:string, qtyWanted:number, buy:boolean, reduceOnly:boolean, intentId:string){
+  if(env.LIVE_COPY_TRADING_ENABLED!=='true'||env.LIVE_COPY_LEVERAGE_VERIFIED!=='true'||env.LIVE_COPY_LEVERAGE_MODE!=='cross')throw Error('LIMIT_TEST_LIVE_FLAGS_MISSING');
+  const key=normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY),master=env.HYPERLIQUID_MASTER_ACCOUNT||'';
+  if(!keyFormat(key)||!validAddress(master))throw Error('LIMIT_TEST_CREDENTIALS_INVALID');
+  const [account,book]=await Promise.all([readLiveAccount(env),info({type:'l2Book',coin})]);
+  const asset=account.assetMeta.find((a:any)=>a.coin===coin);if(!asset)throw Error('LIMIT_TEST_ASSET_UNKNOWN');
+  const bid=Number(book?.levels?.[0]?.[0]?.px),ask=Number(book?.levels?.[1]?.[0]?.px);
+  if(!(bid>0&&ask>bid))throw Error('LIMIT_TEST_INVALID_BOOK');
+  const pos=account.positions.find((p:any)=>p.coin===coin);const own=Number(pos?.qty||0);
+  if(buy){if(!reduceOnly||own>=0)throw Error('LIMIT_TEST_NO_SHORT_TO_REDUCE');}
+  else {if(reduceOnly||account.positions.length!==0)throw Error('LIMIT_TEST_ACCOUNT_NOT_FLAT');}
+  const qty=decimalQty(buy?Math.min(Math.abs(own),qtyWanted):qtyWanted,asset.szDecimals);
+  const px=Number(formatPrice(buy?bid:ask,asset.szDecimals));
+  if(!(qty>0&&px>0))throw Error('LIMIT_TEST_PRECISION');
+  // Formatting must never accidentally cross the book.
+  if(buy&&px>=ask||!buy&&px<=bid)throw Error('LIMIT_TEST_POST_ONLY_PRICE_CROSSES');
+  if(!reduceOnly&&qty*px<10.40)throw Error('LIMIT_TEST_BELOW_MIN_NOTIONAL');
+  if(!reduceOnly&&qty*px>11.20)throw Error('LIMIT_TEST_ENTRY_CAP');
+  const cloid=cloidForIntent(intentId);
+  const action={type:'order',orders:[{a:asset.assetId,b:buy,p:String(px),s:qty.toFixed(asset.szDecimals),r:reduceOnly,t:{limit:{tif:'Alo'}},c:cloid}],grouping:'na'};
+  const response=await sendAction(action,key as `0x${string}`,master);
+  const status=response?.response?.data?.statuses?.[0];
+  if(response?.status!=='ok'||!status||status.error)throw Error('LIMIT_TEST_ORDER_REJECTED:'+JSON.stringify(status||response).slice(0,300));
+  return {cloid,qty,price:px,oid:status.resting?.oid??status.filled?.oid??null,fill:status.filled??null};
+}
+export async function cancelMakerTest(env:LiveCopyEnv,coin:string,cloid:string){
+  const key=normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY),master=env.HYPERLIQUID_MASTER_ACCOUNT||'';
+  if(!keyFormat(key)||!validAddress(master))throw Error('LIMIT_TEST_CREDENTIALS_INVALID');
+  const meta=await info({type:'meta'}),id=(meta?.universe||[]).findIndex((x:any)=>x.name===coin);
+  if(id<0)throw Error('LIMIT_TEST_ASSET_UNKNOWN');
+  return sendAction({type:'cancelByCloid',cancels:[{asset:id,cloid}]},key as `0x${string}`,master);
+}
+
 export async function readLiveAccount(env: LiveCopyEnv) {
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
   if (!validAddress(master)) throw Error('MASTER_ACCOUNT_NOT_CONFIGURED');
@@ -327,7 +405,7 @@ export async function cancelStopByCloid(env:LiveCopyEnv,coin:string,cloid:string
 type DB = {prepare(sql:string):{bind(...args:any[]):{first<T=any>():Promise<T|null>;all<T=any>():Promise<{results:T[]}>}}};
 type Env=__LC_EXECUTION.LiveCopyEnv & {
   DB:DB;LIVE_COPY_ADMIN_TOKEN?:string;LIVE_COPY_AUTO_EXECUTION_ENABLED?:string;
-  LIVE_COPY_SOURCE_WALLET?:string;LIVE_COPY_V19_MIN_NOTIONAL?:string;
+  LIVE_COPY_SOURCE_WALLET?:string;LIVE_COPY_V19_MIN_NOTIONAL?:string;LIMIT_TEST_TRADING_ENABLED?:string;
 };
 type Fill={rowid:number;session_id:string;fill_id:string;at:number;coin:string;side:'A'|'B';sz:number;px:number;start_pos:number;source_oid:string};
 type CoinState={coin:string;sourceQty:number;baseline:number;scale:number;episode:number;active:boolean;waitingFlat:boolean;
@@ -476,6 +554,67 @@ export function planV19Reduce(ownQty:number, reduceQty:number, px:number, fullCl
   if(remainingUsd>0 && remainingUsd<MIN)return {action:'AVOID_DUST',notional,remainingUsd};
   return {action:'SEND_REMOVE',notional,remainingUsd};
 }
+
+/** V19.14: isolate *strategy state*, NOT account, in the same Durable Object.
+ * Legacy short execution remains disabled. V19.15 audits all source fill actions without executing.
+ * This monitor is strictly single-coin / single-position and is guarded by
+ * the original strategy STOP + flat account + no exchange orders.
+ */
+const LIMIT_TEST_SOURCE='0xbb160cb61e694570f9d570f9fcde7c61dd2143ad';
+const LIMIT_TEST_KEY='v19_limit_short_test_v1';
+const LIMIT_TEST_NOTIONAL=10.40;
+const LIMIT_TEST_ENTRY_TTL_MS=2300;
+const LIMIT_TEST_EXIT_TTL_MS=1800;
+const LIMIT_TEST_MAX_HOLD_MS=12000;
+type LTOrder={cloid:string;coin:string;at:number;qty:number;px:number;side:'ENTRY'|'EXIT';state:'UNKNOWN'|'OPEN';};
+type LTState={active:boolean;halted:boolean;reason:string;started:number;lastPoll:number;sourceAfter:number;seen:string[];
+  coin:string;sourceShort:boolean;sourceExit:boolean;enteredAt:number;exitMakerTried?:boolean;order?:LTOrder;
+  completed:number;opens:number;missed:number;forcedTaker:number;errors:string[];
+  history:Array<{at:number;coin:string;event:string;detail:string}>;};
+function ltDefault():LTState{return {active:false,halted:false,reason:'NOT_STARTED',started:0,lastPoll:0,sourceAfter:0,seen:[],coin:'',sourceShort:false,sourceExit:false,enteredAt:0,completed:0,opens:0,missed:0,forcedTaker:0,errors:[],history:[]};}
+
+
+/** V19.15 FULL TRADE source audit, read-only.
+ * Derive actions from actual source fill startPosition + signed fill size.
+ * Handles LONG, SHORT, ADD, partial close, CLOSE, and reversal. A fill
+ * spanning zero is one REVERSAL, not two independently executable orders.
+ * No maker orders are submitted by this diagnostic.
+ */
+type FullTradeEvent={at:number;coin:string;action:string;side:string;before:number;after:number;delta:number;price:number;fee:number;closedPnl:number;fillId:string};
+function classifySourceFullTrade(f:any):FullTradeEvent|null {
+  const coin=String(f?.coin||'');
+  const at=Number(f?.time),sz=Math.abs(Number(f?.sz)),before=Number(f?.startPosition),price=Number(f?.px);
+  const side=String(f?.side||'').toUpperCase();
+  if(!coin||!Number.isFinite(at)||!Number.isFinite(sz)||sz<=0||!Number.isFinite(before)||!Number.isFinite(price)||price<=0||!['A','B'].includes(side))return null;
+  const delta=side==='B'?sz:-sz;
+  const after=Number((before+delta).toPrecision(12));
+  const eps=Math.max(1e-9,sz*1e-7);
+  const sign=(n:number)=>Math.abs(n)<=eps?0:n>0?1:-1;
+  const b=sign(before),a=sign(after);
+  let action:string;
+  if(b===0&&a!==0)action=a>0?'OPEN_LONG':'OPEN_SHORT';
+  else if(b!==0&&a===0)action='CLOSE';
+  else if(b!==0&&a!==0&&b!==a)action='REVERSAL_'+(a>0?'LONG':'SHORT');
+  else if(b===a&&Math.abs(after)>Math.abs(before)+eps)action='ADD';
+  else if(b===a&&Math.abs(after)<Math.abs(before)-eps)action='PARTIAL_CLOSE';
+  else action='UNCHANGED_OR_ROUNDING';
+  return {at,coin,action,side,before,after,delta,price,fee:Number(f?.fee||0),closedPnl:Number(f?.closedPnl||0),fillId:String(f?.hash||'')+':'+String(f?.tid??f?.oid??'')+':'+at};
+}
+
+/** V19.16 durable, independent FULL TRADE state. Old LT state retained solely
+ * for migration visibility and is NEVER automatically armed. */
+const FT_KEY='v19_full_trade_v1916';
+type FTOrder={cloid:string;coin:string;at:number;qty:number;reduceOnly:boolean;state:'SUBMITTING'|'OPEN'|'CANCELING'};
+type FTState={active:boolean;halted:boolean;started:number;reason:string;coin:string;sourceQty:number;target:number;scale:number;
+  episode:number;episodeAt:number;lastActionAt:number;lastFillAt:number;lastEntryAttemptAt:number;
+  order?:FTOrder;stop?:{cloid:string;qty:number;at:number;status:'SUBMITTING'|'RESTING'};
+  pendingReversal?:{qty:number;px:number;at:number};seen:string[];ignoredCoins:string[];
+  wsReadyAt:number;wsDisconnectedAt:number;seq:number;hadExposure:boolean;completed:number;missed:number;
+  errors:string[];history:Array<{at:number;coin:string;event:string;detail:string}>;lastOrderResolvedAt:number;exitMakerAttemptAt:number;emergencyIntent?:string;exitBarrier:boolean;};
+function ftDefault():FTState{return {active:false,halted:false,started:0,reason:'NOT_STARTED',coin:'',sourceQty:0,target:0,scale:0,
+  episode:0,episodeAt:0,lastActionAt:0,lastFillAt:0,lastEntryAttemptAt:0,seen:[],ignoredCoins:[],wsReadyAt:0,wsDisconnectedAt:0,
+  seq:0,hadExposure:false,completed:0,missed:0,errors:[],history:[],lastOrderResolvedAt:0,exitMakerAttemptAt:0,exitBarrier:false};}
+
 export class LiveCopyControllerStage7 {
   private busy=false;
   private arm:number|null=null;
@@ -541,7 +680,7 @@ export class LiveCopyControllerStage7 {
       sourceSession:latest?.session_id||'',coins,events:0,syncs:0,skipped:0,orders:0,lastSync:0,errors:[],recent:[],stoppedReason:'',sessionCapital:capitalRecord.value,sessionEquityBasis:capitalRecord.basis};
     await this.state.storage.put('live_copy_v19_arm',s.live?{startedAt:at}:null);await this.state.storage.put('live_copy_v19_last_reconcile',0);this.arm=s.live?at:null;
     await this.save(s);await this.state.storage.setAlarm(Date.now()+1000);
-    return J({ok:true,version:'V19_13_IP_REST_MONITOR',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
+    return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',mode:s.mode,live:s.live,cursor:s.cursor,existing_source_positions_ignored:Object.keys(coins).length});
   }
   private async processFills(s:Session){
     const rows=await this.d1Read('PROCESS_FILLS',()=>this.env.DB.prepare(`SELECT rowid,session_id,fill_id,at,coin,side,sz,px,start_pos,source_oid
@@ -1159,12 +1298,12 @@ export class LiveCopyControllerStage7 {
       // current position is checked again before any later execution.
       const processed=await this.processFills(s);s.syncs++;s.lastSync=Date.now();await this.save(s);
       const now=Date.now();const cooldown=Number(s.cooldownUntil||0);
-      if(cooldown>now)return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,
+      if(cooldown>now)return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_RATE_LIMIT_BACKOFF',retry_after:cooldown,real_orders_sent:0});
       const last=Number(await this.state.storage.get('live_copy_v19_last_reconcile')||0);
       const interval=processed>0?INFO_RECONCILE_MIN_MS:INFO_RECONCILE_IDLE_MS;
-      if(now-last<interval)return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,
+      if(now-last<interval)return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',processed,
         cursor:s.cursor,events:s.events,exchange_deferred:true,
         reason:'INFO_POLL_COALESCING',next_check_at:last+interval,real_orders_sent:0});
       // Reserve the INFO polling slot before sending requests. A WebSocket
@@ -1179,7 +1318,7 @@ export class LiveCopyControllerStage7 {
         s.cooldownUntil=0;
         s.errors=(s.errors||[]).filter(e=>!String(e).includes('INFO_HTTP_429'));
         await this.save(s);
-        return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,cursor:s.cursor,
+        return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',processed,cursor:s.cursor,
           events:s.events,live:this.authorized(s),...result});
       }catch(e){
         const rateLimited=/429|RATE_LIMIT|TOO_MANY_REQUESTS/i.test(String(e));
@@ -1189,7 +1328,7 @@ export class LiveCopyControllerStage7 {
           s.errors=(s.errors||[]).filter(x=>!String(x).includes('INFO_HTTP_429'));
           s.errors.unshift('INFO_HTTP_429 · automatic INFO requests paused');
           await this.save(s);
-          return J({ok:true,version:'V19_13_IP_REST_MONITOR',processed,cursor:s.cursor,
+          return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',processed,cursor:s.cursor,
             events:s.events,exchange_deferred:true,reason:'INFO_RATE_LIMIT_BACKOFF',
             retry_after:s.cooldownUntil,real_orders_sent:0});
         }
@@ -1245,14 +1384,359 @@ export class LiveCopyControllerStage7 {
       return J({ok:true,stopped:true,account_flat:true,actions});
     }catch(e){return J({ok:false,error:'CLOSE_ALL_FAILED',detail:String(e),actions,stopped:true},503);}
   }
-  async alarm():Promise<void>{const s=await this.load();if(s.mode!=='RUNNING')return;
+
+  /* V19.16 FULL TRADE LIVE -- isolated state, same existing Durable Object. */
+  private ftWs:WebSocket|null=null;
+  private ftWsReady=false;
+  private ftQueue:Promise<void>=Promise.resolve();
+  private ftEnqueue<T>(fn:()=>Promise<T>):Promise<T>{
+    const job=this.ftQueue.then(fn);
+    this.ftQueue=job.then(()=>{},()=>{});
+    return job;
+  }
+  private async ltLoad():Promise<FTState>{return (await this.state.storage.get(FT_KEY) as FTState)||ftDefault();}
+  private async ltSave(t:FTState){await this.state.storage.put(FT_KEY,t);}
+  private ltLog(t:FTState,event:string,detail:string,coin?:string){t.history.unshift({at:Date.now(),coin:coin||t.coin||'—',event,detail});t.history=t.history.slice(0,160);}
+  private async ltFlat(){
+    const [account,orders]=await Promise.all([__LC_EXECUTION.readLiveAccount(this.env),postInfo({type:'frontendOpenOrders',user:this.env.HYPERLIQUID_MASTER_ACCOUNT})]);
+    if(!Array.isArray(orders))throw Error('FULL_TRADE_ORDER_READ_INVALID');
+    return {account,orders,flat:!account.positions.length&&!orders.length};
+  }
+  private async ftConnect():Promise<boolean>{
+    if(this.ftWs?.readyState===1&&this.ftWsReady)return true;
+    if(this.ftWs?.readyState===0)return false;
+    const ws=new WebSocket('wss://api.hyperliquid.xyz/ws');this.ftWs=ws;this.ftWsReady=false;
+    ws.addEventListener('open',()=>{
+      if(this.ftWs!==ws)return;
+      ws.send(JSON.stringify({method:'subscribe',subscription:{type:'userFills',user:LIMIT_TEST_SOURCE,aggregateByTime:false}}));
+      ws.send(JSON.stringify({method:'subscribe',subscription:{type:'userFills',user:this.env.HYPERLIQUID_MASTER_ACCOUNT,aggregateByTime:false}}));
+    });
+    ws.addEventListener('message',(event:MessageEvent)=>{
+      if(this.ftWs!==ws)return;
+      try{const msg=JSON.parse(String(event.data));
+        if(msg?.channel==='subscriptionResponse'&&msg?.data?.subscription?.type==='userFills'&&
+          String(msg.data.subscription.user||'').toLowerCase()===LIMIT_TEST_SOURCE.toLowerCase()){
+          this.ftWsReady=true;
+          void this.ftWsAck();return;
+        }
+        if(msg?.channel==='userFills'&&Array.isArray(msg.data?.fills)){
+          const user=String(msg.data.user||'').toLowerCase();
+          if(user===LIMIT_TEST_SOURCE.toLowerCase()){
+            // Snapshots since START are deduplicated; never trade on old fills.
+            const task=this.ftEnqueue(()=>this.ftProcessFills(msg.data.fills,msg.data.isSnapshot===true))
+              .then(()=>this.ftSync()).catch(e=>this.ftFatal('WS_FILL_PROCESS_FAILED '+String(e)));
+            this.state.waitUntil?.(task);
+          }else if(user===String(this.env.HYPERLIQUID_MASTER_ACCOUNT||'').toLowerCase()&&!msg.data.isSnapshot){
+            const task=this.ftSync().catch(e=>this.ftFatal('OWN_FILL_RECONCILIATION '+String(e)));
+            this.state.waitUntil?.(task);
+          }
+        }
+      }catch(e){void this.ftFatal('WS_MESSAGE_INVALID '+String(e));}
+    });
+    const lost=()=>{if(this.ftWs!==ws)return;this.ftWsReady=false;void this.ftDisconnect();};
+    ws.addEventListener('close',lost);ws.addEventListener('error',lost);
+    return false;
+  }
+  private async ftWsAck(){const t=await this.ltLoad();if(t.active){t.wsReadyAt=Date.now();t.wsDisconnectedAt=0;this.ltLog(t,'WS_CONNECTED','Hyperliquid userFills subscription acknowledged');await this.ltSave(t);await this.ftSync();}}
+  private async ftDisconnect(){const t=await this.ltLoad();if(!t.started)return;t.wsDisconnectedAt=Date.now();this.ltLog(t,'WS_DISCONNECTED','New entries blocked; position monitored for safe exit');await this.ltSave(t);await this.state.storage.setAlarm(Date.now()+1000);}
+  private async ftFatal(reason:string){const t=await this.ltLoad();t.halted=true;t.active=false;t.reason='SAFETY_HALT';t.errors.unshift(reason);this.ltLog(t,'SAFETY_HALT',reason);await this.ltSave(t);await this.state.storage.setAlarm(Date.now()+1000);}
+  private async ftProcessFills(raw:any[],isSnapshot:boolean){
+    const t=await this.ltLoad();if(!t.started)return;
+    const evs=raw.map(classifySourceFullTrade).filter((v:FullTradeEvent|null):v is FullTradeEvent=>v!==null)
+      .sort((a:FullTradeEvent,b:FullTradeEvent)=>a.at-b.at||a.fillId.localeCompare(b.fillId));
+    for(const e of evs){
+      if(e.at<t.started||t.seen.includes(e.fillId))continue;
+      t.seen.push(e.fillId);if(t.seen.length>1000)t.seen.shift();
+      t.lastFillAt=Math.max(t.lastFillAt,e.at);
+      this.ltLog(t,'SOURCE_'+e.action,`${e.before} => ${e.after} · $${e.price} · ${isSnapshot?'snapshot':'stream'}`,e.coin);
+      if(t.ignoredCoins.includes(e.coin)){
+        if(Math.abs(e.after)<1e-10)t.ignoredCoins=t.ignoredCoins.filter(c=>c!==e.coin);
+        continue;
+      }
+      if(!t.active){continue;}
+      if(t.coin&&t.coin!==e.coin){
+        if(Math.abs(e.after)>1e-10){t.active=false;t.reason='SOURCE_MULTI_COIN_IGNORED';this.ltLog(t,'SOURCE_OTHER_COIN_IGNORED',e.coin,e.coin);}
+        continue;
+      }
+      if(!t.coin){
+        if(Math.abs(e.before)>1e-10||Math.abs(e.after)<1e-10)continue;
+        if(Date.now()-e.at>1500){t.missed++;this.ltLog(t,'SOURCE_ENTRY_STALE','Entry skipped; older than 1.5 seconds',e.coin);t.ignoredCoins.push(e.coin);continue;}
+        t.coin=e.coin;t.scale=LIMIT_TEST_NOTIONAL/(Math.abs(e.after)*e.price);
+        t.episode++;t.episodeAt=e.at;t.target=0;t.lastActionAt=0;
+      }
+      if(t.coin===e.coin){
+        if(t.exitBarrier){
+          // Source reopened while our prior position was still closing.
+          // Skip the new episode rather than conflate two positions.
+          t.target=0;t.lastActionAt=e.at;
+          this.ltLog(t,'EPISODE_BARRIER','New source fill ignored until own position confirmed flat');
+          continue;
+        }
+        if(t.pendingReversal){
+          // Follow only the latest new-side source quantity; never mix old
+          // episode scaling into the new one while our old position remains.
+          if(Math.abs(e.after)<1e-10)t.pendingReversal=undefined;
+          else t.pendingReversal={qty:e.after,px:e.price,at:e.at};
+          t.target=0;t.lastActionAt=e.at;continue;
+        }
+        if(e.action.startsWith('REVERSAL_')){
+          // Reversal: close existing own exposure first. New episode may be
+          // missed if source is already gone; never cross directly in one order.
+          t.target=0;t.pendingReversal={qty:e.after,px:e.price,at:e.at};
+        }else{
+          t.sourceQty=e.after;
+          t.target=Math.abs(e.after)<1e-10?0:e.after*t.scale;
+          if(t.target===0)t.exitBarrier=true;
+        }
+        t.lastActionAt=e.at;
+      }
+    }
+    await this.ltSave(t);
+  }
+  private async ltStart(body:any):Promise<Response>{
+    if(body?.confirm!=='START_FULL_TRADE_LIVE_10_TRADES')return J({ok:false,error:'FULL_TRADE_EXPLICIT_CONFIRM_REQUIRED'},409);
+    if(this.env.LIMIT_TEST_TRADING_ENABLED!=='true'||!this.liveConfigured())return J({ok:false,error:'FULL_TRADE_FLAGS_MISSING'},409);
+    if(!this.env.HYPERLIQUID_API_PRIVATE_KEY||!this.env.HYPERLIQUID_MASTER_ACCOUNT)return J({ok:false,error:'FULL_TRADE_CREDENTIALS_MISSING'},409);
+    if(!/^0x[0-9a-fA-F]{64}$/.test(__LC_EXECUTION.normalizeKey(this.env.HYPERLIQUID_API_PRIVATE_KEY)))
+      return J({ok:false,error:'FULL_TRADE_API_KEY_INVALID_FORMAT'},409);
+    if(LIMIT_TEST_SOURCE.toLowerCase()===this.env.HYPERLIQUID_MASTER_ACCOUNT.toLowerCase())return J({ok:false,error:'SOURCE_CANNOT_BE_OWN_ACCOUNT'},409);
+    const old=await this.load();if(old.mode==='RUNNING')return J({ok:false,error:'STOP_OLD_COPY_FIRST'},409);
+    const prev=await this.ltLoad();if(prev.active||prev.order||prev.halted||prev.coin)return J({ok:false,error:'FULL_TRADE_PREVIOUS_UNRESOLVED'},409);
+    const {flat,account,orders}=await this.ltFlat();if(!flat)return J({ok:false,error:'FULL_TRADE_ACCOUNT_NOT_FLAT',positions:account.positions,openOrders:orders},409);
+    if(!Number.isFinite(Number(account.accountValue))||Number(account.accountValue)<5)
+      return J({ok:false,error:'FULL_TRADE_INSUFFICIENT_ACCOUNT_VALUE',minimum_usd:5,account_value:account.accountValue},409);
+    const source=await postInfo({type:'clearinghouseState',user:LIMIT_TEST_SOURCE});
+    if(!Array.isArray(source?.assetPositions))throw Error('FULL_TRADE_SOURCE_INVALID');
+    const now=Date.now(),t=ftDefault();t.started=now;t.active=true;t.reason='CONNECTING';
+    t.ignoredCoins=source.assetPositions.filter((x:any)=>Math.abs(Number(x?.position?.szi||0))>0).map((x:any)=>String(x.position.coin));
+    this.ltLog(t,'START','Awaiting confirmed Hyperliquid userFills WebSocket; 10 full-trade episodes; max $31.20 exposure');
+    await this.ltSave(t);await this.ftConnect();await this.state.storage.setAlarm(now+1000);
+    return J({ok:true,mode:'FULL_TRADE_STARTING',source:LIMIT_TEST_SOURCE,waiting_for_ws_ack:true,
+      maximum_completed:10,warning:'No trade until source userFills subscription is acknowledged; post-only orders may not fill.'});
+  }
+  private async ltStop():Promise<Response>{
+    const t=await this.ltLoad();t.active=false;t.target=0;t.reason='USER_STOP_CLOSE_REQUIRED';
+    this.ltLog(t,'USER_STOP','No more entries; live exposure will be reconciled and reduced');await this.ltSave(t);
+    await this.state.storage.setAlarm(Date.now()+1000);
+    return J({ok:true,entry_stopped:true,positions_may_remain:true,requires_flat_verification:true});
+  }
+  private async ltStatus():Promise<Response>{
+    const t=await this.ltLoad();let statistics:any={};
+    if(t.started){try{
+      const f=await postInfo({type:'userFillsByTime',user:this.env.HYPERLIQUID_MASTER_ACCOUNT,startTime:t.started,aggregateByTime:false});
+      const fills=(Array.isArray(f)?f:[]).filter((x:any)=>Number(x.time)>=t.started);
+      const fee=fills.reduce((a:number,x:any)=>a+Number(x.fee||0),0);
+      const pnl=fills.reduce((a:number,x:any)=>a+Number(x.closedPnl||0),0);
+      statistics={fills:fills.length,total_fees_usd:fee,realized_gross_usd:pnl,realized_net_ex_funding_usd:pnl-fee,
+        maker_fills:fills.filter((x:any)=>x.crossed===false).length,taker_fills:fills.filter((x:any)=>x.crossed===true).length,
+        caveat:'All account fills since START; keep old bot stopped and account dedicated to this test. Funding excluded.'};
+    }catch(e){statistics={error:String(e)};}}
+    let fullTradeAudit:any={};try{
+      const raw=await postInfo({type:'userFillsByTime',user:LIMIT_TEST_SOURCE,startTime:Date.now()-900000,aggregateByTime:false});
+      const events=(Array.isArray(raw)?raw:[]).map(classifySourceFullTrade).filter(Boolean)
+        .sort((a:any,b:any)=>b.at-a.at).slice(0,100);
+      fullTradeAudit={mode:'SOURCE_FILLS',events,observed_events:events.length};
+    }catch(e){fullTradeAudit={error:String(e)};}
+    return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',source:LIMIT_TEST_SOURCE,
+      trade_scope:'LONG_SHORT_ADD_PARTIAL_CLOSE_CLOSE_REVERSAL',live_start_available:true,
+      websocket_connected:this.ftWsReady&&this.ftWs?.readyState===1,statistics,fullTradeAudit,...t});
+  }
+  private async ftEnsureProtection(t:FTState,qty:number,entry:number,orders:any[]):Promise<boolean>{
+    if(!qty){return true;}
+    if(!(entry>0)){await this.ftFatal('PROTECTION_ENTRY_PRICE_UNKNOWN');return false;}
+    const old=t.stop;
+    const existing=old&&orders.find((x:any)=>String(x.cloid||'').toLowerCase()===old.cloid.toLowerCase());
+    if(old?.status==='RESTING'&&!existing&&Math.abs(Number(old.qty)-Math.abs(qty))<1e-10){
+      await this.ftFatal('PROTECTIVE_STOP_DISAPPEARED_CHECK_EXCHANGE');return false;
+    }
+    if(existing&&Math.abs(Number(old!.qty)-Math.abs(qty))<1e-10)return true;
+    // Native reduce-only stop before proceeding with further exposure.
+    const price=qty>0?entry*0.975:entry*1.025;
+    const cloidId=`FT:STOP:${t.started}:${t.episode}:${t.coin}:${++t.seq}`;
+    const cloid=__LC_EXECUTION.cloidForIntent(cloidId);
+    t.stop={cloid,qty:Math.abs(qty),at:Date.now(),status:'SUBMITTING'};await this.ltSave(t);
+    const placed=await __LC_EXECUTION.placeStopMarket(this.env,cloidId,t.coin,qty,price);
+    if(!placed.ok){await this.ftFatal('NATIVE_STOP_NOT_CONFIRMED '+placed.status+' '+String(placed.reason||''));return false;}
+    t.stop={cloid,qty:Math.abs(qty),at:Date.now(),status:'RESTING'};
+    this.ltLog(t,'STOP_INSTALLED',`${qty} @ ${price.toFixed(8)}`);await this.ltSave(t);
+    if(old){try{const ok=await __LC_EXECUTION.cancelStopByCloid(this.env,t.coin,old.cloid);
+      if(!ok){await this.ftFatal('OLD_STOP_CANCEL_NOT_CONFIRMED');return false;}}
+      catch(e){await this.ftFatal('OLD_STOP_CANCEL_UNKNOWN '+String(e));return false;}}
+    return true;
+  }
+  private async ftOrderStatus(t:FTState,ownQty:number):Promise<boolean>{
+    if(!t.order)return true;
+    const p=t.order,now=Date.now(),master=this.env.HYPERLIQUID_MASTER_ACCOUNT||'';
+    let status:any;try{status=await postInfo({type:'orderStatus',user:master,oid:p.cloid});}
+    catch(e){await this.ftFatal('ORDER_STATUS_READ_FAILED '+String(e));return false;}
+    const v=String(status?.order?.status||'').toLowerCase();
+    if(status?.status!=='order'||!status?.order?.order){await this.ftFatal('UNKNOWN_ORDER_STATUS '+p.cloid);return false;}
+    const open=v==='open';
+    if(open){
+      const ttl=p.reduceOnly?650:850;
+      if(p.state==='CANCELING'){
+        if(now-p.at>2200)await this.ftFatal('CANCEL_CONFIRMATION_TIMEOUT '+p.cloid);
+        return false;
+      }
+      if(now-p.at>ttl||!t.active||t.target===0){
+        p.state='CANCELING';await this.ltSave(t);
+        try{await __LC_EXECUTION.cancelMakerTest(this.env,p.coin,p.cloid);this.ltLog(t,'MAKER_CANCEL_SENT',p.cloid);}
+        catch(e){await this.ftFatal('CANCEL_OUTCOME_UNKNOWN '+String(e));}
+      }
+      return false;
+    }
+    // Status known terminal; reconcile the actual position on next loop.
+    this.ltLog(t,'ORDER_RESOLVED',p.cloid+' '+v);t.order=undefined;t.lastOrderResolvedAt=now;
+    await this.ltSave(t);return false;
+  }
+  private ftSync():Promise<Response>{return this.ftEnqueue(()=>this.ftSyncCore());}
+  private async ftEmergencyClose(t:FTState,qty:number,reason:string):Promise<Response>{
+    if(t.emergencyIntent)return J({ok:false,error:'EMERGENCY_ALREADY_USED_REQUIRES_RECONCILIATION'},503);
+    if(!t.coin||!qty)return J({ok:true,flat:true});
+    const id='FT:SAFE_CLOSE:'+t.started+':'+t.episode+':'+t.coin+':'+(++t.seq);
+    t.emergencyIntent=id;t.halted=true;t.active=false;t.target=0;t.reason=reason;
+    this.ltLog(t,'EMERGENCY_CLOSE_REQUEST',reason+' qty='+qty);await this.ltSave(t);
+    try{
+      const mids=await postInfo({type:'allMids'}),price=Number(mids?.[t.coin]);
+      if(!(price>0))throw Error('EMERGENCY_PRICE_MISSING');
+      const result=await __LC_EXECUTION.executeLiveIoc(this.env,{intentId:id,coin:t.coin,
+        direction:qty<0?'LONG':'SHORT',quantity:Math.abs(qty),reduceOnly:true,referencePrice:price});
+      this.ltLog(t,'EMERGENCY_CLOSE_RESULT',result.status+' filled='+String(result.filledQty||0));
+      await this.ltSave(t);
+      if(result.orderSent==='UNKNOWN'||!result.executed){await this.ftFatal('EMERGENCY_NOT_CONFIRMED '+result.status);return J({ok:false,error:'EMERGENCY_NOT_CONFIRMED'},503);}
+      return J({ok:true,emergency_reduce_only:true,status:result.status});
+    }catch(e){await this.ftFatal('EMERGENCY_UNCERTAIN '+String(e));return J({ok:false,error:'EMERGENCY_UNCERTAIN',detail:String(e)},503);}
+  }
+  private async ftSyncCore():Promise<Response>{
+    if(this.busy)return J({ok:true,deferred:'BUSY'});
+    this.busy=true;let t=await this.ltLoad();
+    try{
+      if(!t.started)return J({ok:true,idle:true});
+      const now=Date.now();
+      const snapshot=await this.ltFlat(),actual=snapshot.account.positions;
+      if(actual.length>1||actual.some((p:any)=>t.coin&&p.coin!==t.coin)||(!t.coin&&actual.length)){
+        await this.ftFatal('UNEXPECTED_ACCOUNT_POSITION');return J({ok:false,error:'UNEXPECTED_ACCOUNT_POSITION'},503);
+      }
+      const pos=actual[0],qty=Number(pos?.qty||0);
+      if(t.stop?.status==='SUBMITTING'){
+        const present=snapshot.orders.find((o:any)=>String(o.cloid||'').toLowerCase()===t.stop!.cloid.toLowerCase());
+        if(!present){await this.ftFatal('STOP_SUBMIT_OUTCOME_UNKNOWN');return J({ok:false,error:'STOP_SUBMIT_OUTCOME_UNKNOWN'},503);}
+        t.stop.status='RESTING';await this.ltSave(t);
+      }
+      if(qty){t.hadExposure=true;await this.ltSave(t);
+        if(!await this.ftEnsureProtection(t,qty,Number(pos.entry||0),snapshot.orders))
+          return this.ftEmergencyClose(t,qty,'NATIVE_STOP_NOT_CONFIRMED');
+      }
+      if(t.order){await this.ftOrderStatus(t,qty);return J({ok:true,pending:t.order?.cloid||'resolved'});}
+      if(!qty&&t.stop){
+        if(t.hadExposure&&t.target!==0){t.target=0;t.active=false;t.reason='FLAT_AFTER_PROTECTED_POSITION';
+          this.ltLog(t,'FLAT_AFTER_PROTECTION','Do not re-enter the same episode after exchange flattened position');await this.ltSave(t);}
+        // Own position is flat; remove our protective order before re-entry.
+        const exists=snapshot.orders.some((o:any)=>String(o.cloid||'').toLowerCase()===t.stop!.cloid.toLowerCase());
+        if(exists){const old=t.stop.cloid;
+          try{const ok=await __LC_EXECUTION.cancelStopByCloid(this.env,t.coin,old);if(!ok)throw Error('STOP_CANCEL_NOT_CONFIRMED');}
+          catch(e){await this.ftFatal('FLAT_STOP_CLEANUP_FAILED '+String(e));return J({ok:false,error:'STOP_CLEANUP_FAILED'},503);}
+          t.stop=undefined;await this.ltSave(t);return J({ok:true,stop_cleanup_requested:true});
+        }
+        t.stop=undefined;await this.ltSave(t);
+      }
+      if(t.halted){
+        if(!qty&&!t.order&&!t.stop){t.coin='';await this.ltSave(t);try{this.ftWs?.close(1000,'halted');}catch{}this.ftWs=null;this.ftWsReady=false;}
+        return J({ok:false,error:'SAFETY_HALTED',manual_exchange_check_required:!!qty},409);
+      }
+      const staleWs=!this.ftWsReady||this.ftWs?.readyState!==1||!t.wsReadyAt;
+      const connecting=staleWs&&now-t.started<5500&&!t.wsDisconnectedAt;
+      if(connecting)return J({ok:true,awaiting_websocket_subscription:true});
+      if(staleWs&&t.active){t.active=false;t.target=0;t.reason='WEBSOCKET_DISCONNECTED';this.ltLog(t,'WS_UNAVAILABLE','Stop new entries and reduce live exposure');await this.ltSave(t);}
+      if(qty&&now-t.episodeAt>LIMIT_TEST_MAX_HOLD_MS){t.target=0;t.active=false;t.reason='MAX_HOLD';await this.ltSave(t);}
+      // A closed/reversed source first requires a verified flat account.
+      if(t.pendingReversal&&Math.abs(qty)<1e-10){
+        if(t.hadExposure){t.completed++;t.hadExposure=false;this.ltLog(t,'REVERSAL_OLD_EPISODE_CLOSED','completed='+t.completed);}
+        t.exitMakerAttemptAt=0;t.emergencyIntent=undefined;
+        if(now-t.pendingReversal.at<1200&&t.active&&t.completed<10){
+          const rev=t.pendingReversal;t.sourceQty=rev.qty;t.scale=LIMIT_TEST_NOTIONAL/(Math.abs(rev.qty)*rev.px);
+          t.target=rev.qty*t.scale;t.episode++;t.episodeAt=rev.at;
+        }else{t.target=0;t.missed++;t.sourceQty=0;t.coin='';}
+        t.pendingReversal=undefined;await this.ltSave(t);
+      }
+      const target=t.active?t.target:0;
+      if(Math.abs(qty)<1e-10&&Math.abs(target)<1e-10){
+        if(t.coin){
+          t.completed+=t.hadExposure?1:0;t.missed+=t.hadExposure?0:1;
+          this.ltLog(t,'EPISODE_DONE',`completed=${t.completed}, missed=${t.missed}`);
+          t.coin='';t.sourceQty=0;t.target=0;t.scale=0;t.hadExposure=false;t.episodeAt=0;t.exitMakerAttemptAt=0;t.emergencyIntent=undefined;t.exitBarrier=false;
+          if(t.completed>=10){t.active=false;t.reason='TEN_CLOSED_TRADES';}
+          await this.ltSave(t);
+        }
+        return J({ok:true,flat:true,completed:t.completed});
+      }
+      const sign=(x:number)=>x>1e-10?1:x<-1e-10?-1:0;
+      const reduce=qty!==0&&(target===0||sign(target)!==sign(qty)||Math.abs(target)<Math.abs(qty)-1e-10);
+      const delta=reduce?-Math.sign(qty)*Math.min(Math.abs(qty),sign(qty)===sign(target)?Math.abs(qty)-Math.abs(target):Math.abs(qty)):target-qty;
+      if(!Number.isFinite(delta)||Math.abs(delta)<1e-10){
+        if(t.exitMakerAttemptAt||t.emergencyIntent){t.exitMakerAttemptAt=0;t.emergencyIntent=undefined;await this.ltSave(t);}
+        return J({ok:true,in_sync:true});
+      }
+      if(!reduce){
+        if(!t.active||now-t.lastActionAt>1500||staleWs)return J({ok:true,entry_not_sent:'STALE_OR_STOPPED'});
+        if(t.lastEntryAttemptAt===t.lastActionAt)return J({ok:true,entry_not_sent:'ALREADY_ATTEMPTED_THIS_FILL'});
+        t.lastEntryAttemptAt=t.lastActionAt;
+      }
+      const ref=Number((await postInfo({type:'allMids'}))?.[t.coin]);
+      if(!(ref>0))throw Error('PRICE_NOT_AVAILABLE');
+      // Do not repeatedly leave a close order resting while source is already flat.
+      // After a canceled maker exit, use one reduce-only IOC fallback with an
+      // intentionally durable ID. An unknown outcome ALWAYS halts for reconciliation.
+      if(reduce&&t.exitMakerAttemptAt>0&&now-t.exitMakerAttemptAt>=650){
+        if(t.emergencyIntent){await this.ftFatal('EMERGENCY_INTENT_ALREADY_USED_UNCERTAIN');return J({ok:false,error:'EMERGENCY_INTENT_UNCERTAIN'},503);}
+        const id='FT:EMERGENCY:'+t.started+':'+t.episode+':'+t.coin+':'+(++t.seq);
+        t.emergencyIntent=id;await this.ltSave(t);
+        const result=await __LC_EXECUTION.executeLiveIoc(this.env,{intentId:id,coin:t.coin,
+          direction:delta>0?'LONG':'SHORT',quantity:Math.abs(delta),reduceOnly:true,referencePrice:ref});
+        this.ltLog(t,'EMERGENCY_REDUCE',String(result.status)+' qty='+String(result.filledQty||0));
+        if(result.orderSent==='UNKNOWN'||!result.executed){await this.ftFatal('EMERGENCY_EXIT_NOT_CONFIRMED '+String(result.status));return J({ok:false,error:'EMERGENCY_EXIT_NOT_CONFIRMED'},503);}
+        // Never send an additional IOC in this episode without exchange check.
+        await this.ltSave(t);return J({ok:true,emergency_exit_submitted:true,status:result.status});
+      }
+      if(reduce&&t.exitMakerAttemptAt===0){t.exitMakerAttemptAt=now;await this.ltSave(t);}
+      if(!reduce&&Math.abs(delta*ref)<10)return J({ok:true,entry_not_sent:'BELOW_EXCHANGE_MINIMUM'});
+      const intentId=`FT:${reduce?'REDUCE':'OPEN'}:${t.started}:${t.episode}:${t.coin}:${++t.seq}`;
+      const cloid=__LC_EXECUTION.cloidForIntent(intentId);
+      const dir=delta>0?'LONG':'SHORT';
+      t.order={cloid,coin:t.coin,at:now,qty:Math.abs(delta),reduceOnly:reduce,state:'SUBMITTING'};
+      await this.ltSave(t); // durable before any exchange mutation, prevents duplicate order retry
+      try{
+        const r=await __LC_EXECUTION.makerFullTradeOrder(this.env,t.coin,Math.abs(delta),dir,reduce,intentId);
+        t.order={...t.order,cloid:r.cloid,qty:r.qty,state:'OPEN'};
+        this.ltLog(t,reduce?'MAKER_REDUCE':'MAKER_OPEN',`${dir} ${r.qty} @ ${r.price}, ${r.responseStatus}`);
+        await this.ltSave(t);await this.state.storage.setAlarm(Date.now()+700);
+        return J({ok:true,order_submitted:true,cloid:r.cloid});
+      }catch(e){
+        // UNKNOWN after submission requires explicit exchange reconciliation.
+        const msg=String(e);await this.ftFatal('MAKER_SEND_OR_ACK_UNCERTAIN '+msg);
+        return J({ok:false,error:'MAKER_UNCERTAIN',detail:msg},503);
+      }
+    }catch(e){await this.ftFatal('SYNC_FAILED '+String(e));return J({ok:false,error:'FULL_TRADE_SAFETY_HALT',detail:String(e)},503);}
+    finally{this.busy=false;}
+  }
+
+  async alarm():Promise<void>{const lt=await this.ltLoad();if(lt.started&&(lt.active||lt.order||lt.coin||lt.stop)){
+    if(lt.active&&(!this.ftWs||this.ftWs.readyState>1))await this.ftConnect();
+    await this.ftSync();const next=await this.ltLoad();
+    if(next.started&&(next.active||next.order||next.coin||next.stop))await this.state.storage.setAlarm(Date.now()+(next.halted?5000:1000));
+    return;
+  }const s=await this.load();if(s.mode!=='RUNNING')return;
     await this.sync();const current=await this.load();if(current.mode==='RUNNING')await this.state.storage.setAlarm(Math.max(Date.now()+5000,(current.cooldownUntil||0)+1000));}
   async fetch(req:Request):Promise<Response>{
     if(!this.env.LIVE_COPY_ADMIN_TOKEN||req.headers.get('authorization')!=='Bearer '+this.env.LIVE_COPY_ADMIN_TOKEN)return J({ok:false,error:'UNAUTHORIZED'},401);
     const path=new URL(req.url).pathname;const method=req.method;
-    if(method==='POST'&&path==='/start')return this.start(await req.json().catch(()=>({})));
-    if(method==='POST'&&path==='/stop'){const s=await this.load();s.mode='STOPPED';s.stoppedReason='STOP';await this.save(s);await this.state.storage.deleteAlarm?.();this.arm=null;await this.state.storage.put('live_copy_v19_arm',null);return J({ok:true,mode:'STOPPED',positions_untouched:true});}
-    if(method==='POST'&&path==='/close-all')return this.closeAll();
+    if(method==='POST'&&path==='/limit-test/start')return this.ltStart(await req.json().catch(()=>({})));
+    if(method==='POST'&&path==='/limit-test/stop')return this.ltStop();
+    if(method==='POST'&&path==='/limit-test/sync')return this.ftSync();
+    if(method==='GET'&&path==='/limit-test/status')return this.ltStatus();
+    if(method==='POST'&&path==='/start'){const lt=await this.ltLoad();if(lt.active||lt.order||lt.coin||lt.halted)return J({ok:false,error:'LIMIT_TEST_MUST_BE_FLAT_AND_STOPPED'},409);return this.start(await req.json().catch(()=>({})));}
+    if(method==='POST'&&path==='/stop'){const lt=await this.ltLoad();if(lt.active||lt.order||lt.coin)return J({ok:false,error:'USE_LIMIT_TEST_STOP'},409);const s=await this.load();s.mode='STOPPED';s.stoppedReason='STOP';await this.save(s);await this.state.storage.deleteAlarm?.();this.arm=null;await this.state.storage.put('live_copy_v19_arm',null);return J({ok:true,mode:'STOPPED',positions_untouched:true});}
+    if(method==='POST'&&path==='/close-all'){const lt=await this.ltLoad();if(lt.active||lt.order||lt.coin)return J({ok:false,error:'LIMIT_TEST_ACTIVE_USE_LIMIT_STOP_AND_MANUAL_EXCHANGE_CHECK'},409);return this.closeAll();}
     if(method==='POST'&&['/sync','/order-sync'].includes(path))return this.sync();
     if(method==='GET'&&['/status','/v19-status','/order-follow-status'].includes(path)){
       const s=await this.load();const latest=await this.latest().catch(()=>null);const d1Diagnostic=await this.state.storage.get('live_copy_v19_d1_diagnostic')||null;const coins=Object.values(s.coins).map(p=>({coin:p.coin,source_qty:p.sourceQty,desired_qty:p.desired,scale:p.scale,active:p.active,waiting_flat:p.waitingFlat,entry_pending:p.entryPending===true,last_fill_kind:p.lastFillKind||null,
@@ -1266,7 +1750,7 @@ export class LiveCopyControllerStage7 {
         last_price:p.lastPx,last_fill_at:p.lastFillAt,updated_at:p.lastActionAt,error:p.lastError,pending:p.pending?.status||null,episode:p.episode,inherited_mode:p.inheritedMode===true,inherited_pending_add_usd:Number(p.inheritedPendingUsd||0),
           pending_reduce_usd:Number(p.pendingReduceUsd||0),reduce_state:p.reduceState||null,
           dust_close_alert:p.dustCloseReason||null,entry_kind:p.lastFillKind||null,entry_confirmed:p.entryStatus==='COMPLETE',entry_status:p.entryStatus||null,entry_target_qty:p.entryTargetQty||0,entry_confirmed_qty:p.entryConfirmedQty||0,entry_remaining_usd:Number(p.entryRemainingUsd||0),rejection_retry_until:p.lastRejectedUntil||0,last_reject_reason:p.lastRejectReason||null}));
-      return J({ok:true,version:'V19_13_IP_REST_MONITOR',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
+      return J({ok:true,version:'V19_16_FULL_TRADE_LIVE_CANDIDATE',mode:s.mode,session_kind:s.live?'LIVE':'DRY_RUN',live_execution:s.mode==='RUNNING'&&s.live&&this.liveConfigured(),
         cursor:s.cursor,latest_fill_row:latest?.rowid||0,lag_rows:latest?Math.max(0,latest.rowid-s.cursor):null,d1_diagnostic:d1Diagnostic,processed_fills:s.events,orders_sent_and_filled:s.orders,
         skipped:s.skipped,syncs:s.syncs,last_sync:s.lastSync,minimum_notional_usd:MIN,max_position_notional_usd:MAX_POSITION_USD,max_position_margin_at_10x_usd:MAX_POSITION_USD/10,stop_loss_roe_pct:25,no_add_to_losing:true,safety_source_audit_interval_ms:SAFETY_AUDIT_INTERVAL_MS,api_backoff_until:s.cooldownUntil||0,api_backoff_seconds:Math.max(0,Math.ceil(((s.cooldownUntil||0)-Date.now())/1000)),exchange_poll_interval_ms:INFO_RECONCILE_MIN_MS,source_session:s.sourceSession,started_at:s.startedAt,
         coins,decisions:s.lastDecisions||[],errors:s.errors,recent:s.recent,stopped_reason:s.stoppedReason,mode_description:'PERCENTAGE_FILLS_INHERITED_ADD_ACCUMULATION_10_40'});
