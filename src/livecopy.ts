@@ -426,7 +426,7 @@ export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent, 
   if (item?.filled) return {ok:true,executed:true,status:'FILLED',coin:intent.coin,intentId:intent.intentId,
     requestedQty:qty,filledQty:n(item.filled.totalSz),averageFillPrice:n(item.filled.avgPx),oid:item.filled.oid,raw:result};
   if (item?.resting) return {...base,status:'UNEXPECTED_RESTING_ORDER',raw:result};
-  return {...base,status:item?.error?'REJECTED':'NOT_FILLED',raw:result};
+  return {...base,status:item?.error?'REJECTED':'UNKNOWN_EXCHANGE_STATUS',raw:result};
 }
 
 }
@@ -916,6 +916,94 @@ export class LiveCopyControllerStage7 {
   private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
   private async save(s:Snapshot){await this.state.storage.put(KEY,s);}
   private audit(s:Snapshot,kind:string,coin?:string,detail?:string){s.recent.unshift({at:Date.now(),kind,coin,detail});s.recent=s.recent.slice(0,100);}
+  // Per-coin uncertainty is NOT a global session failure. Do not discard the
+  // durable exchange intent. We will investigate before accepting a new signal
+  // for this coin. Other coins keep their five-second synchronization.
+  private async isolateExchangeCoin(coin:string,intentId:string,outcome:string){
+    const snap=await this.load();
+    const pending=await this.state.storage.get<Record<string,{intentId:string;firstSeen:number;lastCheck:number;emptyChecks:number}>>('live_copy_v23_pending_exchange')||{};
+    pending[coin]={intentId,firstSeen:Date.now(),lastCheck:0,emptyChecks:0};
+    await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+    this.audit(snap,'COIN_EXCHANGE_PENDING',coin,`${outcome}; intent=${intentId}; other_coins_continue`);
+    await this.save(snap);
+  }
+  private async reconcileIsolatedCoins(){
+    const pending=await this.state.storage.get<Record<string,{intentId:string;firstSeen:number;lastCheck:number;emptyChecks:number}>>('live_copy_v23_pending_exchange')||{};
+    const candidates=Object.entries(pending).filter(([,x])=>Date.now()-x.lastCheck>=15000);
+    if(!candidates.length)return;
+    const user=this.env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
+    if(!/^0x[0-9a-fA-F]{40}$/.test(user))return;
+    const postInfo=async(body:any):Promise<any>=>{
+      const response=await fetch('https://api.hyperliquid.xyz/info',{
+        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      if(!response.ok)throw Error('RECONCILE_HTTP_'+response.status);
+      return await response.json();
+    };
+    // One candidate per synchronization tick to avoid a burst of info calls.
+    const [coin,check]=candidates[0];
+    const ledger=await this.ledger();
+    const intent=ledger.intents[check.intentId];
+    if(!intent||!['UNKNOWN','PARTIAL','SUBMITTING','PREPARED'].includes(intent.status)){
+      delete pending[coin];await this.state.storage.put('live_copy_v23_pending_exchange',pending);return;
+    }
+    // A partially-filled order already changed our actual exposure: never
+    // discard that quantity simply because the remaining amount is uncertain.
+    if(intent.confirmedFillQty>0||intent.status==='PARTIAL')return;
+    try{
+      const [account,openOrders,history,fills]=await Promise.all([
+        readLiveAccount(this.env),
+        postInfo({type:'frontendOpenOrders',user}),
+        postInfo({type:'historicalOrders',user}),
+        postInfo({type:'userFillsByTime',user,startTime:Math.max(0,intent.createdAt-2000),endTime:Date.now(),aggregateByTime:false})
+      ]);
+      if(!Array.isArray(openOrders)||!Array.isArray(history)||!Array.isArray(fills))throw Error('RECONCILE_INVALID_RESPONSE');
+      const current=account.positions.find(p=>p.coin===coin)?.qty||0;
+      const expected=ledger.confirmedByCoin[coin]||0;
+      const precision=account.assetMeta.find(a=>a.coin===coin)?.szDecimals;
+      if(precision===undefined)throw Error('RECONCILE_UNKNOWN_ASSET');
+      const epsilon=0.51*10**(-precision);
+      const fillsCoin=fills.filter((f:any)=>f.coin===coin&&Number(f.time)>=intent.createdAt-2000);
+      const ordersCoin=history.filter((h:any)=>h?.order?.coin===coin&&Number(h?.order?.timestamp||h?.statusTimestamp||0)>=intent.createdAt-2000);
+      const openCoin=openOrders.some((o:any)=>o.coin===coin);
+      if(Math.abs(current-expected)>epsilon||fillsCoin.length||ordersCoin.length||openCoin){
+        const snap=await this.load();
+        this.audit(snap,'COIN_RECONCILE_NEEDS_REVIEW',coin,
+          `position_diff=${current-expected}; fills=${fillsCoin.length}; orders=${ordersCoin.length}; open=${openCoin}`);
+        await this.save(snap);
+        // Keep uncertainty isolated. No second write of an unknown intent.
+        check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+        return;
+      }
+      check.emptyChecks++;
+      check.lastCheck=Date.now();
+      // Require repeated, independent absence of position, orders and fills
+      // after settlement has had time to appear on the exchange.
+      if(check.emptyChecks<2||Date.now()-intent.createdAt<30000){
+        await this.state.storage.put('live_copy_v23_pending_exchange',pending);return;
+      }
+      const freshLedger=await this.ledger();
+      const same=freshLedger.intents[check.intentId];
+      if(!same||same.status!=='UNKNOWN'||same.confirmedFillQty>0)return;
+      freshLedger.intents[check.intentId]={...same,status:'CANCELLED',updatedAt:Date.now(),lastError:'EXCHANGE_NO_ORDER_NO_FILL_CONFIRMED_TWICE'};
+      await this.state.storage.put('live_copy_v23_ledger',freshLedger);
+      const snap=await this.load();
+      if(Math.abs(expected)<epsilon){delete snap.coins[coin];}
+      else if(snap.coins[coin]){
+        snap.coins[coin].suspended=false;
+        snap.coins[coin].pendingIntentId=null;
+        snap.coins[coin].confirmedOwnQty=expected;
+        snap.coins[coin].needsSourceRebase=true;
+      }
+      delete pending[coin];
+      await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+      this.audit(snap,'COIN_ORDER_ABSENT_RESUMED',coin,`intent=${check.intentId}; next_fresh_signal`);
+      await this.save(snap);
+    }catch(error){
+      check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+      const snap=await this.load();this.audit(snap,'COIN_RECONCILE_RETRY',coin,String(error).slice(0,130));await this.save(snap);
+    }
+  }
+
   // Alarms are serialized by the Durable Object. Never overwrite fresh state from /sync.
   async alarm():Promise<void>{
     const s=await this.load();
@@ -963,7 +1051,14 @@ export class LiveCopyControllerStage7 {
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
-    if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);if(Object.values(ledger.intents).some(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status)))return json({ok:false,error:'UNRESOLVED_INTENTS_REQUIRE_MANUAL_RECONCILIATION'},409);if(!report.safeToTrade)return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
+    if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);const unresolved=Object.values(ledger.intents).filter(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+          if(report.rows.some(r=>r.status!=='MATCH'&&r.status!=='UNRESOLVED_INTENT'))return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);
+          const pending=await this.state.storage.get<Record<string,{intentId:string;firstSeen:number;lastCheck:number;emptyChecks:number}>>('live_copy_v23_pending_exchange')||{};
+          for(const i of unresolved){
+            if(!pending[i.coin])pending[i.coin]={intentId:i.id,firstSeen:Date.now(),lastCheck:0,emptyChecks:0};
+          }
+          await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+          if(unresolved.length)this.audit(s,'LIVE_RESUME_ISOLATED_ORDERS',undefined,unresolved.map(i=>i.coin).join(','));}catch(e){return json({ok:false,error:'PRE_START_ACCOUNT_CHECK_FAILED',detail:String(e)},409);}}if(!this.state.storage.setAlarm)return json({ok:false,error:'ALARM_STORAGE_UNAVAILABLE'},503);
       // Fail closed on restart: never silently backfill a stopped interval.
       // Existing owned positions require explicit reconciliation/handling, not a fresh anchor.
       if(this.liveEnabled()){
@@ -1004,10 +1099,11 @@ export class LiveCopyControllerStage7 {
         await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
         return json({ok:true,bootstrapped:true,session:cursor.session,rowid:cursor.rowid,processed:0,trading_enabled:this.liveEnabled()});
       }
+      await this.reconcileIsolatedCoins();
       const rows=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events WHERE rowid>? ORDER BY rowid ASC LIMIT 100').bind(cursor.rowid).all<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
       // Fetch metadata ONLY when source fills are waiting. A dashboard REFRESH
       // is read-only and must never trigger a /meta request or stop LIVE.
-      if(!(rows.results||[]).length)return json({ok:true,trading_enabled:this.liveAuthorized(s),processed:0,ignored:0,cursor,has_more:false});
+      if(!(rows.results||[]).length){await this.reconcileIsolatedCoins();return json({ok:true,trading_enabled:this.liveAuthorized(s),processed:0,ignored:0,cursor,has_more:false});}
       const META_KEY='live_copy_v23_stage15_metadata_cache';
       const META_RETRY_KEY='live_copy_v23_stage15_meta_retry_after';
       const now=Date.now();
@@ -1037,6 +1133,13 @@ export class LiveCopyControllerStage7 {
       const precisions=new Map<string,number>(universe!.map(a=>[a.name,a.szDecimals]));
       let processed=0,ignored=0;let failure:any=null;
       for(const row of rows.results||[]){
+        const isolated=await this.state.storage.get<Record<string,{intentId:string}>>('live_copy_v23_pending_exchange')||{};
+        if(isolated[row.coin]){
+          const snap=await this.load();this.audit(snap,'COIN_SIGNAL_SKIPPED_PENDING_EXCHANGE',row.coin,`rowid=${row.rowid}`);await this.save(snap);
+          ignored++;cursor={session:row.session_id,rowid:row.rowid};
+          await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
+          continue;
+        }
         // A changed watcher session must not be spliced into the old target chain.
         if(cursor.session && row.session_id!==cursor.session){failure={error:'WATCHER_SESSION_CHANGED_REQUIRES_REARM',rowid:row.rowid};break;}
         let e:any;try{e=JSON.parse(row.payload);}catch{failure={error:'BAD_SOURCE_PAYLOAD',rowid:row.rowid};break;}
@@ -1076,6 +1179,12 @@ export class LiveCopyControllerStage7 {
               continue;
             }
             // An unresolved exchange intent cannot be erased as a source signal.
+          }
+          if(result.error==='EXCHANGE_RECONCILIATION_REQUIRED' && result.intentId){
+            await this.isolateExchangeCoin(row.coin,result.intentId,result.outcome||'UNKNOWN');
+            ignored++;cursor={session:row.session_id,rowid:row.rowid};
+            await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
+            continue;
           }
           failure={error:'EVENT_REJECTED',rowid:row.rowid,coin:row.coin,detail:result};break;
         }
@@ -1142,6 +1251,8 @@ export class LiveCopyControllerStage7 {
       if(Date.now()-eventMs>120000||eventMs-Date.now()>30000)
         return json({ok:false,error:'STALE_OR_FUTURE_WHALE_FILL',eventMs},409);
     }
+    const pendingExchange=await this.state.storage.get<Record<string,{intentId:string}>>('live_copy_v23_pending_exchange')||{};
+    if(pendingExchange[coin])return json({ok:true,isolated:true,ignored:true,reason:'COIN_PENDING_EXCHANGE_RECONCILIATION',exchange_order_sent:false});
     const id=`${coin}:${fill_id}`;
     if(s.seen[id])return json({ok:true,duplicate:true,exchange_order_sent:false});
     // STAGE18 ZEC EXCLUSION: Never create/increase ZEC exposure.
@@ -1288,7 +1399,11 @@ export class LiveCopyControllerStage7 {
       await this.halt('PRE_TRADE_CHECK_FAILED:'+detail.slice(0,120),coin);
       return json({ok:false,error:'PRE_TRADE_CHECK_FAILED',detail},409);
     }
-    if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){await this.halt('UNRESOLVED_INTENT_BEFORE_NEW_ORDER',coin);return json({ok:false,error:'UNRESOLVED_INTENT_BEFORE_NEW_ORDER'},409);}
+    if(Object.values(ledger.intents).some(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))){
+      const pendingIntent=Object.values(ledger.intents).find(i=>i.coin===coin&&['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status))!;
+      await this.isolateExchangeCoin(coin,pendingIntent.id,pendingIntent.status);
+      return json({ok:true,isolated:true,ignored:true,reason:'UNRESOLVED_COIN_INTENT',exchange_order_sent:false});
+    }
     const intentId=`AUTO:${coin}:${fill_id}`;
     let planned;
     try{planned=planAndReserve({state:record,ledger,whaleTargetQty:whale_target_qty,price:markPrice,szDecimals:sz_decimals,sourceFillId:fill_id,intentId,now:Date.now()});}
@@ -1320,8 +1435,8 @@ export class LiveCopyControllerStage7 {
     s.coins[coin]=settled.state as Coin;
     this.audit(s,'LIVE_ORDER_'+settled.outcome,coin,intentId);
     if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'){
-      s.mode='STOPPED';await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
-      return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:settled.outcome,intentId},409);
+      await this.isolateExchangeCoin(coin,intentId,settled.outcome);
+      return json({ok:true,isolated:true,reason:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:settled.outcome,intentId,exchange_order_sent:true},200);
     }
     // A reversal of an already copied position requires two exchange legs:
     // close the old side first, then open the new side on this same fill.
@@ -1361,9 +1476,8 @@ export class LiveCopyControllerStage7 {
           s.coins[coin]=reverseSettled.state as Coin;
           this.audit(s,'REVERSAL_OPEN_'+reverseSettled.outcome,coin,reverseId);
           if(reverseSettled.outcome==='UNKNOWN'||reverseSettled.outcome==='PARTIAL'){
-            s.mode='STOPPED';await this.save(s);
-            if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();
-            return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:reverseSettled.outcome,intentId:reverseId},409);
+            await this.isolateExchangeCoin(coin,reverseId,reverseSettled.outcome);
+            return json({ok:true,isolated:true,reason:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:reverseSettled.outcome,intentId:reverseId,exchange_order_sent:true},200);
           }
           s.seen[id]=Date.now();await this.save(s);
           return json({ok:true,proposal:planned.proposal,outcome:settled.outcome,intentId,
