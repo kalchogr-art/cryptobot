@@ -1,3 +1,4 @@
+// STAGE18 SOURCE-REDUCTION GUARD (2026-11-20): Never increase copy exposure on a source PARTIAL_CLOSE / CLOSE. Preserve desired target and record skipped mismatch.
 // Stage18 reconciliation: per-intent historical OID matching; rate-limited reconciliation; no trade sizing changes.
 // STAGE18 SKIP-RECORD-CLEAR: definitive no-order rejects never become UNKNOWN; terminal IOC partials resolve; dropped source fills are never replayed. Genuine uncertain writes retain exchange reconciliation.
 // STAGE18 FAST COIN RECOVERY: resolved markers checked each 5s, rejected historical orders no longer hold coin forever; skipped live fills retried immediately after verified resolution while fresh. No margin change.
@@ -1624,6 +1625,22 @@ export class LiveCopyControllerStage7 {
     // whether an order is executable BEFORE asking Hyperliquid for any live data.
     // This preserves the original accumulator and avoids API bursts per micro-fill.
     const preview=planCopyAction({state:record,whaleTargetQty:whale_target_qty,price,szDecimals:sz_decimals});
+    // A source-side reduction can expose an older positive accumulator gap.
+    // Do not send an ADD/OPEN for that gap while the trader is reducing exposure.
+    // Only an actual new source increase is allowed to trigger new exposure.
+    const sourceReduction = Math.abs(whale_before_qty)>1e-10 &&
+      (Math.abs(whale_target_qty)<1e-10 ||
+        (Math.sign(whale_before_qty)===Math.sign(whale_target_qty) &&
+         Math.abs(whale_target_qty)<Math.abs(whale_before_qty)-1e-10));
+    if(sourceReduction && (preview.kind==='ADD'||preview.kind==='OPEN'||
+        (preview.kind==='PARTIAL_CLOSE'&&!preview.reduceOnly))){
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'SOURCE_REDUCTION_ADD_BLOCKED',coin,
+        `fill=${fill_id}; source_before=${whale_before_qty}; source_after=${whale_target_qty}; planned=${preview.kind}; desired=${preview.desiredOwnQty}; own=${record.confirmedOwnQty}; next_signal_allowed`);
+      await this.save(s);
+      return json({ok:true,ignored:true,reason:'SOURCE_REDUCTION_ADD_BLOCKED',
+        proposal:preview,exchange_order_sent:false,trading_enabled:true});
+    }
     if(preview.kind==='NONE'){
       s.coins[coin]=record;s.seen[id]=Date.now();
       this.audit(s,'LIVE_ACCUMULATING',coin,preview.reason);await this.save(s);
@@ -1669,6 +1686,16 @@ export class LiveCopyControllerStage7 {
       return json({ok:true,ignored:true,reason:'ZEC_EXCLUDED_NO_NEW_EXPOSURE',exchange_order_sent:false});
     }
     if(!planned.intent){s.coins[coin]=record;s.seen[id]=Date.now();this.audit(s,'LIVE_ACCUMULATING',coin,planned.proposal.reason);await this.save(s);return json({ok:true,proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});}
+    // Final guard before ANY intent is committed to storage or sent to Hyperliquid.
+    if(sourceReduction && (!planned.proposal.reduceOnly ||
+        (planned.proposal.kind!=='PARTIAL_CLOSE'&&planned.proposal.kind!=='FULL_CLOSE'))){
+      s.coins[coin]=record;s.seen[id]=Date.now();
+      this.audit(s,'SOURCE_REDUCTION_ADD_BLOCKED',coin,
+        `fill=${fill_id}; final_plan=${planned.proposal.kind}; signed_delta=${planned.proposal.signedDelta}; next_signal_allowed`);
+      await this.save(s);
+      return json({ok:true,ignored:true,reason:'SOURCE_REDUCTION_ADD_BLOCKED',
+        proposal:planned.proposal,exchange_order_sent:false,trading_enabled:true});
+    }
     // Persist the reservation and in-flight state BEFORE the exchange request.
     await this.state.storage.put('live_copy_v23_ledger',planned.ledger);
     s.coins[coin]=planned.state as Coin;await this.save(s);
