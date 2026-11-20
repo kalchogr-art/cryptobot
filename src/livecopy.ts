@@ -1,3 +1,9 @@
+// STAGE18 PARTIAL/REVERSAL PATCH (2026-11-20):
+// - No margin/entry-size increase; still $10.40 notional at cross 10x.
+// - Aggregate sub-minimum partials; near-flat (>=75% reduced) can FULL_CLOSE.
+// - Preserve source scale for owned positions after isolated/missed fills.
+// - Complete a recovered reversal even if sign crossed while source was skipped.
+// - Separate REVERSAL_CLOSE_FILLED and REVERSAL_OPEN outcome logs.
 /**
  * LIVE COPY V2.3 STAGE18 - consolidated single source.
  * All runtime TypeScript modules from the uploaded archive are namespaced here.
@@ -65,8 +71,21 @@ export function planCopyAction(input:{
     if(closeQty===0)return none('CLOSE_BELOW_PRECISION_REQUIRES_MANUAL_REVIEW',desired,pendingNotional);
     return {kind:'FULL_CLOSE',coin:s.coin,signedDelta:-actual,quantity:closeQty,reduceOnly:true,desiredOwnQty:desired,pendingNotional,reason:'TARGET_FLAT_OR_REVERSED'};
   }
-  if(quantity===0||quantity*price+tiny<min)return none('ACCUMULATING_MICRO_DELTAS',desired,pendingNotional);
   const increasing=sign(actual)===0||sign(delta)===sign(actual);
+  // Small partial closes cannot generally pass the exchange's ~$10 notional
+  // minimum at a $10.40 copied position. Accumulate them, but do not keep a
+  // near-full position when the source has already reduced its exposure >=75%.
+  // A single FULL_CLOSE reduce-only order replaces a sub-minimum partial only
+  // when the current close quantity itself reaches the strategy minimum.
+  if(!increasing && sign(actual)!==0 && sign(desired)===sign(actual) &&
+      Math.abs(desired)<=Math.abs(actual)*0.25+tiny &&
+      Math.abs(actual)*price+tiny>=min){
+    const closeQty=truncate(Math.abs(actual),d);
+    if(closeQty>0)return {kind:'FULL_CLOSE',coin:s.coin,signedDelta:-sign(actual)*closeQty,
+      quantity:closeQty,reduceOnly:true,desiredOwnQty:desired,pendingNotional,
+      reason:'NEAR_FLAT_SOURCE_FULL_REDUCE'};
+  }
+  if(quantity===0||quantity*price+tiny<min)return none('ACCUMULATING_MICRO_DELTAS',desired,pendingNotional);
   if(!increasing && quantity>Math.abs(actual)+tiny)return none('CLOSE_EXCEEDS_CONFIRMED_POSITION',desired,pendingNotional);
   return {kind:sign(actual)===0?'OPEN':increasing?'ADD':'PARTIAL_CLOSE',coin:s.coin,
     signedDelta:round(sign(delta)*quantity),quantity,reduceOnly:!increasing,
@@ -1047,7 +1066,7 @@ export class LiveCopyControllerStage7 {
     const path=new URL(request.url).pathname;
     const s=await this.load();
     await this.restoreLiveArm(s);
-    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE_15_3_SAFETY_REVIEW',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
@@ -1351,14 +1370,14 @@ export class LiveCopyControllerStage7 {
       if(unresolved)return json({ok:false,error:'EXCHANGE_RECONCILIATION_REQUIRED'},409);
       const actual=liveLedger.confirmedByCoin[coin]||0;
       if(Math.abs(actual)>1e-9){
-        // Rebase against the SOURCE position immediately before this fresh fill.
-        // Actual is read from the confirmed ledger, never inferred from the whale.
-        const baseline=Math.abs(whale_before_qty)>1e-10
-          ? Math.abs(whale_before_qty) : Math.abs(whale_target_qty);
-        if(baseline>1e-10){
-          old.scale=Math.abs(actual)/baseline;
-          old.anchorTargetQty=whale_before_qty;
-        }
+        // Keep the ORIGINAL entry scaling for exchange-owned positions.
+        // Replacing scale with |actual|/|source_before| silently discards every
+        // missed PARTIAL_CLOSE and ADD while a coin was isolated. The upcoming
+        // fresh fill is planned against the CURRENT source target instead.
+        // Opposite-side source changes are handled as a close/reversal below.
+        old.anchorTargetQty=whale_before_qty;
+        this.audit(s,'COIN_TARGET_CATCHUP',coin,
+          `confirmed_qty=${actual}; preserved_scale=${old.scale}; source_before=${whale_before_qty}`);
       }else if(Math.abs(whale_before_qty)>1e-10){
         // No open exchange position: a fresh ADD may act as a new entry.
         old.scale=(Math.ceil(10.40/price*10**sz_decimals-1e-9)/10**sz_decimals)
@@ -1377,6 +1396,11 @@ export class LiveCopyControllerStage7 {
     // Stage18 entry correction: start a new copy on an inherited ADD or
     // a genuine whale REVERSAL. Existing inherited reductions remain ignored.
     const whaleReversal=whale_before_qty*whale_target_qty<0;
+    // An opposite live position must be closed and then reopened in the new
+    // direction even when the source's actual sign-crossing fill was skipped.
+    const ownedDirectionReversal=!!old && Math.abs(old.confirmedOwnQty)>1e-9 &&
+      Math.abs(whale_target_qty)>1e-10 &&
+      Math.sign(old.confirmedOwnQty)!==Math.sign(whale_target_qty);
     const inheritedAdd=Math.abs(whale_before_qty)>1e-10 &&
       Math.sign(whale_before_qty)===Math.sign(whale_target_qty) &&
       Math.abs(whale_target_qty)>Math.abs(whale_before_qty)+1e-10;
@@ -1486,13 +1510,15 @@ export class LiveCopyControllerStage7 {
     // A reversal of an already copied position requires two exchange legs:
     // close the old side first, then open the new side on this same fill.
     // Otherwise the old Stage18 only closed and never opened the new direction.
-    if(whaleReversal && old && planned.proposal.kind==='FULL_CLOSE' && settled.outcome==='FILLED'){
+    if((whaleReversal||ownedDirectionReversal) && old && planned.proposal.kind==='FULL_CLOSE' && settled.outcome==='FILLED'){
       const remaining=settled.ledger.confirmedByCoin[coin]||0;
       if(Math.abs(remaining)<1e-9){
         const reverseScale=10.40/(Math.abs(whale_target_qty)*markPrice);
         const reverseRecord:Coin={coin,anchorTargetQty:whale_target_qty,scale:reverseScale,
           confirmedOwnQty:remaining,pendingIntentId:null,suspended:false,lastFillId:fill_id,
           lastWhaleTarget:whale_target_qty,lastPrice:price,lastEventAt:time,episode:(old.episode||0)+1};
+        this.audit(s,'REVERSAL_CLOSE_FILLED',coin,
+          ownedDirectionReversal&&!whaleReversal?'SOURCE_CHANGED_WHILE_ISOLATED':'SOURCE_REVERSAL');
         const reverseId=`AUTO:${coin}:${fill_id}:REV_OPEN`;
         let reversePlanned;
         try{reversePlanned=planAndReserve({state:reverseRecord,ledger:settled.ledger,
@@ -1520,6 +1546,11 @@ export class LiveCopyControllerStage7 {
           await this.state.storage.put('live_copy_v23_ledger',reverseSettled.ledger);
           s.coins[coin]=reverseSettled.state as Coin;
           this.audit(s,'REVERSAL_OPEN_'+reverseSettled.outcome,coin,reverseId);
+          // A REJECTED second leg is an explicitly unsuccessful new entry,
+          // not a completed REVERSAL. The fresh opposite-side scale is kept
+          // so the next verified source fill can attempt a new entry.
+          if(reverseSettled.outcome==='REJECTED')
+            this.audit(s,'REVERSAL_NEW_ENTRY_REJECTED',coin,reverseId);
           if(reverseSettled.outcome==='UNKNOWN'||reverseSettled.outcome==='PARTIAL'){
             await this.isolateExchangeCoin(coin,reverseId,reverseSettled.outcome);
             return json({ok:true,isolated:true,reason:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:reverseSettled.outcome,intentId:reverseId,exchange_order_sent:true},200);
