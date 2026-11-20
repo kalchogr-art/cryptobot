@@ -1,3 +1,4 @@
+// STAGE18 SKIP-RECORD-CLEAR: definitive no-order rejects never become UNKNOWN; terminal IOC partials resolve; dropped source fills are never replayed. Genuine uncertain writes retain exchange reconciliation.
 // STAGE18 FAST COIN RECOVERY: resolved markers checked each 5s, rejected historical orders no longer hold coin forever; skipped live fills retried immediately after verified resolution while fresh. No margin change.
 // STAGE18 COIN RECOVERY PATCH: orphan pending markers cleared; latest skipped source event retried only while fresh after verified exchange reconciliation; shows pending_exchange_coins in /status. No margin change.
 // STAGE18 PARTIAL/REVERSAL PATCH (2026-11-20):
@@ -216,8 +217,15 @@ export function settleExchangeReceipt(ledger:LiveLedger, receipt:ExchangeReceipt
       throw Error('REQUESTED_QUANTITY_MISMATCH');
     // The execution adapter must supply this receipt directly; never accept a browser-supplied receipt.
     const next=recordExchangeFill(ledger,intent.id,qty,now,receipt.oid===undefined?undefined:String(receipt.oid));
-    const status=next.intents[intent.id].status;
-    return {ledger:next,outcome:status==='FILLED'?'FILLED':'PARTIAL',reason:'EXCHANGE_REPORTED_FILL'};
+    // Hyperliquid IOC: an exchange-confirmed filled receipt is terminal, even
+    // if it filled less than requested. The unfilled remainder is cancelled by
+    // IOC semantics. Preserve ONLY the actual confirmed quantity in the ledger.
+    // Leaving a terminal partial IOC as PARTIAL permanently blocked this coin.
+    if(next.intents[intent.id].status==='PARTIAL'){
+      next.intents[intent.id]={...next.intents[intent.id],status:'FILLED',
+        lastError:'IOC_PARTIAL_FILL_REMAINDER_CANCELLED'};
+    }
+    return {ledger:next,outcome:'FILLED',reason:'EXCHANGE_CONFIRMED_TERMINAL_IOC_FILL'};
   }
   if (receipt.status==='REJECTED' && !receipt.executed) {
     return {ledger:markRejected(ledger,intent.id,now,'EXCHANGE_REJECTED'),outcome:'REJECTED',reason:'EXCHANGE_REJECTED'};
@@ -389,53 +397,53 @@ export async function readLiveAccount(env: LiveCopyEnv) {
     assetMeta:(meta.universe||[]).map((a:any,i:number)=>({coin:a.name,assetId:i,szDecimals:a.szDecimals,maxLeverage:a.maxLeverage}))};
 }
 export async function executeLiveIoc(env: LiveCopyEnv, intent: LiveOrderIntent, precheckedAccount?: Awaited<ReturnType<typeof readLiveAccount>>): Promise<LiveResult> {
-  const base = {ok:false,executed:false,status:'BLOCKED',coin:intent.coin,intentId:intent.intentId};
-  if (env.LIVE_COPY_TRADING_ENABLED !== 'true') return {...base,status:'LIVE_DISABLED'};
+  const base = {ok:false,executed:false,status:'REJECTED',coin:intent.coin,intentId:intent.intentId};
+  if (env.LIVE_COPY_TRADING_ENABLED !== 'true') return {...base,status:'REJECTED'};
   const key = normalizeKey(env.HYPERLIQUID_API_PRIVATE_KEY);
   const master = env.HYPERLIQUID_MASTER_ACCOUNT?.trim() || '';
-  if (!keyFormat(key) || !validAddress(master)) return {...base,status:'CREDENTIALS_NOT_CONFIGURED'};
+  if (!keyFormat(key) || !validAddress(master)) return {...base,status:'REJECTED'};
   if (!intent.intentId || !/^[A-Za-z0-9]{2,20}$/.test(intent.coin) ||
       !['LONG','SHORT'].includes(intent.direction) || !Number.isFinite(intent.quantity) ||
       intent.quantity<=0 || !Number.isFinite(intent.referencePrice) || intent.referencePrice<=0)
-    return {...base,status:'INVALID_INTENT'};
+    return {...base,status:'REJECTED'};
   // An account snapshot checked in the same serialized Durable Object event may be reused.
   // Manual orders and reversal second legs still fetch fresh exchange positions.
   const snapshot = precheckedAccount ?? await readLiveAccount(env);
   const asset = snapshot.assetMeta.find((a:any)=>a.coin===intent.coin);
-  if (!asset) return {...base,status:'UNKNOWN_ASSET'};
+  if (!asset) return {...base,status:'REJECTED'};
   const qty = decimalQty(intent.quantity, asset.szDecimals);
-  if (!(qty>0)) return {...base,status:'BELOW_SIZE_PRECISION'};
+  if (!(qty>0)) return {...base,status:'REJECTED'};
   const pos = snapshot.positions.find((p:any)=>p.coin===intent.coin);
   const current = pos?.qty || 0;
   const buy = intent.reduceOnly ? current < 0 : intent.direction === 'LONG';
   if (intent.reduceOnly) {
-    if (current===0) return {...base,status:'NO_POSITION_TO_REDUCE'};
-    if (qty > Math.abs(current)+1e-10) return {...base,status:'REDUCE_EXCEEDS_POSITION'};
+    if (current===0) return {...base,status:'REJECTED'};
+    if (qty > Math.abs(current)+1e-10) return {...base,status:'REJECTED'};
   } else if (current!==0 && Math.sign(current)!==(buy?1:-1)) {
-    return {...base,status:'OPPOSITE_POSITION_EXISTS'};
+    return {...base,status:'REJECTED'};
   }
   // Verify or configure leverage using the exchange itself. An environment flag alone
   // is NOT evidence of the leverage actually configured on Hyperliquid.
   // Do not change leverage for reduce-only orders (closing should remain possible).
   if (!intent.reduceOnly) {
-    if (env.LIVE_COPY_LEVERAGE_VERIFIED !== 'true') return {...base,status:'LEVERAGE_APPROVAL_MISSING'};
-    if (env.LIVE_COPY_LEVERAGE_MODE !== 'cross') return {...base,status:'LEVERAGE_MODE_NOT_APPROVED'};
-    if (asset.maxLeverage < 10) return {...base,status:'ASSET_MAX_LEVERAGE_BELOW_10X'};
+    if (env.LIVE_COPY_LEVERAGE_VERIFIED !== 'true') return {...base,status:'REJECTED'};
+    if (env.LIVE_COPY_LEVERAGE_MODE !== 'cross') return {...base,status:'REJECTED'};
+    if (asset.maxLeverage < 10) return {...base,status:'REJECTED'};
     if (pos && (Number(pos.leverage?.value) !== 10 || pos.leverage?.type !== 'cross'))
-      return {...base,status:'EXISTING_POSITION_LEVERAGE_MISMATCH'};
+      return {...base,status:'REJECTED'};
     // Exchange confirms this action before any opening/add order is submitted.
     // Failure or ambiguous response => fail closed, never submit the order.
     let leverageResponse:any;
     try {
       leverageResponse = await sendAction({type:'updateLeverage',asset:asset.assetId,isCross:true,leverage:10},key as `0x${string}`,master);
     } catch (error) {
-      return {...base,status:'LEVERAGE_UPDATE_UNCONFIRMED_NO_ORDER',raw:String(error)};
+      return {...base,status:'REJECTED',raw:String(error)};
     }
     if (leverageResponse?.status !== 'ok' || leverageResponse?.response?.type !== 'default')
-      return {...base,status:'LEVERAGE_UPDATE_REJECTED_NO_ORDER',raw:leverageResponse};
+      return {...base,status:'REJECTED',raw:leverageResponse};
   }
   const px = n(intent.referencePrice);
-  if (!intent.reduceOnly && qty*px < DEFAULT_MIN_NOTIONAL) return {...base,status:'BELOW_STRATEGY_MIN_NOTIONAL'};
+  if (!intent.reduceOnly && qty*px < DEFAULT_MIN_NOTIONAL) return {...base,status:'REJECTED'};
   // IOC price bound relative to the supplied *fresh* reference price.
   // Caller must verify reference freshness and use an account-level serialized executor.
   const limitPx = n(formatPrice(px*(buy?(1+MAX_PRICE_DEVIATION):(1-MAX_PRICE_DEVIATION)),asset.szDecimals));
@@ -968,14 +976,59 @@ export class LiveCopyControllerStage7 {
       // A resolved / superseded intent must not leave an orphan pending marker.
       // The skipped chain is NOT backfilled; the next fresh fill must re-anchor.
       const snap=await this.load();
-      if(snap.coins[coin])snap.coins[coin].needsSourceRebase=true;
+      if(snap.coins[coin]){
+        if(Math.abs(ledger.confirmedByCoin[coin]||0)<1e-9)delete snap.coins[coin];
+        else snap.coins[coin].needsSourceRebase=true;
+      }
       delete pending[coin];await this.state.storage.put('live_copy_v23_pending_exchange',pending);
       this.audit(snap,'COIN_PENDING_MARKER_CLEARED',coin,'intent already resolved; next fresh fill');
       await this.save(snap);return;
     }
-    // A partially-filled order already changed our actual exposure: never
-    // discard that quantity simply because the remaining amount is uncertain.
-    if(intent.confirmedFillQty>0||intent.status==='PARTIAL')return;
+    // Earlier builds left exchange-confirmed IOC partials permanently pending.
+    // IOC has no resting remainder; after matching the owned exchange position
+    // and ensuring there are no live orders for this coin, close the old marker
+    // without undoing the actually filled quantity.
+    if(intent.status==='PARTIAL' && intent.confirmedFillQty>0){
+      try{
+        const account=await readLiveAccount(this.env);
+        const openOrders=await postInfo({type:'frontendOpenOrders',user});
+        if(!Array.isArray(openOrders))throw Error('OPEN_ORDERS_INVALID_RESPONSE');
+        const current=account.positions.find(p=>p.coin===coin)?.qty||0;
+        const expected=ledger.confirmedByCoin[coin]||0;
+        const precision=account.assetMeta.find(a=>a.coin===coin)?.szDecimals;
+        if(precision===undefined)throw Error('RECONCILE_UNKNOWN_ASSET');
+        if(Math.abs(current-expected)>0.51*10**(-precision)||openOrders.some((o:any)=>o.coin===coin)){
+          const snap=await this.load();this.audit(snap,'COIN_PARTIAL_NEEDS_REVIEW',coin,
+            `position_diff=${current-expected}; open_orders=${openOrders.filter((o:any)=>o.coin===coin).length}`);
+          await this.save(snap);check.lastCheck=Date.now();
+          await this.state.storage.put('live_copy_v23_pending_exchange',pending);return;
+        }
+        const fresh=await this.ledger();
+        const same=fresh.intents[check.intentId];
+        if(!same||same.status!=='PARTIAL'||same.confirmedFillQty!==intent.confirmedFillQty)return;
+        fresh.intents[check.intentId]={...same,status:'FILLED',updatedAt:Date.now(),
+          lastError:'IOC_PARTIAL_CONFIRMED_REMAINDER_CANCELLED'};
+        await this.state.storage.put('live_copy_v23_ledger',fresh);
+        const snap=await this.load();
+        if(snap.coins[coin]){
+          snap.coins[coin].confirmedOwnQty=expected;
+          snap.coins[coin].suspended=false;
+          snap.coins[coin].pendingIntentId=null;
+          snap.coins[coin].needsSourceRebase=true;
+        }
+        delete pending[coin];await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+        this.audit(snap,'COIN_PARTIAL_IOC_RESUMED',coin,
+          `filled=${same.confirmedFillQty}; next fresh fill; no replay`);
+        await this.save(snap);return;
+      }catch(error){
+        check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+        const snap=await this.load();this.audit(snap,'COIN_RECONCILE_RETRY',coin,String(error).slice(0,130));
+        await this.save(snap);return;
+      }
+    }
+    // A genuinely UNKNOWN write with some confirmed fills is not automatically
+    // terminal; keep it isolated until its remaining execution is known.
+    if(intent.confirmedFillQty>0)return;
     try{
       const [account,openOrders,history,fills]=await Promise.all([
         readLiveAccount(this.env),
@@ -1032,16 +1085,9 @@ export class LiveCopyControllerStage7 {
         snap.coins[coin].confirmedOwnQty=expected;
         snap.coins[coin].needsSourceRebase=true;
       }
-      // Persist only the last skipped public fill for a short recovery window.
-      // It can be retried after exchange-absence confirmation, not while UNKNOWN.
-      const skipped=(check as any).latestSkipped as undefined|{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string};
-      if(skipped && Date.now()-skipped.at<115000 && skipped.at<=Date.now()+30000){
-        const recovery=await this.state.storage.get<Record<string,typeof skipped>>('live_copy_v23_coin_recovery_queue')||{};
-        recovery[coin]=skipped;await this.state.storage.put('live_copy_v23_coin_recovery_queue',recovery);
-        this.audit(snap,'COIN_FRESH_SIGNAL_QUEUED',coin,`rowid=${skipped.rowid}`);
-      }else if(skipped){
-        this.audit(snap,'COIN_OLD_SIGNAL_DISCARDED',coin,`rowid=${skipped.rowid}; no stale order`);
-      }
+      // Source events skipped during an unknown exchange outcome are final.
+      // Never send a stale fill after recovery; the next fresh signal reanchors.
+      await this.state.storage.put('live_copy_v23_coin_recovery_queue',{});
       delete pending[coin];
       await this.state.storage.put('live_copy_v23_pending_exchange',pending);
       this.audit(snap,'COIN_ORDER_ABSENT_RESUMED',coin,`intent=${check.intentId}; next_fresh_signal`);
@@ -1095,7 +1141,7 @@ export class LiveCopyControllerStage7 {
     const path=new URL(request.url).pathname;
     const s=await this.load();
     await this.restoreLiveArm(s);
-    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),pending_exchange_reason:'ONLY_UNRESOLVED_EXCHANGE_WRITES',source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
@@ -1148,37 +1194,9 @@ export class LiveCopyControllerStage7 {
         return json({ok:true,bootstrapped:true,session:cursor.session,rowid:cursor.rowid,processed:0,trading_enabled:this.liveEnabled()});
       }
       await this.reconcileIsolatedCoins();
-      // Recover a recent source event swallowed during per-coin reconciliation.
-      // Old signals are never traded; a later fresh fill will rebase exposure.
-      const recoveredKeys=await this.state.storage.get<Record<string,{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>>('live_copy_v23_coin_recovery_queue')||{};
-      for(const [coinKey,entry] of Object.entries(recoveredKeys)){
-        const row=entry as {rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string};
-        if(Date.now()-row.at>115000||row.at>Date.now()+30000){
-          delete recoveredKeys[coinKey];await this.state.storage.put('live_copy_v23_coin_recovery_queue',recoveredKeys);continue;
-        }
-        const pending=await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange')||{};
-        if(pending[row.coin])continue;
-        // At most one recovered signal per sync to avoid a burst of exchange calls.
-        try{
-          const e=JSON.parse(row.payload);
-          const meta=await this.state.storage.get<{at:number;universe:Array<{name:string;szDecimals:number}>}>('live_copy_v23_stage15_metadata_cache');
-          const decimals=meta?.universe?.find(a=>a.name===row.coin)?.szDecimals;
-          if(decimals===undefined)break;
-          const response=await this.fetch(new Request('https://live-copy.internal/event',{method:'POST',
-            headers:{authorization:`Bearer ${this.env.LIVE_COPY_ADMIN_TOKEN}`,'content-type':'application/json'},
-            body:JSON.stringify({coin:row.coin,fill_id:row.fill_id,whale_before_qty:e.target_before,
-              whale_target_qty:e.target_after,price:e.price,sz_decimals:decimals,time:row.at})}));
-          const result:any=await response.json();
-          if(response.ok){
-            delete recoveredKeys[coinKey];await this.state.storage.put('live_copy_v23_coin_recovery_queue',recoveredKeys);
-            const snap=await this.load();this.audit(snap,'COIN_RECOVERED_FRESH_SIGNAL',row.coin,
-              `rowid=${row.rowid}; outcome=${result.outcome||result.reason||'OK'}`);await this.save(snap);
-          }else if(result.error==='STALE_OR_FUTURE_WHALE_FILL'||result.error==='OUT_OF_ORDER_EVENT'){
-            delete recoveredKeys[coinKey];await this.state.storage.put('live_copy_v23_coin_recovery_queue',recoveredKeys);
-          }
-        }catch{}
-        break;
-      }
+      // SKIP -> RECORD -> NEXT: never replay an earlier public fill as a delayed order.
+      // The next fresh fill must become the new source anchor after isolation clears.
+      await this.state.storage.put('live_copy_v23_coin_recovery_queue',{});
       const rows=await this.env.DB.prepare('SELECT rowid,session_id,fill_id,at,coin,action,payload FROM mc_watch_events WHERE rowid>? ORDER BY rowid ASC LIMIT 100').bind(cursor.rowid).all<{rowid:number;session_id:string;fill_id:string;at:number;coin:string;action:string;payload:string}>();
       // Fetch metadata ONLY when source fills are waiting. A dashboard REFRESH
       // is read-only and must never trigger a /meta request or stop LIVE.
@@ -1222,22 +1240,13 @@ export class LiveCopyControllerStage7 {
             // Reprocess THIS source row in this sync tick, not 15+ min later.
             // It will still pass /event's ordinary freshness and ownership checks.
           } else {
-          // Keep only the most recent source observation while exchange outcome
-          // is unresolved. Never submit it until reconciliation has cleared.
+          // Record and discard this fill, do not queue it for later execution.
+          // A genuinely unknown exchange write is tracked separately in the
+          // immutable ledger; its pending marker must not be cleared blindly.
           const snap=await this.load();
-          const marker=(isolated as any)[row.coin];
-          if(row.fill_id && row.session_id){
-            try{
-              const e=JSON.parse(row.payload);
-              if(e?.source==='HYPERLIQUID_PUBLIC_FILL' &&
-                 !['GAP_CLOSE','RESYNC_CLOSE','RESYNC_REVERSAL'].includes(row.action)){
-                marker.latestSkipped={rowid:row.rowid,session_id:row.session_id,fill_id:row.fill_id,
-                  at:row.at,coin:row.coin,action:row.action,payload:row.payload};
-                await this.state.storage.put('live_copy_v23_pending_exchange',isolated);
-              }
-            }catch{}
-          }
-          this.audit(snap,'COIN_SIGNAL_SKIPPED_PENDING_EXCHANGE',row.coin,`rowid=${row.rowid}`);await this.save(snap);
+          snap.seen[`${row.coin}:${row.fill_id}`]=Date.now();
+          this.audit(snap,'COIN_SIGNAL_SKIPPED_PENDING_EXCHANGE',row.coin,`rowid=${row.rowid}; recorded; not replayed`);
+          await this.save(snap);
           ignored++;cursor={session:row.session_id,rowid:row.rowid};
           await this.state.storage.put('live_copy_v23_d1_cursor',cursor);
           continue;
@@ -1587,6 +1596,9 @@ export class LiveCopyControllerStage7 {
     await this.state.storage.put('live_copy_v23_ledger',settled.ledger);
     s.coins[coin]=settled.state as Coin;
     this.audit(s,'LIVE_ORDER_'+settled.outcome,coin,intentId);
+    if(settled.outcome==='REJECTED'){
+      this.audit(s,'COIN_SIGNAL_SKIPPED_ORDER_REJECTED',coin,`fill=${fill_id}; intent=${intentId}; next signal allowed`);
+    }
     if(settled.outcome==='UNKNOWN'||settled.outcome==='PARTIAL'){
       await this.isolateExchangeCoin(coin,intentId,settled.outcome);
       return json({ok:true,isolated:true,reason:'EXCHANGE_RECONCILIATION_REQUIRED',outcome:settled.outcome,intentId,exchange_order_sent:true},200);
