@@ -1,3 +1,4 @@
+// Stage18 reconciliation: per-intent historical OID matching; rate-limited reconciliation; no trade sizing changes.
 // STAGE18 SKIP-RECORD-CLEAR: definitive no-order rejects never become UNKNOWN; terminal IOC partials resolve; dropped source fills are never replayed. Genuine uncertain writes retain exchange reconciliation.
 // STAGE18 FAST COIN RECOVERY: resolved markers checked each 5s, rejected historical orders no longer hold coin forever; skipped live fills retried immediately after verified resolution while fresh. No margin change.
 // STAGE18 COIN RECOVERY PATCH: orphan pending markers cleared; latest skipped source event retried only while fresh after verified exchange reconciliation; shows pending_exchange_coins in /status. No margin change.
@@ -981,15 +982,24 @@ export class LiveCopyControllerStage7 {
     this.audit(snap,'COIN_EXCHANGE_PENDING',coin,`${outcome}; intent=${intentId}; other_coins_continue`);
     await this.save(snap);
   }
+  // Shared, durable reconciliation throttle: 5s D1 polling does not imply 5s
+  // exchange-order-history polling. HTTP 429 suspends reconciliation globally.
+  private readonly RECONCILE_BACKOFF_KEY='live_copy_v23_reconcile_backoff_until';
+  private readonly RECONCILE_INTERVAL_MS=20000;
   private async reconcileIsolatedCoins(){
+    if(Date.now()<(await this.state.storage.get<number>(this.RECONCILE_BACKOFF_KEY)||0))return;
     const pending=await this.state.storage.get<Record<string,{intentId:string;firstSeen:number;lastCheck:number;emptyChecks:number}>>('live_copy_v23_pending_exchange')||{};
-    const candidates=Object.entries(pending).filter(([,x])=>Date.now()-x.lastCheck>=5000);
+    const candidates=Object.entries(pending).filter(([,x])=>Date.now()-x.lastCheck>=this.RECONCILE_INTERVAL_MS);
     if(!candidates.length)return;
     const user=this.env.HYPERLIQUID_MASTER_ACCOUNT?.trim()||'';
     if(!/^0x[0-9a-fA-F]{40}$/.test(user))return;
     const postInfo=async(body:any):Promise<any>=>{
       const response=await fetch('https://api.hyperliquid.xyz/info',{
         method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      if(response.status===429){
+        await this.state.storage.put(this.RECONCILE_BACKOFF_KEY,Date.now()+90000);
+        throw Error('RECONCILE_HTTP_429');
+      }
       if(!response.ok)throw Error('RECONCILE_HTTP_'+response.status);
       return await response.json();
     };
@@ -1094,6 +1104,7 @@ export class LiveCopyControllerStage7 {
           `filled=${same.confirmedFillQty}; next fresh fill; no replay`);
         await this.save(snap);return;
       }catch(error){
+        if(/(?:HTTP_429|429)/.test(String(error)))await this.state.storage.put(this.RECONCILE_BACKOFF_KEY,Date.now()+90000);
         check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
         const snap=await this.load();this.audit(snap,'COIN_RECONCILE_RETRY',coin,String(error).slice(0,130));
         await this.save(snap);return;
@@ -1103,36 +1114,40 @@ export class LiveCopyControllerStage7 {
     // terminal; keep it isolated until its remaining execution is known.
     if(intent.confirmedFillQty>0)return;
     try{
-      const [account,openOrders,history,fills]=await Promise.all([
+      // Only an exchange OID can attribute a historical order to THIS intent.
+      // All historical orders on the same coin are not evidence of this write.
+      const knownOid=intent.exchangeOid===undefined||intent.exchangeOid===null
+        ? null:String(intent.exchangeOid);
+      const [account,openOrders,fills]=await Promise.all([
         readLiveAccount(this.env),
         postInfo({type:'frontendOpenOrders',user}),
-        postInfo({type:'historicalOrders',user}),
         postInfo({type:'userFillsByTime',user,startTime:Math.max(0,intent.createdAt-2000),endTime:Date.now(),aggregateByTime:false})
       ]);
-      if(!Array.isArray(openOrders)||!Array.isArray(history)||!Array.isArray(fills))throw Error('RECONCILE_INVALID_RESPONSE');
+      if(!Array.isArray(openOrders)||!Array.isArray(fills))throw Error('RECONCILE_INVALID_RESPONSE');
+      const history=knownOid?await postInfo({type:'historicalOrders',user}):[];
+      if(!Array.isArray(history))throw Error('RECONCILE_INVALID_HISTORY');
       const current=account.positions.find(p=>p.coin===coin)?.qty||0;
       const expected=ledger.confirmedByCoin[coin]||0;
       const precision=account.assetMeta.find(a=>a.coin===coin)?.szDecimals;
       if(precision===undefined)throw Error('RECONCILE_UNKNOWN_ASSET');
       const epsilon=0.51*10**(-precision);
+      // A matching OID is definitive; without one, conservatively check all
+      // fills for this coin since the intent (but never adopt those fills).
       const fillsCoin=fills.filter((f:any)=>f.coin===coin&&Number(f.time)>=intent.createdAt-2000);
-      const ordersCoin=history.filter((h:any)=>h?.order?.coin===coin&&Number(h?.order?.timestamp||h?.statusTimestamp||0)>=intent.createdAt-2000);
+      const ordersCoin=history.filter((h:any)=>
+        h?.order?.coin===coin && String(h?.order?.oid??h?.oid??'')===knownOid);
       const openCoin=openOrders.some((o:any)=>o.coin===coin);
-      // Historical IOC orders that were explicitly REJECTED or CANCELLED are
-      // not evidence of an outstanding exchange write. The old code treated
-      // ANY historical order on the coin as UNKNOWN forever, even when its
-      // final status proved it never filled. Never dismiss a filled, resting,
-      // partially filled or unrecognised status.
-      const nonExecutingOrder=(h:any)=>{
+      const terminalNoFill=(h:any)=>{
         const status=String(h?.status||h?.order?.status||'').toLowerCase();
         return ['rejected','canceled','cancelled','expired','margin_canceled',
           'insufficientmargin','postonlycanceled'].includes(status);
       };
-      const unresolvedOrders=ordersCoin.filter((h:any)=>!nonExecutingOrder(h));
+      const unresolvedOrders=ordersCoin.filter((h:any)=>!terminalNoFill(h));
       if(Math.abs(current-expected)>epsilon||fillsCoin.length||unresolvedOrders.length||openCoin){
+        check.emptyChecks=0;
         const snap=await this.load();
         this.audit(snap,'COIN_RECONCILE_NEEDS_REVIEW',coin,
-          `position_diff=${current-expected}; fills=${fillsCoin.length}; unresolved_orders=${unresolvedOrders.length}; ignored_rejected_orders=${ordersCoin.length-unresolvedOrders.length}; open=${openCoin}`);
+          `position_diff=${current-expected}; fills=${fillsCoin.length}; unresolved_orders=${unresolvedOrders.length}; matched_oid=${knownOid||'none'}; ignored_rejected_orders=${ordersCoin.length-unresolvedOrders.length}; open=${openCoin}`);
         await this.save(snap);
         // Keep uncertainty isolated. No second write of an unknown intent.
         check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
@@ -1147,7 +1162,7 @@ export class LiveCopyControllerStage7 {
       }
       const freshLedger=await this.ledger();
       const same=freshLedger.intents[check.intentId];
-      if(!same||same.status!=='UNKNOWN'||same.confirmedFillQty>0)return;
+      if(!same||!['UNKNOWN','SUBMITTING','PREPARED'].includes(same.status)||same.confirmedFillQty>0)return;
       freshLedger.intents[check.intentId]={...same,status:'CANCELLED',updatedAt:Date.now(),lastError:'EXCHANGE_NO_ORDER_NO_FILL_CONFIRMED_TWICE'};
       await this.state.storage.put('live_copy_v23_ledger',freshLedger);
       const snap=await this.load();
@@ -1166,6 +1181,7 @@ export class LiveCopyControllerStage7 {
       this.audit(snap,'COIN_ORDER_ABSENT_RESUMED',coin,`intent=${check.intentId}; next_fresh_signal`);
       await this.save(snap);
     }catch(error){
+      if(/(?:HTTP_429|429)/.test(String(error)))await this.state.storage.put(this.RECONCILE_BACKOFF_KEY,Date.now()+90000);
       check.lastCheck=Date.now();await this.state.storage.put('live_copy_v23_pending_exchange',pending);
       const snap=await this.load();this.audit(snap,'COIN_RECONCILE_RETRY',coin,String(error).slice(0,130));await this.save(snap);
     }
@@ -1214,7 +1230,7 @@ export class LiveCopyControllerStage7 {
     const path=new URL(request.url).pathname;
     const s=await this.load();
     await this.restoreLiveArm(s);
-    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,skipped_coins:Object.entries(s.skippedCoins||{}).map(([coin,item])=>({coin,...item})).sort((a,b)=>b.at-a.at),processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),pending_exchange_reason:'ONLY_UNRESOLVED_EXCHANGE_WRITES',source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,skipped_coins:Object.entries(s.skippedCoins||{}).map(([coin,item])=>({coin,...item})).sort((a,b)=>b.at-a.at),processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),pending_exchange_reason:'ONLY_UNRESOLVED_EXCHANGE_WRITES',reconcile_backoff_until:(await this.state.storage.get<number>(this.RECONCILE_BACKOFF_KEY))||0,reconcile_interval_seconds:this.RECONCILE_INTERVAL_MS,source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
