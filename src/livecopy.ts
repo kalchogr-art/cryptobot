@@ -879,7 +879,7 @@ type Env=LiveCopyEnv & {LIVE_COPY_LEVERAGE_VERIFIED?:string;LIVE_COPY_AUTO_EXECU
 type Storage={get<T>(key:string):Promise<T|undefined>;put(key:string,value:unknown):Promise<void>;setAlarm?(when:number):Promise<void>;deleteAlarm?():Promise<void>};
 type State={storage:Storage};
 type Coin=CopyCoinState & {lastWhaleTarget:number;lastPrice:number;lastEventAt:number;episode:number;needsSourceRebase?:boolean};
-type Snapshot={version:2;mode:'STOPPED'|'RUNNING';sessionKind?:'DRY_RUN'|'LIVE';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[]};
+type Snapshot={version:2;mode:'STOPPED'|'RUNNING';sessionKind?:'DRY_RUN'|'LIVE';startedAt:number|null;coins:Record<string,Coin>;seen:Record<string,number>;recent:{at:number;kind:string;coin?:string;detail?:string}[];skippedCoins?:Record<string,{at:number;kind:string;reason:string;count:number}>};
 const KEY='live_copy_v23_stage7';
 const fresh=():Snapshot=>({version:2,mode:'STOPPED',sessionKind:'DRY_RUN',startedAt:null,coins:{},seen:{},recent:[]});
 const json=(v:unknown,status=200)=>new Response(JSON.stringify(v),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
@@ -942,9 +942,34 @@ export class LiveCopyControllerStage7 {
     return retryAfter;
   }
   constructor(private state:State,private env:Env){}
-  private async load(){return await this.state.storage.get<Snapshot>(KEY)||fresh();}
+  private async load(){
+    const s=await this.state.storage.get<Snapshot>(KEY)||fresh();
+    // One-time migration: show skips still present in older event history.
+    if(!s.skippedCoins){
+      s.skippedCoins={};
+      for(const event of [...s.recent].reverse()){
+        if(!event.coin||!/SKIP|EXCLUDED|SIGNAL_CANCELLED|NEW_ENTRY_REJECTED/.test(event.kind))continue;
+        const old=s.skippedCoins[event.coin];
+        s.skippedCoins[event.coin]={at:event.at,kind:event.kind,reason:event.detail?.trim()||event.kind,count:(old?.count||0)+1};
+      }
+    }
+    return s;
+  }
   private async save(s:Snapshot){await this.state.storage.put(KEY,s);}
-  private audit(s:Snapshot,kind:string,coin?:string,detail?:string){s.recent.unshift({at:Date.now(),kind,coin,detail});s.recent=s.recent.slice(0,100);}
+  private audit(s:Snapshot,kind:string,coin?:string,detail?:string){
+    const at=Date.now();
+    s.recent.unshift({at,kind,coin,detail});s.recent=s.recent.slice(0,100);
+    // Persist skipped signals independently: frequent AUTO_SYNC_OK logs must not hide them.
+    // Never mark accumulation, recovery, or a successful order as a skipped signal.
+    if(coin&&(/SKIP|EXCLUDED|SIGNAL_CANCELLED|NEW_ENTRY_REJECTED/.test(kind))){
+      const old=s.skippedCoins?.[coin];
+      s.skippedCoins ||= {};
+      s.skippedCoins[coin]={at,kind,reason:detail?.trim()||kind,count:(old?.count||0)+1};
+      // Bound long-running session state, retaining the 60 most recently skipped coins.
+      const entries=Object.entries(s.skippedCoins);
+      if(entries.length>60){entries.sort((a,b)=>b[1].at-a[1].at);s.skippedCoins=Object.fromEntries(entries.slice(0,60));}
+    }
+  }
   // Per-coin uncertainty is NOT a global session failure. Do not discard the
   // durable exchange intent. We will investigate before accepting a new signal
   // for this coin. Other coins keep their five-second synchronization.
@@ -1189,7 +1214,7 @@ export class LiveCopyControllerStage7 {
     const path=new URL(request.url).pathname;
     const s=await this.load();
     await this.restoreLiveArm(s);
-    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),pending_exchange_reason:'ONLY_UNRESOLVED_EXCHANGE_WRITES',source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
+    if(request.method==='GET'&&path==='/status')return json({ok:true,version:'V2.3_STAGE18_PARTIAL_REVERSAL_CATCHUP',mode:s.mode,auto_sync_enabled:s.mode==='RUNNING',poll_interval_seconds:5,live_execution_wired:true,manual_close_wired:true,session_kind:s.sessionKind||'DRY_RUN',live_session_authorized:this.liveAuthorized(s),manual_close_enabled:this.env.LIVE_COPY_TRADING_ENABLED==='true'&&(this.env as any).LIVE_COPY_MANUAL_CLOSE_ENABLED==='true',trading_enabled:this.liveAuthorized(s),auto_execution_configured:this.liveEnabled(),started_at:s.startedAt,coins:Object.values(s.coins),recent:s.recent,skipped_coins:Object.entries(s.skippedCoins||{}).map(([coin,item])=>({coin,...item})).sort((a,b)=>b.at-a.at),processed_event_ids:Object.keys(s.seen).length,ledger_intents:Object.keys((await this.ledger()).intents).length,pending_exchange_coins:Object.keys((await this.state.storage.get<Record<string,unknown>>('live_copy_v23_pending_exchange'))||{}),pending_exchange_reason:'ONLY_UNRESOLVED_EXCHANGE_WRITES',source_rebase_coins:Object.values(s.coins).filter(c=>c.needsSourceRebase).map(c=>c.coin),direction_mismatch_coins:Object.values(s.coins).filter(c=>Math.abs(c.confirmedOwnQty)>1e-9&&Math.abs(c.lastWhaleTarget)>1e-9&&Math.sign(c.confirmedOwnQty)!==Math.sign(c.lastWhaleTarget)).map(c=>c.coin)});
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
@@ -1783,12 +1808,15 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <section><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="LIVE_COPY_ADMIN_TOKEN"><button id="connect">🔗 СВЪРЖИ</button><button id="refresh">↻ REFRESH</button><button id="sync">↻ SYNC NEW FILLS</button><button id="start">▶ START · AUTO SYNC</button><button id="stop">■ STOP</button><button id="all" class="danger" disabled title="Изисква STOP и разрешение за реално затваряне">CLOSE ALL · НЕАКТИВНО</button></div><p id="connection" role="status" class="muted">Връзка: НЕСВЪРЗАН</p><p class="muted">Екранът се обновява автоматично през 5 сек, когато е отворен.</p><p id="message" role="status">Въведи администраторския токен и натисни СВЪРЖИ.</p></section>
 <section><h2>Състояние</h2><div class="cards"><div class="card">MODE<b id="mode">—</b></div><div class="card">REAL EXECUTION<b id="real">—</b></div><div class="card">TRACKED COINS<b id="coins">—</b></div><div class="card">LEDGER INTENTS<b id="intents">—</b></div><div class="card">PROCESSED FILLS<b id="fills">—</b></div></div></section>
 <section><h2>Проследявани монети · не са потвърдени реални позиции</h2><div style="overflow:auto"><table><thead><tr><th>Монета</th><th>Цел трейдър</th><th>Наше потвърдено количество</th><th>Чакащ intent</th><th>Статус</th><th>Действие</th></tr></thead><tbody id="positions"><tr><td colspan="6">Няма данни</td></tr></tbody></table></div><p class="muted">CLOSE на отделна позиция ще се активира едва след реално потвърдено изпълнение и защитена синхронизация с борсата.</p></section>
+<section><h2>Пропуснати сигнали · SKIPPED COINS</h2><p class="muted">Само монети с пропуснат сигнал, последна причина и общ брой пропуски. Данните се пазят отделно от „Последни събития“.</p><div style="overflow:auto"><table><thead><tr><th>Монета</th><th>Последна причина</th><th>Тип</th><th>Час</th><th>Брой</th></tr></thead><tbody id="skipped-coins"><tr><td colspan="5">Няма пропуснати сигнали</td></tr></tbody></table></div></section>
 <section><h2>Последни събития</h2><pre id="recent">—</pre></section>
 <script>
 const $=x=>document.getElementById(x);const esc=x=>String(x??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function call(action,method='GET',payload={}){const token=$('token').value.trim();if(!token)throw Error('Въведи LIVE_COPY_ADMIN_TOKEN');const r=await fetch('/live-copy/api/'+action,{method,headers:{authorization:'Bearer '+token,...(method==='POST'?{'content-type':'application/json'}:{})},...(method==='POST'?{body:JSON.stringify(payload)}:{})});const d=await r.json();if(!r.ok)throw Error((d.error||'HTTP '+r.status)+' '+(d.detail||''));return d;}
 let refreshBusy=false;
-async function refresh(silent=false){if(refreshBusy)return;refreshBusy=true;try{const d=await call('status');$('mode').textContent=d.mode||'—';$('real').textContent=d.trading_enabled?'LIVE ACTIVE':(d.auto_execution_configured?'LIVE ARMED':'DRY RUN');$('coins').textContent=(d.coins||[]).length;$('intents').textContent=d.ledger_intents??'—';$('fills').textContent=d.processed_event_ids??'—';$('all').disabled=!(d.manual_close_enabled&&d.mode==='STOPPED');$('positions').innerHTML=(d.coins||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.lastWhaleTarget)+'</td><td>'+esc(p.confirmedOwnQty)+'</td><td>'+esc(p.pendingIntentId||'—')+'</td><td>'+esc(p.suspended?'SUSPENDED':'TRACKING')+'</td><td><button class=\"danger\" data-close=\"'+esc(p.coin)+'\" '+(d.manual_close_enabled&&d.mode==='STOPPED'?'':'disabled')+'>CLOSE</button></td></tr>').join('')||'<tr><td colspan="6">Няма проследявани монети</td></tr>';$('recent').textContent=JSON.stringify(d.recent||[],null,2);$('connection').textContent='Връзка: СВЪРЗАН · '+(d.mode||'STATUS OK');if(!silent)$('message').textContent='Данните са обновени. LIVE изпълнението е '+(d.trading_enabled?'включено':'изключено')+'.';}catch(e){$('connection').textContent='Връзка: НЕСВЪРЗАН';$('message').textContent='Грешка при обновяването: '+String(e);}finally{refreshBusy=false;}}
+async function refresh(silent=false){if(refreshBusy)return;refreshBusy=true;try{const d=await call('status');$('mode').textContent=d.mode||'—';$('real').textContent=d.trading_enabled?'LIVE ACTIVE':(d.auto_execution_configured?'LIVE ARMED':'DRY RUN');$('coins').textContent=(d.coins||[]).length;$('intents').textContent=d.ledger_intents??'—';$('fills').textContent=d.processed_event_ids??'—';$('all').disabled=!(d.manual_close_enabled&&d.mode==='STOPPED');$('positions').innerHTML=(d.coins||[]).map(p=>'<tr><td>'+esc(p.coin)+'</td><td>'+esc(p.lastWhaleTarget)+'</td><td>'+esc(p.confirmedOwnQty)+'</td><td>'+esc(p.pendingIntentId||'—')+'</td><td>'+esc(p.suspended?'SUSPENDED':'TRACKING')+'</td><td><button class=\"danger\" data-close=\"'+esc(p.coin)+'\" '+(d.manual_close_enabled&&d.mode==='STOPPED'?'':'disabled')+'>CLOSE</button></td></tr>').join('')||'<tr><td colspan="6">Няма проследявани монети</td></tr>';const skipped=Array.isArray(d.skipped_coins)?d.skipped_coins:[];
+$('skipped-coins').innerHTML=skipped.length?skipped.map(x=>'<tr><td><b>'+esc(x.coin)+'</b></td><td>'+esc(x.reason)+'</td><td>'+esc(x.kind)+'</td><td>'+esc(new Date(x.at).toLocaleString('bg-BG',{timeZone:'Europe/Sofia'}))+'</td><td>'+esc(x.count)+'</td></tr>').join(''):'<tr><td colspan="5">Няма пропуснати сигнали</td></tr>';
+$('recent').textContent=JSON.stringify(d.recent||[],null,2);$('connection').textContent='Връзка: СВЪРЗАН · '+(d.mode||'STATUS OK');if(!silent)$('message').textContent='Данните са обновени. LIVE изпълнението е '+(d.trading_enabled?'включено':'изключено')+'.';}catch(e){$('connection').textContent='Връзка: НЕСВЪРЗАН';$('message').textContent='Грешка при обновяването: '+String(e);}finally{refreshBusy=false;}}
 async function control(action){try{const status=await call('status');const live=action==='start'&&status.auto_execution_configured;if(!confirm(live?'ВНИМАНИЕ: START ще изпраща РЕАЛНИ поръчки в Hyperliquid. Продължи?':action==='start'?'Стартирай DRY RUN синхронизацията?':'STOP спира новите ордери, но НЕ затваря позиции. Продължи?'))return;if(live&&!confirm('ПОТВЪРДИ ОТНОВО: реална търговия с 10x ливъридж.'))return;await call(action,'POST',live?{confirm:'START_REAL_HYPERLIQUID_COPY'}:{});await refresh();}catch(e){$('message').textContent='Грешка: '+String(e);}}
 $('sync').onclick=async()=>{try{const d=await call('sync','POST');$('message').textContent=JSON.stringify(d,null,2);await refresh();}catch(e){$('message').textContent=String(e);}};$('connect').onclick=refresh;$('token').addEventListener('keydown',e=>{if(e.key==='Enter')refresh();});$('refresh').onclick=()=>refresh(false);$('start').onclick=()=>control('start');$('stop').onclick=()=>control('stop');
 // UI-only poll: GET /status, no manual /sync or Hyperliquid calls.
