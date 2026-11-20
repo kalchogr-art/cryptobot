@@ -997,7 +997,55 @@ export class LiveCopyControllerStage7 {
         const expected=ledger.confirmedByCoin[coin]||0;
         const precision=account.assetMeta.find(a=>a.coin===coin)?.szDecimals;
         if(precision===undefined)throw Error('RECONCILE_UNKNOWN_ASSET');
-        if(Math.abs(current-expected)>0.51*10**(-precision)||openOrders.some((o:any)=>o.coin===coin)){
+        const epsilon=0.51*10**(-precision);
+        const coinOpenOrders=openOrders.filter((o:any)=>o.coin===coin);
+        // A prior IOC partial may be fully closed on Hyperliquid while the
+        // local ledger still holds its historical filled quantity. The old
+        // mismatch branch kept that coin pending forever. Confirm a FLAT
+        // exchange position twice, with no open orders or other unresolved
+        // intents, before correcting the local POSITION BALANCE only.
+        // Historical fills/intents are retained for audit; no new order is sent.
+        const otherUnresolved=Object.values(ledger.intents).some(i=>
+          i.coin===coin&&i.id!==check.intentId&&
+          ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+        if(Math.abs(current)<=epsilon && Math.abs(expected)>epsilon &&
+           coinOpenOrders.length===0 && !otherUnresolved){
+          check.emptyChecks=(check.emptyChecks||0)+1;
+          check.lastCheck=Date.now();
+          if(check.emptyChecks<2){
+            await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+            const snap=await this.load();
+            this.audit(snap,'COIN_FLAT_RECHECK',coin,
+              `ledger_qty=${expected}; exchange_qty=${current}; checks=${check.emptyChecks}`);
+            await this.save(snap);return;
+          }
+          // Re-read under this Durable Object lock before committing the
+          // ledger adjustment. A newly submitted unresolved intent must win.
+          const flatLedger=await this.ledger();
+          const flatIntent=flatLedger.intents[check.intentId];
+          const conflicting=Object.values(flatLedger.intents).some(i=>
+            i.coin===coin&&i.id!==check.intentId&&
+            ['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+          if(!flatIntent||flatIntent.status!=='PARTIAL'||conflicting ||
+             Math.abs((flatLedger.confirmedByCoin[coin]||0)-expected)>epsilon){
+            check.emptyChecks=0;await this.state.storage.put('live_copy_v23_pending_exchange',pending);return;
+          }
+          flatLedger.confirmedByCoin[coin]=0;
+          flatLedger.intents[check.intentId]={...flatIntent,status:'FILLED',
+            updatedAt:Date.now(),lastError:'IOC_PARTIAL_TERMINAL_EXCHANGE_FLAT_LEDGER_REBASED'};
+          delete flatLedger.suspendedCoins[coin];
+          flatLedger.lastReconciledAt=Date.now();
+          await this.state.storage.put('live_copy_v23_ledger',flatLedger);
+          const snap=await this.load();
+          delete snap.coins[coin];
+          delete pending[coin];
+          await this.state.storage.put('live_copy_v23_pending_exchange',pending);
+          this.audit(snap,'COIN_FLAT_LEDGER_RESET',coin,
+            `old_ledger_qty=${expected}; exchange_qty=${current}; open_orders=0; history_preserved; next_fresh_signal`);
+          await this.save(snap);return;
+        }
+        check.emptyChecks=0;
+        if(Math.abs(current-expected)>epsilon||coinOpenOrders.length>0){
           const snap=await this.load();this.audit(snap,'COIN_PARTIAL_NEEDS_REVIEW',coin,
             `position_diff=${current-expected}; open_orders=${openOrders.filter((o:any)=>o.coin===coin).length}`);
           await this.save(snap);check.lastCheck=Date.now();
