@@ -1235,7 +1235,60 @@ export class LiveCopyControllerStage7 {
     if(request.method!=='POST')return json({ok:false,error:'NOT_FOUND'},404);
     let body:any={};try{body=await request.json();}catch{return json({ok:false,error:'INVALID_JSON'},400);}
     if(path==='/stop'){this.liveArmAt=null;await this.state.storage.put('live_copy_v23_stage15_live_arm',null);s.mode='STOPPED';this.audit(s,'STOP');await this.save(s);if(this.state.storage.deleteAlarm)await this.state.storage.deleteAlarm();return json({ok:true,mode:s.mode,positions_untouched:true});}
-    if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);const ledger=await this.ledger();const report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);const unresolved=Object.values(ledger.intents).filter(i=>['PREPARED','SUBMITTING','UNKNOWN','PARTIAL'].includes(i.status));
+    if(path==='/start'){this.liveArmAt=null;if(this.liveEnabled()&&body.confirm!=='START_REAL_HYPERLIQUID_COPY')return json({ok:false,error:'EXPLICIT_LIVE_CONFIRMATION_REQUIRED'},409);if(this.liveEnabled()){try{const account=await readLiveAccount(this.env);
+          let ledger=await this.ledger();
+          let report=reconcileCopyLedger(ledger,account.positions,account.assetMeta);
+          // External manual close: never let a stale confirmed quantity prevent START
+          // when exchange twice verifies FLAT, there are no resting orders, and no
+          // unresolved writes for that coin. Historical fills/intents remain untouched.
+          // A fresh whale ADD / REVERSAL can re-arm the manually closed coin later.
+          const blockers=report.rows.filter(r=>r.status!=='MATCH'&&r.status!=='UNRESOLVED_INTENT');
+          const unresolvedStatuses=new Set(['PREPARED','SUBMITTING','UNKNOWN','PARTIAL']);
+          const candidateRows=blockers.filter(r=>{
+            const d=account.assetMeta.find(a=>a.coin===r.coin)?.szDecimals;
+            const epsilon=d===undefined?0:0.51*10**(-d);
+            return r.status==='MISMATCH' && d!==undefined &&
+              Math.abs(r.exchangeQty)<=epsilon && Math.abs(r.expectedQty)>epsilon &&
+              !Object.values(ledger.intents).some(i=>i.coin===r.coin&&unresolvedStatuses.has(i.status));
+          });
+          if(candidateRows.length===blockers.length && candidateRows.length>0){
+            const response=await fetch('https://api.hyperliquid.xyz/info',{
+              method:'POST',headers:{'content-type':'application/json'},
+              body:JSON.stringify({type:'frontendOpenOrders',user:account.masterAccount})});
+            if(!response.ok)throw Error('MANUAL_CLOSE_OPEN_ORDERS_HTTP_'+response.status);
+            const openOrders=await response.json() as any[];
+            if(!Array.isArray(openOrders))throw Error('MANUAL_CLOSE_OPEN_ORDERS_INVALID');
+            // A second fresh account snapshot is required before altering local accounting.
+            const verified=await readLiveAccount(this.env);
+            const allFlat=candidateRows.every(r=>{
+              const d=verified.assetMeta.find(a=>a.coin===r.coin)?.szDecimals;
+              const epsilon=d===undefined?0:0.51*10**(-d);
+              return d!==undefined &&
+                Math.abs(verified.positions.find(p=>p.coin===r.coin)?.qty||0)<=epsilon &&
+                !openOrders.some(o=>o.coin===r.coin);
+            });
+            if(allFlat){
+              const latest=await this.ledger();
+              const stillSafe=candidateRows.every(r=>
+                Math.abs((latest.confirmedByCoin[r.coin]||0)-r.expectedQty)<1e-9 &&
+                !Object.values(latest.intents).some(i=>i.coin===r.coin&&unresolvedStatuses.has(i.status)));
+              if(stillSafe){
+                for(const r of candidateRows){
+                  latest.confirmedByCoin[r.coin]=0;
+                  latest.suspendedCoins[r.coin]=true;
+                  delete s.coins[r.coin];
+                  this.audit(s,'EXTERNAL_MANUAL_CLOSE_RECONCILED',r.coin,
+                    `old_ledger_qty=${r.expectedQty}; exchange_qty=0; open_orders=0; history_preserved; next_fresh_entry`);
+                }
+                latest.lastReconciledAt=Date.now();
+                await this.state.storage.put('live_copy_v23_ledger',latest);
+                await this.save(s);
+                ledger=latest;
+                report=reconcileCopyLedger(ledger,verified.positions,verified.assetMeta);
+              }
+            }
+          }
+          const unresolved=Object.values(ledger.intents).filter(i=>unresolvedStatuses.has(i.status));
           if(report.rows.some(r=>r.status!=='MATCH'&&r.status!=='UNRESOLVED_INTENT'))return json({ok:false,error:'PRE_START_RECONCILIATION_BLOCKED',report},409);
           const pending=await this.state.storage.get<Record<string,{intentId:string;firstSeen:number;lastCheck:number;emptyChecks:number}>>('live_copy_v23_pending_exchange')||{};
           for(const i of unresolved){
